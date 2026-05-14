@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: RFC / design discussion
+    url: https://github.com/Briany4717/byard/discussions
+    about: >
+      For architectural proposals or open-ended design questions,
+      start a discussion or open an RFC pull request.

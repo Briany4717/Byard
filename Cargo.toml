@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+# Crates will be added here as phases land.
+# Planned layout:
+#   crates/byard-core      — engine subsystems (render, spatial, logic, concurrency)
+#   crates/byard-compiler  — bylang lexer, parser, and AST interpreter
+#   crates/byard-macro     — #[byard_controller] procedural macro
+#   crates/byard-platform  — PlatformHost implementations (winit, etc.)
+#   crates/byard           — public façade re-exporting the above
+members = []
+
+[workspace.package]
+version     = "0.0.0"
+edition     = "2024"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/Briany4717/byard"
+homepage    = "https://github.com/Briany4717/byard"
+authors     = ["Byard contributors"]
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code          = "forbid"
+missing_docs         = "warn"
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow these pedantic lints that are too noisy for a young codebase:
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"

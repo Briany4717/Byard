@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a new capability or change.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For **architectural changes** (new subsystem, change to the memory model,
+        changes to `bylang` semantics), please write an RFC instead of filing
+        an issue. See [`docs/rfcs/0000-template.md`](../../docs/rfcs/0000-template.md).
+
+        For smaller, scoped additions, this template is the right place.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: >
+        Describe the use-case or pain point. "I want X" is less useful than
+        "When I try to do Y, I can't because Z."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like to see added or changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have considered
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this affect?
+      multiple: true
+      options:
+        - Render subsystem (wgpu pipelines)
+        - Spatial subsystem (layout / hit-testing)
+        - Logic subsystem (signals / arenas)
+        - Concurrency subsystem (threading / double-buffer)
+        - bylang (DSL syntax / compiler)
+        - Rust ↔ bylang bridge (byard_controller macro)
+        - PlatformHost / windowing
+        - Documentation
+        - Other
