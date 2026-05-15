@@ -247,12 +247,14 @@ Byard does not panic on GPU errors. All fallible engine operations return
 `byard-core` that wraps `wgpu` error types with additional context (backend
 name, shader stage, feature flag).
 
-The error boundary is at initialisation time. `wgpu` surfaces shader
-compilation failures synchronously via `wgpu::error_scope` during the pipeline
-compilation phase at startup. If any pipeline fails to compile, the engine
-returns `Err(ByardError::PipelineCompilation { pipeline, reason })` to the
-caller before entering the render loop. The application decides how to handle
-it — log and exit, show a fallback UI, or surface the error to the developer.
+The error boundary is at initialisation time. During the pipeline compilation
+phase at startup, the engine wraps each `Device::create_shader_module` call
+inside a `Device::push_error_scope` / `Device::pop_error_scope` pair with
+`ErrorFilter::Validation`. `pop_error_scope` returns a future that is driven
+to completion before the render loop begins. If any pipeline fails to compile,
+the engine returns `Err(ByardError::PipelineCompilation { pipeline, reason })`
+to the caller. The application decides how to handle it — log and exit, show a
+fallback UI, or surface the error to the developer.
 
 **There is no software rendering fallback.** Byard requires a `wgpu`-compatible
 GPU with support for the features used by its pipelines. This constraint is
@@ -264,7 +266,7 @@ explicit and documented. Attempting to run on an unsupported backend returns
 The `byard-core` crate maps directly to the four subsystems. Each subsystem is
 a top-level module. No subsystem module imports from another subsystem module
 directly — cross-subsystem communication goes through the types defined in the
-`frame` module, which is the shared data boundary.
+`frame.rs` module, which is the shared data boundary.
 
 ```
 crates/byard-core/src/
@@ -280,7 +282,7 @@ The dependency graph within the crate is strictly layered:
 
 ```
 encoder  ──┐
-atlas    ──┤─→  frame  ←─  relay
+atlas    ──┤─→  frame.rs  ←─  relay
 evaluator ─┘
 ```
 
@@ -381,7 +383,7 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
 
 ## Future possibilities
 
-- **Compositors.** Embedding the engine as a system-level GPU compositor, with no
+- **System compositor.** Embedding the engine as a system-level GPU compositor, with no
   windowing layer. The `PlatformHost` abstraction is specifically designed to
   make this possible.
 - **Native mobile targets.** The `PlatformHost` abstraction covers Android and
