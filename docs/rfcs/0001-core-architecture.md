@@ -3,7 +3,7 @@
 - **Status:** Active
 - **Author:** Briany4717
 - **Created:** 2026-05-03
-- **Last updated:** 2026-05-13
+- **Last updated:** 2026-05-14
 
 ---
 
@@ -106,10 +106,10 @@ The engine is composed of four concurrent subsystems:
 
 | Subsystem | Internal name | Responsibility |
 |-----------|---------------|----------------|
-| Logic | *Evaluator* | Signal state, memory arenas, dirty-flag collection |
-| Spatial | *Atlas* | Taffy layout, spatial hash grid for hit-testing |
-| Render | *Encoder* | Multi-pipeline wgpu command dispatch |
-| Concurrency | *Relay* | Thread management, double-buffered visual state, Tokio I/O pool |
+| Logic | `Evaluator` | Signal state, memory arenas, dirty-flag collection |
+| Spatial | `Atlas` | Taffy layout, spatial hash grid for hit-testing |
+| Render | `Encoder` | Multi-pipeline wgpu command dispatch |
+| Concurrency | `Relay` | Thread management, double-buffered visual state, Tokio I/O pool |
 
 ### 2. Memory model (Zero-GC)
 
@@ -240,6 +240,55 @@ prioritises:
 | **Dev** | AST interpreter | Hot-reload: changes are picked up without recompilation |
 | **Prod** | Transpiler → Rust | AOT: `bylang` compiles to native Rust that generates GPU primitives directly |
 
+### 8. GPU error handling
+
+Byard does not panic on GPU errors. All fallible engine operations return
+`Result<T, ByardError>`. `ByardError` is a non-exhaustive enum defined in
+`byard-core` that wraps `wgpu` error types with additional context (backend
+name, shader stage, feature flag).
+
+The error boundary is at initialisation time. `wgpu` surfaces shader
+compilation failures synchronously via `wgpu::error_scope` during the pipeline
+compilation phase at startup. If any pipeline fails to compile, the engine
+returns `Err(ByardError::PipelineCompilation { pipeline, reason })` to the
+caller before entering the render loop. The application decides how to handle
+it — log and exit, show a fallback UI, or surface the error to the developer.
+
+**There is no software rendering fallback.** Byard requires a `wgpu`-compatible
+GPU with support for the features used by its pipelines. This constraint is
+explicit and documented. Attempting to run on an unsupported backend returns
+`Err(ByardError::UnsupportedBackend)` at device creation time.
+
+### 9. `byard-core` crate layout
+
+The `byard-core` crate maps directly to the four subsystems. Each subsystem is
+a top-level module. No subsystem module imports from another subsystem module
+directly — cross-subsystem communication goes through the types defined in the
+`frame` module, which is the shared data boundary.
+
+```
+crates/byard-core/src/
+├── lib.rs          — public API surface, re-exports, ByardError
+├── evaluator/      — Signal<T>, ViewArena, dirty-flag collection
+├── atlas/          — Taffy integration, spatial hash grid
+├── encoder/        — wgpu pipelines (SolidBox, DecoratedBox, TextGlyph, TextureSampler)
+├── relay/          — thread management, RenderFrame, atomic frame swap, Tokio pool
+└── frame.rs        — RenderFrame and the primitive types shared across subsystems
+```
+
+The dependency graph within the crate is strictly layered:
+
+```
+encoder  ──┐
+atlas    ──┤─→  frame  ←─  relay
+evaluator ─┘
+```
+
+`frame.rs` is the only module that all subsystems may depend on. `encoder` and
+`atlas` never depend on `relay`. `evaluator` never depends on `encoder`. Any
+cross-subsystem dependency that violates this graph is a design defect and must
+be resolved before merging.
+
 ---
 
 ## Drawbacks
@@ -305,15 +354,15 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
 
 **Before merging / Phase 1 scope:**
 
-- [ ] **Accessibility tree.** How exactly does the `accesskit` tree map to Taffy
-  node IDs? Who owns the mapping — the spatial subsystem or a dedicated
-  accessibility subsystem? This needs a sub-RFC before Phase 1 ships.
-- [ ] **Phase 1 scope.** What is the exact deliverable that closes Phase 1?
-  A rendered rectangle? A scrollable list? An interactive button? The milestone
-  must be defined before coding starts so contributors know what to build toward.
-- [ ] **Runtime GPU error handling.** What happens when a WGSL shader fails to
-  compile at runtime (e.g. unsupported feature on the target GPU)? Is there a
-  fallback pipeline? Does the engine panic or surface an error?
+- [x] **Phase 1 scope.** Resolved: Phase 1 closes when the engine renders a
+  solid rectangle with `border-radius` and a reactive text label driven by a
+  `Signal`. This exercises all four subsystems. Tracked in the Phase 1 milestone.
+- [x] **Runtime GPU error handling.** Resolved: see section 8. No panic, no
+  software fallback. `Result<T, ByardError>` at the initialisation boundary.
+- [ ] **Accessibility tree.** Deferred to Phase 2. A dedicated `AccessBridge`
+  subsystem will own the `accesskit` tree, subscribing to mount/unmount events
+  from `Atlas`. `Atlas` exposes a notification interface and has no knowledge of
+  accessibility internals. A sub-RFC is required before Phase 2 begins.
 
 **During implementation:**
 
@@ -332,7 +381,7 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
 
 ## Future possibilities
 
-- **Coreolis.** Embedding the engine as a system-level GPU compositor, with no
+- **Compositors.** Embedding the engine as a system-level GPU compositor, with no
   windowing layer. The `PlatformHost` abstraction is specifically designed to
   make this possible.
 - **Native mobile targets.** The `PlatformHost` abstraction covers Android and
