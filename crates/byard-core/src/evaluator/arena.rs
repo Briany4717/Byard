@@ -120,13 +120,13 @@ impl Default for ViewArena {
 
 impl Drop for ViewArena {
     fn drop(&mut self) {
-        // Pop-based loop: each iteration is independent, so a panicking
-        // destructor leaves the remaining entries in `self.drops`. The
-        // `Vec` then runs its own `Drop` during unwinding, ensuring the
-        // remaining `DropEntry` records are released (though the inner
-        // values they pointed at will leak — Rust's normal behaviour on
-        // panic during drop).
-        let mut drops = self.drops.borrow_mut();
+        // Take the registry out of the RefCell entirely. This releases
+        // the borrow before any user destructor runs, so destructors that
+        // happen to call back into the arena (e.g. for diagnostics) will
+        // not panic. Each iteration uses `pop` so a panicking destructor
+        // leaves the remaining entries in `drops`, whose own Drop will
+        // then clean them up during unwinding.
+        let mut drops = std::mem::take(&mut *self.drops.borrow_mut());
         while let Some(entry) = drops.pop() {
             // SAFETY: each `entry.ptr` was produced by `Bump::alloc` for a
             // value of the type that `entry.drop_fn` was monomorphised for,

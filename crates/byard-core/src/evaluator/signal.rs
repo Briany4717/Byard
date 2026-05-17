@@ -98,20 +98,33 @@ impl Drop for BorrowGuard<'_> {
 /// via normal return or unwinding).
 struct WriteGuard<'g> {
     state: &'g Cell<isize>,
-    version: &'g AtomicU64,
+    version: Option<&'g AtomicU64>,
 }
 
 impl<'g> WriteGuard<'g> {
     fn new(state: &'g Cell<isize>, version: &'g AtomicU64) -> Self {
         state.set(BORROW_MUT_SENTINEL);
-        Self { state, version }
+        Self {
+            state,
+            version: Some(version),
+        }
+    }
+
+    fn for_subscribe(state: &'g Cell<isize>) -> Self {
+        state.set(BORROW_MUT_SENTINEL);
+        Self {
+            state,
+            version: None,
+        }
     }
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         self.state.set(0);
-        self.version.fetch_add(1, Ordering::Release);
+        if let Some(version) = self.version {
+            version.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -201,27 +214,51 @@ impl<'a, T: 'static> Signal<'a, T> {
     }
 
     /// Registers a dependency on this signal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `with_subscribers` call is currently in progress on the
+    /// same slot (i.e. mutating the subscriber list while it is being
+    /// enumerated would invalidate the borrow).
     pub fn subscribe(&self, target: TargetId) {
-        // SAFETY: see `read`. The borrow of the dirty list is confined to
-        // this method and cannot alias any outstanding `Signal` borrow,
-        // because `dirty_targets` is a separate `UnsafeCell`.
+        // SAFETY: see `read`.
         let slot = unsafe { self.slot.as_ref() };
-        // SAFETY: this is the only code path that touches `dirty_targets`,
-        // and it is single-threaded by `!Send`.
+
+        let state = slot.borrow_state.get();
+        assert!(
+            state == 0,
+            "Signal::subscribe called while a with_subscribers borrow is in progress \
+         (current borrow_state = {state})",
+        );
+        let _guard = WriteGuard::for_subscribe(&slot.borrow_state);
+
+        // SAFETY: borrow counter is at the exclusive sentinel; no other
+        // reference to `dirty_targets` exists.
         let targets: &mut Vec<TargetId> = unsafe { &mut *slot.dirty_targets.get() };
         targets.push(target);
     }
 
     /// Calls `f` with the targets currently registered on this signal.
     ///
-    /// The subscriber list is borrowed only for the duration of the closure,
-    /// so callers can enumerate it without allocating a cloned snapshot.
-    /// This is the preferred API for hot-path iteration (e.g. the dirty-flag
-    /// collection loop). Use [`Signal::subscribers`] only when you need an
-    /// owned snapshot.
+    /// The subscriber list is borrowed only for the duration of the closure.
+    /// This is the preferred API for hot-path iteration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the closure attempts to call `subscribe` (or any other
+    /// mutator) on the same slot through a copied handle.
     pub fn with_subscribers<R>(&self, f: impl FnOnce(&[TargetId]) -> R) -> R {
-        // SAFETY: read-only borrow, same justification as `subscribe`.
+        // SAFETY: see `read`.
         let slot = unsafe { self.slot.as_ref() };
+
+        let state = slot.borrow_state.get();
+        assert!(
+            state >= 0,
+            "Signal::with_subscribers called while a mutating borrow is in progress",
+        );
+        let _guard = BorrowGuard::shared(&slot.borrow_state);
+
+        // SAFETY: borrow counter is positive; no mutator can run concurrently.
         let targets: &Vec<TargetId> = unsafe { &*slot.dirty_targets.get() };
         f(targets.as_slice())
     }
@@ -445,5 +482,36 @@ mod tests {
 
         let sum: u32 = signal.with_subscribers(|targets| targets.iter().map(|t| t.index()).sum());
         assert_eq!(sum, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "Signal::subscribe called while a with_subscribers borrow")]
+    fn subscribe_inside_with_subscribers_panics() {
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        let copy = signal;
+        signal.with_subscribers(|_| {
+            copy.subscribe(TargetId::new(1, 0, 0));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Signal::with_subscribers called while a mutating borrow")]
+    fn with_subscribers_inside_write_panics() {
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        let copy = signal;
+        signal.write(|_| {
+            copy.with_subscribers(|_| {});
+        });
+    }
+
+    #[test]
+    fn subscribe_does_not_change_version() {
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        signal.subscribe(TargetId::new(1, 0, 0));
+        signal.subscribe(TargetId::new(2, 0, 0));
+        assert_eq!(signal.version(), 0, "subscribe is not a value mutation");
     }
 }
