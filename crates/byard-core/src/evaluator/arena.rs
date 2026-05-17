@@ -3,7 +3,7 @@
 //! `ViewArena` wraps a [`bumpalo::Bump`] allocator and a registry of `Drop`
 //! glue functions. Values allocated into the arena have their destructors
 //! recorded; when the arena is dropped, every registered destructor runs in
-//! a single linear pass before the underlying memory is released.
+//! reverse registration order before the underlying memory is released.
 //!
 //! This is the implementation of the apoptosis model described in
 //! RFC-0001 2.1: deterministic destruction with no global heap
@@ -54,8 +54,14 @@ unsafe fn drop_glue<T>(ptr: *mut u8) {
 /// A contiguous memory arena scoped to the lifetime of a single `View`.
 ///
 /// Allocate values with [`ViewArena::alloc`]; they live until the arena is
-/// dropped, at which point every registered `Drop` runs in registration
-/// order, then the underlying memory is released in one operation.
+/// dropped, at which point every registered `Drop` runs in **reverse
+/// registration order** (LIFO), then the underlying memory is released in
+/// one operation.
+///
+/// LIFO ordering matches Rust's standard RAII semantics for stack values
+/// and is required for panic safety: each destructor pops from the
+/// registry before running, so a panic mid-pass leaves the remaining
+/// entries in the `Vec` to be cleaned up by its own `Drop`.
 ///
 /// `ViewArena` is `!Send` and `!Sync` by construction.
 pub struct ViewArena {
