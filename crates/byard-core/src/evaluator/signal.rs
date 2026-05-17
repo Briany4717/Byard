@@ -70,8 +70,6 @@ pub struct Signal<'a, T: 'static> {
 /// reentrancy counter is correct even if the user's closure panics.
 struct BorrowGuard<'g> {
     state: &'g Cell<isize>,
-    /// Value to set on drop. For shared borrows: `current - 1`.
-    /// For exclusive borrows: `0`.
     on_drop: isize,
 }
 
@@ -84,16 +82,36 @@ impl<'g> BorrowGuard<'g> {
             on_drop: current,
         }
     }
-
-    fn exclusive(state: &'g Cell<isize>) -> Self {
-        state.set(BORROW_MUT_SENTINEL);
-        Self { state, on_drop: 0 }
-    }
 }
 
 impl Drop for BorrowGuard<'_> {
     fn drop(&mut self) {
         self.state.set(self.on_drop);
+    }
+}
+
+/// RAII guard for exclusive borrows that also bumps `dirty_version`
+/// atomically on drop — even if the user closure panics.
+///
+/// This guarantees that any observable mutation of the value is reflected
+/// in the version counter before control returns to the caller (whether
+/// via normal return or unwinding).
+struct WriteGuard<'g> {
+    state: &'g Cell<isize>,
+    version: &'g AtomicU64,
+}
+
+impl<'g> WriteGuard<'g> {
+    fn new(state: &'g Cell<isize>, version: &'g AtomicU64) -> Self {
+        state.set(BORROW_MUT_SENTINEL);
+        Self { state, version }
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.state.set(0);
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -107,6 +125,7 @@ impl<T: 'static> Clone for Signal<'_, T> {
 
 impl<'a, T: 'static> Signal<'a, T> {
     /// Allocates a new signal inside `arena` with the given initial value.
+    #[must_use]
     pub fn new_in(arena: &'a ViewArena, initial: T) -> Self {
         let slot = arena.alloc(SignalSlot {
             value: UnsafeCell::new(initial),
@@ -151,12 +170,19 @@ impl<'a, T: 'static> Signal<'a, T> {
     /// Mutates the value of the signal and increments the version counter
     /// atomically.
     ///
+    /// The version increment happens **before** the user closure returns,
+    /// inside the `BorrowGuard`'s `Drop`. This means a panic from the closure
+    /// still marks the signal dirty — consistent with the principle that any
+    /// observable mutation must be visible to the dirty-flag collection.
+    ///
     /// # Panics
     ///
     /// Panics if any other borrow (read or write) is currently in
     /// progress on the same slot.
     pub fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        // SAFETY: see `read`.
+        // SAFETY: the slot is alive (lifetime `'a` ensures the arena
+        // outlives this handle). `Signal` is `!Send`, so we are the only
+        // thread that can access this slot.
         let slot = unsafe { self.slot.as_ref() };
 
         let state = slot.borrow_state.get();
@@ -165,15 +191,12 @@ impl<'a, T: 'static> Signal<'a, T> {
             "Signal::write called while another borrow is in progress on the same slot \
          (current borrow_state = {state})"
         );
-        let _guard = BorrowGuard::exclusive(&slot.borrow_state);
+        let _guard = WriteGuard::new(&slot.borrow_state, &slot.dirty_version);
 
         // SAFETY: borrow counter is at the exclusive sentinel, so no other
         // reference (shared or exclusive) to this value exists.
         let value: &mut T = unsafe { &mut *slot.value.get() };
-        let result = f(value);
-
-        slot.dirty_version.fetch_add(1, Ordering::Release);
-        result
+        f(value)
     }
 
     /// Registers a dependency on this signal.
@@ -371,5 +394,31 @@ mod tests {
         signal.write(|_| {
             signal.write(|v| *v = 1);
         });
+    }
+
+    #[test]
+    fn write_panic_still_marks_signal_dirty() {
+        use std::panic;
+
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            signal.write(|v| {
+                *v = 99;
+                panic!("intentional");
+            });
+        }));
+
+        assert!(
+            result.is_err(),
+            "the panic should propagate to catch_unwind"
+        );
+        assert_eq!(
+            signal.version(),
+            1,
+            "version must reflect the observable mutation"
+        );
+        assert_eq!(signal.read(|v| *v), 99, "the value was actually mutated");
     }
 }
