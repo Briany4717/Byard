@@ -37,6 +37,41 @@ fn bench<F: FnMut()>(name: &str, iters: u64, ops_per_iter: u64, mut f: F) {
     }
 }
 
+fn bench_with_setup<S, F, T>(
+    name: &str,
+    iters: u64,
+    ops_per_iter: u64,
+    mut setup: S,
+    mut measure: F,
+) where
+    S: FnMut() -> T,
+    F: FnMut(T),
+{
+    for _ in 0..1000 {
+        let state = setup();
+        measure(state);
+    }
+
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..iters {
+        let state = setup();
+        let start = Instant::now();
+        measure(state);
+        total += start.elapsed();
+    }
+
+    let per_op = total.as_nanos() as f64 / (iters * ops_per_iter) as f64;
+    let per_batch = total.as_nanos() as f64 / iters as f64;
+
+    if ops_per_iter == 1 {
+        println!("{name:50} {per_op:>10.2} ns/op   ({iters} iters)");
+    } else {
+        println!(
+            "{name:50} {per_op:>10.2} ns/op   {per_batch:>10.2} ns/batch   ({iters} iters x {ops_per_iter} ops)"
+        );
+    }
+}
+
 fn main() {
     println!("\n=== Evaluator benchmarks ===\n");
 
@@ -65,8 +100,8 @@ fn main() {
         },
     );
 
-    bench(
-        "arena: apoptosis with 1000 String drops",
+    bench_with_setup(
+        "arena: apoptosis with 1000 String drops (drop only)",
         10_000,
         1000,
         || {
@@ -74,6 +109,9 @@ fn main() {
             for _ in 0..1000 {
                 arena.alloc(String::from("x"));
             }
+            arena
+        },
+        |arena| {
             drop(black_box(arena));
         },
     );
