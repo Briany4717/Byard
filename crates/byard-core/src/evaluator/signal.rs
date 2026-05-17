@@ -29,6 +29,7 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::arena::ViewArena;
 use super::target::TargetId;
@@ -37,9 +38,15 @@ use super::target::TargetId;
 ///
 /// Users never name this type directly — it is allocated by
 /// [`Signal::new_in`] and accessed exclusively through `Signal` handles.
+///
+/// The `dirty_version` is an atomic counter incremented on every write,
+/// allowing other subsystems to detect changes without taking locks.
+/// `dirty_targets` is the list of [`TargetId`]s registered via
+/// [`Signal::subscribe`] — written only from the Logic thread.
 pub struct SignalSlot<T> {
     value: UnsafeCell<T>,
     dirty_targets: UnsafeCell<Vec<TargetId>>,
+    dirty_version: AtomicU64,
 }
 
 /// A `Copy` handle to a reactive value living in a [`ViewArena`].
@@ -66,12 +73,8 @@ impl<T: 'static> Signal<T> {
         let slot = arena.alloc(SignalSlot {
             value: UnsafeCell::new(initial),
             dirty_targets: UnsafeCell::new(Vec::new()),
+            dirty_version: AtomicU64::new(0),
         });
-        // SAFETY: `arena.alloc` returns a valid `&mut SignalSlot<T>` whose
-        // lifetime is tied to the arena. We capture a raw pointer to it; the
-        // arena keeps the storage alive until it is dropped, and `Signal<T>`
-        // is `!Send`, so the pointer is only ever dereferenced from the
-        // same thread that holds the arena.
         let slot = NonNull::from(slot);
         Self {
             slot,
@@ -95,17 +98,27 @@ impl<T: 'static> Signal<T> {
     }
 
     /// Mutates the value of the signal and marks all registered targets
-    /// as dirty.
+    /// as dirty by incrementing the version counter atomically.
     ///
     /// The closure receives a mutable reference to the value. After it
-    /// returns, every previously registered [`TargetId`] is considered
-    /// dirty for the current tick.
+    /// returns, [`Signal::version`] will return a strictly greater value,
+    /// allowing other subsystems to observe the change without taking a lock.
     pub fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        // SAFETY: see `read`. Additionally, the closure-based API prevents
-        // the mutable borrow from escaping, so there is no possibility of
-        // aliasing it with any other reference during the call.
+        // SAFETY: see `read`. The closure-based API prevents the mutable
+        // borrow from escaping, so there is no possibility of aliasing it
+        // with any other reference during the call.
         let value: &mut T = unsafe { &mut *self.slot.as_ref().value.get() };
-        f(value)
+        let result = f(value);
+
+        // SAFETY: `dirty_version` is `AtomicU64`, safe to access through a
+        // shared reference from any thread (though Signal<T> is !Send, so
+        // in practice only this thread writes; remote readers may still
+        // observe via raw pointer if a subsystem holds the slot address).
+        unsafe { self.slot.as_ref() }
+            .dirty_version
+            .fetch_add(1, Ordering::Release);
+
+        result
     }
 
     /// Registers a dependency on this signal.
@@ -128,6 +141,23 @@ impl<T: 'static> Signal<T> {
         // method body.
         let targets: &Vec<TargetId> = unsafe { &*self.slot.as_ref().dirty_targets.get() };
         targets.clone()
+    }
+
+    /// Returns the current version counter of this signal.
+    ///
+    /// The counter is incremented atomically on every [`Signal::write`].
+    /// Other subsystems can cache the version they last observed and
+    /// detect changes by comparing — no locks, no allocations.
+    ///
+    /// Uses `Ordering::Acquire` to synchronise with the `Release` store in
+    /// `write`.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        // SAFETY: `dirty_version` is atomic; safe to load through a
+        // shared reference.
+        unsafe { self.slot.as_ref() }
+            .dirty_version
+            .load(Ordering::Acquire)
     }
 }
 
@@ -224,5 +254,52 @@ mod tests {
         // The Guard inside the signal slot must run its Drop when the
         // arena is released.
         assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn version_starts_at_zero() {
+        let mut arena = ViewArena::new();
+        let signal = Signal::new_in(&mut arena, 0_u32);
+        assert_eq!(signal.version(), 0);
+    }
+
+    #[test]
+    fn write_increments_version() {
+        let mut arena = ViewArena::new();
+        let signal = Signal::new_in(&mut arena, 0_u32);
+
+        signal.write(|v| *v = 1);
+        assert_eq!(signal.version(), 1);
+
+        signal.write(|v| *v = 2);
+        assert_eq!(signal.version(), 2);
+
+        signal.write(|v| *v = 3);
+        assert_eq!(signal.version(), 3);
+    }
+
+    #[test]
+    fn read_does_not_change_version() {
+        let mut arena = ViewArena::new();
+        let signal = Signal::new_in(&mut arena, 42_u32);
+
+        let _ = signal.read(|v| *v);
+        let _ = signal.read(|v| *v);
+        let _ = signal.read(|v| *v);
+
+        assert_eq!(signal.version(), 0);
+    }
+
+    #[test]
+    fn version_observable_across_copies_of_handle() {
+        let mut arena = ViewArena::new();
+        let signal = Signal::new_in(&mut arena, 0_u32);
+        let copy = signal;
+
+        signal.write(|v| *v = 100);
+
+        // Both handles see the same atomic counter.
+        assert_eq!(signal.version(), 1);
+        assert_eq!(copy.version(), 1);
     }
 }

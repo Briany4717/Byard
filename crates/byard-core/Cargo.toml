@@ -13,3 +13,7 @@ bumpalo = { version = "3", features = ["collections"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "evaluator"
+harness = false
