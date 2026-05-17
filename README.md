@@ -100,7 +100,7 @@ Byard is being built in phases.
 - **Phase 0 — Design** *(complete)* — RFCs, architecture, crate layout.
 - **Phase 1 — Engine core** *(current)* — `wgpu` multi-pipeline renderer, Taffy
   integration, the spatial hash grid, and the double-buffered threading model.
-  Scope defined in RFC-0001 9. Progress tracked in the
+  Scope and progress tracked in the
   [Phase 1 milestone](https://github.com/Briany4717/byard/milestones).
 - **Phase 2 — `bylang` compiler** — `logos` lexer, hand-written recursive descent
   parser, and the dev-mode AST interpreter.
