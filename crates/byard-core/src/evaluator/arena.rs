@@ -9,7 +9,9 @@
 //! RFC-0001 2.1: deterministic destruction with no global heap
 //! fragmentation and no garbage collector. The drop pass itself is
 //! `O(n)` in the number of registered destructors; the underlying memory
-//! release is then a single `O(1)` operation.
+//! release is then an `O(c)` operation where `c` is the number of
+//! internal `Bump` chunks (typically 1 for views below a few KB,
+//! growing geometrically thereafter).
 //!
 //! # Allocation through shared references
 //!
@@ -88,7 +90,7 @@ impl ViewArena {
     /// resulting references. If `T` needs to be dropped (per
     /// [`std::mem::needs_drop`]), a destructor entry is registered so
     /// `Drop` runs when the arena is released.
-    pub fn alloc<T: 'static>(&self, value: T) -> &mut T {
+    pub fn alloc<'a, T: 'a>(&'a self, value: T) -> &'a mut T {
         let slot: &mut T = self.bump.alloc(value);
 
         if std::mem::needs_drop::<T>() {
