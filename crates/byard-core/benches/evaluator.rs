@@ -10,7 +10,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use byard_core::evaluator::{Signal, TargetId, ViewArena};
+use byard_core::evaluator::{Signal, ViewArena};
+use byard_core::frame::TargetId;
 
 fn bench<F: FnMut()>(name: &str, iters: u64, ops_per_iter: u64, mut f: F) {
     // Warm-up
