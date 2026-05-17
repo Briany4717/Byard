@@ -33,14 +33,14 @@ fn main() {
 
     // ── ViewArena allocation ─────────────────────────────────────────────
     bench("arena: alloc u64 (trivially-droppable)", 1_000_000, || {
-        let mut arena = ViewArena::new();
+        let arena = ViewArena::new();
         for i in 0..100 {
             black_box(arena.alloc(black_box(i as u64)));
         }
     });
 
     bench("arena: alloc String (drop-registered)", 1_000_000, || {
-        let mut arena = ViewArena::new();
+        let arena = ViewArena::new();
         for _ in 0..100 {
             black_box(arena.alloc(String::from("hello")));
         }
@@ -48,7 +48,7 @@ fn main() {
 
     // ── Apoptosis (drop entire arena) ────────────────────────────────────
     bench("arena: apoptosis with 1000 String drops", 10_000, || {
-        let mut arena = ViewArena::new();
+        let arena = ViewArena::new();
         for _ in 0..1000 {
             arena.alloc(String::from("x"));
         }
@@ -56,8 +56,8 @@ fn main() {
     });
 
     // ── Signal operations ────────────────────────────────────────────────
-    let mut arena = ViewArena::new();
-    let signal = Signal::new_in(&mut arena, 0_u64);
+    let arena = ViewArena::new();
+    let signal = Signal::new_in(&arena, 0_u64);
 
     bench("signal: read u64", 10_000_000, || {
         black_box(signal.read(|v| *v));
@@ -73,16 +73,16 @@ fn main() {
 
     // ── Signal creation ──────────────────────────────────────────────────
     bench("signal: new_in (full allocation)", 1_000_000, || {
-        let mut arena = ViewArena::new();
+        let arena = ViewArena::new();
         for i in 0..100 {
-            black_box(Signal::new_in(&mut arena, i as u64));
+            black_box(Signal::new_in(&arena, i as u64));
         }
     });
 
     // ── Subscribe scaling ────────────────────────────────────────────────
     bench("signal: subscribe 1000 targets", 10_000, || {
-        let mut arena = ViewArena::new();
-        let signal = Signal::new_in(&mut arena, 0_u64);
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u64);
         for i in 0..1000 {
             signal.subscribe(TargetId::new(i, 0, 0));
         }
@@ -93,10 +93,11 @@ fn main() {
         "signal: 100 signals × 10 subs × 100 writes",
         1_000,
         || {
-            let mut arena = ViewArena::new();
-            let signals: Vec<_> = (0..100)
-                .map(|i| Signal::new_in(&mut arena, i as u64))
-                .collect();
+            let arena = ViewArena::new();
+            let mut signals = Vec::with_capacity(100);
+            for i in 0..100_u64 {
+                signals.push(Signal::new_in(&arena, i));
+            }
 
             for (i, sig) in signals.iter().enumerate() {
                 for j in 0..10 {
