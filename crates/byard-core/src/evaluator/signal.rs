@@ -37,7 +37,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::arena::ViewArena;
-use super::target::TargetId;
+use crate::frame::TargetId;
 
 /// The arena-allocated backing storage for a [`Signal<T>`].
 ///
@@ -217,18 +217,17 @@ impl<'a, T: 'static> Signal<'a, T> {
     ///
     /// # Panics
     ///
-    /// Panics if a `with_subscribers` call is currently in progress on the
-    /// same slot (i.e. mutating the subscriber list while it is being
-    /// enumerated would invalidate the borrow).
+    /// Panics if any other borrow on the same slot is in progress — including
+    /// `read`, `write`, or `with_subscribers` via a copied handle.
     pub fn subscribe(&self, target: TargetId) {
         // SAFETY: see `read`.
         let slot = unsafe { self.slot.as_ref() };
 
         let state = slot.borrow_state.get();
-        assert!(
-            state == 0,
-            "Signal::subscribe called while a with_subscribers borrow is in progress \
-         (current borrow_state = {state})",
+        assert_eq!(
+            state, 0,
+            "Signal::subscribe called while another borrow is in progress on the same slot \
+         (current borrow_state = {state})"
         );
         let _guard = WriteGuard::for_subscribe(&slot.borrow_state);
 
@@ -245,8 +244,8 @@ impl<'a, T: 'static> Signal<'a, T> {
     ///
     /// # Panics
     ///
-    /// Panics if the closure attempts to call `subscribe` (or any other
-    /// mutator) on the same slot through a copied handle.
+    /// Panics if a `write` or `subscribe` is currently in progress on the
+    /// same slot through a copied handle.
     pub fn with_subscribers<R>(&self, f: impl FnOnce(&[TargetId]) -> R) -> R {
         // SAFETY: see `read`.
         let slot = unsafe { self.slot.as_ref() };
@@ -254,7 +253,7 @@ impl<'a, T: 'static> Signal<'a, T> {
         let state = slot.borrow_state.get();
         assert!(
             state >= 0,
-            "Signal::with_subscribers called while a mutating borrow is in progress",
+            "Signal::with_subscribers called while an exclusive borrow is in progress",
         );
         let _guard = BorrowGuard::shared(&slot.borrow_state);
 
@@ -485,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Signal::subscribe called while a with_subscribers borrow")]
+    #[should_panic(expected = "Signal::subscribe called while another borrow is in progress")]
     fn subscribe_inside_with_subscribers_panics() {
         let arena = ViewArena::new();
         let signal = Signal::new_in(&arena, 0_u32);
@@ -496,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Signal::with_subscribers called while a mutating borrow")]
+    #[should_panic(expected = "Signal::with_subscribers called while an exclusive borrow")]
     fn with_subscribers_inside_write_panics() {
         let arena = ViewArena::new();
         let signal = Signal::new_in(&arena, 0_u32);
