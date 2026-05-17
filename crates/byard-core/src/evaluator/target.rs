@@ -30,8 +30,9 @@ pub struct TargetId(u64);
 impl TargetId {
     /// Constructs a `TargetId` from its three components.
     ///
-    /// `generation` and `kind` are each truncated to 16 bits.
-    /// Constructs a `TargetId` from its three components.
+    /// The `index`, `generation`, and `kind` are packed into a single
+    /// 64-bit word — see the [`TargetId`] type documentation for the
+    /// bit layout.
     #[must_use]
     pub const fn new(index: u32, generation: u16, kind: u16) -> Self {
         let raw = (index as u64) | ((generation as u64) << 32) | ((kind as u64) << 48);
