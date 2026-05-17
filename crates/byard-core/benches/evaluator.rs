@@ -10,9 +10,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use byard_core::evaluator::EvaluatorTick;
 use byard_core::evaluator::{Signal, ViewArena};
 use byard_core::frame::TargetId;
-use byard_core::evaluator::EvaluatorTick;
 
 fn bench<F: FnMut()>(name: &str, iters: u64, ops_per_iter: u64, mut f: F) {
     // Warm-up
@@ -77,7 +77,14 @@ fn bench_with_setup<S, F, T>(
 fn main() {
     println!("\n=== Evaluator benchmarks ===\n");
 
-    // ── ViewArena allocation ─────────────────────────────────────────────
+    bench_arena();
+    bench_signal();
+    bench_tick();
+
+    println!();
+}
+
+fn bench_arena() {
     bench(
         "arena: alloc u64 (trivially-droppable)",
         1_000_000,
@@ -117,7 +124,9 @@ fn main() {
             drop(black_box(arena));
         },
     );
+}
 
+fn bench_signal() {
     let arena = ViewArena::new();
     let signal = Signal::new_in(&arena, 0_u64);
 
@@ -149,9 +158,9 @@ fn main() {
     });
 
     bench(
-        "signal: 100 signals × 10 subs × 100 writes",
+        "signal: 100 signals x 10 subs x 100 writes",
         1_000,
-        100 * 10 + 100 * 100, // subscribes + writes
+        100 * 10 + 100 * 100,
         || {
             let arena = ViewArena::new();
             let mut signals = Vec::with_capacity(100);
@@ -172,21 +181,21 @@ fn main() {
             }
         },
     );
+}
 
-    // ── Tick cycle ───────────────────────────────────────────────────────
+fn bench_tick() {
     bench_with_setup(
         "tick: collect_dirty (10 signals, no writes)",
         100_000,
         1,
         || {
-            let arena = Box::leak(Box::new(ViewArena::new()));
+            let arena: &'static ViewArena = Box::leak(Box::new(ViewArena::new()));
             let mut tick = EvaluatorTick::new();
             for i in 0..10_u32 {
                 let signal = Signal::new_in(arena, i);
                 signal.subscribe(TargetId::new(i, 0, 0));
                 tick.register(signal);
             }
-            // First call clears the "initial version" baseline.
             tick.collect_dirty();
             tick
         },
@@ -211,7 +220,6 @@ fn main() {
                 })
                 .collect();
             tick.collect_dirty();
-            // Dirty them all
             for s in &signals {
                 s.write(|v| *v = v.wrapping_add(1));
             }
@@ -221,6 +229,4 @@ fn main() {
             black_box(tick.collect_dirty());
         },
     );
-
-    println!();
 }
