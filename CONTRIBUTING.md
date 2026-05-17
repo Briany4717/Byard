@@ -69,13 +69,23 @@ cargo test --workspace
 
 # Build
 cargo build --workspace
-
-# Benchmarks (Evaluator subsystem and onwards)
-cargo bench
 ```
 
 CI runs all of the above on every pull request. A PR cannot be merged until it is
 green.
+
+### Benchmarks
+
+The Evaluator subsystem ships with benchmarks under `crates/byard-core/benches/`.
+They are **not** part of CI — they are local-only tools for verifying that
+changes don't regress hot-path performance.
+
+```sh
+cargo bench
+```
+
+Run them before merging changes to performance-sensitive code (signal
+read/write paths, arena allocation, drop registry).
 
 ### Toolchain
 
