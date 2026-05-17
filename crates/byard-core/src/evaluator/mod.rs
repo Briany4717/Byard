@@ -17,5 +17,11 @@
 //!   to hand off to the encoder via [`crate::frame`].
 
 pub mod arena;
+pub mod signal;
+pub mod target;
+
+pub use signal::Signal;
+
+pub use target::TargetId;
 
 pub use arena::ViewArena;
