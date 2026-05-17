@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use byard_core::evaluator::{Signal, TargetId, ViewArena};
 
-fn bench<F: FnMut()>(name: &str, iters: u64, mut f: F) {
+fn bench<F: FnMut()>(name: &str, iters: u64, ops_per_iter: u64, mut f: F) {
     // Warm-up
     for _ in 0..1000 {
         f();
@@ -23,64 +23,84 @@ fn bench<F: FnMut()>(name: &str, iters: u64, mut f: F) {
         f();
     }
     let elapsed = start.elapsed();
-    let per_op = elapsed.as_nanos() as f64 / iters as f64;
 
-    println!("{name:50} {per_op:>10.2} ns/op   ({iters} iters)");
+    let total_ops = iters * ops_per_iter;
+    let per_op = elapsed.as_nanos() as f64 / total_ops as f64;
+    let per_batch = elapsed.as_nanos() as f64 / iters as f64;
+
+    if ops_per_iter == 1 {
+        println!("{name:50} {per_op:>10.2} ns/op   ({iters} iters)");
+    } else {
+        println!(
+            "{name:50} {per_op:>10.2} ns/op   {per_batch:>10.2} ns/batch   ({iters} iters x {ops_per_iter} ops)"
+        );
+    }
 }
 
 fn main() {
     println!("\n=== Evaluator benchmarks ===\n");
 
     // ── ViewArena allocation ─────────────────────────────────────────────
-    bench("arena: alloc u64 (trivially-droppable)", 1_000_000, || {
-        let arena = ViewArena::new();
-        for i in 0..100 {
-            black_box(arena.alloc(black_box(i as u64)));
-        }
-    });
+    bench(
+        "arena: alloc u64 (trivially-droppable)",
+        1_000_000,
+        100,
+        || {
+            let arena = ViewArena::new();
+            for i in 0..100_u64 {
+                black_box(arena.alloc(black_box(i)));
+            }
+        },
+    );
 
-    bench("arena: alloc String (drop-registered)", 1_000_000, || {
-        let arena = ViewArena::new();
-        for _ in 0..100 {
-            black_box(arena.alloc(String::from("hello")));
-        }
-    });
+    bench(
+        "arena: alloc String (drop-registered)",
+        1_000_000,
+        100,
+        || {
+            let arena = ViewArena::new();
+            for _ in 0..100 {
+                black_box(arena.alloc(String::from("hello")));
+            }
+        },
+    );
 
-    // ── Apoptosis (drop entire arena) ────────────────────────────────────
-    bench("arena: apoptosis with 1000 String drops", 10_000, || {
-        let arena = ViewArena::new();
-        for _ in 0..1000 {
-            arena.alloc(String::from("x"));
-        }
-        drop(black_box(arena));
-    });
+    bench(
+        "arena: apoptosis with 1000 String drops",
+        10_000,
+        1000,
+        || {
+            let arena = ViewArena::new();
+            for _ in 0..1000 {
+                arena.alloc(String::from("x"));
+            }
+            drop(black_box(arena));
+        },
+    );
 
-    // ── Signal operations ────────────────────────────────────────────────
     let arena = ViewArena::new();
     let signal = Signal::new_in(&arena, 0_u64);
 
-    bench("signal: read u64", 10_000_000, || {
+    bench("signal: read u64", 10_000_000, 1, || {
         black_box(signal.read(|v| *v));
     });
 
-    bench("signal: write u64", 10_000_000, || {
+    bench("signal: write u64", 10_000_000, 1, || {
         signal.write(|v| *v = black_box(42));
     });
 
-    bench("signal: write with increment", 10_000_000, || {
+    bench("signal: write with increment", 10_000_000, 1, || {
         signal.write(|v| *v = v.wrapping_add(1));
     });
 
-    // ── Signal creation ──────────────────────────────────────────────────
-    bench("signal: new_in (full allocation)", 1_000_000, || {
+    bench("signal: new_in (full allocation)", 1_000_000, 100, || {
         let arena = ViewArena::new();
-        for i in 0..100 {
-            black_box(Signal::new_in(&arena, i as u64));
+        for i in 0..100_u64 {
+            black_box(Signal::new_in(&arena, i));
         }
     });
 
-    // ── Subscribe scaling ────────────────────────────────────────────────
-    bench("signal: subscribe 1000 targets", 10_000, || {
+    bench("signal: subscribe 1000 targets", 10_000, 1000, || {
         let arena = ViewArena::new();
         let signal = Signal::new_in(&arena, 0_u64);
         for i in 0..1000 {
@@ -88,10 +108,10 @@ fn main() {
         }
     });
 
-    // ── Worst case: many signals + many subscribers + many writes ────────
     bench(
         "signal: 100 signals × 10 subs × 100 writes",
         1_000,
+        100 * 10 + 100 * 100, // subscribes + writes
         || {
             let arena = ViewArena::new();
             let mut signals = Vec::with_capacity(100);
