@@ -5,7 +5,7 @@
 //! This subsystem owns the specialised render pipelines compiled at startup:
 //!
 //! - **`SolidBox`** — Axis-aligned rectangles with solid fill and `border-radius`.
-//! - **`DecoratedBox`** — Rectangles with gradients, box-shadows, and paramétric
+//! - **`DecoratedBox`** — Rectangles with gradients, box-shadows, and parametric
 //!   decorations.
 //! - **`TextGlyph`** — Text rendering via a `glyphon` glyph atlas.
 //! - **`TextureSampler`** — UV-mapped quads for decoded images and icons.
