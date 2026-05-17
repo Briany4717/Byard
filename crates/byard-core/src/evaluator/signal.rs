@@ -51,6 +51,29 @@ pub(crate) struct SignalSlot<T> {
     borrow_state: Cell<isize>,
 }
 
+impl<T> SignalSlot<T> {
+    /// Returns a reference to the atomic version counter.
+    ///
+    /// Used by [`EvaluatorTick`](crate::evaluator::EvaluatorTick) to poll
+    /// versions without going through `Signal`'s borrow-guarded API.
+    /// Safe because `AtomicU64` is itself thread-safe.
+    pub(crate) fn dirty_version_ref(&self) -> &AtomicU64 {
+        &self.dirty_version
+    }
+
+    /// Returns a shared reference to the subscriber list.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee that no exclusive borrow of `dirty_targets`
+    /// is active. This is upheld by the Logic-thread-only invariant when
+    /// called from `EvaluatorTick::collect_dirty`.
+    pub(crate) unsafe fn subscribers_ref(&self) -> &[TargetId] {
+        // SAFETY: caller upholds the contract above.
+        unsafe { (*self.dirty_targets.get()).as_slice() }
+    }
+}
+
 /// Marker value for `borrow_state` indicating an exclusive borrow.
 const BORROW_MUT_SENTINEL: isize = -1;
 
@@ -278,6 +301,18 @@ impl<'a, T: 'static> Signal<'a, T> {
         unsafe { self.slot.as_ref() }
             .dirty_version
             .load(Ordering::Acquire)
+    }
+
+    /// Returns the raw address of this signal's backing slot.
+    ///
+    /// Used internally by [`EvaluatorTick`](crate::evaluator::EvaluatorTick) to
+    /// detect duplicate registrations in debug builds. Two `Signal` handles
+    /// that compare equal by this pointer refer to the same underlying slot.
+    ///
+    /// The returned pointer is opaque — it must not be dereferenced.
+    #[must_use]
+    pub(crate) fn slot_ptr(self) -> *const () {
+        self.slot.as_ptr().cast()
     }
 }
 
