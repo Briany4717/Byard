@@ -9,6 +9,11 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bumpalo = "3"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "evaluator"
+harness = false

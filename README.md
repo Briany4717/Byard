@@ -95,13 +95,13 @@ decorative properties are passed as arguments to the base component.
 
 ## Roadmap
 
-Byard is being built in phases. The detailed scope of Phase 1 is an
-[open question in RFC-0001](docs/rfcs/0001-core-architecture.md#unresolved-questions)
-and is being defined now.
+Byard is being built in phases.
 
-- **Phase 0 — Design** *(current)* — RFCs, architecture, crate layout.
-- **Phase 1 — Engine core** — `wgpu` multi-pipeline renderer, Taffy integration,
-  the spatial hash grid, and the double-buffered threading model.
+- **Phase 0 — Design** *(complete)* — RFCs, architecture, crate layout.
+- **Phase 1 — Engine core** *(current)* — `wgpu` multi-pipeline renderer, Taffy
+  integration, the spatial hash grid, and the double-buffered threading model.
+  Scope and progress tracked in the
+  [Phase 1 milestone](https://github.com/Briany4717/byard/milestones).
 - **Phase 2 — `bylang` compiler** — `logos` lexer, hand-written recursive descent
   parser, and the dev-mode AST interpreter.
 - **Phase 3 — Rust ↔ `bylang` bridge** — the `#[byard_controller]` macro and LSP
@@ -114,9 +114,10 @@ out of the design phase.
 
 ## Contributing
 
-Byard is open to contributions from day one. Because the project is still in its
-design phase, **the most valuable contributions right now are design review and
-discussion on the RFCs** rather than code.
+Byard is open to contributions from day one. The
+[Phase 1 milestone](https://github.com/Briany4717/byard/milestones) tracks the
+current implementation work — look for issues labelled `phase-1` and
+`good first issue` to get started.
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [Code of Conduct](CODE_OF_CONDUCT.md) before opening an issue or pull request.
