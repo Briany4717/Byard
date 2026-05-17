@@ -170,10 +170,11 @@ impl<'a, T: 'static> Signal<'a, T> {
     /// Mutates the value of the signal and increments the version counter
     /// atomically.
     ///
-    /// The version increment happens **before** the user closure returns,
-    /// inside the `BorrowGuard`'s `Drop`. This means a panic from the closure
-    /// still marks the signal dirty — consistent with the principle that any
-    /// observable mutation must be visible to the dirty-flag collection.
+    /// The version increment happens inside `WriteGuard`'s `Drop`, which
+    /// runs after the user closure returns (or while unwinding from a
+    /// panic). This guarantees that any observable mutation is reflected
+    /// in `Signal::version` before control returns to the caller, even if
+    /// the closure panics.
     ///
     /// # Panics
     ///
@@ -211,13 +212,26 @@ impl<'a, T: 'static> Signal<'a, T> {
         targets.push(target);
     }
 
-    /// Returns a snapshot of the targets currently registered on this signal.
-    #[must_use]
-    pub fn subscribers(&self) -> Vec<TargetId> {
+    /// Calls `f` with the targets currently registered on this signal.
+    ///
+    /// The subscriber list is borrowed only for the duration of the closure,
+    /// so callers can enumerate it without allocating a cloned snapshot.
+    /// This is the preferred API for hot-path iteration (e.g. the dirty-flag
+    /// collection loop). Use [`Signal::subscribers`] only when you need an
+    /// owned snapshot.
+    pub fn with_subscribers<R>(&self, f: impl FnOnce(&[TargetId]) -> R) -> R {
         // SAFETY: read-only borrow, same justification as `subscribe`.
         let slot = unsafe { self.slot.as_ref() };
         let targets: &Vec<TargetId> = unsafe { &*slot.dirty_targets.get() };
-        targets.clone()
+        f(targets.as_slice())
+    }
+
+    /// Returns an owned snapshot of the targets currently registered.
+    ///
+    /// Allocates. Prefer [`Signal::with_subscribers`] in hot paths.
+    #[must_use]
+    pub fn subscribers(&self) -> Vec<TargetId> {
+        self.with_subscribers(<[TargetId]>::to_vec)
     }
 
     /// Returns the current version counter of this signal.
@@ -420,5 +434,16 @@ mod tests {
             "version must reflect the observable mutation"
         );
         assert_eq!(signal.read(|v| *v), 99, "the value was actually mutated");
+    }
+
+    #[test]
+    fn with_subscribers_borrows_without_allocating() {
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        signal.subscribe(TargetId::new(1, 0, 0));
+        signal.subscribe(TargetId::new(2, 0, 0));
+
+        let sum: u32 = signal.with_subscribers(|targets| targets.iter().map(|t| t.index()).sum());
+        assert_eq!(sum, 3);
     }
 }
