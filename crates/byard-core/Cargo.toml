@@ -9,7 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bumpalo = { version = "3", features = ["collections"] }
+bumpalo = "3"
 
 [lints]
 workspace = true
