@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use byard_core::evaluator::{Signal, ViewArena};
 use byard_core::frame::TargetId;
+use byard_core::evaluator::EvaluatorTick;
 
 fn bench<F: FnMut()>(name: &str, iters: u64, ops_per_iter: u64, mut f: F) {
     // Warm-up
@@ -169,6 +170,55 @@ fn main() {
                     sig.write(|v| *v = i as u64);
                 }
             }
+        },
+    );
+
+    // ── Tick cycle ───────────────────────────────────────────────────────
+    bench_with_setup(
+        "tick: collect_dirty (10 signals, no writes)",
+        100_000,
+        1,
+        || {
+            let arena = Box::leak(Box::new(ViewArena::new()));
+            let mut tick = EvaluatorTick::new();
+            for i in 0..10_u32 {
+                let signal = Signal::new_in(arena, i);
+                signal.subscribe(TargetId::new(i, 0, 0));
+                tick.register(signal);
+            }
+            // First call clears the "initial version" baseline.
+            tick.collect_dirty();
+            tick
+        },
+        |mut tick| {
+            black_box(tick.collect_dirty());
+        },
+    );
+
+    bench_with_setup(
+        "tick: collect_dirty (10 signals, all dirty)",
+        100_000,
+        1,
+        || {
+            let arena: &'static ViewArena = Box::leak(Box::new(ViewArena::new()));
+            let mut tick = EvaluatorTick::new();
+            let signals: Vec<_> = (0..10_u32)
+                .map(|i| {
+                    let s = Signal::new_in(arena, i);
+                    s.subscribe(TargetId::new(i, 0, 0));
+                    tick.register(s);
+                    s
+                })
+                .collect();
+            tick.collect_dirty();
+            // Dirty them all
+            for s in &signals {
+                s.write(|v| *v = v.wrapping_add(1));
+            }
+            tick
+        },
+        |mut tick| {
+            black_box(tick.collect_dirty());
         },
     );
 
