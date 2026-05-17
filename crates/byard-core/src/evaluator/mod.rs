@@ -15,3 +15,7 @@
 //! - **Dirty-flag tick** — On each logic tick, the evaluator collects all dirty
 //!   flags set since the last tick and produces the minimal set of dirty rectangles
 //!   to hand off to the encoder via [`crate::frame`].
+
+pub mod arena;
+
+pub use arena::ViewArena;

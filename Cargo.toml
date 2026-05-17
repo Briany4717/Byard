@@ -19,8 +19,8 @@ authors     = ["Byard contributors"]
 rust-version = "1.85"
 
 [workspace.lints.rust]
-unsafe_code          = "forbid"
-missing_docs         = "warn"
+unsafe_code     = "deny"
+missing_docs    = "warn"
 
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
