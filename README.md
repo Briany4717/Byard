@@ -134,4 +134,5 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 inclusion in this work by you, as defined in the Apache-2.0 license, shall be
 dual-licensed as above, without any additional terms or conditions.
 
-With love ❤️, from rustaceans to rustaceans.
+Made with love for the Rust community.
+For those who believe UI deserves the same rigor as systems code.
