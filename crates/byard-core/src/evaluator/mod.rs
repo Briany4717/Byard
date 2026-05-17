@@ -18,7 +18,8 @@
 
 pub mod arena;
 pub mod signal;
-
-pub use signal::Signal;
+pub mod tick;
 
 pub use arena::ViewArena;
+pub use signal::Signal;
+pub use tick::EvaluatorTick;
