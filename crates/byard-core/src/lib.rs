@@ -35,16 +35,10 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ByardError {
-    /// A render pipeline failed to compile during initialisation.
-    PipelineCompilation {
-        /// Name of the pipeline that failed (e.g. `"SolidBox"`).
-        pipeline: String,
-        /// The underlying error message from `wgpu`.
-        reason: String,
-    },
-
-    /// The GPU backend does not meet Byard's minimum requirements.
+    PipelineCompilation { pipeline: String, reason: String },
     UnsupportedBackend,
+    /// An error from the Atlas subsystem (layout, hit-testing).
+    Layout(crate::atlas::AtlasError),
 }
 
 impl fmt::Display for ByardError {
@@ -53,10 +47,15 @@ impl fmt::Display for ByardError {
             Self::PipelineCompilation { pipeline, reason } => {
                 write!(f, "pipeline '{pipeline}' failed to compile: {reason}")
             }
-            Self::UnsupportedBackend => {
-                write!(f, "no compatible wgpu backend found")
-            }
+            Self::UnsupportedBackend => write!(f, "no compatible wgpu backend found"),
+            Self::Layout(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl From<crate::atlas::AtlasError> for ByardError {
+    fn from(e: crate::atlas::AtlasError) -> Self {
+        Self::Layout(e)
     }
 }
 
