@@ -303,6 +303,7 @@ impl LayoutAtlas {
     ///
     /// Panics if the atlas is in the `Building` state. Call [`Self::compute`]
     /// first.
+    #[track_caller]
     pub fn populate_frame(&self, frame: &mut RenderFrame) {
         assert_eq!(
             self.state,
@@ -380,6 +381,7 @@ impl Default for LayoutAtlas {
 
 #[cfg(test)]
 mod tests {
+    use crate::ByardError;
     use super::*;
 
     /// Acceptance criterion: Atlas computes a valid layout for a single
@@ -648,5 +650,12 @@ mod tests {
         assert_f32_eq(b_rect.y, 0.0);
         assert_f32_eq(b_rect.width, 50.0);
         assert_f32_eq(b_rect.height, 50.0);
+    }
+
+    #[test]
+    fn atlas_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AtlasError>();
+        assert_send_sync::<ByardError>();
     }
 }
