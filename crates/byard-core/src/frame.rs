@@ -75,6 +75,62 @@ impl TargetId {
     }
 }
 
+/// An axis-aligned rectangle in logical pixel coordinates.
+///
+/// Produced by the Atlas as the resolved position and size of a node,
+/// consumed by the Encoder to issue draw commands. Lives in `frame`
+/// because it crosses the subsystem boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    /// Top-left X coordinate in logical pixels.
+    pub x: f32,
+    /// Top-left Y coordinate in logical pixels.
+    pub y: f32,
+    /// Width in logical pixels.
+    pub width: f32,
+    /// Height in logical pixels.
+    pub height: f32,
+}
+
+impl Rect {
+    /// Constructs a new rectangle.
+    #[must_use]
+    pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Returns `true` if the rectangle contains the given point.
+    #[must_use]
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+}
+
+/// Logical-pixel dimensions of the surface that hosts a layout.
+///
+/// Passed to [`LayoutAtlas::compute`](crate::atlas::LayoutAtlas::compute) as
+/// the available space for the root node.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    /// Width of the host surface in logical pixels.
+    pub width: f32,
+    /// Height of the host surface in logical pixels.
+    pub height: f32,
+}
+
+impl Viewport {
+    /// Constructs a new viewport.
+    #[must_use]
+    pub const fn new(width: f32, height: f32) -> Self {
+        Self { width, height }
+    }
+}
+
 /// An immutable snapshot of all render primitives for a single frame.
 ///
 /// Produced by the logic thread (evaluator + atlas) and consumed by the render
@@ -122,5 +178,23 @@ mod tests {
         const fn assert_copy<T: Copy>() {}
         assert_copy::<TargetId>();
         assert_eq!(std::mem::size_of::<TargetId>(), 8);
+    }
+
+    #[test]
+    fn rect_contains_point_inside() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(r.contains(50.0, 30.0));
+    }
+
+    #[test]
+    fn rect_does_not_contain_point_on_right_edge() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(!r.contains(110.0, 30.0), "right edge is exclusive");
+    }
+
+    #[test]
+    fn rect_does_not_contain_point_outside() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(!r.contains(0.0, 0.0));
     }
 }
