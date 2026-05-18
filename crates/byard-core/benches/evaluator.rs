@@ -10,6 +10,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use byard_core::evaluator::EvaluatorTick;
 use byard_core::evaluator::{Signal, ViewArena};
 use byard_core::frame::TargetId;
 
@@ -76,7 +77,14 @@ fn bench_with_setup<S, F, T>(
 fn main() {
     println!("\n=== Evaluator benchmarks ===\n");
 
-    // ── ViewArena allocation ─────────────────────────────────────────────
+    bench_arena();
+    bench_signal();
+    bench_tick();
+
+    println!();
+}
+
+fn bench_arena() {
     bench(
         "arena: alloc u64 (trivially-droppable)",
         1_000_000,
@@ -116,7 +124,9 @@ fn main() {
             drop(black_box(arena));
         },
     );
+}
 
+fn bench_signal() {
     let arena = ViewArena::new();
     let signal = Signal::new_in(&arena, 0_u64);
 
@@ -148,9 +158,9 @@ fn main() {
     });
 
     bench(
-        "signal: 100 signals × 10 subs × 100 writes",
+        "signal: 100 signals x 10 subs x 100 writes",
         1_000,
-        100 * 10 + 100 * 100, // subscribes + writes
+        100 * 10 + 100 * 100,
         || {
             let arena = ViewArena::new();
             let mut signals = Vec::with_capacity(100);
@@ -171,6 +181,52 @@ fn main() {
             }
         },
     );
+}
 
-    println!();
+fn bench_tick() {
+    bench_with_setup(
+        "tick: collect_dirty (10 signals, no writes)",
+        100_000,
+        1,
+        || {
+            let arena: &'static ViewArena = Box::leak(Box::new(ViewArena::new()));
+            let mut tick = EvaluatorTick::new();
+            for i in 0..10_u32 {
+                let signal = Signal::new_in(arena, i);
+                signal.subscribe(TargetId::new(i, 0, 0));
+                tick.register(signal);
+            }
+            tick.collect_dirty();
+            tick
+        },
+        |mut tick| {
+            black_box(tick.collect_dirty());
+        },
+    );
+
+    bench_with_setup(
+        "tick: collect_dirty (10 signals, all dirty)",
+        100_000,
+        1,
+        || {
+            let arena: &'static ViewArena = Box::leak(Box::new(ViewArena::new()));
+            let mut tick = EvaluatorTick::new();
+            let signals: Vec<_> = (0..10_u32)
+                .map(|i| {
+                    let s = Signal::new_in(arena, i);
+                    s.subscribe(TargetId::new(i, 0, 0));
+                    tick.register(s);
+                    s
+                })
+                .collect();
+            tick.collect_dirty();
+            for s in &signals {
+                s.write(|v| *v = v.wrapping_add(1));
+            }
+            tick
+        },
+        |mut tick| {
+            black_box(tick.collect_dirty());
+        },
+    );
 }
