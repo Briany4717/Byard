@@ -45,6 +45,9 @@ pub enum ByardError {
 
     /// The GPU backend does not meet Byard's minimum requirements.
     UnsupportedBackend,
+
+    /// An error from the Atlas subsystem (layout, hit-testing).
+    Layout(crate::atlas::AtlasError),
 }
 
 impl fmt::Display for ByardError {
@@ -53,11 +56,58 @@ impl fmt::Display for ByardError {
             Self::PipelineCompilation { pipeline, reason } => {
                 write!(f, "pipeline '{pipeline}' failed to compile: {reason}")
             }
-            Self::UnsupportedBackend => {
-                write!(f, "no compatible wgpu backend found")
-            }
+            Self::UnsupportedBackend => write!(f, "no compatible wgpu backend found"),
+            Self::Layout(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for ByardError {}
+impl From<crate::atlas::AtlasError> for ByardError {
+    fn from(e: crate::atlas::AtlasError) -> Self {
+        Self::Layout(e)
+    }
+}
+
+impl std::error::Error for ByardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Layout(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byard_error_layout_chains_source() {
+        use crate::atlas::AtlasError;
+        use std::error::Error;
+
+        let inner_msg = "backend exploded".to_string();
+        let atlas_err = AtlasError::Backend(inner_msg);
+        let byard_err: ByardError = atlas_err.into();
+
+        assert!(
+            byard_err.source().is_some(),
+            "Layout variant must expose source"
+        );
+        assert_eq!(
+            byard_err.to_string(),
+            "layout backend error: backend exploded"
+        );
+    }
+
+    #[test]
+    fn byard_error_pipeline_has_no_source() {
+        use std::error::Error;
+
+        let err = ByardError::PipelineCompilation {
+            pipeline: "SolidBox".to_string(),
+            reason: "bad shader".to_string(),
+        };
+        assert!(err.source().is_none());
+    }
+}
