@@ -11,8 +11,16 @@ use taffy::{AvailableSpace, Dimension, NodeId, Size, Style, TaffyError, TaffyTre
 
 /// Opaque identifier for a node owned by a [`LayoutAtlas`].
 ///
-/// Wraps [`taffy::NodeId`] so the Atlas does not leak Taffy types into the
-/// rest of the engine.
+/// Wraps [`taffy::NodeId`] so the Atlas does not leak Taffy types into
+/// the rest of the engine.
+///
+/// # Caveat: cross-atlas safety
+///
+/// `AtlasNodeId` is currently **not** scoped to the atlas that created it.
+/// Passing an ID from one [`LayoutAtlas`] to another may return incorrect
+/// geometry or hit a backend error rather than a clean rejection.
+/// Callers must only use IDs with their originating atlas. A future
+/// sub-issue will add a generation tag to enforce this at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AtlasNodeId(NodeId);
 
@@ -35,10 +43,11 @@ impl LeafSize {
 
 /// Style for a container node.
 ///
-/// Phase 1 exposes only the minimum needed for the acceptance criteria
-/// (one container with a child). Further style fields will be added as
-/// the `bylang` DSL grows.
+/// Phase 1 exposes only the minimum needed for the acceptance criteria.
+/// Marked `#[non_exhaustive]` so additional style fields can be added
+/// without breaking downstream code.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ContainerStyle {
     /// Explicit width, if any. `None` means "grow to fit children".
     pub width: Option<f32>,
@@ -47,11 +56,18 @@ pub struct ContainerStyle {
 }
 
 /// Errors produced by the [`LayoutAtlas`].
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum AtlasError {
     /// The layout backend returned an error during tree construction
     /// or layout computation.
     Backend(String),
+}
+
+impl AtlasError {
+    pub(crate) fn from_taffy(e: TaffyError) -> Self {
+        Self::Backend(e.to_string())
+    }
 }
 
 impl fmt::Display for AtlasError {
@@ -125,7 +141,7 @@ impl LayoutAtlas {
     ///
     /// # Errors
     ///
-    /// Returns [`AtlasError::Taffy`] if the underlying engine refuses the
+    /// Returns [`AtlasError::Backend`] if the underlying engine refuses the
     /// node (extremely rare; indicates resource exhaustion).
     pub fn add_leaf(&mut self, size: LeafSize) -> Result<AtlasNodeId, AtlasError> {
         self.assert_building("add_leaf");
@@ -138,7 +154,7 @@ impl LayoutAtlas {
             ..Default::default()
         };
 
-        let node = self.tree.new_leaf(style)?;
+        let node = self.tree.new_leaf(style).map_err(AtlasError::from_taffy)?;
         Ok(AtlasNodeId(node))
     }
 
@@ -150,7 +166,7 @@ impl LayoutAtlas {
     ///
     /// # Errors
     ///
-    /// Returns [`AtlasError::Taffy`] if the underlying engine refuses the
+    /// Returns [`AtlasError::Backend`] if the underlying engine refuses the
     /// node, or if any child has already been attached to another parent.
     pub fn add_container(
         &mut self,
@@ -174,7 +190,7 @@ impl LayoutAtlas {
         self.children_scratch.extend(children.iter().map(|c| c.0));
         let node = self
             .tree
-            .new_with_children(taffy_style, &self.children_scratch)?;
+            .new_with_children(taffy_style, &self.children_scratch).map_err(AtlasError::from_taffy)?;
         Ok(AtlasNodeId(node))
     }
 
@@ -201,7 +217,7 @@ impl LayoutAtlas {
     ///
     /// # Errors
     ///
-    /// Returns [`AtlasError::Taffy`] if layout computation fails.
+    /// Returns [`AtlasError::Backend`] if layout computation fails.
     pub fn compute(&mut self, viewport: Viewport) -> Result<(), AtlasError> {
         self.assert_building("compute");
 
@@ -214,7 +230,7 @@ impl LayoutAtlas {
             height: AvailableSpace::Definite(viewport.height),
         };
 
-        self.tree.compute_layout(root.0, available)?;
+        self.tree.compute_layout(root.0, available).map_err(AtlasError::from_taffy)?;
         self.state = AtlasState::Computed;
         Ok(())
     }
@@ -224,10 +240,10 @@ impl LayoutAtlas {
     /// # Caveat: orphan nodes
     ///
     /// If `node` was added to the tree but never attached (directly or
-    /// transitively) to the root passed to `compute`, this returns the
-    /// default `Rect` of all zeros rather than `None`. This matches Taffy's
-    /// underlying behaviour. Callers should only query rects for nodes
-    /// known to be reachable from the root.
+    /// transitively) to the root configured via [`Self::set_root`], this
+    /// returns the default `Rect` of all zeros rather than `None`. This
+    /// matches Taffy's underlying behaviour. Callers should only query
+    /// rects for nodes known to be reachable from the root.
     ///
     /// # Panics
     ///
@@ -235,10 +251,7 @@ impl LayoutAtlas {
     /// [`Self::compute`] first.
     #[must_use]
     pub fn resolved_rect(&self, node: AtlasNodeId) -> Option<Rect> {
-        assert!(
-            self.state == AtlasState::Computed,
-            "LayoutAtlas::resolved_rect called before compute — geometry is not available yet",
-        );
+        assert_eq!(self.state, AtlasState::Computed, "LayoutAtlas::resolved_rect called before compute — geometry is not available yet");
 
         let layout = self.tree.layout(node.0).ok()?;
         Some(Rect {
@@ -266,28 +279,30 @@ impl LayoutAtlas {
     /// Panics if the atlas is in the `Building` state. Call [`Self::compute`]
     /// first.
     pub fn populate_frame(&self, frame: &mut RenderFrame) {
-        assert!(
-            self.state == AtlasState::Computed,
-            "LayoutAtlas::populate_frame called before compute — geometry is not available yet",
-        );
+        assert_eq!(self.state, AtlasState::Computed, "LayoutAtlas::populate_frame called before compute — geometry is not available yet");
 
-        let Some(root) = self.root else {
-            return;
-        };
+        let root = self.root.expect(
+            "LayoutAtlas::populate_frame reached Computed state without a root node — \
+         this indicates an internal state-machine inconsistency",
+        );
 
         self.walk_and_push(root, frame);
     }
 
     /// Recursively walks the tree from `node` in pre-order, pushing each
     /// resolved rectangle into `frame`.
-    fn walk_and_push(&self, node: AtlasNodeId, frame: &mut RenderFrame) {
-        if let Some(rect) = self.resolved_rect_internal(node) {
-            frame.push_rect(rect);
-        }
-
-        if let Ok(children) = self.tree.children(node.0) {
-            for child in children {
-                self.walk_and_push(AtlasNodeId(child), frame);
+    fn walk_and_push(&self, root: AtlasNodeId, frame: &mut RenderFrame) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if let Some(rect) = self.resolved_rect_internal(node) {
+                frame.push_rect(rect);
+            }
+            if let Ok(children) = self.tree.children(node.0) {
+                // Push in reverse so the leftmost child is popped first,
+                // preserving pre-order traversal semantics.
+                for child in children.iter().rev() {
+                    stack.push(AtlasNodeId(*child));
+                }
             }
         }
     }
@@ -525,32 +540,6 @@ mod tests {
     }
 
     #[test]
-    fn populate_frame_with_no_root_is_noop() {
-        use crate::frame::RenderFrame;
-
-        let mut atlas = LayoutAtlas::new();
-        // No nodes, no root. Force state to Computed by calling compute on
-        // an empty tree is invalid, so we manually verify the no-root path
-        // by creating a node, setting it as root, computing, then clearing.
-        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
-        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
-        atlas.clear();
-
-        // After clear, root is None but we're back in Building state.
-        // Set up a new computed state without a root for the test.
-        // Simplest: just verify the empty-root branch doesn't panic by
-        // re-using a freshly computed atlas with no children.
-        let leaf2 = atlas.add_leaf(LeafSize::new(5.0, 5.0)).unwrap();
-        atlas.set_root(leaf2);
-        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
-
-        let mut frame = RenderFrame::new();
-        atlas.populate_frame(&mut frame);
-        assert_eq!(frame.rects().len(), 1, "single leaf produces single rect");
-    }
-
-    #[test]
     #[should_panic(expected = "called before compute")]
     fn populate_frame_before_compute_panics() {
         use crate::frame::RenderFrame;
@@ -585,5 +574,39 @@ mod tests {
         let orphan_rect = atlas.resolved_rect(orphan).unwrap();
         assert_f32_eq(orphan_rect.width, 0.0);
         assert_f32_eq(orphan_rect.height, 0.0);
+    }
+
+    #[test]
+    fn flex_row_positions_children_with_offset() {
+        use taffy::FlexDirection;
+
+        let mut atlas = LayoutAtlas::new();
+        let a = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        let b = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+
+        // We can't set flex_direction through our current ContainerStyle —
+        // this test validates the location mapping is correct using Taffy's
+        // default block layout, which still produces non-zero y for the
+        // second child.
+        let root = atlas
+            .add_container(
+                ContainerStyle {
+                    width: Some(200.0),
+                    height: Some(200.0),
+                },
+                &[a, b],
+            )
+            .unwrap();
+        atlas.set_root(root);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let a_rect = atlas.resolved_rect(a).unwrap();
+        let b_rect = atlas.resolved_rect(b).unwrap();
+
+        // Block layout stacks children vertically.
+        assert_f32_eq(a_rect.x, 0.0);
+        assert_f32_eq(a_rect.y, 0.0);
+        assert_f32_eq(b_rect.x, 0.0);
+        assert_f32_eq(b_rect.y, 50.0);
     }
 }

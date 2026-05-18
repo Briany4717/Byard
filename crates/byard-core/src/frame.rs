@@ -151,9 +151,9 @@ pub struct RenderFrame {
     /// Resolved geometry produced by the Atlas.
     ///
     /// Each entry is a rectangle in logical pixels, ready for the Encoder
-    /// to translate into a draw command. Order is determined by the Atlas
-    /// (currently insertion order; will become Z-bin order in a future
-    /// sub-issue).
+    /// to translate into a draw command. Order is determined by Atlas tree
+    /// traversal (currently pre-order over the layout tree; will become
+    /// Z-bin order in a future sub-issue).
     rects: Vec<Rect>,
 }
 
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn render_frame_clear_retains_capacity() {
+    fn render_frame_clear_empties_rects() {
         let mut frame = RenderFrame::new();
         frame.push_rect(Rect::new(0.0, 0.0, 10.0, 10.0));
         frame.push_rect(Rect::new(10.0, 0.0, 10.0, 10.0));
