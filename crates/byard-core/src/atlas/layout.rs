@@ -43,15 +43,30 @@ impl LeafSize {
 
 /// Style for a container node.
 ///
-/// Phase 1 exposes only the minimum needed for the acceptance criteria.
+/// # Layout defaults (Taffy 0.10)
+///
+/// When constructed via `Default::default()` or with only `width`/`height`
+/// set, Taffy applies these defaults:
+///
+/// - `display: Flex`
+/// - `flex_direction: Row` — children flow left-to-right
+/// - `align_items: Stretch` — children stretch on the cross axis if their
+///   size is not explicitly set, otherwise they keep their declared size
+/// - `justify_content: FlexStart` — children packed against the start of
+///   the main axis with no gap
+///
+/// These match CSS flexbox defaults. Phase 1 does not yet expose
+/// `flex_direction`, `align_items`, etc. through `ContainerStyle` —
+/// callers needing those must wait for the builder API sub-issue.
+///
 /// Marked `#[non_exhaustive]` so additional style fields can be added
 /// without breaking downstream code.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct ContainerStyle {
-    /// Explicit width, if any. `None` means "grow to fit children".
+    /// Explicit width in logical pixels. `None` means "grow to fit children".
     pub width: Option<f32>,
-    /// Explicit height, if any. `None` means "grow to fit children".
+    /// Explicit height in logical pixels. `None` means "grow to fit children".
     pub height: Option<f32>,
 }
 
@@ -65,7 +80,7 @@ pub enum AtlasError {
 }
 
 impl AtlasError {
-    pub(crate) fn from_taffy(e: TaffyError) -> Self {
+    pub(crate) fn from_taffy(e: &TaffyError) -> Self {
         Self::Backend(e.to_string())
     }
 }
@@ -154,7 +169,10 @@ impl LayoutAtlas {
             ..Default::default()
         };
 
-        let node = self.tree.new_leaf(style).map_err(AtlasError::from_taffy)?;
+        let node = self
+            .tree
+            .new_leaf(style)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
         Ok(AtlasNodeId(node))
     }
 
@@ -190,7 +208,8 @@ impl LayoutAtlas {
         self.children_scratch.extend(children.iter().map(|c| c.0));
         let node = self
             .tree
-            .new_with_children(taffy_style, &self.children_scratch).map_err(AtlasError::from_taffy)?;
+            .new_with_children(taffy_style, &self.children_scratch)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
         Ok(AtlasNodeId(node))
     }
 
@@ -230,7 +249,9 @@ impl LayoutAtlas {
             height: AvailableSpace::Definite(viewport.height),
         };
 
-        self.tree.compute_layout(root.0, available).map_err(AtlasError::from_taffy)?;
+        self.tree
+            .compute_layout(root.0, available)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
         self.state = AtlasState::Computed;
         Ok(())
     }
@@ -251,7 +272,11 @@ impl LayoutAtlas {
     /// [`Self::compute`] first.
     #[must_use]
     pub fn resolved_rect(&self, node: AtlasNodeId) -> Option<Rect> {
-        assert_eq!(self.state, AtlasState::Computed, "LayoutAtlas::resolved_rect called before compute — geometry is not available yet");
+        assert_eq!(
+            self.state,
+            AtlasState::Computed,
+            "LayoutAtlas::resolved_rect called before compute — geometry is not available yet"
+        );
 
         let layout = self.tree.layout(node.0).ok()?;
         Some(Rect {
@@ -279,7 +304,11 @@ impl LayoutAtlas {
     /// Panics if the atlas is in the `Building` state. Call [`Self::compute`]
     /// first.
     pub fn populate_frame(&self, frame: &mut RenderFrame) {
-        assert_eq!(self.state, AtlasState::Computed, "LayoutAtlas::populate_frame called before compute — geometry is not available yet");
+        assert_eq!(
+            self.state,
+            AtlasState::Computed,
+            "LayoutAtlas::populate_frame called before compute — geometry is not available yet"
+        );
 
         let root = self.root.expect(
             "LayoutAtlas::populate_frame reached Computed state without a root node — \
@@ -577,17 +606,22 @@ mod tests {
     }
 
     #[test]
-    fn flex_row_positions_children_with_offset() {
-        use taffy::FlexDirection;
-
+    fn flex_row_layout_positions_children_at_known_offsets() {
+        // Pixel-perfect layout contract for Phase 1.
+        //
+        // Taffy 0.10 with `Style::default()` uses Display::Flex and
+        // FlexDirection::Row. A container of 200x200 with two 50x50 children
+        // lays them out left-to-right at y=0:
+        //
+        //   child A → (x=0,  y=0, w=50, h=50)
+        //   child B → (x=50, y=0, w=50, h=50)
+        //
+        // This validates the location field is correctly threaded from
+        // taffy::Layout into our frame::Rect.
         let mut atlas = LayoutAtlas::new();
+
         let a = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
         let b = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
-
-        // We can't set flex_direction through our current ContainerStyle —
-        // this test validates the location mapping is correct using Taffy's
-        // default block layout, which still produces non-zero y for the
-        // second child.
         let root = atlas
             .add_container(
                 ContainerStyle {
@@ -603,10 +637,16 @@ mod tests {
         let a_rect = atlas.resolved_rect(a).unwrap();
         let b_rect = atlas.resolved_rect(b).unwrap();
 
-        // Block layout stacks children vertically.
+        // Child A: top-left corner of the container.
         assert_f32_eq(a_rect.x, 0.0);
         assert_f32_eq(a_rect.y, 0.0);
-        assert_f32_eq(b_rect.x, 0.0);
-        assert_f32_eq(b_rect.y, 50.0);
+        assert_f32_eq(a_rect.width, 50.0);
+        assert_f32_eq(a_rect.height, 50.0);
+
+        // Child B: stacked immediately to the right of A on the main axis.
+        assert_f32_eq(b_rect.x, 50.0);
+        assert_f32_eq(b_rect.y, 0.0);
+        assert_f32_eq(b_rect.width, 50.0);
+        assert_f32_eq(b_rect.height, 50.0);
     }
 }
