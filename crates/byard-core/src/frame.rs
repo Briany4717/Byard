@@ -105,6 +105,12 @@ impl Rect {
     }
 
     /// Returns `true` if the rectangle contains the given point.
+    ///
+    /// Uses half-open bounds: the left (`x`) and top (`y`) edges are
+    /// **inclusive**, while the right (`x + width`) and bottom
+    /// (`y + height`) edges are **exclusive**. This matches the convention
+    /// used by the spatial hash grid (sub-issue pending) and avoids
+    /// off-by-one disagreements during hit-testing.
     #[must_use]
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
@@ -136,12 +142,49 @@ impl Viewport {
 /// Produced by the logic thread (evaluator + atlas) and consumed by the render
 /// thread (encoder) via an atomic pointer swap managed by the relay.
 ///
-/// This type is intentionally cheap to clone — it will be wrapped in an `Arc`
-/// for the double-buffer exchange.
+/// Phase 1 only carries the resolved rectangles produced by the Atlas. As
+/// the Encoder grows, additional primitives (text glyph runs, decorated
+/// boxes, texture samplers) will be added as parallel `Vec`s — the
+/// structure is intentionally SoA-friendly for batched GPU dispatch.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct RenderFrame {
-    // Primitives will be added here as the subsystems are implemented.
+    /// Resolved geometry produced by the Atlas.
+    ///
+    /// Each entry is a rectangle in logical pixels, ready for the Encoder
+    /// to translate into a draw command. Order is determined by the Atlas
+    /// (currently insertion order; will become Z-bin order in a future
+    /// sub-issue).
+    rects: Vec<Rect>,
+}
+
+impl RenderFrame {
+    /// Creates an empty frame.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears the frame, retaining internal capacity.
+    ///
+    /// After the first frame, subsequent populations pay zero allocation
+    /// cost as long as primitive counts stay within the high-water mark.
+    pub fn clear(&mut self) {
+        self.rects.clear();
+    }
+
+    /// Appends a resolved rectangle to the frame.
+    ///
+    /// Called by the Atlas during `populate_frame`. Not part of the public
+    /// engine API — external code reads frames, it does not build them.
+    pub(crate) fn push_rect(&mut self, rect: Rect) {
+        self.rects.push(rect);
+    }
+
+    /// Returns the resolved rectangles in this frame.
+    #[must_use]
+    pub fn rects(&self) -> &[Rect] {
+        &self.rects
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +239,22 @@ mod tests {
     fn rect_does_not_contain_point_outside() {
         let r = Rect::new(10.0, 20.0, 100.0, 50.0);
         assert!(!r.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn render_frame_starts_empty() {
+        let frame = RenderFrame::new();
+        assert!(frame.rects().is_empty());
+    }
+
+    #[test]
+    fn render_frame_clear_retains_capacity() {
+        let mut frame = RenderFrame::new();
+        frame.push_rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        frame.push_rect(Rect::new(10.0, 0.0, 10.0, 10.0));
+        assert_eq!(frame.rects().len(), 2);
+
+        frame.clear();
+        assert!(frame.rects().is_empty());
     }
 }
