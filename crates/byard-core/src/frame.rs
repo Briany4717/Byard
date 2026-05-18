@@ -80,7 +80,7 @@ impl TargetId {
 /// Produced by the Atlas as the resolved position and size of a node,
 /// consumed by the Encoder to issue draw commands. Lives in `frame`
 /// because it crosses the subsystem boundary.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
     /// Top-left X coordinate in logical pixels.
     pub x: f32,
@@ -121,7 +121,7 @@ impl Rect {
 ///
 /// Passed to [`LayoutAtlas::compute`](crate::atlas::LayoutAtlas::compute) as
 /// the available space for the root node.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Viewport {
     /// Width of the host surface in logical pixels.
     pub width: f32,
@@ -137,7 +137,13 @@ impl Viewport {
     }
 }
 
-/// An immutable snapshot of all render primitives for a single frame.
+/// A snapshot of all render primitives for a single frame.
+///
+/// Built by the Logic thread (evaluator + atlas) and read by the Render
+/// thread (encoder). The Logic thread mutates the frame during
+/// construction via crate-private APIs; once handed off to the Render
+/// thread (via the Relay's atomic pointer swap) it is treated as
+/// immutable for the duration of that frame.
 ///
 /// Produced by the logic thread (evaluator + atlas) and consumed by the render
 /// thread (encoder) via an atomic pointer swap managed by the relay.

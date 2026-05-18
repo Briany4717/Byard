@@ -381,8 +381,8 @@ impl Default for LayoutAtlas {
 
 #[cfg(test)]
 mod tests {
-    use crate::ByardError;
     use super::*;
+    use crate::ByardError;
 
     /// Acceptance criterion: Atlas computes a valid layout for a single
     /// rectangle with a child.
