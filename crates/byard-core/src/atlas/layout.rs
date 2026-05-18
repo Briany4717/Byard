@@ -87,7 +87,7 @@ pub struct LayoutAtlas {
     tree: TaffyTree<()>,
     root: Option<AtlasNodeId>,
     state: AtlasState,
-    /// Reusable buffer for converting AtlasNodeId → NodeId during
+    /// Reusable buffer for converting `AtlasNodeId` → `NodeId` during
     /// container creation. Kept on the struct so containers with
     /// children do not allocate after the first frame.
     children_scratch: Vec<NodeId>,
@@ -170,12 +170,11 @@ impl LayoutAtlas {
             },
             ..Default::default()
         };
-
-        // Convert our newtype IDs back to Taffy IDs for the call.
-        let taffy_children: Vec<NodeId> = children.iter().map(|c| c.0).collect();
         self.children_scratch.clear();
         self.children_scratch.extend(children.iter().map(|c| c.0));
-        let node = self.tree.new_with_children(taffy_style, &self.children_scratch)?;
+        let node = self
+            .tree
+            .new_with_children(taffy_style, &self.children_scratch)?;
         Ok(AtlasNodeId(node))
     }
 
@@ -321,7 +320,11 @@ impl LayoutAtlas {
 
     #[track_caller]
     fn assert_building(&self, method: &str) {
-        assert_eq!(self.state, AtlasState::Building, "LayoutAtlas::{method} called while in Computed state — call clear() first");
+        assert_eq!(
+            self.state,
+            AtlasState::Building,
+            "LayoutAtlas::{method} called while in Computed state — call clear() first"
+        );
     }
 }
 

@@ -35,8 +35,17 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ByardError {
-    PipelineCompilation { pipeline: String, reason: String },
+    /// A render pipeline failed to compile during initialisation.
+    PipelineCompilation {
+        /// Name of the pipeline that failed (e.g. `"SolidBox"`).
+        pipeline: String,
+        /// The underlying error message from `wgpu`.
+        reason: String,
+    },
+
+    /// The GPU backend does not meet Byard's minimum requirements.
     UnsupportedBackend,
+
     /// An error from the Atlas subsystem (layout, hit-testing).
     Layout(crate::atlas::AtlasError),
 }
