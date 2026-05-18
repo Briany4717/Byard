@@ -23,7 +23,7 @@
 //! 1. **Building** — nodes can be added and modified. `compute` is the
 //!    only valid transition out. Querying resolved geometry panics.
 //! 2. **Computed** — resolved geometry is accessible. Adding or modifying
-//!    nodes panics. `reset` returns to Building, preserving capacity.
+//!    nodes panics. `clear` returns to Building, preserving capacity.
 //!
 //! Per RFC-0001 §4.1, `compute` is called exactly once per frame, after
 //! all mutations have been applied by the Logic thread.
