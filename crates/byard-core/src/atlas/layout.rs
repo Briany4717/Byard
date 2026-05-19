@@ -70,6 +70,16 @@ pub struct ContainerStyle {
     pub height: Option<f32>,
 }
 
+impl ContainerStyle {
+    /// Constructs a `ContainerStyle` with the given explicit dimensions.
+    ///
+    /// Either dimension may be `None` to mean "grow to fit children".
+    #[must_use]
+    pub const fn new(width: Option<f32>, height: Option<f32>) -> Self {
+        Self { width, height }
+    }
+}
+
 /// Errors produced by the [`LayoutAtlas`].
 #[non_exhaustive]
 #[derive(Debug)]
@@ -395,18 +405,28 @@ impl LayoutAtlas {
     /// (e.g. when registering a `Signal` that points to a yet-to-be-built
     /// layout target).
     ///
-    /// # Panics on impossibility
+    /// # Truncation
     ///
-    /// In practice, an Atlas with `u32::MAX` (4 billion) nodes is not
-    /// representable in any realistic UI workload. The cast is checked
-    /// at the type level by clippy and explicitly allowed here.
+    /// The returned value is `u32` to match the [`TargetId`] bit layout.
+    /// In the theoretical case of an atlas containing more than `u32::MAX`
+    /// (≈ 4.3 billion) nodes, the cast truncates and subsequent `TargetId`s
+    /// will alias earlier ones. A `debug_assert!` catches this in debug
+    /// builds; in release the bug would surface as ghost dirty marks on
+    /// the wrong nodes.
+    ///
+    /// In practice this limit is unreachable — 4 billion nodes at ~100
+    /// bytes each would require ~400 GB of RAM for the tree alone.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn next_target_index(&self) -> u32 {
-        // Truncation is theoretically possible on 64-bit targets if
-        // nodes_by_index.len() > u32::MAX, but a UI tree of 4 billion
-        // nodes is not a realistic configuration.
-        self.nodes_by_index.len() as u32
+        let len = self.nodes_by_index.len();
+        debug_assert!(
+            u32::try_from(len).is_ok(),
+            "LayoutAtlas exceeded u32::MAX nodes — TargetId indexing will alias",
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            len as u32
+        }
     }
 
     /// Returns the current view generation.
@@ -891,5 +911,71 @@ mod tests {
         assert_eq!(atlas.current_generation(), 1);
         atlas.clear();
         assert_eq!(atlas.current_generation(), 2);
+    }
+
+    /// Acceptance criterion: a signal that mutates one leaf produces
+    /// exactly one `TargetId` in the tick, which the atlas processes as
+    /// exactly one `mark_dirty` call.
+    ///
+    /// This is the end-to-end validation of the Evaluator → Atlas flow
+    /// described in RFC-0001 §2.2 and §4.1.
+    #[test]
+    fn signal_mutation_propagates_to_atlas_via_target_id() {
+        use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
+
+        // ── Setup the Atlas ──────────────────────────────────────────────
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(200.0, 200.0)).unwrap();
+
+        // The leaf is registered as TargetId index 0 in the atlas.
+        let leaf_target = TargetId::new(
+            atlas.next_target_index().wrapping_sub(1),
+            atlas.current_generation(),
+            TargetKind::AtlasNode as u16,
+        );
+
+        // ── Setup an Evaluator signal subscribed to the leaf ─────────────
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        signal.subscribe(leaf_target);
+
+        let mut tick = EvaluatorTick::new();
+        tick.register(signal);
+
+        // First tick: no writes, no dirty targets.
+        let dirty = tick.collect_dirty();
+        assert!(
+            dirty.is_empty(),
+            "no writes should produce no dirty targets"
+        );
+
+        // ── Mutate the signal ────────────────────────────────────────────
+        signal.write(|v| *v = 42);
+
+        // The tick must collect exactly one TargetId pointing at our leaf.
+        let dirty = tick.collect_dirty();
+        assert_eq!(dirty.len(), 1, "one mutation → one dirty target");
+        assert_eq!(dirty[0], leaf_target);
+
+        // ── Atlas processes the dirty set ────────────────────────────────
+        atlas.mark_dirty_all(&dirty);
+
+        // Recompute completes successfully (Taffy has the leaf marked dirty
+        // and re-runs layout for the affected subtree).
+        atlas.recompute_dirty(Viewport::new(200.0, 200.0)).unwrap();
+
+        // Geometry is still queryable post-recompute.
+        let rect = atlas.resolved_rect(leaf).unwrap();
+        assert_f32_eq(rect.width, 50.0);
+        assert_f32_eq(rect.height, 50.0);
+    }
+
+    #[test]
+    fn container_style_constructor_round_trips() {
+        let s = ContainerStyle::new(Some(100.0), Some(200.0));
+        assert_eq!(s.width, Some(100.0));
+        assert_eq!(s.height, Some(200.0));
     }
 }
