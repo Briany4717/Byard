@@ -32,6 +32,23 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetId(u64);
 
+/// Discriminant identifying which subsystem owns a [`TargetId`].
+///
+/// Stored in the high 16 bits of every `TargetId` so subsystems can filter
+/// the broadcast `mark_dirty_all` calls down to their own targets without
+/// coordination.
+///
+/// `#[repr(u16)]` guarantees the in-memory representation matches the
+/// `TargetId` bit layout, so `TargetKind::Foo as u16` is a zero-cost cast.
+#[repr(u16)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A layout node owned by `LayoutAtlas`.
+    AtlasNode = 1,
+    // Future: EncoderPrimitive = 2, etc.
+}
+
 impl TargetId {
     /// Constructs a `TargetId` from its three components.
     ///
@@ -262,5 +279,13 @@ mod tests {
 
         frame.clear();
         assert!(frame.rects().is_empty());
+    }
+
+    #[test]
+    fn target_kind_round_trips_through_target_id() {
+        let id = TargetId::new(7, 3, TargetKind::AtlasNode as u16);
+        assert_eq!(id.kind(), TargetKind::AtlasNode as u16);
+        assert_eq!(id.index(), 7);
+        assert_eq!(id.generation(), 3);
     }
 }
