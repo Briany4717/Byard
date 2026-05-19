@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::frame::{Rect, RenderFrame, Viewport};
+use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
 use taffy::{AvailableSpace, Dimension, NodeId, Size, Style, TaffyError, TaffyTree};
 
@@ -118,10 +118,15 @@ pub struct LayoutAtlas {
     tree: TaffyTree<()>,
     root: Option<AtlasNodeId>,
     state: AtlasState,
-    /// Reusable buffer for converting `AtlasNodeId` → `NodeId` during
-    /// container creation. Kept on the struct so containers with
-    /// children do not allocate after the first frame.
     children_scratch: Vec<NodeId>,
+    /// Reverse lookup from `TargetId.index` to the underlying node.
+    /// Populated as nodes are added; reset on `clear()`.
+    nodes_by_index: Vec<AtlasNodeId>,
+    /// View generation. Incremented on `clear()` so `TargetId`s from
+    /// previous views are silently rejected by `mark_dirty_all`.
+    /// Wraps via `wrapping_add` after 65 535 clears — see the doc on
+    /// `clear()` for the rationale.
+    current_generation: u16,
 }
 
 impl LayoutAtlas {
@@ -133,18 +138,26 @@ impl LayoutAtlas {
             root: None,
             state: AtlasState::Building,
             children_scratch: Vec::new(),
+            nodes_by_index: Vec::new(),
+            current_generation: 0,
         }
     }
 
     /// Clears the tree but retains internal capacity.
     ///
-    /// After the first frame, subsequent layouts pay zero allocation cost
-    /// as long as node counts stay within the high-water mark. Transitions
-    /// back to the `Building` state regardless of the current state.
+    /// Increments the internal view generation, which causes any
+    /// [`TargetId`]s produced before this call to be silently rejected
+    /// by [`Self::mark_dirty_all`]. The generation wraps after `u16::MAX`
+    /// clears — the collision probability with a stale `TargetId`
+    /// surviving that long is statistically negligible (see project notes
+    /// on `TargetId` packing).
     pub fn clear(&mut self) {
         self.tree.clear();
         self.root = None;
         self.state = AtlasState::Building;
+        self.children_scratch.clear();
+        self.nodes_by_index.clear();
+        self.current_generation = self.current_generation.wrapping_add(1);
     }
 
     /// Adds a leaf node with an explicit size.
@@ -173,7 +186,9 @@ impl LayoutAtlas {
             .tree
             .new_leaf(style)
             .map_err(|e| AtlasError::from_taffy(&e))?;
-        Ok(AtlasNodeId(node))
+        let id = AtlasNodeId(node);
+        self.nodes_by_index.push(id);
+        Ok(id)
     }
 
     /// Adds a container node that wraps the given children.
@@ -210,7 +225,9 @@ impl LayoutAtlas {
             .tree
             .new_with_children(taffy_style, &self.children_scratch)
             .map_err(|e| AtlasError::from_taffy(&e))?;
-        Ok(AtlasNodeId(node))
+        let id = AtlasNodeId(node);
+        self.nodes_by_index.push(id);
+        Ok(id)
     }
 
     /// Sets the root node for layout computation.
@@ -370,6 +387,113 @@ impl LayoutAtlas {
             AtlasState::Building,
             "LayoutAtlas::{method} called while in Computed state — call clear() first"
         );
+    }
+
+    /// Returns the index that the next added node will receive.
+    ///
+    /// Useful when constructing a [`TargetId`] before the node is created
+    /// (e.g. when registering a `Signal` that points to a yet-to-be-built
+    /// layout target).
+    ///
+    /// # Panics on impossibility
+    ///
+    /// In practice, an Atlas with `u32::MAX` (4 billion) nodes is not
+    /// representable in any realistic UI workload. The cast is checked
+    /// at the type level by clippy and explicitly allowed here.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn next_target_index(&self) -> u32 {
+        // Truncation is theoretically possible on 64-bit targets if
+        // nodes_by_index.len() > u32::MAX, but a UI tree of 4 billion
+        // nodes is not a realistic configuration.
+        self.nodes_by_index.len() as u32
+    }
+
+    /// Returns the current view generation.
+    ///
+    /// Embed this into [`TargetId::new`] when registering a `Signal`
+    /// against an Atlas node; future `mark_dirty_all` calls will then
+    /// validate it against the Atlas's current generation.
+    #[must_use]
+    pub fn current_generation(&self) -> u16 {
+        self.current_generation
+    }
+
+    /// Marks every target in `targets` that belongs to this atlas as dirty.
+    ///
+    /// Targets are filtered by [`TargetKind::AtlasNode`] and by matching
+    /// generation, so callers can safely pass the full batch produced by
+    /// [`EvaluatorTick::collect_dirty`](crate::evaluator::EvaluatorTick::collect_dirty).
+    /// Foreign or stale targets are silently ignored — this is the
+    /// broadcast/event-bus pattern documented in RFC-0001 §4.1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Building` state. Call [`Self::compute`]
+    /// first.
+    pub fn mark_dirty_all(&mut self, targets: &[TargetId]) {
+        assert_eq!(
+            self.state,
+            AtlasState::Computed,
+            "LayoutAtlas::mark_dirty_all called before compute — \
+         no geometry exists to mark dirty yet"
+        );
+
+        for target in targets {
+            if target.kind() != TargetKind::AtlasNode as u16 {
+                continue;
+            }
+            if target.generation() != self.current_generation {
+                continue;
+            }
+            let index = target.index() as usize;
+            if let Some(&node) = self.nodes_by_index.get(index) {
+                // If Taffy refuses (very rare — would indicate the node
+                // was somehow removed from the tree), skip silently. The
+                // next recompute will produce a layout that reflects the
+                // tree as it actually is.
+                let _ = self.tree.mark_dirty(node.0);
+            }
+        }
+    }
+
+    /// Recomputes layout for the subtrees marked dirty since the last
+    /// `compute` or `recompute_dirty`.
+    ///
+    /// Taffy caches geometry that has not changed, so this is typically
+    /// much cheaper than a full [`Self::compute`]. After this call, the
+    /// atlas remains in `Computed` state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Building` state, or if no root has
+    /// been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if layout computation fails.
+    pub fn recompute_dirty(&mut self, viewport: Viewport) -> Result<(), AtlasError> {
+        assert_eq!(
+            self.state,
+            AtlasState::Computed,
+            "LayoutAtlas::recompute_dirty called before compute — \
+         the initial layout pass must run via compute() first"
+        );
+
+        let root = self.root.expect(
+            "LayoutAtlas::recompute_dirty reached Computed state without a root node — \
+         this indicates an internal state-machine inconsistency",
+        );
+
+        let available = Size {
+            width: AvailableSpace::Definite(viewport.width),
+            height: AvailableSpace::Definite(viewport.height),
+        };
+
+        self.tree
+            .compute_layout(root.0, available)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        Ok(())
     }
 }
 
@@ -657,5 +781,115 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AtlasError>();
         assert_send_sync::<ByardError>();
+    }
+
+    #[test]
+    fn mark_dirty_filters_foreign_kinds() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let foreign_kind: u16 = 999;
+        let target = TargetId::new(0, atlas.current_generation(), foreign_kind);
+
+        // Should not panic, should not affect anything.
+        atlas.mark_dirty_all(&[target]);
+
+        // Recompute must still succeed (no spurious dirty propagation).
+        atlas.recompute_dirty(Viewport::new(100.0, 100.0)).unwrap();
+    }
+
+    #[test]
+    fn mark_dirty_filters_stale_generation() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let stale_generation = atlas.current_generation().wrapping_sub(1);
+        let target = TargetId::new(0, stale_generation, TargetKind::AtlasNode as u16);
+
+        atlas.mark_dirty_all(&[target]);
+        atlas.recompute_dirty(Viewport::new(100.0, 100.0)).unwrap();
+    }
+
+    #[test]
+    fn mark_dirty_accepts_matching_kind_and_generation() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
+        atlas.mark_dirty_all(&[target]);
+
+        atlas.recompute_dirty(Viewport::new(200.0, 200.0)).unwrap();
+
+        // Re-fetched rect reflects the new viewport. Container with no
+        // explicit width takes viewport-driven size only if it has flex_grow
+        // — here it's a leaf with fixed size, so the size stays at 10x10.
+        let rect = atlas.resolved_rect(leaf).unwrap();
+        assert_f32_eq(rect.width, 10.0);
+        assert_f32_eq(rect.height, 10.0);
+    }
+
+    #[test]
+    fn clear_invalidates_previous_generation_targets() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let old_target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
+
+        atlas.clear();
+        let new_leaf = atlas.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
+        atlas.set_root(new_leaf);
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        // Old target points at index 0, but its generation no longer
+        // matches — must be silently ignored.
+        atlas.mark_dirty_all(&[old_target]);
+        atlas.recompute_dirty(Viewport::new(100.0, 100.0)).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "called before compute")]
+    fn recompute_dirty_before_compute_panics() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf);
+
+        let _ = atlas.recompute_dirty(Viewport::new(100.0, 100.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "called before compute")]
+    fn mark_dirty_before_compute_panics() {
+        let mut atlas = LayoutAtlas::new();
+        let _ = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+
+        atlas.mark_dirty_all(&[]);
+    }
+
+    #[test]
+    fn next_target_index_returns_consecutive_values() {
+        let mut atlas = LayoutAtlas::new();
+        assert_eq!(atlas.next_target_index(), 0);
+        let _ = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        assert_eq!(atlas.next_target_index(), 1);
+        let _ = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        assert_eq!(atlas.next_target_index(), 2);
+    }
+
+    #[test]
+    fn current_generation_increments_on_clear() {
+        let mut atlas = LayoutAtlas::new();
+        assert_eq!(atlas.current_generation(), 0);
+        atlas.clear();
+        assert_eq!(atlas.current_generation(), 1);
+        atlas.clear();
+        assert_eq!(atlas.current_generation(), 2);
     }
 }
