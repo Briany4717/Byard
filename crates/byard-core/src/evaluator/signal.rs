@@ -1,7 +1,7 @@
 //! Reactive value handles backed by arena-allocated slots.
 //!
-//! A [`Signal<'a, T>`] is a `Copy` handle that points to a [`SignalSlot<T>`]
-//! living inside a [`ViewArena`](super::arena::ViewArena). Mutating a signal
+//! A [`Signal<'a, T>`] is a `Copy` handle that points to an internal slot
+//! living inside a [`ViewArena`]. Mutating a signal
 //! does **not** rebuild a virtual tree: it updates the value in place and
 //! increments an atomic version counter so downstream subsystems can detect
 //! changes without taking locks.
