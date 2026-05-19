@@ -18,3 +18,7 @@ workspace = true
 [[bench]]
 name = "evaluator"
 harness = false
+
+[[bench]]
+name = "atlas"
+harness = false
