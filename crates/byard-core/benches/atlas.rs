@@ -47,17 +47,25 @@ fn build_deep_tree_building(depth: u32, branch_factor: u32) -> LayoutAtlas {
     atlas
 }
 
+/// Builds a deep tree, runs the initial layout, and returns the atlas
+/// along with a `TargetId` pointing at the **first leaf** created
+/// during recursive construction.
+///
+/// The first leaf is always at index 0, regardless of tree shape — the
+/// recursive builder descends into the deepest leftmost branch before
+/// creating any container, so the first `add_leaf` call always runs
+/// first and receives index 0.
+///
+/// Returning a real leaf (rather than the root, which receives the
+/// highest index in this post-order construction) means the incremental
+/// benchmark measures actual leaf invalidation propagating up through
+/// the ancestor chain, not root cache reuse.
 fn build_deep_tree_computed(depth: u32, branch_factor: u32) -> (LayoutAtlas, TargetId) {
     let mut atlas = build_deep_tree_building(depth, branch_factor);
     atlas.compute(Viewport::new(1024.0, 768.0)).unwrap();
 
-    // Target a deep leaf (last one created during recursion → highest index).
-    let leaf_index = atlas.next_target_index().wrapping_sub(1);
-    let dirty_target = TargetId::new(
-        leaf_index,
-        atlas.current_generation(),
-        TargetKind::AtlasNode as u16,
-    );
+    // Index 0 is the first leaf created — always a real leaf, never the root.
+    let dirty_target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
 
     (atlas, dirty_target)
 }
@@ -87,12 +95,12 @@ fn bench_deep_incremental(name: &str, depth: u32, branch: u32, iters: u64) {
     );
 }
 
-/// Builds a balanced tree with the given number of leaf nodes.
+/// Builds a flat tree with `leaf_count` siblings under a single container,
+/// in `Building` state.
 ///
-/// Returns the atlas (already computed once) plus the `TargetId` pointing
-/// at one specific leaf — used as the "dirty" target in the incremental
-/// benchmark.
-/// Builds a balanced tree with `leaf_count` leaves, in `Building` state.
+/// The caller is responsible for calling `compute` before any incremental
+/// operation. Used by the flat-tree benchmarks where the worst-case shape
+/// for Flexbox invalidation is measured.
 fn build_tree_building(leaf_count: usize) -> LayoutAtlas {
     let mut atlas = LayoutAtlas::new();
 
@@ -187,6 +195,19 @@ fn main() {
     bench_full_recompute("atlas: flat full compute (1000 leaves)", 1000, 100);
     bench_incremental_recompute("atlas: flat incremental 1/1000", 1000, 100);
 
+    println!("\n── Acceptance-criterion benchmark: ~100-node tree ──");
+
+    // depth=2 branch=10 → 100 leaves + 10 mid containers + 1 root = 111 nodes.
+    // This is the exact shape called out in the recompute_dirty acceptance
+    // criterion ("100-node tree").
+    bench_deep_full(
+        "atlas: 100-leaf full compute (depth=2 branch=10)",
+        2,
+        10,
+        10_000,
+    );
+    bench_deep_incremental("atlas: 100-leaf incremental 1 dirty leaf", 2, 10, 10_000);
+
     println!("\n── Deep balanced trees (realistic UI hierarchies) ──");
     println!("\n  Small panel: depth=3, branch=4 → 64 leaves");
     bench_deep_full("atlas: deep full compute (3x4 = 64 leaves)", 3, 4, 10_000);
@@ -199,6 +220,18 @@ fn main() {
     println!("\n  Full IDE: depth=5, branch=5 → 3125 leaves");
     bench_deep_full("atlas: deep full compute (5x5 = 3125 leaves)", 5, 5, 100);
     bench_deep_incremental("atlas: deep incremental 1/3125", 5, 5, 100);
+
+    // Alternative shape: depth=3 branch=5 → 125 leaves + 25 + 5 + 1 = 156 nodes.
+    // Same order of magnitude in leaf count but deeper, demonstrating that
+    // deeper trees show better incremental speedups.
+    println!("\n  Comparison: deeper but similar leaf count");
+    bench_deep_full(
+        "atlas: 125-leaf full compute (depth=3 branch=5)",
+        3,
+        5,
+        10_000,
+    );
+    bench_deep_incremental("atlas: 125-leaf incremental 1 dirty leaf", 3, 5, 10_000);
 
     println!();
 }

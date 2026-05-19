@@ -20,7 +20,7 @@
 //!
 //! # State machine
 //!
-//! [`LayoutAtlas`] enforces a strict lifecycle:
+//! [`LayoutAtlas`] enforces a strict lifecycle with two states:
 //!
 //! 1. **Building** — nodes can be added (`add_leaf`, `add_container`) and
 //!    the root can be set. Querying resolved geometry or marking nodes
@@ -30,10 +30,14 @@
 //!    Dirty subtrees can be re-laid out incrementally via
 //!    `mark_dirty_all` + `recompute_dirty`. Adding or modifying nodes
 //!    panics until `clear` is called.
-//! 3. **Clear** — `clear()` returns to **Building**, preserves internal
-//!    capacity, and increments the view generation so any
-//!    [`TargetId`](crate::frame::TargetId)s from the previous view are
-//!    silently rejected by future `mark_dirty_all` calls.
+//!
+//! ## Transitions
+//!
+//! - `compute(viewport)` — Building → Computed.
+//! - `clear()` — Computed → Building. Preserves internal capacity and
+//!   increments the view generation so any
+//!   [`TargetId`](crate::frame::TargetId)s from the previous view are
+//!   silently rejected by future `mark_dirty_all` calls.
 //!
 //! Per RFC-0001 §4.1, `compute` is called exactly once per frame at the
 //! end of the mutation phase, then `recompute_dirty` is called on
