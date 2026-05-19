@@ -14,19 +14,47 @@
 //!   event descriptors.
 //!
 //! Atlas exposes resolved geometry to the encoder exclusively through
-//! [`crate::frame::Rect`].
+//! [`crate::frame::Rect`] and reacts to dirty-flag notifications produced
+//! by the Evaluator subsystem via [`crate::frame::TargetId`] +
+//! [`crate::frame::TargetKind::AtlasNode`].
 //!
 //! # State machine
 //!
-//! [`LayoutAtlas`] enforces a strict two-phase lifecycle:
+//! [`LayoutAtlas`] enforces a strict lifecycle:
 //!
-//! 1. **Building** — nodes can be added and modified. `compute` is the
-//!    only valid transition out. Querying resolved geometry panics.
-//! 2. **Computed** — resolved geometry is accessible. Adding or modifying
-//!    nodes panics. `clear` returns to Building, preserving capacity.
+//! 1. **Building** — nodes can be added (`add_leaf`, `add_container`) and
+//!    the root can be set. Querying resolved geometry or marking nodes
+//!    dirty panics.
+//! 2. **Computed** — `compute(viewport)` transitions here. Resolved
+//!    geometry is accessible via `resolved_rect` and `populate_frame`.
+//!    Dirty subtrees can be re-laid out incrementally via
+//!    `mark_dirty_all` + `recompute_dirty`. Adding or modifying nodes
+//!    panics until `clear` is called.
+//! 3. **Clear** — `clear()` returns to **Building**, preserves internal
+//!    capacity, and increments the view generation so any
+//!    [`TargetId`](crate::frame::TargetId)s from the previous view are
+//!    silently rejected by future `mark_dirty_all` calls.
 //!
-//! Per RFC-0001 §4.1, `compute` is called exactly once per frame, after
-//! all mutations have been applied by the Logic thread.
+//! Per RFC-0001 §4.1, `compute` is called exactly once per frame at the
+//! end of the mutation phase, then `recompute_dirty` is called on
+//! subsequent frames whenever the Evaluator reports dirty targets.
+//!
+//! # Cross-subsystem flow
+//!
+//! The Atlas is one consumer of the broadcast `TargetId` stream produced
+//! by the Logic thread:
+//!
+//! ```text
+//! signals mutate  →  EvaluatorTick::collect_dirty()  →  Vec<TargetId>
+//!                                                       │
+//!                            ┌──────────────────────────┼──────────────┐
+//!                            ▼                          ▼              ▼
+//!                  atlas.mark_dirty_all(...)   encoder.mark_dirty_all(...)   ...
+//! ```
+//!
+//! Each subsystem filters the broadcast by [`TargetKind`](crate::frame::TargetKind)
+//! and ignores foreign or stale entries. See [`LayoutAtlas::mark_dirty_all`]
+//! for the filtering rules.
 
 pub mod layout;
 
