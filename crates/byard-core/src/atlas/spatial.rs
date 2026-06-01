@@ -109,7 +109,10 @@ impl SpatialGrid {
         let entry = GridEntry { rect, target };
 
         let (min_col, min_row) = Self::quantize(rect.x, rect.y);
-        let (max_col, max_row) = Self::quantize(rect.x + rect.width, rect.y + rect.height);
+        let (max_col, max_row) = Self::quantize(
+            (rect.x + rect.width).next_down(),
+            (rect.y + rect.height).next_down(),
+        );
 
         for row in min_row..=max_row {
             for col in min_col..=max_col {
@@ -270,14 +273,16 @@ mod tests {
     }
 
     #[test]
-    fn rect_aligned_to_cell_boundary_spans_one_cell() {
-        // Rect from (0, 0) to (127.999, 127.999) — fits inside cell (0, 0).
+    fn rect_exactly_one_cell_wide_spans_one_cell() {
+        // Rect [0, 128) × [0, 128) — exactly one cell. The exclusive
+        // upper bound (128.0) must NOT spill into cell (1, _).
         let mut grid = SpatialGrid::new();
-        grid.insert(
-            Rect::new(0.0, 0.0, CELL_SIZE - 0.001, CELL_SIZE - 0.001),
-            make_target(1),
+        grid.insert(Rect::new(0.0, 0.0, CELL_SIZE, CELL_SIZE), make_target(1));
+        assert_eq!(
+            grid.occupied_cells(),
+            1,
+            "half-open bound must not spill into next cell"
         );
-        assert_eq!(grid.occupied_cells(), 1);
     }
 
     #[test]
