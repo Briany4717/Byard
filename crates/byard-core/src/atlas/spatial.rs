@@ -387,6 +387,7 @@ mod tests {
         assert_eq!(grid.query(550.0, 550.0), Some(new));
     }
 
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn repeated_clear_reinsert_cycles_stay_correct() {
         // Run multiple frame cycles to verify no accumulation of stale data.
