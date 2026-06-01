@@ -16,7 +16,7 @@ license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/Briany4717/byard"
 homepage    = "https://github.com/Briany4717/byard"
 authors     = ["Byard contributors"]
-rust-version = "1.85"
+rust-version = "1.86"
 
 [workspace.lints.rust]
 unsafe_code     = "deny"
