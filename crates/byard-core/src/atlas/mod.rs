@@ -61,5 +61,8 @@
 //! for the filtering rules.
 
 pub mod layout;
+pub mod spatial;
 
 pub use layout::{AtlasError, AtlasNodeId, ContainerStyle, LayoutAtlas, LeafSize};
+
+pub use spatial::{CELL_SIZE, SpatialGrid};
