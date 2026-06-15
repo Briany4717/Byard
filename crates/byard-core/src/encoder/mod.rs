@@ -161,10 +161,9 @@ impl EncoderSubsystem {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // Uniform buffer: vec2<f32> viewport dimensions (8 bytes).
         let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ByardCore - Viewport Uniform Buffer"),
-            size: 8,
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -177,7 +176,7 @@ impl EncoderSubsystem {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: None,
+                    min_binding_size: wgpu::BufferSize::new(16),
                 },
                 count: None,
             }],
@@ -224,7 +223,10 @@ impl EncoderSubsystem {
     /// Must be called whenever the surface is resized before the next frame
     /// that uses this encoder.
     pub fn update_viewport(&self, viewport: Viewport) {
-        let size_data = [viewport.width, viewport.height];
+        // Write 16 bytes to match the padded uniform buffer size.
+        // The shader only reads the first 8 bytes (vec2<f32>); the trailing
+        // two floats are zero padding required by the 16-byte alignment rule.
+        let size_data = [viewport.width, viewport.height, 0.0_f32, 0.0];
         self.queue
             .write_buffer(&self.viewport_buffer, 0, bytemuck::cast_slice(&size_data));
     }
@@ -233,7 +235,8 @@ impl EncoderSubsystem {
     ///
     /// Creates a transient instance buffer from `instances`, records a render pass
     /// that clears the target and draws every rectangle, then returns the finished
-    /// command buffer. The caller submits it with `queue.submit([encoder.encode_frame(...)])`.
+    /// command buffer ready for submission. The caller must submit it on the
+    /// same [`wgpu::Queue`] that was used to initialise this encoder.
     ///
     /// If `instances` is empty the pass still runs (clearing the target to
     /// transparent) but no draw call is issued.
