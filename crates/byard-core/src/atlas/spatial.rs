@@ -424,4 +424,37 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn spatial_grid_spec_compliance() {
+        let mut grid = SpatialGrid::new();
+        let target_parent = make_target(1);
+        let target_child = make_target(2);
+
+        // 1. Hit-testing puro & 2. Z-order implícito
+        // Parent and child overlap. Child is inserted later.
+        grid.insert(Rect::new(0.0, 0.0, 200.0, 200.0), target_parent);
+        grid.insert(Rect::new(0.0, 0.0, 100.0, 100.0), target_child);
+
+        // Inside the overlap (both child and parent) -> should return child (last inserted)
+        assert_eq!(grid.query(50.0, 50.0), Some(target_child));
+        // Outside child but inside parent -> should return parent
+        assert_eq!(grid.query(150.0, 150.0), Some(target_parent));
+        // Outside both -> should return None
+        assert_eq!(grid.query(250.0, 250.0), None);
+
+        // 3. Manejo de Negativos
+        // Insert a rectangle in negative coordinate space
+        let target_neg = make_target(3);
+        grid.insert(Rect::new(-100.0, -100.0, 50.0, 50.0), target_neg);
+        // Query inside negative space
+        assert_eq!(grid.query(-75.0, -75.0), Some(target_neg));
+        // Query on negative border/outside
+        assert_eq!(grid.query(-150.0, -150.0), None);
+
+        // 4. Ciclo de Invalidation (clear)
+        grid.clear();
+        assert_eq!(grid.query(50.0, 50.0), None);
+        assert_eq!(grid.query(-75.0, -75.0), None);
+    }
 }

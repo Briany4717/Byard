@@ -9,6 +9,9 @@ use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
 use taffy::{AvailableSpace, Dimension, NodeId, Size, Style, TaffyError, TaffyTree};
 
+use super::spatial::SpatialGrid;
+
+
 /// Opaque identifier for a node owned by a [`LayoutAtlas`].
 ///
 /// Wraps [`taffy::NodeId`] so the Atlas does not leak Taffy types into
@@ -125,10 +128,11 @@ enum AtlasState {
 /// See the module-level docs for the lifecycle contract and the RFC for
 /// the architectural rationale.
 pub struct LayoutAtlas {
-    tree: TaffyTree<()>,
+    tree: TaffyTree<u32>,
     root: Option<AtlasNodeId>,
     state: AtlasState,
     children_scratch: Vec<NodeId>,
+    grid: SpatialGrid,
     /// Reverse lookup from `TargetId.index` to the underlying node.
     /// Populated as nodes are added; reset on `clear()`.
     nodes_by_index: Vec<AtlasNodeId>,
@@ -148,6 +152,7 @@ impl LayoutAtlas {
             root: None,
             state: AtlasState::Building,
             children_scratch: Vec::new(),
+            grid: SpatialGrid::new(),
             nodes_by_index: Vec::new(),
             current_generation: 0,
         }
@@ -166,6 +171,7 @@ impl LayoutAtlas {
         self.root = None;
         self.state = AtlasState::Building;
         self.children_scratch.clear();
+        self.grid.clear();
         self.nodes_by_index.clear();
         self.current_generation = self.current_generation.wrapping_add(1);
     }
@@ -192,9 +198,11 @@ impl LayoutAtlas {
             ..Default::default()
         };
 
+        let next_index = self.nodes_by_index.len() as u32;
+
         let node = self
             .tree
-            .new_leaf(style)
+            .new_leaf_with_context(style, next_index)
             .map_err(|e| AtlasError::from_taffy(&e))?;
         let id = AtlasNodeId(node);
         self.nodes_by_index.push(id);
@@ -231,9 +239,13 @@ impl LayoutAtlas {
         };
         self.children_scratch.clear();
         self.children_scratch.extend(children.iter().map(|c| c.0));
+        let next_index = self.nodes_by_index.len() as u32;
         let node = self
             .tree
             .new_with_children(taffy_style, &self.children_scratch)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        self.tree
+            .set_node_context(node, Some(next_index))
             .map_err(|e| AtlasError::from_taffy(&e))?;
         let id = AtlasNodeId(node);
         self.nodes_by_index.push(id);
@@ -280,6 +292,7 @@ impl LayoutAtlas {
             .compute_layout(root.0, available)
             .map_err(|e| AtlasError::from_taffy(&e))?;
         self.state = AtlasState::Computed;
+        self.rebuild_grid();
         Ok(())
     }
 
@@ -346,6 +359,29 @@ impl LayoutAtlas {
         self.walk_and_push(root, frame);
     }
 
+    /// Performs spatial hit-testing to find the topmost node at the given screen coordinates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Building` state.
+    #[must_use]
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<AtlasNodeId> {
+        assert_eq!(
+            self.state,
+            AtlasState::Computed,
+            "LayoutAtlas::hit_test called while in Building state — layout must be computed first"
+        );
+
+        if let Some(target) = self.grid.query(x, y) {
+            if target.generation() == self.current_generation
+                && target.index() < self.nodes_by_index.len() as u32
+            {
+                return Some(self.nodes_by_index[target.index() as usize]);
+            }
+        }
+        None
+    }
+
     /// Recursively walks the tree from `node` in pre-order, pushing each
     /// resolved rectangle into `frame`.
     fn walk_and_push(&self, root: AtlasNodeId, frame: &mut RenderFrame) {
@@ -353,6 +389,30 @@ impl LayoutAtlas {
         while let Some(node) = stack.pop() {
             if let Some(rect) = self.resolved_rect_internal(node) {
                 frame.push_rect(rect);
+            }
+            if let Ok(children) = self.tree.children(node.0) {
+                // Push in reverse so the leftmost child is popped first,
+                // preserving pre-order traversal semantics.
+                for child in children.iter().rev() {
+                    stack.push(AtlasNodeId(*child));
+                }
+            }
+        }
+    }
+
+    /// Rebuilds the hit-testing spatial grid from the current layout.
+    fn rebuild_grid(&mut self) {
+        self.grid.clear();
+        let Some(root) = self.root else {
+            return;
+        };
+
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let index = *self.tree.get_node_context(node.0).unwrap();
+            let target = TargetId::new(index, self.current_generation, TargetKind::AtlasNode as u16);
+            if let Some(rect) = self.resolved_rect_internal(node) {
+                self.grid.insert(rect, target);
             }
             if let Ok(children) = self.tree.children(node.0) {
                 // Push in reverse so the leftmost child is popped first,
@@ -513,6 +573,7 @@ impl LayoutAtlas {
         self.tree
             .compute_layout(root.0, available)
             .map_err(|e| AtlasError::from_taffy(&e))?;
+        self.rebuild_grid();
         Ok(())
     }
 }
@@ -977,5 +1038,93 @@ mod tests {
         let s = ContainerStyle::new(Some(100.0), Some(200.0));
         assert_eq!(s.width, Some(100.0));
         assert_eq!(s.height, Some(200.0));
+    }
+
+    #[test]
+    fn hit_test_pure_success_and_miss() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // Hit within leaf
+        assert_eq!(atlas.hit_test(50.0, 50.0), Some(leaf));
+
+        // Miss (empty area)
+        assert_eq!(atlas.hit_test(150.0, 150.0), None);
+    }
+
+    #[test]
+    fn hit_test_z_order_implicit() {
+        let mut atlas = LayoutAtlas::new();
+        // A child that overlaps with its parent.
+        // Let's create a container of size 200x200, and a child of size 100x100.
+        // Taffy flexbox layout will position the child at (0, 0) relative to the container.
+        let child = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        let parent = atlas
+            .add_container(
+                ContainerStyle {
+                    width: Some(200.0),
+                    height: Some(200.0),
+                },
+                &[child],
+            )
+            .unwrap();
+        atlas.set_root(parent);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // The intersection is at (0, 0) to (100, 100).
+        // Since child is traversed later (pre-order: parent then child),
+        // query should return the child node.
+        assert_eq!(atlas.hit_test(50.0, 50.0), Some(child));
+
+        // Outside child, but inside parent
+        assert_eq!(atlas.hit_test(150.0, 150.0), Some(parent));
+    }
+
+    #[test]
+    fn hit_test_negative_coordinates() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // Should return None safely without panic
+        assert_eq!(atlas.hit_test(-50.0, -50.0), None);
+    }
+
+    #[test]
+    fn hit_test_invalidation_cycle() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        atlas.set_root(leaf);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // Verify hit-test works initially
+        assert_eq!(atlas.hit_test(50.0, 50.0), Some(leaf));
+
+        // Clear and construct a new view
+        atlas.clear();
+
+        let new_leaf = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        atlas.set_root(new_leaf);
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // The old node is no longer valid, and coordinates outside the new leaf (e.g. 75, 75)
+        // should return None, even though they were inside the old leaf.
+        assert_eq!(atlas.hit_test(75.0, 75.0), None);
+        // Inside the new leaf, it should return new_leaf
+        assert_eq!(atlas.hit_test(25.0, 25.0), Some(new_leaf));
+    }
+
+    #[test]
+    #[should_panic(expected = "called while in Building state")]
+    fn hit_test_in_building_state_panics() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        atlas.set_root(leaf);
+
+        // This must panic because compute has not been called.
+        let _ = atlas.hit_test(50.0, 50.0);
     }
 }
