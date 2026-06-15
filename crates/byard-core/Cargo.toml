@@ -11,6 +11,8 @@ rust-version.workspace = true
 [dependencies]
 bumpalo = "3"
 taffy = "0.10"
+rustc-hash = "2"
+smallvec = "1"
 
 [lints]
 workspace = true
@@ -21,4 +23,8 @@ harness = false
 
 [[bench]]
 name = "atlas"
+harness = false
+
+[[bench]]
+name = "spatial"
 harness = false

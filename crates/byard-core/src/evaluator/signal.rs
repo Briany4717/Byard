@@ -36,6 +36,8 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use smallvec::SmallVec;
+
 use super::arena::ViewArena;
 use crate::frame::TargetId;
 
@@ -44,7 +46,7 @@ use crate::frame::TargetId;
 /// Crate-private: external code interacts with `Signal` handles only.
 pub(crate) struct SignalSlot<T> {
     value: UnsafeCell<T>,
-    dirty_targets: UnsafeCell<Vec<TargetId>>,
+    dirty_targets: UnsafeCell<SmallVec<[TargetId; 2]>>,
     dirty_version: AtomicU64,
     /// Runtime borrow counter. Positive = shared borrows in progress;
     /// `BORROW_MUT_SENTINEL` = exclusive borrow in progress; 0 = idle.
@@ -165,7 +167,7 @@ impl<'a, T: 'static> Signal<'a, T> {
     pub fn new_in(arena: &'a ViewArena, initial: T) -> Self {
         let slot = arena.alloc(SignalSlot {
             value: UnsafeCell::new(initial),
-            dirty_targets: UnsafeCell::new(Vec::new()),
+            dirty_targets: UnsafeCell::new(SmallVec::new()),
             dirty_version: AtomicU64::new(0),
             borrow_state: Cell::new(0),
         });
@@ -256,7 +258,7 @@ impl<'a, T: 'static> Signal<'a, T> {
 
         // SAFETY: borrow counter is at the exclusive sentinel; no other
         // reference to `dirty_targets` exists.
-        let targets: &mut Vec<TargetId> = unsafe { &mut *slot.dirty_targets.get() };
+        let targets: &mut SmallVec<[TargetId; 2]> = unsafe { &mut *slot.dirty_targets.get() };
         targets.push(target);
     }
 
@@ -281,7 +283,7 @@ impl<'a, T: 'static> Signal<'a, T> {
         let _guard = BorrowGuard::shared(&slot.borrow_state);
 
         // SAFETY: borrow counter is positive; no mutator can run concurrently.
-        let targets: &Vec<TargetId> = unsafe { &*slot.dirty_targets.get() };
+        let targets: &SmallVec<[TargetId; 2]> = unsafe { &*slot.dirty_targets.get() };
         f(targets.as_slice())
     }
 

@@ -37,6 +37,13 @@ use bumpalo::Bump;
 /// Each entry stores a raw pointer to a value living in the bump arena and
 /// a monomorphised function pointer that calls `ptr::drop_in_place` for the
 /// concrete type. No `Box`, no vtable.
+///
+/// # Safety warning
+///
+/// This struct does NOT implement the [`Drop`] trait. Its resources must be
+/// manually released by calling `drop_fn` with `ptr`. Failing to do so (for
+/// instance, if the destruction loop is interrupted by a panic) will leak
+/// the resources of the pointed-to value.
 struct DropEntry {
     ptr: *mut u8,
     drop_fn: unsafe fn(*mut u8),
@@ -60,12 +67,20 @@ unsafe fn drop_glue<T>(ptr: *mut u8) {
 /// registration order** (LIFO), then the underlying memory is released in
 /// one operation.
 ///
-/// LIFO ordering matches Rust's standard RAII semantics for stack values
-/// and is required for panic safety: each destructor pops from the
-/// registry before running, so a panic mid-pass leaves the remaining
-/// entries in the `Vec` to be cleaned up by its own `Drop`.
+/// LIFO ordering matches Rust's standard RAII semantics for stack values.
+/// Destructors of registered types must never panic. Because `DropEntry`
+/// relies on raw pointers and does not implement the `Drop` trait, any panic
+/// during the destruction pass will halt the loop and cause all remaining
+/// registered destructors to be skipped, leaking their allocated resources.
 ///
 /// `ViewArena` is `!Send` and `!Sync` by construction.
+///
+/// # Drop-time restriction
+///
+/// Destructors of arena-allocated values must not allocate new values
+/// into the same arena. Doing so is not unsafe (no UB), but the new
+/// value's destructor will be silently skipped. This is a fundamental
+/// limitation of the detached-registry drop model.
 pub struct ViewArena {
     bump: Bump,
     drops: RefCell<Vec<DropEntry>>,
@@ -118,21 +133,37 @@ impl Default for ViewArena {
     }
 }
 
-impl Drop for ViewArena {
+struct DropRegistryGuard {
+    entries: Vec<DropEntry>,
+}
+
+impl Drop for DropRegistryGuard {
     fn drop(&mut self) {
-        // Take the registry out of the RefCell entirely. This releases
-        // the borrow before any user destructor runs, so destructors that
-        // happen to call back into the arena (e.g. for diagnostics) will
-        // not panic. Each iteration uses `pop` so a panicking destructor
-        // leaves the remaining entries in `drops`, whose own Drop will
-        // then clean them up during unwinding.
-        let mut drops = std::mem::take(&mut *self.drops.borrow_mut());
-        while let Some(entry) = drops.pop() {
+        // Pop and drop each registered entry in LIFO order.
+        // User destructors must not panic. A panic during this loop will
+        // exit the drop handler, causing the remaining entries in `self.entries`
+        // to be leaked (since `DropEntry` does not implement `Drop` and contains raw pointers).
+        while let Some(entry) = self.entries.pop() {
             // SAFETY: each `entry.ptr` was produced by `Bump::alloc` for a
             // value of the type that `entry.drop_fn` was monomorphised for,
             // and the value has not been dropped before.
             unsafe { (entry.drop_fn)(entry.ptr) };
         }
+    }
+}
+
+impl Drop for ViewArena {
+    fn drop(&mut self) {
+        // Take the registry out of the RefCell entirely. This releases
+        // the borrow before any user destructor runs, so destructors that
+        // happen to call back into the arena (e.g. for diagnostics) will
+        // not panic.
+        //
+        // Wrapping the entries in DropRegistryGuard ensures LIFO destruction.
+        // If a user destructor panics, the remaining entries in the registry
+        // will be leaked because they are not wrapped in compiler-managed Drop types.
+        let drops = std::mem::take(&mut *self.drops.borrow_mut());
+        let _guard = DropRegistryGuard { entries: drops };
     }
 }
 
