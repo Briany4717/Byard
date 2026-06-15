@@ -13,6 +13,8 @@ bumpalo = "3"
 taffy = "0.10"
 rustc-hash = "2"
 smallvec = "1"
+wgpu = "24.0"
+bytemuck = { version = "1.14", features = ["derive"] }
 
 [lints]
 workspace = true
