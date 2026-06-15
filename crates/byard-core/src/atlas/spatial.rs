@@ -431,7 +431,7 @@ mod tests {
         let target_parent = make_target(1);
         let target_child = make_target(2);
 
-        // 1. Hit-testing puro & 2. Z-order implícito
+        // 1. Pure hit-testing & 2. Implicit Z-order
         // Parent and child overlap. Child is inserted later.
         grid.insert(Rect::new(0.0, 0.0, 200.0, 200.0), target_parent);
         grid.insert(Rect::new(0.0, 0.0, 100.0, 100.0), target_child);
@@ -443,7 +443,7 @@ mod tests {
         // Outside both -> should return None
         assert_eq!(grid.query(250.0, 250.0), None);
 
-        // 3. Manejo de Negativos
+        // 3. Negative coordinate handling
         // Insert a rectangle in negative coordinate space
         let target_neg = make_target(3);
         grid.insert(Rect::new(-100.0, -100.0, 50.0, 50.0), target_neg);
