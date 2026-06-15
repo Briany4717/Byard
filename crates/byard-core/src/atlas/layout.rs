@@ -11,7 +11,6 @@ use taffy::{AvailableSpace, Dimension, NodeId, Size, Style, TaffyError, TaffyTre
 
 use super::spatial::SpatialGrid;
 
-
 /// Opaque identifier for a node owned by a [`LayoutAtlas`].
 ///
 /// Wraps [`taffy::NodeId`] so the Atlas does not leak Taffy types into
@@ -198,7 +197,7 @@ impl LayoutAtlas {
             ..Default::default()
         };
 
-        let next_index = self.nodes_by_index.len() as u32;
+        let next_index = self.next_target_index();
 
         let node = self
             .tree
@@ -239,7 +238,7 @@ impl LayoutAtlas {
         };
         self.children_scratch.clear();
         self.children_scratch.extend(children.iter().map(|c| c.0));
-        let next_index = self.nodes_by_index.len() as u32;
+        let next_index = self.next_target_index();
         let node = self
             .tree
             .new_with_children(taffy_style, &self.children_scratch)
@@ -374,7 +373,7 @@ impl LayoutAtlas {
 
         if let Some(target) = self.grid.query(x, y) {
             if target.generation() == self.current_generation
-                && target.index() < self.nodes_by_index.len() as u32
+                && (target.index() as usize) < self.nodes_by_index.len()
             {
                 return Some(self.nodes_by_index[target.index() as usize]);
             }
@@ -410,7 +409,8 @@ impl LayoutAtlas {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             let index = *self.tree.get_node_context(node.0).unwrap();
-            let target = TargetId::new(index, self.current_generation, TargetKind::AtlasNode as u16);
+            let target =
+                TargetId::new(index, self.current_generation, TargetKind::AtlasNode as u16);
             if let Some(rect) = self.resolved_rect_internal(node) {
                 self.grid.insert(rect, target);
             }
