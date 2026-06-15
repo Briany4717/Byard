@@ -452,7 +452,7 @@ mod tests {
         // Query on negative border/outside
         assert_eq!(grid.query(-150.0, -150.0), None);
 
-        // 4. Ciclo de Invalidation (clear)
+        // 4. Invalidation cycle (clear)
         grid.clear();
         assert_eq!(grid.query(50.0, 50.0), None);
         assert_eq!(grid.query(-75.0, -75.0), None);
