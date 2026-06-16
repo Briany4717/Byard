@@ -99,6 +99,71 @@ impl ContainerStyle {
     }
 }
 
+/// Declarative description of a layout (sub)tree.
+///
+/// `AtlasNodeSpec` values are plain data — building one never touches
+/// Taffy or any [`LayoutAtlas`], so describing a tree can never fail.
+/// They're produced with [`LayoutAtlasBuilder::leaf`] /
+/// [`LayoutAtlasBuilder::container`] and committed to a real atlas in one
+/// recursive pass via [`LayoutAtlas::build`] or [`LayoutAtlas::build_root`].
+///
+/// This is the fluent construction API from issue #15 — it sits on top
+/// of [`LayoutAtlas::add_leaf`] / [`LayoutAtlas::add_container`] /
+/// [`LayoutAtlas::set_root`] and calls them in the exact same depth-first,
+/// children-before-parent order a hand-written imperative sequence would,
+/// so it produces identical [`AtlasNodeId`]s. The low-level methods are
+/// the tested foundation (PR #14) and are unchanged by this type.
+#[derive(Debug, Clone)]
+pub enum AtlasNodeSpec {
+    /// Describes a leaf, mirroring [`LayoutAtlas::add_leaf`].
+    Leaf(LeafSize),
+    /// Describes a container and its children, mirroring
+    /// [`LayoutAtlas::add_container`]. Children are built and attached in
+    /// iteration order.
+    Container(ContainerStyle, Vec<AtlasNodeSpec>),
+}
+
+/// Entry point for building [`AtlasNodeSpec`] trees fluently.
+///
+/// `LayoutAtlasBuilder` does not wrap a [`LayoutAtlas`] — it has no state
+/// of its own. It's a pair of associated functions that produce
+/// [`AtlasNodeSpec`] values, which `LayoutAtlas::build`/`build_root` then
+/// commit. Nesting `container` calls lets a multi-level tree of mixed
+/// leaves and containers be expressed as a single chained expression:
+///
+/// ```
+/// use byard_core::atlas::{ContainerStyle, LayoutAtlas, LayoutAtlasBuilder as B, LeafSize};
+///
+/// let mut atlas = LayoutAtlas::new();
+/// let root = atlas.build_root(
+///     B::container(ContainerStyle::new(Some(300.0), Some(200.0)), [
+///         B::leaf(LeafSize::new(50.0, 50.0)),
+///         B::container(ContainerStyle::default(), [
+///             B::leaf(LeafSize::new(20.0, 20.0)),
+///         ]),
+///     ]),
+/// ).unwrap();
+/// # let _ = root;
+/// ```
+pub struct LayoutAtlasBuilder;
+
+impl LayoutAtlasBuilder {
+    /// Describes a leaf node with the given size.
+    #[must_use]
+    pub const fn leaf(size: LeafSize) -> AtlasNodeSpec {
+        AtlasNodeSpec::Leaf(size)
+    }
+
+    /// Describes a container node wrapping `children`, built in order.
+    #[must_use]
+    pub fn container(
+        style: ContainerStyle,
+        children: impl IntoIterator<Item = AtlasNodeSpec>,
+    ) -> AtlasNodeSpec {
+        AtlasNodeSpec::Container(style, children.into_iter().collect())
+    }
+}
+
 /// Errors produced by the [`LayoutAtlas`].
 #[non_exhaustive]
 #[derive(Debug)]
@@ -355,6 +420,56 @@ impl LayoutAtlas {
         self.validate_node(root)?;
         self.root = Some(root);
         Ok(())
+    }
+
+    /// Commits an [`AtlasNodeSpec`] tree built via [`LayoutAtlasBuilder`].
+    ///
+    /// Walks `spec` depth-first, building every child before its parent —
+    /// the exact same order and resulting [`AtlasNodeId`]s a hand-written
+    /// call sequence of [`Self::add_leaf`] / [`Self::add_container`] would
+    /// produce. Does not set the result as the root; use
+    /// [`Self::build_root`] for that, or call [`Self::set_root`] yourself
+    /// on the returned id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state (same contract as
+    /// [`Self::add_leaf`] / [`Self::add_container`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if the underlying engine refuses a
+    /// node. [`AtlasError::ForeignNode`] cannot occur here — every
+    /// `AtlasNodeId` `build` consumes is one it just created itself while
+    /// walking `spec`, never one supplied by the caller.
+    pub fn build(&mut self, spec: AtlasNodeSpec) -> Result<AtlasNodeId, AtlasError> {
+        match spec {
+            AtlasNodeSpec::Leaf(size) => self.add_leaf(size),
+            AtlasNodeSpec::Container(style, children) => {
+                let mut built = Vec::with_capacity(children.len());
+                for child in children {
+                    built.push(self.build(child)?);
+                }
+                self.add_container(style, &built)
+            }
+        }
+    }
+
+    /// Like [`Self::build`], but also installs the result as the root via
+    /// [`Self::set_root`] — the common case when `spec` describes a whole
+    /// view rather than a fragment to be attached elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// See [`Self::build`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::build`].
+    pub fn build_root(&mut self, spec: AtlasNodeSpec) -> Result<AtlasNodeId, AtlasError> {
+        let root = self.build(spec)?;
+        self.set_root(root)?;
+        Ok(root)
     }
 
     /// Computes layout against the given viewport size.
@@ -1326,4 +1441,5 @@ mod tests {
 
         assert!(byard_err.to_string().contains("AtlasNodeId belongs to"));
     }
+
 }
