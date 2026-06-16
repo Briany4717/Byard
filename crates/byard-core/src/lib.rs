@@ -69,6 +69,19 @@ pub enum ByardError {
     ///
     /// The inner string is the original [`glyphon::RenderError`] message.
     TextRender(String),
+
+    /// The OS refused to spawn a thread (e.g. [`relay::Relay`]'s logic thread).
+    ///
+    /// The inner string is the original [`std::io::Error`] message. Per
+    /// RFC-0001 §8, thread-spawn failure is a recoverable condition, not a
+    /// panic — the caller decides whether to retry or abort startup.
+    ThreadSpawn(String),
+
+    /// The async I/O Tokio runtime failed to initialise.
+    ///
+    /// The inner string is the original [`std::io::Error`] message produced
+    /// by [`tokio::runtime::Builder::build`].
+    RuntimeCreation(String),
 }
 
 impl fmt::Display for ByardError {
@@ -82,6 +95,8 @@ impl fmt::Display for ByardError {
             Self::RenderSurface(msg) => write!(f, "surface error: {msg}"),
             Self::TextPrepare(msg) => write!(f, "text prepare error: {msg}"),
             Self::TextRender(msg) => write!(f, "text render error: {msg}"),
+            Self::ThreadSpawn(msg) => write!(f, "failed to spawn thread: {msg}"),
+            Self::RuntimeCreation(msg) => write!(f, "failed to create async runtime: {msg}"),
         }
     }
 }
