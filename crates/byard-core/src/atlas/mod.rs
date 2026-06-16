@@ -43,6 +43,34 @@
 //! end of the mutation phase, then `recompute_dirty` is called on
 //! subsequent frames whenever the Evaluator reports dirty targets.
 //!
+//! # Builder API
+//!
+//! [`LayoutAtlasBuilder`] (issue #15) sits on top of `add_leaf` /
+//! `add_container` / `set_root` to let a multi-level tree be expressed as
+//! a single chained expression, instead of one imperative call per node:
+//!
+//! ```
+//! use byard_core::atlas::{ContainerStyle, LayoutAtlas, LayoutAtlasBuilder as B, LeafSize};
+//!
+//! let mut atlas = LayoutAtlas::new();
+//! let root = atlas.build_root(
+//!     B::container(ContainerStyle::new(Some(300.0), Some(200.0)), [
+//!         B::leaf(LeafSize::new(50.0, 50.0)),
+//!         B::container(ContainerStyle::default(), [
+//!             B::leaf(LeafSize::new(20.0, 20.0)),
+//!         ]),
+//!     ]),
+//! ).unwrap();
+//! # let _ = root;
+//! ```
+//!
+//! `LayoutAtlasBuilder::leaf` / `container` only build an [`AtlasNodeSpec`]
+//! description — a plain value, no Taffy or atlas access — which
+//! `LayoutAtlas::build` / `build_root` then commits in one depth-first
+//! pass via the same low-level methods, in the same order an equivalent
+//! imperative call sequence would use. The low-level API from PR #14 is
+//! unchanged; the builder is purely additive sugar over it.
+//!
 //! # Cross-subsystem flow
 //!
 //! The Atlas is one consumer of the broadcast `TargetId` stream produced
@@ -63,6 +91,9 @@
 pub mod layout;
 pub mod spatial;
 
-pub use layout::{AtlasError, AtlasNodeId, ContainerStyle, LayoutAtlas, LeafSize};
+pub use layout::{
+    AtlasError, AtlasNodeId, AtlasNodeSpec, ContainerStyle, LayoutAtlas, LayoutAtlasBuilder,
+    LeafSize,
+};
 
 pub use spatial::{CELL_SIZE, SpatialGrid};
