@@ -4,6 +4,7 @@
 //! and lifecycle contract.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
@@ -24,7 +25,22 @@ use super::spatial::SpatialGrid;
 /// Callers must only use IDs with their originating atlas. A future
 /// sub-issue will add a generation tag to enforce this at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AtlasNodeId(NodeId);
+pub struct AtlasNodeId {
+    node_id: NodeId,
+    atlas_id: u32,
+}
+
+// `AtlasNodeId` must stay cheap to pass by value — that's the entire point
+// of scoping it with a plain `u32` rather than, say, an `Arc<str>` tag.
+// `taffy::NodeId` is an 8-byte, 8-byte-aligned newtype over `u64`, so
+// `node_id` (8) + `atlas_id` (4) rounds up to 16 bytes of struct alignment
+// padding. This assertion guards that budget: if a future field pushes
+// `AtlasNodeId` past 16 bytes, the build fails here instead of silently
+// regressing pass-by-value performance.
+const _: () = assert!(
+    std::mem::size_of::<AtlasNodeId>() <= 16,
+    "AtlasNodeId exceeded its 16-byte CPU register optimization budget!"
+);
 
 /// Explicit size for a leaf node.
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +156,10 @@ pub struct LayoutAtlas {
     /// Wraps via `wrapping_add` after 65 535 clears — see the doc on
     /// `clear()` for the rationale.
     current_generation: u16,
+    /// Unique id for this atlas instance, assigned at construction by
+    /// [`Self::next_instance_id`]. Stamped onto every [`AtlasNodeId`] this
+    /// atlas produces so a foreign id can be rejected in `O(1)`.
+    instance_id: u32,
 }
 
 impl LayoutAtlas {
@@ -154,7 +174,30 @@ impl LayoutAtlas {
             grid: SpatialGrid::new(),
             nodes_by_index: Vec::new(),
             current_generation: 0,
+            instance_id: Self::next_instance_id(),
         }
+    }
+
+    /// Returns this atlas's unique instance id.
+    ///
+    /// Every [`AtlasNodeId`] this atlas produces carries this id, so it can
+    /// be rejected with [`AtlasError::ForeignNode`] if later used against a
+    /// different `LayoutAtlas`.
+    #[must_use]
+    pub const fn instance_id(&self) -> u32 {
+        self.instance_id
+    }
+
+    /// Allocates the next globally unique atlas instance id.
+    ///
+    /// Backed by a function-local `AtomicU32` rather than a module-level
+    /// static — keeps the counter's existence scoped to the one place that
+    /// uses it. `Relaxed` ordering is sufficient: callers only need a
+    /// distinct value per atlas, not synchronization with any other memory
+    /// access.
+    fn next_instance_id() -> u32 {
+        static NEXT_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
+        NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Clears the tree but retains internal capacity.
@@ -203,7 +246,10 @@ impl LayoutAtlas {
             .tree
             .new_leaf_with_context(style, next_index)
             .map_err(|e| AtlasError::from_taffy(&e))?;
-        let id = AtlasNodeId(node);
+        let id = AtlasNodeId {
+            node_id: node,
+            atlas_id: self.instance_id,
+        };
         self.nodes_by_index.push(id);
         Ok(id)
     }
@@ -237,7 +283,8 @@ impl LayoutAtlas {
             ..Default::default()
         };
         self.children_scratch.clear();
-        self.children_scratch.extend(children.iter().map(|c| c.0));
+        self.children_scratch
+            .extend(children.iter().map(|c| c.node_id));
         let next_index = self.next_target_index();
         let node = self
             .tree
@@ -246,7 +293,10 @@ impl LayoutAtlas {
         self.tree
             .set_node_context(node, Some(next_index))
             .map_err(|e| AtlasError::from_taffy(&e))?;
-        let id = AtlasNodeId(node);
+        let id = AtlasNodeId {
+            node_id: node,
+            atlas_id: self.instance_id,
+        };
         self.nodes_by_index.push(id);
         Ok(id)
     }
@@ -288,7 +338,7 @@ impl LayoutAtlas {
         };
 
         self.tree
-            .compute_layout(root.0, available)
+            .compute_layout(root.node_id, available)
             .map_err(|e| AtlasError::from_taffy(&e))?;
         self.state = AtlasState::Computed;
         self.rebuild_grid();
@@ -317,7 +367,7 @@ impl LayoutAtlas {
             "LayoutAtlas::resolved_rect called before compute — geometry is not available yet"
         );
 
-        let layout = self.tree.layout(node.0).ok()?;
+        let layout = self.tree.layout(node.node_id).ok()?;
         Some(Rect {
             x: layout.location.x,
             y: layout.location.y,
@@ -389,11 +439,14 @@ impl LayoutAtlas {
             if let Some(rect) = self.resolved_rect_internal(node) {
                 frame.push_rect(rect);
             }
-            if let Ok(children) = self.tree.children(node.0) {
+            if let Ok(children) = self.tree.children(node.node_id) {
                 // Push in reverse so the leftmost child is popped first,
                 // preserving pre-order traversal semantics.
                 for child in children.iter().rev() {
-                    stack.push(AtlasNodeId(*child));
+                    stack.push(AtlasNodeId {
+                        node_id: *child,
+                        atlas_id: self.instance_id,
+                    });
                 }
             }
         }
@@ -408,17 +461,20 @@ impl LayoutAtlas {
 
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let index = *self.tree.get_node_context(node.0).unwrap();
+            let index = *self.tree.get_node_context(node.node_id).unwrap();
             let target =
                 TargetId::new(index, self.current_generation, TargetKind::AtlasNode as u16);
             if let Some(rect) = self.resolved_rect_internal(node) {
                 self.grid.insert(rect, target);
             }
-            if let Ok(children) = self.tree.children(node.0) {
+            if let Ok(children) = self.tree.children(node.node_id) {
                 // Push in reverse so the leftmost child is popped first,
                 // preserving pre-order traversal semantics.
                 for child in children.iter().rev() {
-                    stack.push(AtlasNodeId(*child));
+                    stack.push(AtlasNodeId {
+                        node_id: *child,
+                        atlas_id: self.instance_id,
+                    });
                 }
             }
         }
@@ -429,7 +485,7 @@ impl LayoutAtlas {
     /// Used internally during traversal where the state has already been
     /// validated by the entry point.
     fn resolved_rect_internal(&self, node: AtlasNodeId) -> Option<Rect> {
-        let layout = self.tree.layout(node.0).ok()?;
+        let layout = self.tree.layout(node.node_id).ok()?;
         Some(Rect {
             x: layout.location.x,
             y: layout.location.y,
@@ -532,7 +588,7 @@ impl LayoutAtlas {
                 // was somehow removed from the tree), skip silently. The
                 // next recompute will produce a layout that reflects the
                 // tree as it actually is.
-                let _ = self.tree.mark_dirty(node.0);
+                let _ = self.tree.mark_dirty(node.node_id);
             }
         }
     }
@@ -571,7 +627,7 @@ impl LayoutAtlas {
         };
 
         self.tree
-            .compute_layout(root.0, available)
+            .compute_layout(root.node_id, available)
             .map_err(|e| AtlasError::from_taffy(&e))?;
         self.rebuild_grid();
         Ok(())
