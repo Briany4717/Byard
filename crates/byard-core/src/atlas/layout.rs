@@ -17,13 +17,14 @@ use super::spatial::SpatialGrid;
 /// Wraps [`taffy::NodeId`] so the Atlas does not leak Taffy types into
 /// the rest of the engine.
 ///
-/// # Caveat: cross-atlas safety
+/// # Cross-atlas safety
 ///
-/// `AtlasNodeId` is currently **not** scoped to the atlas that created it.
-/// Passing an ID from one [`LayoutAtlas`] to another may return incorrect
-/// geometry or hit a backend error rather than a clean rejection.
-/// Callers must only use IDs with their originating atlas. A future
-/// sub-issue will add a generation tag to enforce this at runtime.
+/// `AtlasNodeId` is scoped to the [`LayoutAtlas`] instance that created it.
+/// Every atlas is assigned a unique `instance_id` at construction time
+/// (see [`LayoutAtlas::next_instance_id`]), and that id travels with every
+/// `AtlasNodeId` it produces. Passing an ID to a different atlas instance
+/// is rejected with [`AtlasError::ForeignNode`] rather than returning
+/// incorrect geometry or hitting an opaque backend error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AtlasNodeId {
     node_id: NodeId,
@@ -105,6 +106,21 @@ pub enum AtlasError {
     /// The layout backend returned an error during tree construction
     /// or layout computation.
     Backend(String),
+
+    /// An [`AtlasNodeId`] was used with a [`LayoutAtlas`] other than the
+    /// one that created it.
+    ///
+    /// This is a misuse error, not a backend failure — without this check,
+    /// passing an id from one atlas into a sibling atlas would silently
+    /// read or mutate unrelated layout state (or panic deep inside Taffy),
+    /// per the caveat this variant closes off.
+    ForeignNode {
+        /// The `instance_id` of the [`LayoutAtlas`] the id was used with.
+        expected: u32,
+        /// The `instance_id` of the [`LayoutAtlas`] that actually created
+        /// the id.
+        actual: u32,
+    },
 }
 
 impl AtlasError {
@@ -117,6 +133,10 @@ impl fmt::Display for AtlasError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(message) => write!(f, "layout backend error: {message}"),
+            Self::ForeignNode { expected, actual } => write!(
+                f,
+                "AtlasNodeId belongs to atlas instance {actual}, but was used with atlas instance {expected}"
+            ),
         }
     }
 }
@@ -200,6 +220,19 @@ impl LayoutAtlas {
         NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Returns `Ok(())` if `node` was created by this atlas instance, or
+    /// [`AtlasError::ForeignNode`] otherwise.
+    fn validate_node(&self, node: AtlasNodeId) -> Result<(), AtlasError> {
+        if node.atlas_id == self.instance_id {
+            Ok(())
+        } else {
+            Err(AtlasError::ForeignNode {
+                expected: self.instance_id,
+                actual: node.atlas_id,
+            })
+        }
+    }
+
     /// Clears the tree but retains internal capacity.
     ///
     /// Increments the internal view generation, which causes any
@@ -264,12 +297,18 @@ impl LayoutAtlas {
     ///
     /// Returns [`AtlasError::Backend`] if the underlying engine refuses the
     /// node, or if any child has already been attached to another parent.
+    /// Returns [`AtlasError::ForeignNode`] if any child was created by a
+    /// different `LayoutAtlas` instance.
     pub fn add_container(
         &mut self,
         style: ContainerStyle,
         children: &[AtlasNodeId],
     ) -> Result<AtlasNodeId, AtlasError> {
         self.assert_building("add_container");
+
+        for &child in children {
+            self.validate_node(child)?;
+        }
 
         let taffy_style = Style {
             size: Size {
@@ -306,9 +345,16 @@ impl LayoutAtlas {
     /// # Panics
     ///
     /// Panics if the atlas is in the `Computed` state.
-    pub fn set_root(&mut self, root: AtlasNodeId) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::ForeignNode`] if `root` was created by a
+    /// different `LayoutAtlas` instance.
+    pub fn set_root(&mut self, root: AtlasNodeId) -> Result<(), AtlasError> {
         self.assert_building("set_root");
+        self.validate_node(root)?;
         self.root = Some(root);
+        Ok(())
     }
 
     /// Computes layout against the given viewport size.
@@ -350,30 +396,31 @@ impl LayoutAtlas {
     /// # Caveat: orphan nodes
     ///
     /// If `node` was added to the tree but never attached (directly or
-    /// transitively) to the root configured via [`Self::set_root`], this
-    /// returns the default `Rect` of all zeros rather than `None`. This
-    /// matches Taffy's underlying behaviour. Callers should only query
-    /// rects for nodes known to be reachable from the root.
+    /// transitively) to the root configured via [`Self::set_root`], Taffy
+    /// still resolves a default `Rect` of all zeros for it rather than
+    /// failing — this returns `Ok(Some(zero_rect))`, not `Ok(None)`. See
+    /// [`Self::resolved_rect_internal`] for the raw Taffy behaviour this
+    /// wraps. Callers should only query rects for nodes known to be
+    /// reachable from the root.
     ///
     /// # Panics
     ///
     /// Panics if the atlas is in the `Building` state. Call
     /// [`Self::compute`] first.
-    #[must_use]
-    pub fn resolved_rect(&self, node: AtlasNodeId) -> Option<Rect> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::ForeignNode`] if `node` was created by a
+    /// different `LayoutAtlas` instance.
+    pub fn resolved_rect(&self, node: AtlasNodeId) -> Result<Option<Rect>, AtlasError> {
         assert_eq!(
             self.state,
             AtlasState::Computed,
             "LayoutAtlas::resolved_rect called before compute — geometry is not available yet"
         );
+        self.validate_node(node)?;
 
-        let layout = self.tree.layout(node.node_id).ok()?;
-        Some(Rect {
-            x: layout.location.x,
-            y: layout.location.y,
-            width: layout.size.width,
-            height: layout.size.height,
-        })
+        Ok(self.resolved_rect_internal(node))
     }
 
     /// Writes the resolved geometry of every node into `frame`.
@@ -480,10 +527,11 @@ impl LayoutAtlas {
         }
     }
 
-    /// Same as `resolved_rect` but without the state assertion.
-    ///
-    /// Used internally during traversal where the state has already been
-    /// validated by the entry point.
+    /// Same as `resolved_rect` but without the state assertion or the
+    /// cross-atlas check — used internally during traversal, where every
+    /// `node` is already known to belong to this atlas (it was fetched
+    /// from `self.tree` or `self.root`, never supplied by an external
+    /// caller).
     fn resolved_rect_internal(&self, node: AtlasNodeId) -> Option<Rect> {
         let layout = self.tree.layout(node.node_id).ok()?;
         Some(Rect {
@@ -663,15 +711,15 @@ mod tests {
                 &[child],
             )
             .expect("add_container");
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
 
         atlas.compute(Viewport::new(800.0, 600.0)).expect("compute");
 
-        let root_rect = atlas.resolved_rect(root).expect("root rect");
+        let root_rect = atlas.resolved_rect(root).unwrap().expect("root rect");
         assert_f32_eq(root_rect.width, 200.0);
         assert_f32_eq(root_rect.height, 100.0);
 
-        let child_rect = atlas.resolved_rect(child).expect("child rect");
+        let child_rect = atlas.resolved_rect(child).unwrap().expect("child rect");
         assert_f32_eq(child_rect.width, 100.0);
         assert_f32_eq(child_rect.height, 50.0);
     }
@@ -690,7 +738,7 @@ mod tests {
         let root = atlas
             .add_container(ContainerStyle::default(), &[child])
             .unwrap();
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         atlas.clear();
@@ -706,7 +754,7 @@ mod tests {
     fn add_leaf_after_compute_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         // This must panic.
@@ -718,7 +766,7 @@ mod tests {
     fn add_container_after_compute_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let _ = atlas.add_container(ContainerStyle::default(), &[leaf]);
@@ -729,7 +777,7 @@ mod tests {
     fn resolved_rect_before_compute_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
 
         let _ = atlas.resolved_rect(leaf);
     }
@@ -748,10 +796,10 @@ mod tests {
         let root = atlas
             .add_container(ContainerStyle::default(), &[child])
             .unwrap();
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
-        let root_rect = atlas.resolved_rect(root).unwrap();
+        let root_rect = atlas.resolved_rect(root).unwrap().unwrap();
         assert_f32_eq(root_rect.width, 150.0);
         assert_f32_eq(root_rect.height, 75.0);
     }
@@ -796,7 +844,7 @@ mod tests {
                 &[child],
             )
             .unwrap();
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         let mut frame = RenderFrame::new();
@@ -817,7 +865,7 @@ mod tests {
 
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let mut frame = RenderFrame::new();
@@ -838,7 +886,7 @@ mod tests {
 
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
 
         let mut frame = RenderFrame::new();
         atlas.populate_frame(&mut frame);
@@ -849,10 +897,10 @@ mod tests {
     fn set_root_after_compute_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
     }
 
     #[test]
@@ -860,10 +908,10 @@ mod tests {
         let mut atlas = LayoutAtlas::new();
         let root = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
         let orphan = atlas.add_leaf(LeafSize::new(999.0, 999.0)).unwrap();
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
-        let orphan_rect = atlas.resolved_rect(orphan).unwrap();
+        let orphan_rect = atlas.resolved_rect(orphan).unwrap().unwrap();
         assert_f32_eq(orphan_rect.width, 0.0);
         assert_f32_eq(orphan_rect.height, 0.0);
     }
@@ -894,11 +942,11 @@ mod tests {
                 &[a, b],
             )
             .unwrap();
-        atlas.set_root(root);
+        atlas.set_root(root).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
-        let a_rect = atlas.resolved_rect(a).unwrap();
-        let b_rect = atlas.resolved_rect(b).unwrap();
+        let a_rect = atlas.resolved_rect(a).unwrap().unwrap();
+        let b_rect = atlas.resolved_rect(b).unwrap().unwrap();
 
         // Child A: top-left corner of the container.
         assert_f32_eq(a_rect.x, 0.0);
@@ -924,7 +972,7 @@ mod tests {
     fn mark_dirty_filters_foreign_kinds() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let foreign_kind: u16 = 999;
@@ -941,7 +989,7 @@ mod tests {
     fn mark_dirty_filters_stale_generation() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let stale_generation = atlas.current_generation().wrapping_sub(1);
@@ -955,7 +1003,7 @@ mod tests {
     fn mark_dirty_accepts_matching_kind_and_generation() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
@@ -966,7 +1014,7 @@ mod tests {
         // Re-fetched rect reflects the new viewport. Container with no
         // explicit width takes viewport-driven size only if it has flex_grow
         // — here it's a leaf with fixed size, so the size stays at 10x10.
-        let rect = atlas.resolved_rect(leaf).unwrap();
+        let rect = atlas.resolved_rect(leaf).unwrap().unwrap();
         assert_f32_eq(rect.width, 10.0);
         assert_f32_eq(rect.height, 10.0);
     }
@@ -975,14 +1023,14 @@ mod tests {
     fn clear_invalidates_previous_generation_targets() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let old_target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
 
         atlas.clear();
         let new_leaf = atlas.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
-        atlas.set_root(new_leaf);
+        atlas.set_root(new_leaf).unwrap();
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         // Old target points at index 0, but its generation no longer
@@ -996,7 +1044,7 @@ mod tests {
     fn recompute_dirty_before_compute_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
 
         let _ = atlas.recompute_dirty(Viewport::new(100.0, 100.0));
     }
@@ -1043,7 +1091,7 @@ mod tests {
         // ── Setup the Atlas ──────────────────────────────────────────────
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(200.0, 200.0)).unwrap();
 
         // The leaf is registered as TargetId index 0 in the atlas.
@@ -1084,7 +1132,7 @@ mod tests {
         atlas.recompute_dirty(Viewport::new(200.0, 200.0)).unwrap();
 
         // Geometry is still queryable post-recompute.
-        let rect = atlas.resolved_rect(leaf).unwrap();
+        let rect = atlas.resolved_rect(leaf).unwrap().unwrap();
         assert_f32_eq(rect.width, 50.0);
         assert_f32_eq(rect.height, 50.0);
     }
@@ -1100,7 +1148,7 @@ mod tests {
     fn hit_test_pure_success_and_miss() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         // Hit within leaf
@@ -1126,7 +1174,7 @@ mod tests {
                 &[child],
             )
             .unwrap();
-        atlas.set_root(parent);
+        atlas.set_root(parent).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         // The intersection is at (0, 0) to (100, 100).
@@ -1142,7 +1190,7 @@ mod tests {
     fn hit_test_negative_coordinates() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         // Should return None safely without panic
@@ -1153,7 +1201,7 @@ mod tests {
     fn hit_test_invalidation_cycle() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         // Verify hit-test works initially
@@ -1163,7 +1211,7 @@ mod tests {
         atlas.clear();
 
         let new_leaf = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
-        atlas.set_root(new_leaf);
+        atlas.set_root(new_leaf).unwrap();
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         // The old node is no longer valid, and coordinates outside the new leaf (e.g. 75, 75)
@@ -1178,7 +1226,7 @@ mod tests {
     fn hit_test_in_building_state_panics() {
         let mut atlas = LayoutAtlas::new();
         let leaf = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
-        atlas.set_root(leaf);
+        atlas.set_root(leaf).unwrap();
 
         // This must panic because compute has not been called.
         let _ = atlas.hit_test(50.0, 50.0);
