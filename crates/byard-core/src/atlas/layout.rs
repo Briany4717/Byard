@@ -1231,4 +1231,99 @@ mod tests {
         // This must panic because compute has not been called.
         let _ = atlas.hit_test(50.0, 50.0);
     }
+
+    // --- Cross-atlas AtlasNodeId scoping (issue #18) ---------------------
+    //
+    // These tests exercise the actual hazard issue #18 closes off: an
+    // `AtlasNodeId` produced by one `LayoutAtlas` must never be silently
+    // accepted by a different instance. Every entry point that takes an
+    // `AtlasNodeId` from a caller must return `Err(AtlasError::ForeignNode)`
+    // — never panic, never silently produce wrong geometry.
+
+    #[test]
+    fn two_atlases_have_distinct_instance_ids() {
+        let atlas_a = LayoutAtlas::new();
+        let atlas_b = LayoutAtlas::new();
+        assert_ne!(atlas_a.instance_id(), atlas_b.instance_id());
+    }
+
+    #[test]
+    fn set_root_rejects_foreign_node() {
+        let mut atlas_a = LayoutAtlas::new();
+        let foreign_leaf = atlas_a.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+
+        let mut atlas_b = LayoutAtlas::new();
+        let err = atlas_b.set_root(foreign_leaf).unwrap_err();
+
+        match err {
+            AtlasError::ForeignNode { expected, actual } => {
+                assert_eq!(expected, atlas_b.instance_id());
+                assert_eq!(actual, atlas_a.instance_id());
+            }
+            other => panic!("expected AtlasError::ForeignNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_container_rejects_foreign_child() {
+        let mut atlas_a = LayoutAtlas::new();
+        let foreign_leaf = atlas_a.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+
+        let mut atlas_b = LayoutAtlas::new();
+        let local_leaf = atlas_b.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+
+        // Mixing one local and one foreign child must still be rejected —
+        // validation can't be satisfied by having at least one valid id.
+        let err = atlas_b
+            .add_container(
+                ContainerStyle::new(Some(100.0), Some(100.0)),
+                &[local_leaf, foreign_leaf],
+            )
+            .unwrap_err();
+
+        match err {
+            AtlasError::ForeignNode { expected, actual } => {
+                assert_eq!(expected, atlas_b.instance_id());
+                assert_eq!(actual, atlas_a.instance_id());
+            }
+            other => panic!("expected AtlasError::ForeignNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_rect_rejects_foreign_node() {
+        let mut atlas_a = LayoutAtlas::new();
+        let leaf_a = atlas_a.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas_a.set_root(leaf_a).unwrap();
+        atlas_a.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let mut atlas_b = LayoutAtlas::new();
+        let leaf_b = atlas_b.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas_b.set_root(leaf_b).unwrap();
+        atlas_b.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // atlas_b is Computed, so the state assertion passes — the
+        // cross-atlas check must still catch the foreign id from atlas_a.
+        let err = atlas_b.resolved_rect(leaf_a).unwrap_err();
+
+        match err {
+            AtlasError::ForeignNode { expected, actual } => {
+                assert_eq!(expected, atlas_b.instance_id());
+                assert_eq!(actual, atlas_a.instance_id());
+            }
+            other => panic!("expected AtlasError::ForeignNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_node_error_bridges_to_byard_error() {
+        let mut atlas_a = LayoutAtlas::new();
+        let foreign_leaf = atlas_a.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+
+        let mut atlas_b = LayoutAtlas::new();
+        let atlas_err = atlas_b.set_root(foreign_leaf).unwrap_err();
+        let byard_err: ByardError = atlas_err.into();
+
+        assert!(byard_err.to_string().contains("AtlasNodeId belongs to"));
+    }
 }
