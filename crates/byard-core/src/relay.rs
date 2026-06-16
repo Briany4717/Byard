@@ -369,7 +369,7 @@ mod tests {
     fn publish_then_current_returns_published_content() {
         let relay = Relay::new().unwrap();
         let mut frame = relay.acquire_recycled();
-        frame.push_rect(Rect::new(1.0, 2.0, 3.0, 4.0));
+        frame.push_rect(Rect::new(1.0, 2.0, 3.0, 4.0), false);
         relay.publish(frame);
 
         let observed = relay.current().expect("frame was published");
@@ -382,12 +382,12 @@ mod tests {
         let relay = Relay::new().unwrap();
 
         let mut a = relay.acquire_recycled();
-        a.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        a.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0), false);
         relay.publish(a);
 
         let mut b = relay.acquire_recycled();
-        b.push_rect(Rect::new(9.0, 9.0, 9.0, 9.0));
-        b.push_rect(Rect::new(8.0, 8.0, 8.0, 8.0));
+        b.push_rect(Rect::new(9.0, 9.0, 9.0, 9.0), false);
+        b.push_rect(Rect::new(8.0, 8.0, 8.0, 8.0), false);
         relay.publish(b);
 
         let observed = relay.current().unwrap();
@@ -399,7 +399,7 @@ mod tests {
     fn current_can_be_called_repeatedly_without_consuming() {
         let relay = Relay::new().unwrap();
         let mut frame = relay.acquire_recycled();
-        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0));
+        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0), false);
         relay.publish(frame);
 
         let first = relay.current().unwrap();
@@ -412,12 +412,12 @@ mod tests {
         let relay = Relay::new().unwrap();
 
         let mut a = relay.acquire_recycled();
-        a.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0));
+        a.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0), false);
         relay.publish(a);
         let held = relay.current().unwrap(); // render thread "holds" this Arc
 
         let mut b = relay.acquire_recycled();
-        b.push_rect(Rect::new(2.0, 2.0, 2.0, 2.0));
+        b.push_rect(Rect::new(2.0, 2.0, 2.0, 2.0), false);
         relay.publish(b);
 
         // The Arc the test is still holding must be unaffected by the swap.
@@ -436,7 +436,7 @@ mod tests {
         // Publish a frame with content, then publish a second one so the
         // first (uncloned) Arc is reclaimed into the recycle pool.
         let mut a = relay.acquire_recycled();
-        a.push_rect(Rect::new(5.0, 5.0, 5.0, 5.0));
+        a.push_rect(Rect::new(5.0, 5.0, 5.0, 5.0), false);
         relay.publish(a);
         let b = relay.acquire_recycled();
         relay.publish(b);
@@ -491,7 +491,7 @@ mod tests {
         let recycler = relay.recycler();
 
         let mut frame = RenderFrame::new();
-        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0));
+        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0), false);
         frame.clear();
         assert!(recycler.try_send(frame).is_ok());
     }
@@ -676,7 +676,7 @@ mod tests {
     fn render_thread_never_blocks_while_logic_thread_publishes_continuously() {
         let relay = Arc::new(Relay::new().unwrap());
         let handle = Relay::spawn_logic_thread(&relay, |frame| {
-            frame.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+            frame.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0), false);
         })
         .unwrap();
 
@@ -715,7 +715,7 @@ mod tests {
             #[allow(clippy::cast_precision_loss)]
             let generation_f = generation_value as f32;
             for _ in 0..4 {
-                frame.push_rect(Rect::new(generation_f, generation_f, 1.0, 1.0));
+                frame.push_rect(Rect::new(generation_f, generation_f, 1.0, 1.0), false);
             }
         })
         .unwrap();
@@ -739,7 +739,7 @@ mod tests {
     fn current_never_returns_none_once_something_has_been_published() {
         let relay = Arc::new(Relay::new().unwrap());
         let mut seed = relay.acquire_recycled();
-        seed.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        seed.push_rect(Rect::new(0.0, 0.0, 1.0, 1.0), false);
         relay.publish(seed);
 
         let mut readers = Vec::new();
@@ -762,7 +762,7 @@ mod tests {
         for i in 0..10_000 {
             let mut frame = relay.acquire_recycled();
             #[allow(clippy::cast_precision_loss)]
-            frame.push_rect(Rect::new(i as f32, 0.0, 1.0, 1.0));
+            frame.push_rect(Rect::new(i as f32, 0.0, 1.0, 1.0), false);
             relay.publish(frame);
         }
         assert_eq!(relay.current().unwrap().rects().len(), 1);
@@ -772,7 +772,7 @@ mod tests {
     fn dropping_relay_with_unconsumed_latest_frame_does_not_panic() {
         let relay = Relay::new().unwrap();
         let mut frame = relay.acquire_recycled();
-        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0));
+        frame.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0), false);
         relay.publish(frame);
         drop(relay); // must not panic
     }
@@ -792,7 +792,7 @@ mod tests {
         let b = Relay::new().unwrap();
 
         let mut fa = a.acquire_recycled();
-        fa.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0));
+        fa.push_rect(Rect::new(1.0, 1.0, 1.0, 1.0), false);
         a.publish(fa);
 
         assert!(a.current().is_some());

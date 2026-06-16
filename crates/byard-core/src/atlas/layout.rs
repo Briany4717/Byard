@@ -3,6 +3,7 @@
 //! See the module-level documentation in [`super`] for the design intent
 //! and lifecycle contract.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -538,12 +539,20 @@ impl LayoutAtlas {
         Ok(self.resolved_rect_internal(node))
     }
 
-    /// Writes the resolved geometry of every node into `frame`.
+    /// Writes the resolved geometry of every node into `frame`, marking each
+    /// entry dirty if its `TargetId` appears in `dirty_targets`.
     ///
     /// Walks the tree from the root in pre-order and appends each node's
     /// resolved [`Rect`] to the frame. This is how the Atlas hands geometry
     /// to the Encoder without either subsystem importing from the other —
     /// the frame is the shared boundary defined in RFC-0001 §9.
+    ///
+    /// `dirty_targets` is typically the output of
+    /// [`EvaluatorTick::collect_dirty`](crate::evaluator::EvaluatorTick::collect_dirty)
+    /// for this tick. Each node's own `TargetId` (kind, generation, index)
+    /// is reconstructed using the same scheme as [`Self::rebuild_grid`] and
+    /// [`Self::mark_dirty_all`], so stale-generation targets are excluded
+    /// for free — they simply will not match any live node's id.
     ///
     /// The frame is **not** cleared before pushing; callers that want a
     /// fresh frame must call [`RenderFrame::clear`] first. This lets the
@@ -555,7 +564,7 @@ impl LayoutAtlas {
     /// Panics if the atlas is in the `Building` state. Call [`Self::compute`]
     /// first.
     #[track_caller]
-    pub fn populate_frame(&self, frame: &mut RenderFrame) {
+    pub fn populate_frame(&self, frame: &mut RenderFrame, dirty_targets: &[TargetId]) {
         assert_eq!(
             self.state,
             AtlasState::Computed,
@@ -567,7 +576,9 @@ impl LayoutAtlas {
          this indicates an internal state-machine inconsistency",
         );
 
-        self.walk_and_push(root, frame);
+        let dirty: HashSet<u64> = dirty_targets.iter().map(|t| t.as_raw()).collect();
+
+        self.walk_and_push(root, frame, &dirty);
     }
 
     /// Performs spatial hit-testing to find the topmost node at the given screen coordinates.
@@ -594,12 +605,22 @@ impl LayoutAtlas {
     }
 
     /// Recursively walks the tree from `node` in pre-order, pushing each
-    /// resolved rectangle into `frame`.
-    fn walk_and_push(&self, root: AtlasNodeId, frame: &mut RenderFrame) {
+    /// resolved rectangle — and its dirty state — into `frame`.
+    ///
+    /// `dirty` holds the raw (`TargetId::as_raw`) bits of every dirty
+    /// target for this tick. Each node's own `TargetId` is reconstructed
+    /// from its Taffy node-context index, the atlas's current generation,
+    /// and `TargetKind::AtlasNode` — the same triple `rebuild_grid` uses —
+    /// so the lookup is exact and stale generations never match.
+    fn walk_and_push(&self, root: AtlasNodeId, frame: &mut RenderFrame, dirty: &HashSet<u64>) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if let Some(rect) = self.resolved_rect_internal(node) {
-                frame.push_rect(rect);
+                let index = *self.tree.get_node_context(node.node_id).unwrap();
+                let target =
+                    TargetId::new(index, self.current_generation, TargetKind::AtlasNode as u16);
+                let is_dirty = dirty.contains(&target.as_raw());
+                frame.push_rect(rect, is_dirty);
             }
             if let Ok(children) = self.tree.children(node.node_id) {
                 // Push in reverse so the leftmost child is popped first,
@@ -963,7 +984,7 @@ mod tests {
         atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
 
         let mut frame = RenderFrame::new();
-        atlas.populate_frame(&mut frame);
+        atlas.populate_frame(&mut frame, &[]);
 
         assert_eq!(frame.rects().len(), 2, "root + child");
 
@@ -972,6 +993,9 @@ mod tests {
         assert_f32_eq(frame.rects()[0].height, 100.0);
         assert_f32_eq(frame.rects()[1].width, 100.0);
         assert_f32_eq(frame.rects()[1].height, 50.0);
+
+        // No dirty targets were passed in, so nothing is marked dirty.
+        assert_eq!(frame.dirty(), &[false, false]);
     }
 
     #[test]
@@ -984,8 +1008,8 @@ mod tests {
         atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
 
         let mut frame = RenderFrame::new();
-        atlas.populate_frame(&mut frame);
-        atlas.populate_frame(&mut frame);
+        atlas.populate_frame(&mut frame, &[]);
+        atlas.populate_frame(&mut frame, &[]);
 
         assert_eq!(
             frame.rects().len(),
@@ -1004,7 +1028,7 @@ mod tests {
         atlas.set_root(leaf).unwrap();
 
         let mut frame = RenderFrame::new();
-        atlas.populate_frame(&mut frame);
+        atlas.populate_frame(&mut frame, &[]);
     }
 
     #[test]
@@ -1250,6 +1274,60 @@ mod tests {
         let rect = atlas.resolved_rect(leaf).unwrap().unwrap();
         assert_f32_eq(rect.width, 50.0);
         assert_f32_eq(rect.height, 50.0);
+    }
+
+    /// Acceptance criterion (issue #23): a `Signal` mutation results in
+    /// only the affected entries being marked dirty in `RenderFrame`.
+    ///
+    /// Builds a two-leaf tree, subscribes a signal to only one leaf, and
+    /// verifies that after mutating it and ticking, `populate_frame` marks
+    /// exactly that leaf's `RenderFrame` entry dirty — the sibling and the
+    /// root stay clean.
+    #[test]
+    fn evaluator_tick_marks_only_affected_render_frame_entries_dirty() {
+        use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
+        use crate::frame::RenderFrame;
+
+        let mut atlas = LayoutAtlas::new();
+        let a = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        let b = atlas.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        let root = atlas
+            .add_container(
+                ContainerStyle {
+                    width: Some(200.0),
+                    height: Some(200.0),
+                },
+                &[a, b],
+            )
+            .unwrap();
+        atlas.set_root(root).unwrap();
+        atlas.compute(Viewport::new(200.0, 200.0)).unwrap();
+
+        // `b` was the second leaf added, so its TargetId index is 1.
+        let b_target = TargetId::new(1, atlas.current_generation(), TargetKind::AtlasNode as u16);
+
+        let arena = ViewArena::new();
+        let signal = Signal::new_in(&arena, 0_u32);
+        signal.subscribe(b_target);
+
+        let mut tick = EvaluatorTick::new();
+        tick.register(signal);
+
+        // Mutate only the signal subscribed to `b`.
+        signal.write(|v| *v = 1);
+        let dirty_targets = tick.collect_dirty();
+        assert_eq!(dirty_targets, vec![b_target]);
+
+        let mut frame = RenderFrame::new();
+        atlas.populate_frame(&mut frame, &dirty_targets);
+
+        // Pre-order: root, then a, then b.
+        assert_eq!(frame.rects().len(), 3, "root + a + b");
+        assert_eq!(
+            frame.dirty(),
+            &[false, false, true],
+            "only b's entry is dirty — root and a are untouched"
+        );
     }
 
     #[test]

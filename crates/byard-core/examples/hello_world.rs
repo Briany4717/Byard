@@ -117,6 +117,10 @@ impl ApplicationHandler for App {
                 text: "Byard — Phase 1".to_string(),
                 font_size: 20.0,
                 color: [1.0, 1.0, 1.0, 1.0],
+                // Static label: never mutated after this first frame, so it
+                // never needs `dirty: true` on a later tick. `prepare`
+                // shapes it once regardless, since it's new to the cache.
+                dirty: false,
             },
             // Smaller label over the orange rectangle.
             TextLine {
@@ -125,6 +129,7 @@ impl ApplicationHandler for App {
                 text: "TextGlyph".to_string(),
                 font_size: 14.0,
                 color: [0.1, 0.05, 0.0, 1.0],
+                dirty: false,
             },
         ];
 

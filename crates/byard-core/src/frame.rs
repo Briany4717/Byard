@@ -46,7 +46,9 @@ pub struct TargetId(u64);
 pub enum TargetKind {
     /// A layout node owned by `LayoutAtlas`.
     AtlasNode = 1,
-    // Future: EncoderPrimitive = 2, etc.
+    /// A render primitive owned by an Encoder pipeline (`SolidBox`,
+    /// `TextGlyph`, …), addressed by its position in the `RenderFrame`.
+    EncoderPrimitive = 2,
 }
 
 impl TargetId {
@@ -178,6 +180,14 @@ pub struct RenderFrame {
     /// traversal (currently pre-order over the layout tree; will become
     /// Z-bin order in a future sub-issue).
     rects: Vec<Rect>,
+
+    /// Per-entry dirty state, parallel to `rects`.
+    ///
+    /// `dirty[i]` is `true` when `rects[i]` changed since the previous tick
+    /// (as determined by the Evaluator's `Signal` dirty-target collection).
+    /// Encoder pipelines read this instead of re-deriving "did this change"
+    /// themselves — see `TextGlyphPipeline::prepare`.
+    dirty: Vec<bool>,
 }
 
 impl RenderFrame {
@@ -193,20 +203,29 @@ impl RenderFrame {
     /// cost as long as primitive counts stay within the high-water mark.
     pub fn clear(&mut self) {
         self.rects.clear();
+        self.dirty.clear();
     }
 
-    /// Appends a resolved rectangle to the frame.
+    /// Appends a resolved rectangle and its dirty state to the frame.
     ///
     /// Called by the Atlas during `populate_frame`. Not part of the public
     /// engine API — external code reads frames, it does not build them.
-    pub(crate) fn push_rect(&mut self, rect: Rect) {
+    pub(crate) fn push_rect(&mut self, rect: Rect, dirty: bool) {
         self.rects.push(rect);
+        self.dirty.push(dirty);
     }
 
     /// Returns the resolved rectangles in this frame.
     #[must_use]
     pub fn rects(&self) -> &[Rect] {
         &self.rects
+    }
+
+    /// Returns the per-entry dirty state in this frame, parallel to
+    /// [`RenderFrame::rects`].
+    #[must_use]
+    pub fn dirty(&self) -> &[bool] {
+        &self.dirty
     }
 }
 
@@ -273,12 +292,13 @@ mod tests {
     #[test]
     fn render_frame_clear_empties_rects() {
         let mut frame = RenderFrame::new();
-        frame.push_rect(Rect::new(0.0, 0.0, 10.0, 10.0));
-        frame.push_rect(Rect::new(10.0, 0.0, 10.0, 10.0));
+        frame.push_rect(Rect::new(0.0, 0.0, 10.0, 10.0), false);
+        frame.push_rect(Rect::new(10.0, 0.0, 10.0, 10.0), true);
         assert_eq!(frame.rects().len(), 2);
 
         frame.clear();
         assert!(frame.rects().is_empty());
+        assert!(frame.dirty().is_empty());
     }
 
     #[test]
@@ -377,10 +397,27 @@ mod tests {
         let mut frame = RenderFrame::new();
         let a = Rect::new(0.0, 0.0, 10.0, 10.0);
         let b = Rect::new(20.0, 20.0, 30.0, 30.0);
-        frame.push_rect(a);
-        frame.push_rect(b);
+        frame.push_rect(a, false);
+        frame.push_rect(b, true);
         assert_eq!(frame.rects()[0], a);
         assert_eq!(frame.rects()[1], b);
+    }
+
+    #[test]
+    fn render_frame_dirty_is_parallel_to_rects() {
+        let mut frame = RenderFrame::new();
+        frame.push_rect(Rect::new(0.0, 0.0, 10.0, 10.0), false);
+        frame.push_rect(Rect::new(10.0, 0.0, 10.0, 10.0), true);
+        frame.push_rect(Rect::new(20.0, 0.0, 10.0, 10.0), false);
+
+        assert_eq!(frame.dirty(), &[false, true, false]);
+        assert_eq!(frame.dirty().len(), frame.rects().len());
+    }
+
+    #[test]
+    fn render_frame_starts_with_no_dirty_entries() {
+        let frame = RenderFrame::new();
+        assert!(frame.dirty().is_empty());
     }
 
     #[test]
@@ -392,13 +429,14 @@ mod tests {
         let mut frame = RenderFrame::new();
         for i in 0..10 {
             #[allow(clippy::cast_precision_loss)]
-            frame.push_rect(Rect::new(i as f32, 0.0, 10.0, 10.0));
+            frame.push_rect(Rect::new(i as f32, 0.0, 10.0, 10.0), false);
         }
         frame.clear();
         assert!(frame.rects().is_empty(), "clear must empty the frame");
 
-        frame.push_rect(Rect::new(99.0, 0.0, 1.0, 1.0));
+        frame.push_rect(Rect::new(99.0, 0.0, 1.0, 1.0), true);
         assert_eq!(frame.rects().len(), 1, "can push after clear");
         assert_eq!(frame.rects()[0].x, 99.0);
+        assert_eq!(frame.dirty(), &[true]);
     }
 }
