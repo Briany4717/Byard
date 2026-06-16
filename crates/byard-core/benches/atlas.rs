@@ -43,7 +43,7 @@ fn build_deep_tree_building(depth: u32, branch_factor: u32) -> LayoutAtlas {
 
     let mut atlas = LayoutAtlas::new();
     let root = build_subtree(&mut atlas, depth, branch_factor);
-    atlas.set_root(root);
+    atlas.set_root(root).unwrap();
     atlas
 }
 
@@ -112,7 +112,7 @@ fn build_tree_building(leaf_count: usize) -> LayoutAtlas {
     let root = atlas
         .add_container(ContainerStyle::new(Some(1000.0), Some(1000.0)), &leaves)
         .unwrap();
-    atlas.set_root(root);
+    atlas.set_root(root).unwrap();
     atlas
 }
 
