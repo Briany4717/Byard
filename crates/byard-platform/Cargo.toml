@@ -1,0 +1,27 @@
+[package]
+name = "byard-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byard-core = { path = "../byard-core" }
+wgpu = "29.0"
+# winit is a regular (non-dev) dependency of this crate by design: it is the
+# entire reason byard-platform exists (RFC-0001 §6). It never appears in
+# WinitHost's public API surface (PlatformHost::run takes/returns no winit
+# types), so downstream crates can depend on byard-platform without ever
+# importing winit themselves.
+winit = "0.30"
+
+[dev-dependencies]
+# Visual verification example (examples/hello_world.rs).
+# Minimal async executor for blocking on `Engine::init` inside `on_resume`.
+pollster = "0.3"
+
+[lints]
+workspace = true

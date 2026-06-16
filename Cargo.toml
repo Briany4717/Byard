@@ -7,7 +7,7 @@ resolver = "2"
 #   crates/byard-macro     — #[byard_controller] procedural macro
 #   crates/byard-platform  — PlatformHost implementations (winit, etc.)
 #   crates/byard           — public façade re-exporting the above
-members = ["crates/byard-core"]
+members = ["crates/byard-core", "crates/byard-platform"]
 
 [workspace.package]
 version     = "0.0.0"
