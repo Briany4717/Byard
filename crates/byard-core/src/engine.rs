@@ -31,9 +31,11 @@
 use std::sync::Arc;
 
 use crate::ByardError;
+use crate::atlas::{LayoutAtlas, LeafSize};
 use crate::encoder::text_glyph::TextLine;
 use crate::encoder::{BoxInstance, EncoderSubsystem};
-use crate::frame::Viewport;
+use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
+use crate::frame::{TargetId, TargetKind, Viewport};
 
 /// The Byard rendering engine for a single window surface.
 ///
@@ -41,6 +43,14 @@ use crate::frame::Viewport;
 /// Constructed once at startup via [`Engine::init`]; thereafter the platform
 /// calls [`on_resize`](Engine::on_resize) and [`render_frame`](Engine::render_frame)
 /// in response to OS events.
+///
+/// `Engine` also owns one Signal-driven reactive text label ([`ReactiveLabel`]):
+/// every [`render_frame`](Engine::render_frame) call runs a real
+/// `Evaluator → Atlas` tick against it (not just the unit tests in
+/// `atlas/layout.rs`), and [`Engine::set_label_text`] is the production
+/// mutation path. This is what closes Phase 1's stated closure criterion —
+/// "the engine renders ... a reactive text label driven by a Signal" — by
+/// exercising Evaluator, Atlas, and Encoder together outside of test code.
 pub struct Engine {
     encoder: EncoderSubsystem,
     surface: wgpu::Surface<'static>,
@@ -50,6 +60,123 @@ pub struct Engine {
     /// Cached scale factor so surface-loss recovery can recompute the logical
     /// viewport without additional platform input.
     scale_factor: f64,
+    /// The engine's one Signal-driven text label. See the struct doc above.
+    label: ReactiveLabel,
+    /// Reused per-frame scratch buffer for the combined text list (the
+    /// reactive label plus whatever static lines the caller supplies) —
+    /// avoids a per-frame allocation once warmed up, per RFC-0001's
+    /// deterministic-memory goals.
+    text_scratch: Vec<TextLine>,
+}
+
+/// Backing state for [`Engine`]'s one Signal-driven text label.
+///
+/// Bundles a [`ViewArena`], the [`Signal<String>`](Signal) allocated from
+/// it, an [`EvaluatorTick`] tracking that signal, and a trivial single-node
+/// [`LayoutAtlas`] that receives the resulting dirty-target broadcast — the
+/// same Evaluator → Atlas flow RFC-0001 §2.2/§4.1 describes, now exercised
+/// by production code instead of only by `atlas/layout.rs`'s unit tests.
+///
+/// # Self-referential lifetime
+///
+/// `Signal<'a, T>` ties its lifetime to the [`ViewArena`] it was allocated
+/// from. Storing both as sibling fields is therefore self-referential,
+/// which safe Rust cannot express directly. This is resolved the same way
+/// any self-referential owner must: heap-allocate the arena (`Box`, so its
+/// address is stable even if `ReactiveLabel` itself moves) and erase the
+/// signal's lifetime to `'static` via [`Signal::erase_lifetime`]. This is
+/// sound because `arena` and `signal` are dropped together — nothing
+/// outside this struct ever holds a copy of `signal`, so it is never used
+/// after `arena` is gone.
+struct ReactiveLabel {
+    // Boxed so the heap address backing `signal`'s slot never moves, even
+    // if `ReactiveLabel` (or the `Engine` that owns it) is moved.
+    arena: Box<ViewArena>,
+    signal: Signal<'static, String>,
+    tick: EvaluatorTick<'static>,
+    atlas: LayoutAtlas,
+    target: TargetId,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    color: [f32; 4],
+}
+
+impl ReactiveLabel {
+    fn new(text: impl Into<String>, x: f32, y: f32, font_size: f32, color: [f32; 4]) -> Self {
+        let arena = Box::new(ViewArena::new());
+        // SAFETY: see the struct doc above — `arena` is boxed (stable heap
+        // address) and dropped together with `signal` when `ReactiveLabel`
+        // (and the `Engine` that owns it) is dropped.
+        let signal: Signal<'static, String> =
+            unsafe { Signal::new_in(&arena, text.into()).erase_lifetime() };
+
+        // A single trivial (zero-sized) leaf is enough to give the label a
+        // real AtlasNode TargetId to subscribe to and mark dirty — Phase 1
+        // does not yet thread Atlas-resolved geometry into `TextLine` (x/y
+        // are authored directly), so this leaf's only job is to participate
+        // honestly in the dirty-broadcast flow, not to compute position.
+        let mut atlas = LayoutAtlas::new();
+        let node = atlas
+            .add_leaf(LeafSize {
+                width: 0.0,
+                height: 0.0,
+            })
+            .expect("a single freshly created leaf can never fail to add");
+        atlas
+            .set_root(node)
+            .expect("the node just created always belongs to this atlas");
+        atlas
+            .compute(Viewport::new(0.0, 0.0))
+            .expect("computing layout for one zero-sized leaf can never fail");
+
+        let target = TargetId::new(0, atlas.current_generation(), TargetKind::AtlasNode as u16);
+        signal.subscribe(target);
+
+        let mut tick = EvaluatorTick::new();
+        tick.register(signal);
+
+        Self {
+            arena,
+            signal,
+            tick,
+            atlas,
+            target,
+            x,
+            y,
+            font_size,
+            color,
+        }
+    }
+
+    /// Overwrites the label's text content. The signal's version counter
+    /// advances; the next [`ReactiveLabel::text_line`] call observes it.
+    fn set_text(&self, text: impl Into<String>) {
+        self.signal.write(|v| *v = text.into());
+    }
+
+    /// Runs one Evaluator → Atlas tick and returns this frame's `TextLine`,
+    /// with `dirty` reflecting the real dirty-flag pipeline output — never
+    /// a hardcoded value.
+    fn text_line(&mut self) -> Result<TextLine, ByardError> {
+        let dirty_targets = self.tick.collect_dirty();
+        let dirty = if dirty_targets.is_empty() {
+            false
+        } else {
+            self.atlas.mark_dirty_all(&dirty_targets);
+            self.atlas.recompute_dirty(Viewport::new(0.0, 0.0))?;
+            dirty_targets.contains(&self.target)
+        };
+
+        Ok(TextLine {
+            x: self.x,
+            y: self.y,
+            text: self.signal.read(String::clone),
+            font_size: self.font_size,
+            color: self.color,
+            dirty,
+        })
+    }
 }
 
 impl Engine {
@@ -162,7 +289,20 @@ impl Engine {
             surface,
             surface_config,
             scale_factor,
+            label: ReactiveLabel::new("Byard — Phase 1", 110.0, 110.0, 20.0, [1.0, 1.0, 1.0, 1.0]),
+            text_scratch: Vec::new(),
         })
+    }
+
+    /// Replaces the engine's reactive label text.
+    ///
+    /// The next [`Engine::render_frame`] call picks up the change, with the
+    /// resulting `TextLine`'s `dirty` bit set from the real Evaluator →
+    /// Atlas dirty-flag pipeline (RFC-0001 §2.2, §4.1) — this is the
+    /// production mutation path for Phase 1's "reactive text label driven
+    /// by a Signal" closure criterion.
+    pub fn set_label_text(&self, text: impl Into<String>) {
+        self.label.set_text(text);
     }
 
     /// Notifies the engine that the window surface has been resized.
@@ -244,7 +384,19 @@ impl Engine {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let cmd = self.encoder.encode_frame(&view, instances, texts)?;
+        // Run one Evaluator → Atlas tick for the engine's reactive label
+        // and fold it into this frame's text list, ahead of whatever
+        // static lines the caller supplies. This is the production code
+        // path that exercises Signal/EvaluatorTick/LayoutAtlas — not just
+        // the unit tests in `atlas/layout.rs`.
+        let label_line = self.label.text_line()?;
+        self.text_scratch.clear();
+        self.text_scratch.push(label_line);
+        self.text_scratch.extend_from_slice(texts);
+
+        let cmd = self
+            .encoder
+            .encode_frame(&view, instances, &self.text_scratch)?;
         self.encoder.submit(cmd);
         frame.present();
 

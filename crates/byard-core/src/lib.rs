@@ -31,7 +31,7 @@ pub mod relay;
 pub use encoder::BoxInstance;
 pub use encoder::text_glyph::TextLine;
 pub use engine::Engine;
-pub use platform::{PlatformHost, WindowSize};
+pub use platform::{PlatformHost, PointerButton, PointerState, WindowSize};
 
 use std::fmt;
 
