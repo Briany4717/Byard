@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use crate::ByardError;
+use crate::encoder::text_glyph::TextLine;
 use crate::encoder::{BoxInstance, EncoderSubsystem};
 use crate::frame::Viewport;
 
@@ -135,14 +136,26 @@ impl Engine {
         // --- Encoder subsystem ---
         let device = Arc::new(device);
         let queue = Arc::new(queue);
-        let encoder =
-            EncoderSubsystem::init(Arc::clone(&device), Arc::clone(&queue), surface_format).await?;
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let scale_f32 = scale_factor as f32;
+        let mut encoder = EncoderSubsystem::init(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            surface_format,
+            scale_f32,
+        )
+        .await?;
 
         // Viewport uniform uses LOGICAL pixels so all instance coordinates can
         // be authored in density-independent units. cast precision loss is
         // acceptable: logical pixel counts fit well within f32's 24-bit mantissa.
         #[allow(clippy::cast_precision_loss)]
-        encoder.update_viewport(logical_viewport(width, height, scale_factor));
+        encoder.update_viewport(
+            logical_viewport(width, height, scale_factor),
+            width,
+            height,
+            scale_f32,
+        );
 
         Ok(Self {
             encoder,
@@ -171,9 +184,13 @@ impl Engine {
         self.surface_config.height = height;
         self.surface
             .configure(self.encoder.device(), &self.surface_config);
-        #[allow(clippy::cast_precision_loss)]
-        self.encoder
-            .update_viewport(logical_viewport(width, height, scale_factor));
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        self.encoder.update_viewport(
+            logical_viewport(width, height, scale_factor),
+            width,
+            height,
+            scale_factor as f32,
+        );
     }
 
     /// Renders one frame to the window surface.
@@ -193,7 +210,11 @@ impl Engine {
     ///
     /// Returns [`ByardError::RenderSurface`] only on unrecoverable surface
     /// errors such as out-of-memory or GPU timeout.
-    pub fn render_frame(&self, instances: &[BoxInstance]) -> Result<(), ByardError> {
+    pub fn render_frame(
+        &mut self,
+        instances: &[BoxInstance],
+        texts: &[TextLine],
+    ) -> Result<(), ByardError> {
         // wgpu 29: get_current_texture() returns CurrentSurfaceTexture (an enum),
         // replacing the old Result<SurfaceTexture, SurfaceError> API.
         let frame = match self.surface.get_current_texture() {
@@ -223,7 +244,7 @@ impl Engine {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let cmd = self.encoder.encode_frame(&view, instances);
+        let cmd = self.encoder.encode_frame(&view, instances, texts)?;
         self.encoder.submit(cmd);
         frame.present();
 

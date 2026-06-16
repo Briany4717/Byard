@@ -24,6 +24,8 @@
 //! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
 
+pub mod text_glyph;
+
 use std::sync::Arc;
 
 use bytemuck;
@@ -31,6 +33,7 @@ use wgpu::util::DeviceExt;
 
 use crate::ByardError;
 use crate::frame::Viewport;
+use text_glyph::{TextGlyphPipeline, TextLine};
 
 /// GPU-ready instance data for a single solid rectangle.
 ///
@@ -110,6 +113,20 @@ pub struct EncoderSubsystem {
     quad_buffer: wgpu::Buffer,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
+    /// Text rendering pipeline — shares the UI render pass with `SolidBox`.
+    text_pipeline: TextGlyphPipeline,
+    /// DPI scale factor, derived once per resize from the OS-reported value.
+    ///
+    /// Stored here so `encode_frame` can pass it to `TextGlyphPipeline::prepare`
+    /// without requiring the caller to supply it per-frame.
+    scale_factor: f32,
+    /// Set by [`update_viewport`](EncoderSubsystem::update_viewport) and
+    /// consumed (cleared) by [`encode_frame`](EncoderSubsystem::encode_frame).
+    ///
+    /// Forces `TextGlyphPipeline::prepare` to re-prepare even when no text
+    /// content has changed — necessary after a viewport resize because glyphon's
+    /// `Viewport` resolution changed.
+    viewport_dirty: bool,
 }
 
 impl EncoderSubsystem {
@@ -133,6 +150,7 @@ impl EncoderSubsystem {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
+        scale_factor: f32,
     ) -> Result<Self, ByardError> {
         // Static geometry shared by every SolidBox instance.
         let quad_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -188,6 +206,8 @@ impl EncoderSubsystem {
             build_solid_box_pipeline(&device, &bind_group_layout, quad_layout, surface_format)
                 .await?;
 
+        let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format)?;
+
         Ok(Self {
             device,
             queue,
@@ -195,6 +215,9 @@ impl EncoderSubsystem {
             quad_buffer,
             viewport_buffer,
             viewport_bind_group,
+            text_pipeline,
+            scale_factor,
+            viewport_dirty: false,
         })
     }
 
@@ -214,40 +237,66 @@ impl EncoderSubsystem {
         self.queue.submit(std::iter::once(buffer));
     }
 
-    /// Uploads updated viewport dimensions to the GPU uniform buffer.
+    /// Uploads updated viewport dimensions to the GPU uniform buffer and
+    /// notifies the text pipeline of the new resolution.
     ///
-    /// Must be called whenever the surface is resized before the next frame
-    /// that uses this encoder.
-    pub fn update_viewport(&self, viewport: Viewport) {
-        // Write 16 bytes to match the padded uniform buffer size.
-        // The shader only reads the first 8 bytes (vec2<f32>); the trailing
-        // two floats are zero padding required by the 16-byte alignment rule.
+    /// `phys_w`/`phys_h` are the new surface dimensions in **physical pixels**.
+    /// `scale` is the OS DPI scale factor; it is stored so that `encode_frame`
+    /// can pass the correct value to [`TextGlyphPipeline::prepare`] without
+    /// requiring the caller to supply it per-frame.
+    ///
+    /// Must be called whenever the surface is resized before the next frame.
+    pub fn update_viewport(&mut self, viewport: Viewport, phys_w: u32, phys_h: u32, scale: f32) {
+        // SolidBox viewport uniform (logical pixels, padded to 16 bytes).
         let size_data = [viewport.width, viewport.height, 0.0_f32, 0.0];
         self.queue
             .write_buffer(&self.viewport_buffer, 0, bytemuck::cast_slice(&size_data));
+
+        // glyphon Viewport (physical pixels — glyphon always operates in physical px).
+        self.text_pipeline
+            .update_resolution(&self.queue, phys_w, phys_h);
+
+        self.scale_factor = scale;
+        self.viewport_dirty = true;
     }
 
     /// Encodes a single UI frame into a `CommandBuffer` ready for queue submission.
     ///
-    /// Creates a transient instance buffer from `instances`, records a render pass
-    /// that clears the target and draws every rectangle, then returns the finished
-    /// command buffer ready for submission. The caller must submit it on the
-    /// same [`wgpu::Queue`] that was used to initialise this encoder.
+    /// Calls [`TextGlyphPipeline::prepare`] before opening the render pass, then
+    /// within the single render pass draws all `instances` (`SolidBox`) followed by
+    /// all `texts` (`TextGlyph`). On Apple Silicon (TBDR) both pipelines share one
+    /// pass so the tile buffer is never flushed between them.
     ///
-    /// If `instances` is empty the pass still runs (clearing the target to
-    /// transparent) but no draw call is issued.
+    /// If `instances` is empty the `SolidBox` draw call is skipped; if `texts` is
+    /// empty the text render call is skipped. The pass still clears the target.
     ///
     /// # Instance buffer lifetime
     ///
-    /// The buffer is allocated per call and dropped after `encoder.finish()`.
-    /// For Phase 1 frame counts this is acceptable; a persistent ring-buffer
-    /// upload strategy can replace this in a future sub-issue.
-    #[must_use]
+    /// The `SolidBox` instance buffer is allocated per call and dropped after
+    /// `encoder.finish()`. A persistent ring-buffer strategy is a future sub-issue.
+    ///
+    /// # Errors
+    ///
+    /// - [`ByardError::TextPrepare`] — glyphon atlas upload failed.
+    /// - [`ByardError::TextRender`] — glyphon render recording failed.
     pub fn encode_frame(
-        &self,
+        &mut self,
         target_view: &wgpu::TextureView,
         instances: &[BoxInstance],
-    ) -> wgpu::CommandBuffer {
+        texts: &[TextLine],
+    ) -> Result<wgpu::CommandBuffer, ByardError> {
+        // ── Text prepare (before the render pass) ─────────────────────────────
+        let viewport_dirty = self.viewport_dirty;
+        self.text_pipeline.prepare(
+            &self.device,
+            &self.queue,
+            texts,
+            self.scale_factor,
+            viewport_dirty,
+        )?;
+        self.viewport_dirty = false;
+
+        // ── Command encoding ──────────────────────────────────────────────────
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -274,6 +323,7 @@ impl EncoderSubsystem {
                 multiview_mask: None,
             });
 
+            // ── SolidBox ──────────────────────────────────────────────────────
             if !instances.is_empty() {
                 let instance_buffer =
                     self.device
@@ -293,9 +343,14 @@ impl EncoderSubsystem {
                 #[allow(clippy::cast_possible_truncation)]
                 render_pass.draw(0..4, 0..instances.len() as u32);
             }
+
+            // ── TextGlyph (same pass — TBDR optimisation) ─────────────────────
+            if !texts.is_empty() {
+                self.text_pipeline.render(&mut render_pass)?;
+            }
         }
 
-        encoder.finish()
+        Ok(encoder.finish())
     }
 }
 

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use byard_core::{BoxInstance, Engine};
+use byard_core::{BoxInstance, Engine, TextLine};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -48,6 +48,8 @@ struct AppState {
     /// DPI scale factor, so this list renders identically on Retina and
     /// non-HiDPI displays.
     instances: Vec<BoxInstance>,
+    /// Static text overlay rendered in the same pass as `instances`.
+    texts: Vec<TextLine>,
 }
 
 impl ApplicationHandler for App {
@@ -107,6 +109,25 @@ impl ApplicationHandler for App {
             },
         ];
 
+        let texts = vec![
+            // Label over the blue rounded rectangle.
+            TextLine {
+                x: 110.0,
+                y: 110.0,
+                text: "Byard — Phase 1".to_string(),
+                font_size: 20.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+            },
+            // Smaller label over the orange rectangle.
+            TextLine {
+                x: 510.0,
+                y: 190.0,
+                text: "TextGlyph".to_string(),
+                font_size: 14.0,
+                color: [0.1, 0.05, 0.0, 1.0],
+            },
+        ];
+
         // Request the first frame now that the engine is ready.
         window.request_redraw();
 
@@ -114,6 +135,7 @@ impl ApplicationHandler for App {
             window,
             engine,
             instances,
+            texts,
         });
     }
 
@@ -154,7 +176,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 state
                     .engine
-                    .render_frame(&state.instances)
+                    .render_frame(&state.instances, &state.texts)
                     .expect("render_frame failed");
             }
 

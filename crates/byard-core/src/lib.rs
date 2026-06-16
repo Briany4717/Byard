@@ -28,6 +28,7 @@ pub mod frame;
 pub mod relay;
 
 pub use encoder::BoxInstance;
+pub use encoder::text_glyph::TextLine;
 pub use engine::Engine;
 
 use std::fmt;
@@ -58,6 +59,16 @@ pub enum ByardError {
     /// Transient surface losses (e.g. window minimise/restore) are handled
     /// transparently by [`Engine::render_frame`] and never produce this variant.
     RenderSurface(String),
+
+    /// [`glyphon`] failed to upload shaped glyphs to the GPU atlas.
+    ///
+    /// The inner string is the original [`glyphon::PrepareError`] message.
+    TextPrepare(String),
+
+    /// [`glyphon`] failed to record text draw calls into the render pass.
+    ///
+    /// The inner string is the original [`glyphon::RenderError`] message.
+    TextRender(String),
 }
 
 impl fmt::Display for ByardError {
@@ -69,6 +80,8 @@ impl fmt::Display for ByardError {
             Self::UnsupportedBackend => write!(f, "no compatible wgpu backend found"),
             Self::Layout(e) => write!(f, "{e}"),
             Self::RenderSurface(msg) => write!(f, "surface error: {msg}"),
+            Self::TextPrepare(msg) => write!(f, "text prepare error: {msg}"),
+            Self::TextRender(msg) => write!(f, "text render error: {msg}"),
         }
     }
 }
