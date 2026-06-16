@@ -22,9 +22,14 @@
 
 pub mod atlas;
 pub mod encoder;
+pub mod engine;
 pub mod evaluator;
 pub mod frame;
 pub mod relay;
+
+pub use encoder::BoxInstance;
+pub use encoder::text_glyph::TextLine;
+pub use engine::Engine;
 
 use std::fmt;
 
@@ -48,6 +53,22 @@ pub enum ByardError {
 
     /// An error from the Atlas subsystem (layout, hit-testing).
     Layout(crate::atlas::AtlasError),
+
+    /// An unrecoverable error occurred while acquiring or presenting a surface texture.
+    ///
+    /// Transient surface losses (e.g. window minimise/restore) are handled
+    /// transparently by [`Engine::render_frame`] and never produce this variant.
+    RenderSurface(String),
+
+    /// [`glyphon`] failed to upload shaped glyphs to the GPU atlas.
+    ///
+    /// The inner string is the original [`glyphon::PrepareError`] message.
+    TextPrepare(String),
+
+    /// [`glyphon`] failed to record text draw calls into the render pass.
+    ///
+    /// The inner string is the original [`glyphon::RenderError`] message.
+    TextRender(String),
 }
 
 impl fmt::Display for ByardError {
@@ -58,6 +79,9 @@ impl fmt::Display for ByardError {
             }
             Self::UnsupportedBackend => write!(f, "no compatible wgpu backend found"),
             Self::Layout(e) => write!(f, "{e}"),
+            Self::RenderSurface(msg) => write!(f, "surface error: {msg}"),
+            Self::TextPrepare(msg) => write!(f, "text prepare error: {msg}"),
+            Self::TextRender(msg) => write!(f, "text render error: {msg}"),
         }
     }
 }
@@ -109,5 +133,50 @@ mod tests {
             reason: "bad shader".to_string(),
         };
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn byard_error_unsupported_backend_display_and_no_source() {
+        use std::error::Error;
+
+        let err = ByardError::UnsupportedBackend;
+        assert_eq!(err.to_string(), "no compatible wgpu backend found");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn byard_error_render_surface_display_and_no_source() {
+        use std::error::Error;
+
+        let msg = "out of memory on present".to_string();
+        let err = ByardError::RenderSurface(msg.clone());
+        assert_eq!(err.to_string(), format!("surface error: {msg}"));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn byard_error_pipeline_display() {
+        let err = ByardError::PipelineCompilation {
+            pipeline: "SolidBox".to_string(),
+            reason: "bad shader".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "pipeline 'SolidBox' failed to compile: bad shader"
+        );
+    }
+
+    #[test]
+    fn byard_error_is_debug() {
+        // Debug must not panic for any variant.
+        let _ = format!("{:?}", ByardError::UnsupportedBackend);
+        let _ = format!(
+            "{:?}",
+            ByardError::PipelineCompilation {
+                pipeline: "x".into(),
+                reason: "y".into(),
+            }
+        );
+        let _ = format!("{:?}", ByardError::RenderSurface("z".into()));
     }
 }

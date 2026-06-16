@@ -18,10 +18,13 @@
 //! Primitives are batched into Z-bins (stacking contexts) and ordered first by
 //! pipeline, then by local Z-index, to minimise GPU context switches.
 //!
-//! Pipeline creation is wrapped in `Device::push_error_scope` /
-//! `Device::pop_error_scope` with `ErrorFilter::Validation`. Failures are
-//! surfaced as [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
+//! Pipeline creation is wrapped in `Device::push_error_scope` (returns an
+//! `ErrorScopeGuard` in wgpu 28+) and `scope.pop().await` with
+//! `ErrorFilter::Validation`. Failures are surfaced as
+//! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
+
+pub mod text_glyph;
 
 use std::sync::Arc;
 
@@ -30,6 +33,7 @@ use wgpu::util::DeviceExt;
 
 use crate::ByardError;
 use crate::frame::Viewport;
+use text_glyph::{TextGlyphPipeline, TextLine};
 
 /// GPU-ready instance data for a single solid rectangle.
 ///
@@ -109,10 +113,28 @@ pub struct EncoderSubsystem {
     quad_buffer: wgpu::Buffer,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
+    /// Text rendering pipeline — shares the UI render pass with `SolidBox`.
+    text_pipeline: TextGlyphPipeline,
+    /// DPI scale factor, derived once per resize from the OS-reported value.
+    ///
+    /// Stored here so `encode_frame` can pass it to `TextGlyphPipeline::prepare`
+    /// without requiring the caller to supply it per-frame.
+    scale_factor: f32,
+    /// Set by [`update_viewport`](EncoderSubsystem::update_viewport) and
+    /// consumed (cleared) by [`encode_frame`](EncoderSubsystem::encode_frame).
+    ///
+    /// Forces `TextGlyphPipeline::prepare` to re-prepare even when no text
+    /// content has changed — necessary after a viewport resize because glyphon's
+    /// `Viewport` resolution changed.
+    viewport_dirty: bool,
 }
 
 impl EncoderSubsystem {
-    /// Initialises the GPU context and compiles the `SolidBox` pipeline.
+    /// Compiles all GPU pipelines using an already-created device and queue.
+    ///
+    /// Adapter selection and device creation are the responsibility of the
+    /// caller (typically [`Engine::init`](crate::engine::Engine::init)), which
+    /// also configures the `wgpu::Surface` before calling this method.
     ///
     /// Shader compilation and pipeline creation are wrapped in a
     /// `push_error_scope` / `pop_error_scope` pair (RFC §8). Any GPU-side
@@ -122,38 +144,14 @@ impl EncoderSubsystem {
     ///
     /// # Errors
     ///
-    /// - [`ByardError::UnsupportedBackend`] — no compatible adapter found or
-    ///   device creation failed.
     /// - [`ByardError::PipelineCompilation`] — the WGSL shader or the pipeline
     ///   descriptor failed GPU-side validation.
     pub async fn init(
-        instance: &wgpu::Instance,
-        surface: &wgpu::Surface<'static>,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
+        scale_factor: f32,
     ) -> Result<Self, ByardError> {
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or(ByardError::UnsupportedBackend)?;
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("ByardCore - Encoder Device"),
-                    required_features: wgpu::Features::empty(),
-                    // Use the adapter's own limits — no artificial WebGL2 cap.
-                    required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .map_err(|_| ByardError::UnsupportedBackend)?;
-
         // Static geometry shared by every SolidBox instance.
         let quad_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ByardCore - Static Quad Buffer"),
@@ -208,50 +206,97 @@ impl EncoderSubsystem {
             build_solid_box_pipeline(&device, &bind_group_layout, quad_layout, surface_format)
                 .await?;
 
+        let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format)?;
+
         Ok(Self {
-            device: Arc::new(device),
-            queue: Arc::new(queue),
+            device,
+            queue,
             render_pipeline,
             quad_buffer,
             viewport_buffer,
             viewport_bind_group,
+            text_pipeline,
+            scale_factor,
+            viewport_dirty: false,
         })
     }
 
-    /// Uploads updated viewport dimensions to the GPU uniform buffer.
+    /// Returns a reference to the underlying `wgpu` device.
     ///
-    /// Must be called whenever the surface is resized before the next frame
-    /// that uses this encoder.
-    pub fn update_viewport(&self, viewport: Viewport) {
-        // Write 16 bytes to match the padded uniform buffer size.
-        // The shader only reads the first 8 bytes (vec2<f32>); the trailing
-        // two floats are zero padding required by the 16-byte alignment rule.
+    /// Used by [`Engine`](crate::engine::Engine) to configure and reconfigure
+    /// the `wgpu::Surface` without duplicating the device handle.
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Submits a command buffer to the GPU queue.
+    ///
+    /// Thin wrapper around `queue.submit` so that callers outside this module
+    /// do not need to hold a separate reference to the queue.
+    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) {
+        self.queue.submit(std::iter::once(buffer));
+    }
+
+    /// Uploads updated viewport dimensions to the GPU uniform buffer and
+    /// notifies the text pipeline of the new resolution.
+    ///
+    /// `phys_w`/`phys_h` are the new surface dimensions in **physical pixels**.
+    /// `scale` is the OS DPI scale factor; it is stored so that `encode_frame`
+    /// can pass the correct value to [`TextGlyphPipeline::prepare`] without
+    /// requiring the caller to supply it per-frame.
+    ///
+    /// Must be called whenever the surface is resized before the next frame.
+    pub fn update_viewport(&mut self, viewport: Viewport, phys_w: u32, phys_h: u32, scale: f32) {
+        // SolidBox viewport uniform (logical pixels, padded to 16 bytes).
         let size_data = [viewport.width, viewport.height, 0.0_f32, 0.0];
         self.queue
             .write_buffer(&self.viewport_buffer, 0, bytemuck::cast_slice(&size_data));
+
+        // glyphon Viewport (physical pixels — glyphon always operates in physical px).
+        self.text_pipeline
+            .update_resolution(&self.queue, phys_w, phys_h);
+
+        self.scale_factor = scale;
+        self.viewport_dirty = true;
     }
 
     /// Encodes a single UI frame into a `CommandBuffer` ready for queue submission.
     ///
-    /// Creates a transient instance buffer from `instances`, records a render pass
-    /// that clears the target and draws every rectangle, then returns the finished
-    /// command buffer ready for submission. The caller must submit it on the
-    /// same [`wgpu::Queue`] that was used to initialise this encoder.
+    /// Calls [`TextGlyphPipeline::prepare`] before opening the render pass, then
+    /// within the single render pass draws all `instances` (`SolidBox`) followed by
+    /// all `texts` (`TextGlyph`). On Apple Silicon (TBDR) both pipelines share one
+    /// pass so the tile buffer is never flushed between them.
     ///
-    /// If `instances` is empty the pass still runs (clearing the target to
-    /// transparent) but no draw call is issued.
+    /// If `instances` is empty the `SolidBox` draw call is skipped; if `texts` is
+    /// empty the text render call is skipped. The pass still clears the target.
     ///
     /// # Instance buffer lifetime
     ///
-    /// The buffer is allocated per call and dropped after `encoder.finish()`.
-    /// For Phase 1 frame counts this is acceptable; a persistent ring-buffer
-    /// upload strategy can replace this in a future sub-issue.
-    #[must_use]
+    /// The `SolidBox` instance buffer is allocated per call and dropped after
+    /// `encoder.finish()`. A persistent ring-buffer strategy is a future sub-issue.
+    ///
+    /// # Errors
+    ///
+    /// - [`ByardError::TextPrepare`] — glyphon atlas upload failed.
+    /// - [`ByardError::TextRender`] — glyphon render recording failed.
     pub fn encode_frame(
-        &self,
+        &mut self,
         target_view: &wgpu::TextureView,
         instances: &[BoxInstance],
-    ) -> wgpu::CommandBuffer {
+        texts: &[TextLine],
+    ) -> Result<wgpu::CommandBuffer, ByardError> {
+        // ── Text prepare (before the render pass) ─────────────────────────────
+        let viewport_dirty = self.viewport_dirty;
+        self.text_pipeline.prepare(
+            &self.device,
+            &self.queue,
+            texts,
+            self.scale_factor,
+            viewport_dirty,
+        )?;
+        self.viewport_dirty = false;
+
+        // ── Command encoding ──────────────────────────────────────────────────
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -268,12 +313,17 @@ impl EncoderSubsystem {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                // wgpu 28: new required field; None disables multiview rendering.
+                multiview_mask: None,
             });
 
+            // ── SolidBox ──────────────────────────────────────────────────────
             if !instances.is_empty() {
                 let instance_buffer =
                     self.device
@@ -293,9 +343,14 @@ impl EncoderSubsystem {
                 #[allow(clippy::cast_possible_truncation)]
                 render_pass.draw(0..4, 0..instances.len() as u32);
             }
+
+            // ── TextGlyph (same pass — TBDR optimisation) ─────────────────────
+            if !texts.is_empty() {
+                self.text_pipeline.render(&mut render_pass)?;
+            }
         }
 
-        encoder.finish()
+        Ok(encoder.finish())
     }
 }
 
@@ -318,12 +373,15 @@ async fn build_solid_box_pipeline(
     // --- GPU VALIDATION ERROR SCOPE (RFC §8) ---
     // Covers create_pipeline_layout + create_shader_module + create_render_pipeline,
     // the three operations listed in RFC §8 as requiring capture.
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // wgpu 28+: push_error_scope returns an owned scope handle; pop is on the handle.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ByardCore - SolidBox Pipeline Layout"),
-        bind_group_layouts: &[bind_group_layout],
-        push_constant_ranges: &[],
+        // wgpu 29: bind_group_layouts is now &[Option<&BindGroupLayout>].
+        bind_group_layouts: &[Some(bind_group_layout)],
+        // wgpu 28: push_constant_ranges removed; replaced by immediate_size: u32.
+        immediate_size: 0,
     });
 
     let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -363,11 +421,11 @@ async fn build_solid_box_pipeline(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
-    if let Some(error) = device.pop_error_scope().await {
+    if let Some(error) = scope.pop().await {
         return Err(ByardError::PipelineCompilation {
             pipeline: "SolidBox".to_string(),
             reason: error.to_string(),
