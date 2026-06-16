@@ -10,7 +10,15 @@ struct InstanceInput {
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
+    /// Fragment position relative to the rectangle centre, in logical pixels.
+    ///
+    /// Covers the padded quad (see vertex shader), so values outside
+    /// ±half_size are valid and represent the anti-alias margin.
     @location(0) local_pos: vec2<f32>,
+    /// Half-size of the *original* (un-padded) rectangle, in logical pixels.
+    ///
+    /// Passed unchanged to `sd_rounded_box` so the SDF always measures distance
+    /// to the intended shape boundary, regardless of quad inflation.
     @location(1) half_size: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) radii: vec4<f32>,
@@ -18,17 +26,42 @@ struct VertexOutput {
 
 @group(0) @binding(0) var<uniform> viewport_size: vec2<f32>;
 
+/// Extra pixels added on every side of the quad beyond the shape boundary.
+///
+/// Without padding the quad ends exactly where the SDF crosses zero, so
+/// the GPU never rasterises the fragments needed to fade alpha to 0 —
+/// the anti-alias fringe is clipped at the cardinal points, making circles
+/// look flat-edged. Two pixels is enough for one-pixel smoothstep at 2× DPI.
+const QUAD_PADDING: f32 = 2.0;
+
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     var out: VertexOutput;
 
     let w = instance.rect.z;
     let h = instance.rect.w;
+
+    // half_size stays at the original, un-padded dimensions.
+    // The SDF always measures distance to this boundary.
     out.half_size = vec2<f32>(w, h) * 0.5;
-    out.local_pos = (vertex.quad_pos - 0.5) * vec2<f32>(w, h);
 
-    let world_pos = instance.rect.xy + vertex.quad_pos * vec2<f32>(w, h);
+    // The quad is inflated by QUAD_PADDING on every side so fragments can
+    // exist beyond the shape boundary and carry out the fade-to-zero.
+    let padded = vec2<f32>(w + QUAD_PADDING * 2.0, h + QUAD_PADDING * 2.0);
 
+    // local_pos: fragment position relative to the rect centre.
+    //   quad_pos = [0,0] → local_pos = -padded/2  (QUAD_PADDING px outside TL corner)
+    //   quad_pos = [0.5, 0.5] → local_pos = [0, 0]  (centre, always)
+    //   quad_pos = [1,1] → local_pos = +padded/2  (QUAD_PADDING px outside BR corner)
+    out.local_pos = (vertex.quad_pos - 0.5) * padded;
+
+    // world_pos: the quad top-left shifts by QUAD_PADDING so the inflation
+    // is symmetric — QUAD_PADDING px of extra space on every side of the rect.
+    let world_pos = instance.rect.xy - vec2<f32>(QUAD_PADDING) + vertex.quad_pos * padded;
+
+    // Convert logical-pixel world position to NDC.
+    // viewport_size is in logical pixels (set from window.scale_factor() in the engine),
+    // so this division is unit-consistent regardless of display density.
     out.position = vec4<f32>(
         (world_pos.x / viewport_size.x) * 2.0 - 1.0,
         1.0 - (world_pos.y / viewport_size.y) * 2.0,
@@ -43,8 +76,8 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
 
 /// SDF for a rounded rectangle with per-corner radii.
 ///
-/// `p`  — fragment position relative to the rectangle centre.
-/// `b`  — half-size of the rectangle (width/2, height/2).
+/// `p`  — fragment position relative to the rectangle centre (logical pixels).
+/// `b`  — half-size of the rectangle (width/2, height/2) (logical pixels).
 /// `r`  — corner radii [top_left, top_right, bottom_right, bottom_left].
 ///
 /// Returns a negative value inside the shape, zero on the boundary, and a
@@ -67,10 +100,11 @@ fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let distance = sd_rounded_box(in.local_pos, in.half_size, in.radii);
 
-    // Anti-alias the edge over one pixel using screen-space derivatives.
-    // fwidth(distance) approximates how fast the SDF changes across a pixel,
-    // giving sub-pixel accuracy without multisampling.
-    let edge_softness = fwidth(distance);
+    // Anti-alias the edge over one pixel using the Euclidean gradient magnitude.
+    // We use length([dpdx, dpdy]) instead of fwidth (Manhattan norm) to get a
+    // uniform anti-alias band in every direction — fwidth is up to √2 wider at
+    // diagonals, which makes circles look slightly diamond-shaped.
+    let edge_softness = length(vec2<f32>(dpdx(distance), dpdy(distance)));
     let alpha = smoothstep(edge_softness, 0.0, distance);
 
     if (alpha <= 0.0) {

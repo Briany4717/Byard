@@ -18,9 +18,10 @@
 //! Primitives are batched into Z-bins (stacking contexts) and ordered first by
 //! pipeline, then by local Z-index, to minimise GPU context switches.
 //!
-//! Pipeline creation is wrapped in `Device::push_error_scope` /
-//! `Device::pop_error_scope` with `ErrorFilter::Validation`. Failures are
-//! surfaced as [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
+//! Pipeline creation is wrapped in `Device::push_error_scope` (returns an
+//! `ErrorScopeGuard` in wgpu 28+) and `scope.pop().await` with
+//! `ErrorFilter::Validation`. Failures are surfaced as
+//! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
 
 use std::sync::Arc;
@@ -112,7 +113,11 @@ pub struct EncoderSubsystem {
 }
 
 impl EncoderSubsystem {
-    /// Initialises the GPU context and compiles the `SolidBox` pipeline.
+    /// Compiles all GPU pipelines using an already-created device and queue.
+    ///
+    /// Adapter selection and device creation are the responsibility of the
+    /// caller (typically [`Engine::init`](crate::engine::Engine::init)), which
+    /// also configures the `wgpu::Surface` before calling this method.
     ///
     /// Shader compilation and pipeline creation are wrapped in a
     /// `push_error_scope` / `pop_error_scope` pair (RFC §8). Any GPU-side
@@ -122,38 +127,13 @@ impl EncoderSubsystem {
     ///
     /// # Errors
     ///
-    /// - [`ByardError::UnsupportedBackend`] — no compatible adapter found or
-    ///   device creation failed.
     /// - [`ByardError::PipelineCompilation`] — the WGSL shader or the pipeline
     ///   descriptor failed GPU-side validation.
     pub async fn init(
-        instance: &wgpu::Instance,
-        surface: &wgpu::Surface<'static>,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
     ) -> Result<Self, ByardError> {
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or(ByardError::UnsupportedBackend)?;
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("ByardCore - Encoder Device"),
-                    required_features: wgpu::Features::empty(),
-                    // Use the adapter's own limits — no artificial WebGL2 cap.
-                    required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .map_err(|_| ByardError::UnsupportedBackend)?;
-
         // Static geometry shared by every SolidBox instance.
         let quad_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ByardCore - Static Quad Buffer"),
@@ -209,13 +189,29 @@ impl EncoderSubsystem {
                 .await?;
 
         Ok(Self {
-            device: Arc::new(device),
-            queue: Arc::new(queue),
+            device,
+            queue,
             render_pipeline,
             quad_buffer,
             viewport_buffer,
             viewport_bind_group,
         })
+    }
+
+    /// Returns a reference to the underlying `wgpu` device.
+    ///
+    /// Used by [`Engine`](crate::engine::Engine) to configure and reconfigure
+    /// the `wgpu::Surface` without duplicating the device handle.
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Submits a command buffer to the GPU queue.
+    ///
+    /// Thin wrapper around `queue.submit` so that callers outside this module
+    /// do not need to hold a separate reference to the queue.
+    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) {
+        self.queue.submit(std::iter::once(buffer));
     }
 
     /// Uploads updated viewport dimensions to the GPU uniform buffer.
@@ -268,10 +264,14 @@ impl EncoderSubsystem {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                // wgpu 28: new required field; None disables multiview rendering.
+                multiview_mask: None,
             });
 
             if !instances.is_empty() {
@@ -318,12 +318,15 @@ async fn build_solid_box_pipeline(
     // --- GPU VALIDATION ERROR SCOPE (RFC §8) ---
     // Covers create_pipeline_layout + create_shader_module + create_render_pipeline,
     // the three operations listed in RFC §8 as requiring capture.
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // wgpu 28+: push_error_scope returns an owned scope handle; pop is on the handle.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ByardCore - SolidBox Pipeline Layout"),
-        bind_group_layouts: &[bind_group_layout],
-        push_constant_ranges: &[],
+        // wgpu 29: bind_group_layouts is now &[Option<&BindGroupLayout>].
+        bind_group_layouts: &[Some(bind_group_layout)],
+        // wgpu 28: push_constant_ranges removed; replaced by immediate_size: u32.
+        immediate_size: 0,
     });
 
     let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -363,11 +366,11 @@ async fn build_solid_box_pipeline(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
-    if let Some(error) = device.pop_error_scope().await {
+    if let Some(error) = scope.pop().await {
         return Err(ByardError::PipelineCompilation {
             pipeline: "SolidBox".to_string(),
             reason: error.to_string(),

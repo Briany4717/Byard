@@ -13,8 +13,16 @@ bumpalo = "3"
 taffy = "0.10"
 rustc-hash = "2"
 smallvec = "1"
-wgpu = "24.0"
+wgpu = "29.0"
 bytemuck = { version = "1.14", features = ["derive"] }
+
+[dev-dependencies]
+# Visual verification example (examples/hello_world.rs).
+# winit 0.30 is required for the `ApplicationHandler` API and for
+# `create_surface` without `unsafe` (wgpu 24 + winit 0.30 co-released).
+winit = "0.30"
+# Minimal async executor for blocking on `Engine::init` inside `main`.
+pollster = "0.3"
 
 [lints]
 workspace = true

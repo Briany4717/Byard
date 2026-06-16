@@ -288,4 +288,117 @@ mod tests {
         assert_eq!(id.index(), 7);
         assert_eq!(id.generation(), 3);
     }
+
+    // ── Rect::contains edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn rect_contains_point_on_left_edge_is_inclusive() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(
+            r.contains(10.0, 30.0),
+            "left edge (x == rect.x) is inclusive"
+        );
+    }
+
+    #[test]
+    fn rect_contains_point_on_top_edge_is_inclusive() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(
+            r.contains(50.0, 20.0),
+            "top edge (y == rect.y) is inclusive"
+        );
+    }
+
+    #[test]
+    fn rect_does_not_contain_point_on_bottom_edge() {
+        // Half-open: y == rect.y + rect.height is exclusive.
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(
+            !r.contains(50.0, 70.0),
+            "bottom edge (y == y + height) is exclusive"
+        );
+    }
+
+    #[test]
+    fn zero_size_rect_contains_nothing() {
+        // A Rect with width=0 or height=0 has no interior; every point is outside.
+        let zero_w = Rect::new(10.0, 10.0, 0.0, 50.0);
+        assert!(
+            !zero_w.contains(10.0, 20.0),
+            "zero-width rect contains nothing"
+        );
+
+        let zero_h = Rect::new(10.0, 10.0, 50.0, 0.0);
+        assert!(
+            !zero_h.contains(20.0, 10.0),
+            "zero-height rect contains nothing"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // comparing literal → stored literal, no arithmetic, always bit-exact
+    fn rect_default_is_all_zeros() {
+        let r = Rect::default();
+        assert_eq!(r.x, 0.0);
+        assert_eq!(r.y, 0.0);
+        assert_eq!(r.width, 0.0);
+        assert_eq!(r.height, 0.0);
+    }
+
+    // ── Viewport ─────────────────────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::float_cmp)] // round-trip through Viewport::new: no arithmetic, bit-exact
+    fn viewport_new_round_trips() {
+        let vp = Viewport::new(1920.0, 1080.0);
+        assert_eq!(vp.width, 1920.0);
+        assert_eq!(vp.height, 1080.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Default-derived zero: no arithmetic, bit-exact
+    fn viewport_default_is_zero() {
+        let vp = Viewport::default();
+        assert_eq!(vp.width, 0.0);
+        assert_eq!(vp.height, 0.0);
+    }
+
+    #[test]
+    fn viewport_is_copy() {
+        const fn assert_copy<T: Copy>() {}
+        assert_copy::<Viewport>();
+        assert_eq!(std::mem::size_of::<Viewport>(), 8);
+    }
+
+    // ── RenderFrame ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_frame_push_rect_preserves_order() {
+        let mut frame = RenderFrame::new();
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(20.0, 20.0, 30.0, 30.0);
+        frame.push_rect(a);
+        frame.push_rect(b);
+        assert_eq!(frame.rects()[0], a);
+        assert_eq!(frame.rects()[1], b);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // x=99.0 stored from a literal, no arithmetic, bit-exact
+    fn render_frame_clear_retains_capacity_for_reuse() {
+        // Clearing a frame with N rects and immediately re-populating with N
+        // rects should not reallocate. We verify correctness (no stale data),
+        // not performance — allocation is observable only via Miri/asan.
+        let mut frame = RenderFrame::new();
+        for i in 0..10 {
+            #[allow(clippy::cast_precision_loss)]
+            frame.push_rect(Rect::new(i as f32, 0.0, 10.0, 10.0));
+        }
+        frame.clear();
+        assert!(frame.rects().is_empty(), "clear must empty the frame");
+
+        frame.push_rect(Rect::new(99.0, 0.0, 1.0, 1.0));
+        assert_eq!(frame.rects().len(), 1, "can push after clear");
+        assert_eq!(frame.rects()[0].x, 99.0);
+    }
 }
