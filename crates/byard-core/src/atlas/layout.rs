@@ -99,6 +99,71 @@ impl ContainerStyle {
     }
 }
 
+/// Declarative description of a layout (sub)tree.
+///
+/// `AtlasNodeSpec` values are plain data — building one never touches
+/// Taffy or any [`LayoutAtlas`], so describing a tree can never fail.
+/// They're produced with [`LayoutAtlasBuilder::leaf`] /
+/// [`LayoutAtlasBuilder::container`] and committed to a real atlas in one
+/// recursive pass via [`LayoutAtlas::build`] or [`LayoutAtlas::build_root`].
+///
+/// This is the fluent construction API from issue #15 — it sits on top
+/// of [`LayoutAtlas::add_leaf`] / [`LayoutAtlas::add_container`] /
+/// [`LayoutAtlas::set_root`] and calls them in the exact same depth-first,
+/// children-before-parent order a hand-written imperative sequence would,
+/// so it produces identical [`AtlasNodeId`]s. The low-level methods are
+/// the tested foundation (PR #14) and are unchanged by this type.
+#[derive(Debug, Clone)]
+pub enum AtlasNodeSpec {
+    /// Describes a leaf, mirroring [`LayoutAtlas::add_leaf`].
+    Leaf(LeafSize),
+    /// Describes a container and its children, mirroring
+    /// [`LayoutAtlas::add_container`]. Children are built and attached in
+    /// iteration order.
+    Container(ContainerStyle, Vec<AtlasNodeSpec>),
+}
+
+/// Entry point for building [`AtlasNodeSpec`] trees fluently.
+///
+/// `LayoutAtlasBuilder` does not wrap a [`LayoutAtlas`] — it has no state
+/// of its own. It's a pair of associated functions that produce
+/// [`AtlasNodeSpec`] values, which `LayoutAtlas::build`/`build_root` then
+/// commit. Nesting `container` calls lets a multi-level tree of mixed
+/// leaves and containers be expressed as a single chained expression:
+///
+/// ```
+/// use byard_core::atlas::{ContainerStyle, LayoutAtlas, LayoutAtlasBuilder as B, LeafSize};
+///
+/// let mut atlas = LayoutAtlas::new();
+/// let root = atlas.build_root(
+///     B::container(ContainerStyle::new(Some(300.0), Some(200.0)), [
+///         B::leaf(LeafSize::new(50.0, 50.0)),
+///         B::container(ContainerStyle::default(), [
+///             B::leaf(LeafSize::new(20.0, 20.0)),
+///         ]),
+///     ]),
+/// ).unwrap();
+/// # let _ = root;
+/// ```
+pub struct LayoutAtlasBuilder;
+
+impl LayoutAtlasBuilder {
+    /// Describes a leaf node with the given size.
+    #[must_use]
+    pub const fn leaf(size: LeafSize) -> AtlasNodeSpec {
+        AtlasNodeSpec::Leaf(size)
+    }
+
+    /// Describes a container node wrapping `children`, built in order.
+    #[must_use]
+    pub fn container(
+        style: ContainerStyle,
+        children: impl IntoIterator<Item = AtlasNodeSpec>,
+    ) -> AtlasNodeSpec {
+        AtlasNodeSpec::Container(style, children.into_iter().collect())
+    }
+}
+
 /// Errors produced by the [`LayoutAtlas`].
 #[non_exhaustive]
 #[derive(Debug)]
@@ -355,6 +420,56 @@ impl LayoutAtlas {
         self.validate_node(root)?;
         self.root = Some(root);
         Ok(())
+    }
+
+    /// Commits an [`AtlasNodeSpec`] tree built via [`LayoutAtlasBuilder`].
+    ///
+    /// Walks `spec` depth-first, building every child before its parent —
+    /// the exact same order and resulting [`AtlasNodeId`]s a hand-written
+    /// call sequence of [`Self::add_leaf`] / [`Self::add_container`] would
+    /// produce. Does not set the result as the root; use
+    /// [`Self::build_root`] for that, or call [`Self::set_root`] yourself
+    /// on the returned id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state (same contract as
+    /// [`Self::add_leaf`] / [`Self::add_container`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if the underlying engine refuses a
+    /// node. [`AtlasError::ForeignNode`] cannot occur here — every
+    /// `AtlasNodeId` `build` consumes is one it just created itself while
+    /// walking `spec`, never one supplied by the caller.
+    pub fn build(&mut self, spec: AtlasNodeSpec) -> Result<AtlasNodeId, AtlasError> {
+        match spec {
+            AtlasNodeSpec::Leaf(size) => self.add_leaf(size),
+            AtlasNodeSpec::Container(style, children) => {
+                let mut built = Vec::with_capacity(children.len());
+                for child in children {
+                    built.push(self.build(child)?);
+                }
+                self.add_container(style, &built)
+            }
+        }
+    }
+
+    /// Like [`Self::build`], but also installs the result as the root via
+    /// [`Self::set_root`] — the common case when `spec` describes a whole
+    /// view rather than a fragment to be attached elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// See [`Self::build`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::build`].
+    pub fn build_root(&mut self, spec: AtlasNodeSpec) -> Result<AtlasNodeId, AtlasError> {
+        let root = self.build(spec)?;
+        self.set_root(root)?;
+        Ok(root)
     }
 
     /// Computes layout against the given viewport size.
@@ -1325,5 +1440,187 @@ mod tests {
         let byard_err: ByardError = atlas_err.into();
 
         assert!(byard_err.to_string().contains("AtlasNodeId belongs to"));
+    }
+
+    // --- Builder API (issue #15) -----------------------------------------
+    //
+    // These tests exercise the acceptance criteria from issue #15: a
+    // multi-level tree expressed as a single chained expression, identical
+    // `AtlasNodeId`s to the equivalent imperative sequence, and that the
+    // low-level API (PR #14) is untouched by the addition.
+
+    /// Acceptance criterion: a 3-level hierarchy mixing leaves and
+    /// containers can be expressed as a single chained expression.
+    #[test]
+    fn builder_expresses_three_level_mixed_hierarchy() {
+        use LayoutAtlasBuilder as B;
+
+        let mut atlas = LayoutAtlas::new();
+
+        let root = atlas
+            .build_root(B::container(
+                ContainerStyle::new(Some(300.0), Some(200.0)),
+                [
+                    B::leaf(LeafSize::new(50.0, 50.0)),
+                    B::container(
+                        ContainerStyle::default(),
+                        [
+                            B::leaf(LeafSize::new(20.0, 20.0)),
+                            B::container(
+                                ContainerStyle::default(),
+                                [B::leaf(LeafSize::new(10.0, 10.0))],
+                            ),
+                        ],
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        // 1 outer container + 1 leaf + 1 inner container + 1 leaf +
+        // 1 innermost container + 1 leaf = 6 nodes.
+        assert_eq!(atlas.node_count(), 6);
+        let root_rect = atlas.resolved_rect(root).unwrap().expect("root rect");
+        assert_f32_eq(root_rect.width, 300.0);
+        assert_f32_eq(root_rect.height, 200.0);
+    }
+
+    /// Acceptance criterion: the builder produces the same `AtlasNodeId`s
+    /// as the equivalent imperative sequence.
+    ///
+    /// Each sequence runs on its own *fresh* atlas. We compare only the
+    /// Taffy-level `node_id` (not the full `AtlasNodeId`): `atlas_id` is
+    /// instance-specific by design, so two different atlases can never
+    /// produce an equal `AtlasNodeId`, regardless of how their trees were
+    /// built. A fresh Taffy tree's internal slot allocation depends only
+    /// on insertion order — there are no removals involved here to make
+    /// slot reuse a confounding factor — so identical `node_id`s on two
+    /// fresh atlases is exactly the signal that `build` issues
+    /// `add_leaf`/`add_container` calls in the same order the imperative
+    /// version does.
+    #[test]
+    fn build_produces_same_ids_as_imperative_sequence() {
+        use LayoutAtlasBuilder as B;
+
+        // Imperative sequence: children before parents, leaf before the
+        // sibling container, matching the builder's depth-first order.
+        let mut imperative = LayoutAtlas::new();
+        let leaf_a = imperative.add_leaf(LeafSize::new(50.0, 50.0)).unwrap();
+        let leaf_b = imperative.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
+        let inner = imperative
+            .add_container(ContainerStyle::default(), &[leaf_b])
+            .unwrap();
+        let root_imperative = imperative
+            .add_container(
+                ContainerStyle::new(Some(300.0), Some(200.0)),
+                &[leaf_a, inner],
+            )
+            .unwrap();
+
+        // Equivalent builder sequence, on a separate fresh atlas.
+        let mut built = LayoutAtlas::new();
+        let root_builder = built
+            .build(B::container(
+                ContainerStyle::new(Some(300.0), Some(200.0)),
+                [
+                    B::leaf(LeafSize::new(50.0, 50.0)),
+                    B::container(
+                        ContainerStyle::default(),
+                        [B::leaf(LeafSize::new(20.0, 20.0))],
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(root_builder.node_id, root_imperative.node_id);
+    }
+
+    /// Acceptance criterion (paraphrased): the low-level API from PR #14
+    /// is unchanged — `add_leaf`/`add_container`/`set_root` still work
+    /// exactly as before, with no signature or behavior change introduced
+    /// by adding the builder.
+    #[test]
+    fn low_level_api_unchanged_alongside_builder() {
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        let root = atlas
+            .add_container(ContainerStyle::default(), &[leaf])
+            .unwrap();
+        atlas.set_root(root).unwrap();
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let rect = atlas.resolved_rect(leaf).unwrap().unwrap();
+        assert_f32_eq(rect.width, 10.0);
+        assert_f32_eq(rect.height, 10.0);
+    }
+
+    /// `build` rejects nodes the same way `add_leaf`/`add_container` do
+    /// once the atlas has moved to `Computed` — the panic contract is
+    /// inherited, not bypassed by going through the builder.
+    #[test]
+    #[should_panic(expected = "called while in Computed state")]
+    fn build_after_compute_panics() {
+        use LayoutAtlasBuilder as B;
+
+        let mut atlas = LayoutAtlas::new();
+        let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+        atlas.set_root(leaf).unwrap();
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let _ = atlas.build(B::leaf(LeafSize::new(5.0, 5.0)));
+    }
+
+    /// A single `build_root` call replaces the imperative
+    /// add-then-set_root pair and leaves the atlas ready to compute.
+    #[test]
+    fn build_root_sets_root_and_allows_compute() {
+        use LayoutAtlasBuilder as B;
+
+        let mut atlas = LayoutAtlas::new();
+        let root = atlas
+            .build_root(B::leaf(LeafSize::new(42.0, 24.0)))
+            .unwrap();
+
+        assert_eq!(atlas.root(), Some(root));
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        let rect = atlas.resolved_rect(root).unwrap().unwrap();
+        assert_f32_eq(rect.width, 42.0);
+        assert_f32_eq(rect.height, 24.0);
+    }
+
+    /// Deeply-nested trees (beyond the 3-level acceptance criterion) build
+    /// correctly — verifies the recursive `build` walk doesn't have a
+    /// depth assumption baked in.
+    #[test]
+    fn builder_handles_deeply_nested_tree() {
+        use LayoutAtlasBuilder as B;
+
+        let mut atlas = LayoutAtlas::new();
+
+        // 5 levels of single-child containers, terminating in a leaf.
+        let spec = B::container(
+            ContainerStyle::default(),
+            [B::container(
+                ContainerStyle::default(),
+                [B::container(
+                    ContainerStyle::default(),
+                    [B::container(
+                        ContainerStyle::default(),
+                        [B::leaf(LeafSize::new(15.0, 15.0))],
+                    )],
+                )],
+            )],
+        );
+
+        let root = atlas.build_root(spec).unwrap();
+        atlas.compute(Viewport::new(100.0, 100.0)).unwrap();
+
+        // 4 containers + 1 leaf.
+        assert_eq!(atlas.node_count(), 5);
+        let root_rect = atlas.resolved_rect(root).unwrap().unwrap();
+        assert_f32_eq(root_rect.width, 15.0);
+        assert_f32_eq(root_rect.height, 15.0);
     }
 }
