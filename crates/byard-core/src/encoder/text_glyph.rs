@@ -9,21 +9,33 @@
 //!   the same `wgpu::RenderPass` already started by the `SolidBox` draw. On
 //!   Apple Silicon (TBDR architecture) every render pass break flushes the
 //!   tile buffer to VRAM; sharing the pass with `SolidBox` eliminates that cost.
-//! - **Dirty detection via `FxHasher`** — each [`TextLine`] carries a
-//!   content hash computed from `(text, font_size, color)`. [`CachedLine`]
-//!   stores the hash of the last-uploaded version; glyphon layout is skipped
-//!   when the hash matches, so unchanged text costs only a hash comparison.
+//! - **Upstream dirty flag, trusted in release** — each [`TextLine`] carries
+//!   a `dirty` bit set by the Evaluator → Atlas → `RenderFrame` pipeline
+//!   (see `frame.rs` and `atlas::layout::LayoutAtlas::populate_frame`).
+//!   `--release` builds re-shape a line's glyph buffer if and only if that
+//!   bit (or `viewport_dirty`) is set — zero hashing, zero extra CPU cost
+//!   for static text. Debug builds additionally compute an `FxHasher`
+//!   content hash as a secondary safety net and panic if it disagrees with
+//!   the upstream flag, catching dependency-tracking bugs in the bylang
+//!   transpiler before they reach production. See [`needs_reshape`] and
+//!   [`assert_dirty_flag_consistency`].
 //! - **Three-pass borrow pattern** — `prepare` splits work across three
 //!   sequential passes to satisfy Rust's field-split borrowing rules (see the
 //!   method documentation for a precise explanation).
 //! - **No panics** — every fallible operation returns [`ByardError`].
 
+// Both imports below feed only `content_hash`, the debug-only secondary
+// safety net described in the module documentation — absent in `--release`,
+// where the upstream dirty flag is trusted exclusively and no hash is ever
+// computed.
+#[cfg(debug_assertions)]
 use std::hash::Hasher as _;
 
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, SwashCache, TextArea,
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+#[cfg(debug_assertions)]
 use rustc_hash::FxHasher;
 use wgpu::MultisampleState;
 
@@ -49,6 +61,13 @@ pub struct TextLine {
     pub font_size: f32,
     /// Text colour: `[r, g, b, a]` in linear space, each component 0–1.
     pub color: [f32; 4],
+    /// Whether this line's content changed since the last tick.
+    ///
+    /// Set upstream by the Evaluator → Atlas → `RenderFrame` pipeline (see
+    /// [`RenderFrame::dirty`](crate::frame::RenderFrame::dirty)) — never
+    /// derived locally by this pipeline. `prepare` trusts this bit
+    /// completely in `--release` builds; see the module documentation.
+    pub dirty: bool,
 }
 
 // ── Internal cache entry ──────────────────────────────────────────────────────
@@ -56,14 +75,22 @@ pub struct TextLine {
 /// Cached GPU-side state for a single [`TextLine`].
 ///
 /// Lives entirely inside [`TextGlyphPipeline`]; never exposed outside this
-/// module. `buffer` is the shaped glyph run; `content_hash` lets `prepare`
-/// skip re-shaping when the visible content has not changed.
+/// module. `buffer` is the shaped glyph run, kept across frames so unchanged
+/// lines cost nothing beyond the `needs_reshape` check. `content_hash`
+/// (debug builds only) is a secondary safety net — see its own doc comment.
 struct CachedLine {
     buffer: Buffer,
     /// `FxHasher` digest of `(text, font_size as bits, color as bits)`.
     ///
-    /// Re-computed each frame from the incoming [`TextLine`]. When it matches
-    /// the stored value we skip `buffer.set_text` + `buffer.shape_until_scroll`.
+    /// **Debug-only secondary safety net.** `prepare` never uses this to
+    /// *decide* whether to re-shape — [`needs_reshape`] is the sole
+    /// decision point in both build profiles, and it only consults the
+    /// upstream `dirty` bit. This hash exists purely so
+    /// [`assert_dirty_flag_consistency`] can catch a transpiler bug where
+    /// content changed but the dirty bit was not set. Absent in
+    /// `--release` — there, the upstream flag is fully trusted and no hash
+    /// is ever computed, for zero extra CPU cost on static text.
+    #[cfg(debug_assertions)]
     content_hash: u64,
 }
 
@@ -72,6 +99,10 @@ struct CachedLine {
 /// Uses [`FxHasher`] (≈3× faster than `SipHash` for small keys) over the
 /// fields that affect the GPU glyph run. Position (`x`, `y`) is excluded —
 /// a translation never invalidates shaped glyphs.
+///
+/// **Debug-only.** This function does not exist in `--release` builds —
+/// see the module documentation for the trust-the-upstream-flag rationale.
+#[cfg(debug_assertions)]
 fn content_hash(text: &str, font_size: f32, color: [f32; 4]) -> u64 {
     let mut h = FxHasher::default();
     h.write(text.as_bytes());
@@ -80,6 +111,39 @@ fn content_hash(text: &str, font_size: f32, color: [f32; 4]) -> u64 {
         h.write_u32(c.to_bits());
     }
     h.finish()
+}
+
+/// Decides whether a text line's glyph buffer needs to be re-shaped this
+/// frame.
+///
+/// This is the **only** decision point `prepare` consults to skip
+/// re-shaping, in both build profiles. It never looks at a content hash —
+/// only the caller-supplied dirty bits — so encoder pipelines never
+/// re-derive "did this change" the way the old `content_hash`-only check
+/// did. Pulled out as a free, pure function so it is unit-testable without
+/// any glyphon or wgpu state.
+fn needs_reshape(viewport_dirty: bool, line_dirty: bool) -> bool {
+    viewport_dirty || line_dirty
+}
+
+/// Debug-only safety net: panics if a line's content actually changed
+/// (`hash_changed`) but the upstream dirty flag (`line_dirty`) was not set.
+///
+/// `prepare`'s reshape decision ([`needs_reshape`]) never consults the
+/// hash — only `line_dirty`. So if this fires, the line would have been
+/// silently left stale on screen, and critically, the same staleness would
+/// occur in `--release` too, where this check does not exist at all. This
+/// is the deliberate trade: paying a hash comparison in debug builds to
+/// catch a transpiler dependency-tracking bug before it ships, in exchange
+/// for zero hashing cost in release.
+///
+/// Absent in `--release` builds.
+#[cfg(debug_assertions)]
+fn assert_dirty_flag_consistency(hash_changed: bool, line_dirty: bool) {
+    assert!(
+        !hash_changed || line_dirty,
+        "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the bylang transpiler dependency tracking."
+    );
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -189,20 +253,38 @@ impl TextGlyphPipeline {
         // Each CachedLine is grown lazily (push when missing) rather than
         // resize_with so the closure does not need to capture &mut font_system
         // at the same time as &mut cache — which would be a double borrow.
+        let preexisting_len = self.cache.len();
         while self.cache.len() < text_lines.len() {
             let metrics = Metrics::new(12.0, 14.0); // placeholder; overwritten below
             let buffer = Buffer::new(&mut self.font_system, metrics);
             self.cache.push(CachedLine {
                 buffer,
+                #[cfg(debug_assertions)]
                 content_hash: 0,
             });
         }
 
         for (i, line) in text_lines.iter().enumerate() {
-            let hash = content_hash(&line.text, line.font_size, line.color);
+            // A line beyond the cache's previous length has no shaped
+            // buffer yet — it must always be shaped on its first
+            // appearance, regardless of `line.dirty` or the debug-only
+            // hash. (`line.dirty` reflects whether the *value* changed
+            // since last tick, not whether this line existed before;
+            // requiring callers to set it for brand-new lines would be an
+            // easy-to-miss footgun, so we detect "new" structurally here.)
+            let is_new = i >= preexisting_len;
             let entry = &mut self.cache[i];
 
-            if !viewport_dirty && entry.content_hash == hash {
+            #[cfg(debug_assertions)]
+            {
+                let hash = content_hash(&line.text, line.font_size, line.color);
+                if !is_new {
+                    assert_dirty_flag_consistency(hash != entry.content_hash, line.dirty);
+                }
+                entry.content_hash = hash;
+            }
+
+            if !is_new && !needs_reshape(viewport_dirty, line.dirty) {
                 continue; // unchanged — skip re-shaping
             }
 
@@ -226,7 +308,6 @@ impl TextGlyphPipeline {
             entry
                 .buffer
                 .shape_until_scroll(&mut self.font_system, false);
-            entry.content_hash = hash;
         }
 
         // ── Pass 2: collect immutable TextArea refs ───────────────────────────
@@ -304,5 +385,109 @@ impl TextGlyphPipeline {
         self.renderer
             .render(&self.atlas, &self.viewport, render_pass)
             .map_err(|e| ByardError::TextRender(e.to_string()))
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// `needs_reshape` and `assert_dirty_flag_consistency` are extracted as pure,
+// glyphon/wgpu-free functions specifically so the dirty-flag decision logic
+// from issue #23's acceptance criteria ("encoder pipelines never recompute
+// did-this-change") can be exercised deterministically here, without a real
+// `wgpu::Device` — the same CPU-mirror-of-decision-logic style already used
+// by `encoder::mod`'s `cpu_sd_rounded_box` tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── needs_reshape: all four (viewport_dirty, line_dirty) combinations ──
+
+    #[test]
+    fn needs_reshape_false_when_nothing_is_dirty() {
+        assert!(!needs_reshape(false, false));
+    }
+
+    #[test]
+    fn needs_reshape_true_when_only_viewport_is_dirty() {
+        assert!(needs_reshape(true, false));
+    }
+
+    #[test]
+    fn needs_reshape_true_when_only_line_is_dirty() {
+        assert!(needs_reshape(false, true));
+    }
+
+    #[test]
+    fn needs_reshape_true_when_both_are_dirty() {
+        assert!(needs_reshape(true, true));
+    }
+
+    // ── assert_dirty_flag_consistency: the debug-only safety net ───────────
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn consistency_check_passes_when_hash_unchanged_and_not_dirty() {
+        assert_dirty_flag_consistency(false, false);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn consistency_check_passes_when_hash_unchanged_but_dirty_anyway() {
+        // Over-marking dirty is wasteful, never unsound — must not panic.
+        assert_dirty_flag_consistency(false, true);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn consistency_check_passes_when_hash_changed_and_dirty_was_set() {
+        assert_dirty_flag_consistency(true, true);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the bylang transpiler dependency tracking."
+    )]
+    fn consistency_check_panics_when_hash_changed_but_dirty_was_not_set() {
+        assert_dirty_flag_consistency(true, false);
+    }
+
+    // ── content_hash: debug-only helper feeding the safety net ─────────────
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn content_hash_is_stable_for_identical_input() {
+        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        let b = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn content_hash_changes_with_text() {
+        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        let b = content_hash("world", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        assert_ne!(a, b);
+    }
+
+    // ── TextLine: dirty field is a plain, independent bit ──────────────────
+
+    #[test]
+    fn text_line_dirty_field_round_trips() {
+        let dirty_line = TextLine {
+            x: 0.0,
+            y: 0.0,
+            text: "hi".to_string(),
+            font_size: 12.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            dirty: true,
+        };
+        assert!(dirty_line.dirty);
+
+        let clean_line = TextLine {
+            dirty: false,
+            ..dirty_line
+        };
+        assert!(!clean_line.dirty);
     }
 }
