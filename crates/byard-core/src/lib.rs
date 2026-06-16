@@ -25,11 +25,13 @@ pub mod encoder;
 pub mod engine;
 pub mod evaluator;
 pub mod frame;
+pub mod platform;
 pub mod relay;
 
 pub use encoder::BoxInstance;
 pub use encoder::text_glyph::TextLine;
 pub use engine::Engine;
+pub use platform::{PlatformHost, WindowSize};
 
 use std::fmt;
 
@@ -82,6 +84,17 @@ pub enum ByardError {
     /// The inner string is the original [`std::io::Error`] message produced
     /// by [`tokio::runtime::Builder::build`].
     RuntimeCreation(String),
+
+    /// A [`platform::PlatformHost`] implementation failed to create its
+    /// window, `wgpu` surface, or event loop.
+    ///
+    /// The inner string is the original platform-specific error message
+    /// (e.g. from `winit::event_loop::EventLoop::new` or
+    /// `wgpu::Instance::create_surface`). `byard-core` never constructs this
+    /// variant itself — it exists so host crates (e.g. `byard-platform`)
+    /// have a `ByardError` to return from [`platform::PlatformHost::on_resume`]
+    /// without inventing their own error type.
+    Platform(String),
 }
 
 impl fmt::Display for ByardError {
@@ -97,6 +110,7 @@ impl fmt::Display for ByardError {
             Self::TextRender(msg) => write!(f, "text render error: {msg}"),
             Self::ThreadSpawn(msg) => write!(f, "failed to spawn thread: {msg}"),
             Self::RuntimeCreation(msg) => write!(f, "failed to create async runtime: {msg}"),
+            Self::Platform(msg) => write!(f, "platform host error: {msg}"),
         }
     }
 }
