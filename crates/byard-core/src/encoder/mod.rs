@@ -32,29 +32,13 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::ByardError;
-use crate::frame::{Rect, Viewport};
+use crate::frame::{Rect, RenderFrame, Viewport};
 use text_glyph::{TextGlyphPipeline, TextLine};
 
-/// GPU-ready instance data for a single solid rectangle.
-///
-/// Each field maps directly to a WGSL `@location` in `solid_box.wgsl`.
-/// The layout is `#[repr(C)]` and implements `bytemuck::Pod` so the slice
-/// can be cast to `&[u8]` and uploaded to the instance buffer with zero copy.
-///
-/// Field order matches the `@location` indices in the vertex shader:
-/// - `@location(1)` — `rect`
-/// - `@location(2)` — `color`
-/// - `@location(3)` — `radii`
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct BoxInstance {
-    /// Rectangle in logical pixels: `[x, y, width, height]`.
-    pub rect: [f32; 4],
-    /// Linear-space fill colour: `[r, g, b, a]`.
-    pub color: [f32; 4],
-    /// Per-corner border radii: `[top_left, top_right, bottom_right, bottom_left]`.
-    pub radii: [f32; 4],
-}
+/// Re-exported from [`crate::frame`] — the canonical definition now lives
+/// there so the Logic thread can populate [`RenderFrame::instances`] without
+/// importing from the Encoder subsystem (RFC-0001 §9).
+pub use crate::frame::BoxInstance;
 
 impl BoxInstance {
     /// Returns the `wgpu` vertex buffer layout for the instance buffer.
@@ -203,6 +187,16 @@ pub struct EncoderSubsystem {
     /// leaving stale ink permanently outside the scissor rect (and
     /// therefore never cleared). See [`dirty_text_bounds`].
     last_text_bounds: Vec<Rect>,
+    /// The [`RenderFrame::version`] value from the last frame rendered via
+    /// [`encode_frame_from_relay`](Self::encode_frame_from_relay).
+    ///
+    /// When the relay advances beyond this version (meaning at least one
+    /// frame was published that the render thread did not process), the
+    /// encoder forces a full redraw and text reshape to ensure no content
+    /// changes are silently skipped — even if the current frame's
+    /// `TextLine::dirty` bits are all `false` because they were cleared
+    /// before the render thread read the frame.
+    last_relay_version: u64,
 }
 
 impl EncoderSubsystem {
@@ -344,6 +338,7 @@ impl EncoderSubsystem {
             last_instance_count: 0,
             last_text_count: 0,
             last_text_bounds: Vec::new(),
+            last_relay_version: 0,
         })
     }
 
@@ -548,6 +543,54 @@ impl EncoderSubsystem {
         update_frame_bookkeeping(self, instances, texts);
 
         Ok(encoder.finish())
+    }
+
+    /// Encodes a frame from a [`RenderFrame`] published by the Relay, with
+    /// version-based forced-redraw semantics (RFC-0001 §5.2).
+    ///
+    /// When `frame.version()` exceeds
+    /// [`last_relay_version`](Self::last_relay_version), the render thread
+    /// skipped at least one frame that had `TextLine::dirty = true`. To
+    /// prevent silently displaying stale glyphs this forces a full redraw and
+    /// marks all texts dirty before passing them to
+    /// [`encode_frame`](Self::encode_frame). Setting `dirty = true` on every
+    /// line guarantees glyph reshape for all lines and also satisfies the
+    /// debug-mode assertion that content-changed lines must carry a set dirty
+    /// bit — the assertion's invariant holds in the normal evaluator pipeline
+    /// but is intentionally bypassed here because the render thread may have
+    /// missed the original dirty=true frame.
+    ///
+    /// # Errors
+    ///
+    /// Same error variants as [`encode_frame`](Self::encode_frame).
+    pub fn encode_frame_from_relay(
+        &mut self,
+        target: &wgpu::Texture,
+        frame: &RenderFrame,
+    ) -> Result<wgpu::CommandBuffer, ByardError> {
+        if frame.version() > self.last_relay_version {
+            self.needs_full_redraw = true;
+            // Rebuild the text list with every dirty bit set. This ensures
+            // (a) every glyph buffer is reshaped (its cached copy may reflect a
+            // stale version) and (b) the debug-only hash-change assertion in
+            // TextGlyphPipeline::prepare cannot fire on "hash changed but
+            // dirty=false" — a state that is legitimate here but would indicate
+            // a transpiler bug in the normal evaluator path.
+            let texts_dirty: Vec<TextLine> = frame
+                .texts()
+                .iter()
+                .map(|t| TextLine {
+                    dirty: true,
+                    ..t.clone()
+                })
+                .collect();
+            let cmd = self.encode_frame(target, frame.instances(), &texts_dirty)?;
+            self.last_relay_version = frame.version();
+            return Ok(cmd);
+        }
+        let cmd = self.encode_frame(target, frame.instances(), frame.texts())?;
+        self.last_relay_version = frame.version();
+        Ok(cmd)
     }
 }
 

@@ -159,6 +159,55 @@ impl Rect {
     }
 }
 
+/// GPU-ready instance data for a single solid rectangle.
+///
+/// Shared between the logic thread (which populates [`RenderFrame::instances`])
+/// and the Encoder (which uploads the slice to the GPU instance buffer). Lives
+/// in `frame` rather than `encoder` because it crosses the subsystem boundary
+/// between the Logic thread's layout pass and the Encoder's GPU dispatch —
+/// see the RFC-0001 §9 dependency graph.
+///
+/// `#[repr(C)]` and `bytemuck` derives match the layout declared in
+/// [`BoxInstance::layout`](crate::encoder::BoxInstance::layout).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BoxInstance {
+    /// Rectangle in logical pixels: `[x, y, width, height]`.
+    pub rect: [f32; 4],
+    /// Linear-space fill colour: `[r, g, b, a]`.
+    pub color: [f32; 4],
+    /// Per-corner border radii: `[top_left, top_right, bottom_right, bottom_left]`.
+    pub radii: [f32; 4],
+}
+
+/// A single line of text to be rendered in a frame.
+///
+/// Shared between the logic thread (which populates [`RenderFrame::texts`]) and
+/// the Encoder's `TextGlyphPipeline`. Lives in `frame` rather than
+/// `encoder::text_glyph` because it crosses the subsystem boundary between the
+/// Evaluator/Atlas and the Encoder — see RFC-0001 §9.
+///
+/// All coordinates are in **logical pixels**, consistent with [`BoxInstance`].
+#[derive(Debug, Clone)]
+pub struct TextLine {
+    /// X position of the text baseline in logical pixels.
+    pub x: f32,
+    /// Y position of the text baseline in logical pixels.
+    pub y: f32,
+    /// Text content.
+    pub text: String,
+    /// Font size in logical pixels.
+    pub font_size: f32,
+    /// Text colour: `[r, g, b, a]` in linear space, each component 0–1.
+    pub color: [f32; 4],
+    /// Whether this line's content changed since the last tick.
+    ///
+    /// Set upstream by the Evaluator → Atlas → `RenderFrame` pipeline — never
+    /// derived locally by the Encoder. The Encoder trusts this bit completely
+    /// in `--release` builds; see `encoder::text_glyph`'s module documentation.
+    pub dirty: bool,
+}
+
 /// Logical-pixel dimensions of the surface that hosts a layout.
 ///
 /// Passed to [`LayoutAtlas::compute`](crate::atlas::LayoutAtlas::compute) as
@@ -181,36 +230,46 @@ impl Viewport {
 
 /// A snapshot of all render primitives for a single frame.
 ///
-/// Built by the Logic thread (evaluator + atlas) and read by the Render
-/// thread (encoder). The Logic thread mutates the frame during
-/// construction via crate-private APIs; once handed off to the Render
-/// thread (via the Relay's atomic pointer swap) it is treated as
-/// immutable for the duration of that frame.
+/// Built by the Logic thread (Evaluator + Atlas) and read by the Render
+/// thread (Encoder). The Logic thread mutates the frame during construction
+/// via crate-private APIs; once handed off to the Render thread (via the
+/// Relay's atomic pointer swap) it is treated as immutable for the duration
+/// of that frame.
 ///
-/// Produced by the logic thread (evaluator + atlas) and consumed by the render
-/// thread (encoder) via an atomic pointer swap managed by the relay.
+/// The structure is intentionally SoA-friendly for batched GPU dispatch: each
+/// primitive type lives in its own `Vec` so the Encoder can cast a slice
+/// directly to bytes and upload it with zero copy.
 ///
-/// Phase 1 only carries the resolved rectangles produced by the Atlas. As
-/// the Encoder grows, additional primitives (text glyph runs, decorated
-/// boxes, texture samplers) will be added as parallel `Vec`s — the
-/// structure is intentionally SoA-friendly for batched GPU dispatch.
+/// [`version`](RenderFrame::version) is a monotonic counter incremented by the
+/// Logic thread whenever any content changes. The Encoder compares it against
+/// the version it saw on the previous frame to detect missed-dirty-frame
+/// scenarios (see `EncoderSubsystem::encode_frame_from_relay`).
 #[derive(Debug, Default)]
 pub struct RenderFrame {
     /// Resolved geometry produced by the Atlas.
     ///
     /// Each entry is a rectangle in logical pixels, ready for the Encoder
-    /// to translate into a draw command. Order is determined by Atlas tree
-    /// traversal (currently pre-order over the layout tree; will become
-    /// Z-bin order in a future sub-issue).
+    /// to translate into a draw command.
     rects: Vec<Rect>,
 
     /// Per-entry dirty state, parallel to `rects`.
     ///
-    /// `dirty[i]` is `true` when `rects[i]` changed since the previous tick
-    /// (as determined by the Evaluator's `Signal` dirty-target collection).
-    /// Encoder pipelines read this instead of re-deriving "did this change"
-    /// themselves — see `TextGlyphPipeline::prepare`.
+    /// `dirty[i]` is `true` when `rects[i]` changed since the previous tick.
     dirty: Vec<bool>,
+
+    /// Solid-rectangle instances populated by the Logic thread each tick.
+    instances: Vec<BoxInstance>,
+
+    /// Text lines populated by the Logic thread each tick.
+    texts: Vec<TextLine>,
+
+    /// Monotonic version counter, incremented by the Logic thread whenever any
+    /// content in this frame changes relative to the previous tick.
+    ///
+    /// The Encoder compares this against the last version it rendered. A version
+    /// advance means the render thread skipped at least one dirty frame and must
+    /// force a full redraw + text reshape to avoid displaying stale glyphs.
+    version: u64,
 }
 
 impl RenderFrame {
@@ -220,22 +279,39 @@ impl RenderFrame {
         Self::default()
     }
 
-    /// Clears the frame, retaining internal capacity.
+    /// Clears the frame, retaining internal buffer capacity.
     ///
-    /// After the first frame, subsequent populations pay zero allocation
-    /// cost as long as primitive counts stay within the high-water mark.
+    /// After the first frame, subsequent populations pay zero allocation cost
+    /// as long as primitive counts stay within the high-water mark. Version is
+    /// reset to zero; the Logic thread always calls [`set_version`](Self::set_version)
+    /// immediately after acquiring a recycled frame.
     pub fn clear(&mut self) {
         self.rects.clear();
         self.dirty.clear();
+        self.instances.clear();
+        self.texts.clear();
+        self.version = 0;
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
-    ///
-    /// Called by the Atlas during `populate_frame`. Not part of the public
-    /// engine API — external code reads frames, it does not build them.
     pub(crate) fn push_rect(&mut self, rect: Rect, dirty: bool) {
         self.rects.push(rect);
         self.dirty.push(dirty);
+    }
+
+    /// Appends a [`BoxInstance`] to the frame.
+    pub(crate) fn push_instance(&mut self, instance: BoxInstance) {
+        self.instances.push(instance);
+    }
+
+    /// Appends a [`TextLine`] to the frame.
+    pub(crate) fn push_text(&mut self, text: TextLine) {
+        self.texts.push(text);
+    }
+
+    /// Sets the frame's version counter.
+    pub(crate) fn set_version(&mut self, version: u64) {
+        self.version = version;
     }
 
     /// Returns the resolved rectangles in this frame.
@@ -244,11 +320,28 @@ impl RenderFrame {
         &self.rects
     }
 
-    /// Returns the per-entry dirty state in this frame, parallel to
-    /// [`RenderFrame::rects`].
+    /// Returns the per-entry dirty state, parallel to [`rects`](Self::rects).
     #[must_use]
     pub fn dirty(&self) -> &[bool] {
         &self.dirty
+    }
+
+    /// Returns the solid-rectangle instances in this frame.
+    #[must_use]
+    pub fn instances(&self) -> &[BoxInstance] {
+        &self.instances
+    }
+
+    /// Returns the text lines in this frame.
+    #[must_use]
+    pub fn texts(&self) -> &[TextLine] {
+        &self.texts
+    }
+
+    /// Returns the monotonic version counter for this frame.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 }
 
