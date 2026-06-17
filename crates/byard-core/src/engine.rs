@@ -90,7 +90,12 @@ pub struct Engine {
 /// after `arena` is gone.
 struct ReactiveLabel {
     // Boxed so the heap address backing `signal`'s slot never moves, even
-    // if `ReactiveLabel` (or the `Engine` that owns it) is moved.
+    // if `ReactiveLabel` (or the `Engine` that owns it) is moved. Never
+    // read directly — its only job is to keep that heap allocation (and
+    // therefore `signal`'s backing slot) alive for as long as `ReactiveLabel`
+    // exists; the value is reached exclusively through `signal`'s erased
+    // `'static` handle, not through this field.
+    #[allow(dead_code, reason = "kept alive only to back `signal`'s slot")]
     arena: Box<ViewArena>,
     signal: Signal<'static, String>,
     tick: EvaluatorTick<'static>,
@@ -105,11 +110,13 @@ struct ReactiveLabel {
 impl ReactiveLabel {
     fn new(text: impl Into<String>, x: f32, y: f32, font_size: f32, color: [f32; 4]) -> Self {
         let arena = Box::new(ViewArena::new());
-        // SAFETY: see the struct doc above — `arena` is boxed (stable heap
-        // address) and dropped together with `signal` when `ReactiveLabel`
-        // (and the `Engine` that owns it) is dropped.
-        let signal: Signal<'static, String> =
-            unsafe { Signal::new_in(&arena, text.into()).erase_lifetime() };
+        // `arena` is boxed (stable heap address) and dropped together with
+        // `signal` when `ReactiveLabel` (and the `Engine` that owns it) is
+        // dropped — see the struct doc above. `Signal::new_in_boxed` is the
+        // safe wrapper around the `unsafe` lifetime erasure that pattern
+        // requires; the `unsafe` block itself stays inside `signal.rs`,
+        // the evaluator subsystem file that owns this invariant.
+        let signal: Signal<'static, String> = Signal::new_in_boxed(&arena, text.into());
 
         // A single trivial (zero-sized) leaf is enough to give the label a
         // real AtlasNode TargetId to subscribe to and mark dirty — Phase 1
@@ -413,4 +420,438 @@ impl Engine {
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn logical_viewport(phys_w: u32, phys_h: u32, scale: f64) -> Viewport {
     Viewport::new(phys_w as f32 / scale as f32, phys_h as f32 / scale as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserts two `f32` values are equal within a small tolerance.
+    ///
+    /// `assert_eq!` on `f32` triggers `clippy::float_cmp`; every value
+    /// checked here is either passed straight through `ReactiveLabel`
+    /// untouched or produced by a simple division, so an exact bit-pattern
+    /// match would normally hold, but this tolerance keeps the intent
+    /// (approximate equality) honest rather than relying on that
+    /// incidental exactness. Mirrors `atlas::layout::tests::assert_f32_eq`.
+    #[track_caller]
+    fn assert_f32_eq(actual: f32, expected: f32) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff < 0.001,
+            "expected {expected}, got {actual} (diff = {diff})",
+        );
+    }
+
+    /// Asserts two `[f32; 4]` colors are equal within [`assert_f32_eq`]'s
+    /// tolerance, component by component.
+    ///
+    /// `assert_eq!` on a float array triggers `clippy::float_cmp` just like
+    /// it does on a bare `f32` (the lint looks through array equality), so
+    /// every color comparison in this module goes through here instead.
+    #[track_caller]
+    fn assert_color_eq(actual: [f32; 4], expected: [f32; 4]) {
+        for i in 0..4 {
+            assert_f32_eq(actual[i], expected[i]);
+        }
+    }
+
+    /// Builds a `ReactiveLabel` with a fixed, distinctive position/size/color
+    /// so tests that only care about text/dirty behaviour don't repeat the
+    /// same four literals everywhere.
+    fn label_with_text(text: &str) -> ReactiveLabel {
+        ReactiveLabel::new(text, 10.0, 20.0, 16.0, [1.0, 0.5, 0.25, 0.75])
+    }
+
+    // ── construction: text content ─────────────────────────────────────
+
+    #[test]
+    fn new_stores_initial_text() {
+        let mut label = label_with_text("hello");
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text, "hello");
+    }
+
+    #[test]
+    fn new_with_empty_string_text() {
+        let mut label = label_with_text("");
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text, "");
+    }
+
+    #[test]
+    fn new_with_unicode_text() {
+        let mut label = label_with_text("Byard — 🦀 ñ");
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text, "Byard — 🦀 ñ");
+    }
+
+    #[test]
+    fn new_with_long_text() {
+        let long = "x".repeat(10_000);
+        let mut label = label_with_text(&long);
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text.len(), 10_000);
+    }
+
+    #[test]
+    fn new_accepts_owned_string() {
+        let owned: String = String::from("owned");
+        let mut label = ReactiveLabel::new(owned, 0.0, 0.0, 12.0, [0.0, 0.0, 0.0, 1.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text, "owned");
+    }
+
+    #[test]
+    fn new_accepts_str_slice() {
+        let mut label = ReactiveLabel::new("slice", 0.0, 0.0, 12.0, [0.0, 0.0, 0.0, 1.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_eq!(line.text, "slice");
+    }
+
+    // ── construction: position, size, color pass-through ────────────────
+
+    #[test]
+    fn new_stores_x_position() {
+        let mut label = label_with_text("t");
+        let line = label.text_line().expect("first tick never fails");
+        assert_f32_eq(line.x, 10.0);
+    }
+
+    #[test]
+    fn new_stores_y_position() {
+        let mut label = label_with_text("t");
+        let line = label.text_line().expect("first tick never fails");
+        assert_f32_eq(line.y, 20.0);
+    }
+
+    #[test]
+    fn new_stores_font_size() {
+        let mut label = label_with_text("t");
+        let line = label.text_line().expect("first tick never fails");
+        assert_f32_eq(line.font_size, 16.0);
+    }
+
+    #[test]
+    fn new_stores_color() {
+        let mut label = label_with_text("t");
+        let line = label.text_line().expect("first tick never fails");
+        assert_color_eq(line.color, [1.0, 0.5, 0.25, 0.75]);
+    }
+
+    #[test]
+    fn new_with_zero_font_size() {
+        let mut label = ReactiveLabel::new("t", 0.0, 0.0, 0.0, [0.0, 0.0, 0.0, 1.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_f32_eq(line.font_size, 0.0);
+    }
+
+    #[test]
+    fn new_with_negative_position() {
+        let mut label = ReactiveLabel::new("t", -50.0, -75.0, 12.0, [0.0, 0.0, 0.0, 1.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_f32_eq(line.x, -50.0);
+        assert_f32_eq(line.y, -75.0);
+    }
+
+    #[test]
+    fn new_with_alpha_zero_color() {
+        let mut label = ReactiveLabel::new("t", 0.0, 0.0, 12.0, [1.0, 1.0, 1.0, 0.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_color_eq(line.color, [1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn new_with_all_color_components_at_max() {
+        let mut label = ReactiveLabel::new("t", 0.0, 0.0, 12.0, [1.0, 1.0, 1.0, 1.0]);
+        let line = label.text_line().expect("first tick never fails");
+        assert_color_eq(line.color, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    // ── dirty-flag lifecycle ──────────────────────────────────────────
+
+    #[test]
+    fn first_text_line_is_not_dirty() {
+        let mut label = label_with_text("t");
+        let line = label.text_line().expect("first tick never fails");
+        assert!(
+            !line.dirty,
+            "a label that was never written to has nothing to mark dirty"
+        );
+    }
+
+    #[test]
+    fn first_text_line_returns_ok() {
+        let mut label = label_with_text("t");
+        assert!(label.text_line().is_ok());
+    }
+
+    #[test]
+    fn set_text_marks_next_tick_dirty() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert!(line.dirty);
+    }
+
+    #[test]
+    fn set_text_updates_text_content() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_eq!(line.text, "after");
+    }
+
+    #[test]
+    fn set_text_does_not_change_x() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_f32_eq(line.x, 10.0);
+    }
+
+    #[test]
+    fn set_text_does_not_change_y() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_f32_eq(line.y, 20.0);
+    }
+
+    #[test]
+    fn set_text_does_not_change_font_size() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_f32_eq(line.font_size, 16.0);
+    }
+
+    #[test]
+    fn set_text_does_not_change_color() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_color_eq(line.color, [1.0, 0.5, 0.25, 0.75]);
+    }
+
+    #[test]
+    fn second_tick_after_dirty_tick_is_clean() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let first = label.text_line().expect("tick after a write never fails");
+        assert!(first.dirty);
+
+        let second = label.text_line().expect("tick with no writes never fails");
+        assert!(
+            !second.dirty,
+            "no write happened between the two ticks, so the second must be clean"
+        );
+    }
+
+    #[test]
+    fn second_tick_after_dirty_tick_keeps_the_same_text() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let _ = label.text_line().expect("tick after a write never fails");
+        let second = label.text_line().expect("tick with no writes never fails");
+        assert_eq!(second.text, "after");
+    }
+
+    #[test]
+    fn multiple_writes_between_ticks_yield_a_single_dirty_tick() {
+        let mut label = label_with_text("v0");
+        label.set_text("v1");
+        label.set_text("v2");
+        label.set_text("v3");
+
+        let line = label
+            .text_line()
+            .expect("tick after several writes never fails");
+        assert!(line.dirty);
+
+        let next = label.text_line().expect("tick with no writes never fails");
+        assert!(
+            !next.dirty,
+            "the three writes must collapse into exactly one dirty tick"
+        );
+    }
+
+    #[test]
+    fn multiple_writes_between_ticks_yield_the_latest_text() {
+        let mut label = label_with_text("v0");
+        label.set_text("v1");
+        label.set_text("v2");
+        label.set_text("v3");
+
+        let line = label
+            .text_line()
+            .expect("tick after several writes never fails");
+        assert_eq!(line.text, "v3");
+    }
+
+    #[test]
+    fn set_text_with_same_value_still_marks_dirty() {
+        // A Signal::write always advances the version counter, even when the
+        // new value is identical to the old one — there is no value-equality
+        // short-circuit anywhere in the Evaluator. This is intentional (see
+        // RFC-0001 §2.2): cheaply comparing arbitrary `T` would not be
+        // possible in general, and skipping it keeps the pipeline simple.
+        let mut label = label_with_text("same");
+        label.set_text("same");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert!(line.dirty);
+        assert_eq!(line.text, "same");
+    }
+
+    #[test]
+    fn set_text_accepts_owned_string() {
+        let mut label = label_with_text("before");
+        let owned: String = String::from("after");
+        label.set_text(owned);
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_eq!(line.text, "after");
+    }
+
+    #[test]
+    fn set_text_accepts_str_slice() {
+        let mut label = label_with_text("before");
+        label.set_text("after");
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_eq!(line.text, "after");
+    }
+
+    #[test]
+    fn set_text_accepts_formatted_string() {
+        let mut label = label_with_text("before");
+        label.set_text(format!("clicked {} time(s)", 3));
+        let line = label.text_line().expect("tick after a write never fails");
+        assert_eq!(line.text, "clicked 3 time(s)");
+    }
+
+    #[test]
+    fn sequential_set_text_calls_apply_in_order() {
+        let mut label = label_with_text("start");
+        for n in 1..=5 {
+            label.set_text(format!("step {n}"));
+            let line = label.text_line().expect("each tick never fails");
+            assert_eq!(line.text, format!("step {n}"));
+            assert!(line.dirty, "each step wrote, so each tick must be dirty");
+        }
+    }
+
+    #[test]
+    fn alternating_write_and_tick_toggles_dirty_each_time() {
+        let mut label = label_with_text("v0");
+        for n in 1..=4 {
+            label.set_text(format!("v{n}"));
+            let dirty_line = label.text_line().expect("tick after a write never fails");
+            assert!(
+                dirty_line.dirty,
+                "iteration {n}: expected dirty after write"
+            );
+
+            let clean_line = label.text_line().expect("tick with no writes never fails");
+            assert!(
+                !clean_line.dirty,
+                "iteration {n}: expected clean with no intervening write"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_ticks_with_no_writes_stay_clean() {
+        let mut label = label_with_text("static");
+        // Consume the initial (clean) state, then tick several more times
+        // with no writes in between — every one must stay clean.
+        for _ in 0..10 {
+            let line = label.text_line().expect("tick with no writes never fails");
+            assert!(!line.dirty);
+            assert_eq!(line.text, "static");
+        }
+    }
+
+    #[test]
+    fn text_line_can_be_called_many_times_consecutively() {
+        let mut label = label_with_text("t");
+        for _ in 0..100 {
+            assert!(label.text_line().is_ok());
+        }
+    }
+
+    // ── independence between separate labels ─────────────────────────
+
+    #[test]
+    fn two_labels_have_independent_text() {
+        let mut a = label_with_text("a-text");
+        let mut b = label_with_text("b-text");
+        assert_eq!(a.text_line().unwrap().text, "a-text");
+        assert_eq!(b.text_line().unwrap().text, "b-text");
+    }
+
+    #[test]
+    fn two_labels_have_independent_dirty_state() {
+        let mut a = label_with_text("a");
+        let mut b = label_with_text("b");
+
+        a.set_text("a2");
+        let a_line = a.text_line().expect("tick after a write never fails");
+        let b_line = b.text_line().expect("tick with no writes never fails");
+
+        assert!(a_line.dirty, "a was written to");
+        assert!(!b_line.dirty, "b was never touched");
+    }
+
+    #[test]
+    fn set_text_on_one_label_does_not_affect_another() {
+        let mut a = label_with_text("a");
+        let mut b = label_with_text("b");
+
+        a.set_text("changed");
+        let _ = a.text_line().expect("tick after a write never fails");
+        let b_line = b.text_line().expect("tick with no writes never fails");
+
+        assert_eq!(b_line.text, "b", "writing to `a` must not leak into `b`");
+    }
+
+    // ── logical_viewport: pure conversion helper ──────────────────────
+
+    #[test]
+    fn logical_viewport_identity_at_scale_one() {
+        let viewport = logical_viewport(800, 600, 1.0);
+        assert_f32_eq(viewport.width, 800.0);
+        assert_f32_eq(viewport.height, 600.0);
+    }
+
+    #[test]
+    fn logical_viewport_halves_dimensions_at_scale_two() {
+        let viewport = logical_viewport(800, 600, 2.0);
+        assert_f32_eq(viewport.width, 400.0);
+        assert_f32_eq(viewport.height, 300.0);
+    }
+
+    #[test]
+    fn logical_viewport_scales_fractionally() {
+        // A 1.5x DPI scale (common on some Windows/Linux HiDPI setups).
+        let viewport = logical_viewport(1200, 900, 1.5);
+        assert_f32_eq(viewport.width, 800.0);
+        assert_f32_eq(viewport.height, 600.0);
+    }
+
+    #[test]
+    fn logical_viewport_zero_dimensions_stay_zero() {
+        let viewport = logical_viewport(0, 0, 2.0);
+        assert_f32_eq(viewport.width, 0.0);
+        assert_f32_eq(viewport.height, 0.0);
+    }
+
+    #[test]
+    fn logical_viewport_large_dimensions_do_not_overflow() {
+        // 8K physical resolution at 1x scale — comfortably within f32's
+        // 24-bit mantissa (RFC-0001 already accepts this precision
+        // trade-off for viewport math; see `Engine::init`'s `cast_precision_loss`
+        // allow).
+        let viewport = logical_viewport(7680, 4320, 1.0);
+        assert_f32_eq(viewport.width, 7680.0);
+        assert_f32_eq(viewport.height, 4320.0);
+    }
 }
