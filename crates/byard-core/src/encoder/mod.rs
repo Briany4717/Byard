@@ -32,7 +32,7 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::ByardError;
-use crate::frame::Viewport;
+use crate::frame::{Rect, Viewport};
 use text_glyph::{TextGlyphPipeline, TextLine};
 
 /// GPU-ready instance data for a single solid rectangle.
@@ -110,6 +110,20 @@ pub struct EncoderSubsystem {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     render_pipeline: wgpu::RenderPipeline,
+    /// No-blend variant of `SolidBox`'s pipeline, used only to paint a fully
+    /// transparent "clear quad" over a dirty rect before it is repainted.
+    ///
+    /// `render_pipeline`'s `ALPHA_BLENDING` state means
+    /// `dst_new = src.rgb * src.a + dst.rgb * (1 - src.a)` — wherever a
+    /// fragment's alpha is 0 (most of a glyph's bounding box, since
+    /// letterforms are sparse), the destination is left **unchanged**.
+    /// Combined with `LoadOp::Load` on an incremental frame, that means old
+    /// ink can never be erased by simply redrawing new content with
+    /// standard "over" blending (issue #31's visual-verification finding).
+    /// `clear_pipeline` uses `blend: None`, so the fragment shader's output
+    /// unconditionally **replaces** the destination regardless of its
+    /// alpha, making it possible to genuinely wipe a rect.
+    clear_pipeline: wgpu::RenderPipeline,
     quad_buffer: wgpu::Buffer,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
@@ -127,6 +141,68 @@ pub struct EncoderSubsystem {
     /// content has changed — necessary after a viewport resize because glyphon's
     /// `Viewport` resolution changed.
     viewport_dirty: bool,
+    /// Persistent off-screen colour target that incremental (scissored) draws
+    /// actually land on.
+    ///
+    /// RFC §3.3's scissor clipping only makes sense against a render target
+    /// with *retained* content across frames. The swapchain image returned by
+    /// `wgpu::Surface::get_current_texture` does not offer that guarantee
+    /// under multi-buffering — wgpu is free to rotate in a stale or
+    /// uninitialised image on any given frame. `persistent_color` is the
+    /// real, always-retained surface that `LoadOp::Load` + `set_scissor_rect`
+    /// draw into; the swapchain image only ever receives a full, unscissored
+    /// copy of this texture's current contents once per frame (see
+    /// `encode_frame`'s final `copy_texture_to_texture` call). See the
+    /// "Scope decision" note in the scissor-clipping PR for the full
+    /// rationale.
+    persistent_color: wgpu::Texture,
+    /// View of [`persistent_color`](Self::persistent_color), cached to avoid
+    /// recreating it every frame.
+    persistent_view: wgpu::TextureView,
+    /// Pixel format shared by `persistent_color` and the swapchain surface.
+    ///
+    /// Stored so [`update_viewport`](Self::update_viewport) can recreate
+    /// `persistent_color` at the new size on resize without requiring the
+    /// caller to pass the format again every time.
+    surface_format: wgpu::TextureFormat,
+    /// Physical-pixel width of [`persistent_color`](Self::persistent_color).
+    phys_w: u32,
+    /// Physical-pixel height of [`persistent_color`](Self::persistent_color).
+    phys_h: u32,
+    /// `true` when the next [`encode_frame`](EncoderSubsystem::encode_frame)
+    /// must draw everything, ignoring per-`TextLine` dirty bits.
+    ///
+    /// Set on construction (nothing has been drawn into `persistent_color`
+    /// yet) and whenever the surface is resized (the recreated texture's
+    /// contents are undefined). Cleared at the end of every `encode_frame`
+    /// call. This is intentionally independent of `EvaluatorTick`'s dirty
+    /// collection: a freshly registered `Signal` reports an empty dirty set
+    /// on its very first collection (nothing has mutated yet), so relying on
+    /// `TextLine::dirty` alone would mean the first frame draws nothing.
+    needs_full_redraw: bool,
+    /// Number of `BoxInstance`s passed to the previous `encode_frame` call.
+    ///
+    /// `BoxInstance`s carry no per-instance dirty bit (nothing in the current
+    /// codebase mutates a `BoxInstance` after construction — see the "Scope
+    /// decision" PR note), so a *count* change is the only structural signal
+    /// available that the instance list changed shape. A mismatch forces a
+    /// full redraw so a future caller that does start mutating the instance
+    /// list cannot silently lose a newly added box to the scissor rect.
+    last_instance_count: usize,
+    /// Number of `TextLine`s passed to the previous `encode_frame` call, for
+    /// the same structural-change reasoning as
+    /// [`last_instance_count`](Self::last_instance_count).
+    last_text_count: usize,
+    /// Per-line bounding boxes (logical pixels) from the previous
+    /// `encode_frame` call, positionally aligned with that call's `texts`
+    /// slice.
+    ///
+    /// A dirty line's scissor contribution must cover **both** its current
+    /// bounds and its bounds from the previous frame: if a line shrinks or
+    /// moves, its old footprint can fall entirely outside the new bounds,
+    /// leaving stale ink permanently outside the scissor rect (and
+    /// therefore never cleared). See [`dirty_text_bounds`].
+    last_text_bounds: Vec<Rect>,
 }
 
 impl EncoderSubsystem {
@@ -142,6 +218,12 @@ impl EncoderSubsystem {
     /// [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
     /// — this method never panics on a GPU error.
     ///
+    /// `width`/`height` are the surface's initial dimensions in **physical
+    /// pixels**, used to allocate the persistent intermediate colour target
+    /// (see [`persistent_color`](Self::persistent_color)) at construction
+    /// time so the very first [`encode_frame`](Self::encode_frame) call has
+    /// somewhere to draw into.
+    ///
     /// # Errors
     ///
     /// - [`ByardError::PipelineCompilation`] — the WGSL shader or the pipeline
@@ -151,6 +233,8 @@ impl EncoderSubsystem {
         queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
         scale_factor: f32,
+        width: u32,
+        height: u32,
     ) -> Result<Self, ByardError> {
         // Static geometry shared by every SolidBox instance.
         let quad_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -202,22 +286,64 @@ impl EncoderSubsystem {
         // `bind_group_layout` is passed into the helper so that `pipeline_layout`
         // can be created inside the error scope alongside the shader and pipeline,
         // matching the full sequence required by RFC §8.
-        let render_pipeline =
-            build_solid_box_pipeline(&device, &bind_group_layout, quad_layout, surface_format)
-                .await?;
+        let render_pipeline = build_solid_box_pipeline(
+            &device,
+            &bind_group_layout,
+            quad_layout,
+            surface_format,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            "ByardCore - SolidBox Render Pipeline",
+        )
+        .await?;
+
+        // See `EncoderSubsystem::clear_pipeline`'s doc comment — same shader
+        // and layout, only the blend state differs (no blending → the
+        // fragment output unconditionally replaces the destination).
+        let clear_pipeline = build_solid_box_pipeline(
+            &device,
+            &bind_group_layout,
+            wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            surface_format,
+            None,
+            "ByardCore - SolidBox Clear Pipeline",
+        )
+        .await?;
 
         let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format)?;
+
+        let (persistent_color, persistent_view) =
+            create_persistent_target(&device, surface_format, width, height);
 
         Ok(Self {
             device,
             queue,
             render_pipeline,
+            clear_pipeline,
             quad_buffer,
             viewport_buffer,
             viewport_bind_group,
             text_pipeline,
             scale_factor,
             viewport_dirty: false,
+            persistent_color,
+            persistent_view,
+            surface_format,
+            phys_w: width,
+            phys_h: height,
+            // Nothing has been drawn into `persistent_color` yet — the first
+            // `encode_frame` call must draw everything unconditionally.
+            needs_full_redraw: true,
+            last_instance_count: 0,
+            last_text_count: 0,
+            last_text_bounds: Vec::new(),
         })
     }
 
@@ -246,6 +372,13 @@ impl EncoderSubsystem {
     /// requiring the caller to supply it per-frame.
     ///
     /// Must be called whenever the surface is resized before the next frame.
+    ///
+    /// If `phys_w`/`phys_h` differ from the currently allocated
+    /// [`persistent_color`](Self::persistent_color) size, that texture is
+    /// recreated at the new size and `needs_full_redraw` is set — the
+    /// recreated texture's contents are undefined, so the next
+    /// `encode_frame` must repopulate it in full rather than trying to
+    /// incrementally patch stale (or garbage) pixels.
     pub fn update_viewport(&mut self, viewport: Viewport, phys_w: u32, phys_h: u32, scale: f32) {
         // SolidBox viewport uniform (logical pixels, padded to 16 bytes).
         let size_data = [viewport.width, viewport.height, 0.0_f32, 0.0];
@@ -258,17 +391,54 @@ impl EncoderSubsystem {
 
         self.scale_factor = scale;
         self.viewport_dirty = true;
+
+        if phys_w != self.phys_w || phys_h != self.phys_h {
+            let (persistent_color, persistent_view) =
+                create_persistent_target(&self.device, self.surface_format, phys_w, phys_h);
+            self.persistent_color = persistent_color;
+            self.persistent_view = persistent_view;
+            self.phys_w = phys_w;
+            self.phys_h = phys_h;
+            self.needs_full_redraw = true;
+        }
     }
 
     /// Encodes a single UI frame into a `CommandBuffer` ready for queue submission.
     ///
-    /// Calls [`TextGlyphPipeline::prepare`] before opening the render pass, then
-    /// within the single render pass draws all `instances` (`SolidBox`) followed by
-    /// all `texts` (`TextGlyph`). On Apple Silicon (TBDR) both pipelines share one
-    /// pass so the tile buffer is never flushed between them.
+    /// Implements RFC-0001 §3.3 (dirty rectangles and scissor clipping). The
+    /// actual incremental drawing target is **not** `target` — it is
+    /// [`persistent_color`](Self::persistent_color), an off-screen texture
+    /// that, unlike the swapchain image, is guaranteed to retain its
+    /// contents across frames. See that field's doc comment for why this
+    /// indirection exists.
     ///
-    /// If `instances` is empty the `SolidBox` draw call is skipped; if `texts` is
-    /// empty the text render call is skipped. The pass still clears the target.
+    /// Three cases, decided by [`needs_full_redraw_this_frame`]:
+    ///
+    /// - **Full redraw** (first call, or after a resize, or the
+    ///   instance/text count changed shape since the previous call): the
+    ///   inner pass clears `persistent_color` and draws every `BoxInstance`
+    ///   and every `TextLine` unscissored — identical to this function's
+    ///   pre-#31 behaviour.
+    /// - **Incremental** (not a full redraw, and at least one `TextLine` is
+    ///   dirty): the inner pass loads (does not clear) `persistent_color`,
+    ///   restricts fragment writes to `wgpu::RenderPass::set_scissor_rect`
+    ///   for the union of the dirty lines' *current and previous* bounding
+    ///   boxes (see [`dirty_text_bounds`]), then draws a fully transparent
+    ///   "clear quad" over exactly that rect via [`clear_pipeline`](
+    ///   Self::clear_pipeline) before redrawing — standard alpha blending
+    ///   alone cannot erase stale content (see that field's doc comment),
+    ///   so this step is required, not optional. Every `BoxInstance` is
+    ///   then redrawn too (the clear quad may have wiped one), bounded by
+    ///   the active scissor rect. `TextGlyphPipeline::prepare`/`render`
+    ///   still receive the **full, unfiltered** `texts` slice; see the note
+    ///   above the `render` call below for why.
+    /// - **Nothing dirty**: the inner pass is skipped entirely — zero GPU
+    ///   work beyond the mandatory composite step below.
+    ///
+    /// In every case, the frame ends with an unscissored
+    /// `copy_texture_to_texture` of `persistent_color`'s current contents
+    /// onto `target` (the swapchain image), since the swapchain's own
+    /// previous contents are never assumed valid.
     ///
     /// # Instance buffer lifetime
     ///
@@ -281,19 +451,49 @@ impl EncoderSubsystem {
     /// - [`ByardError::TextRender`] — glyphon render recording failed.
     pub fn encode_frame(
         &mut self,
-        target_view: &wgpu::TextureView,
+        target: &wgpu::Texture,
         instances: &[BoxInstance],
         texts: &[TextLine],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
+        let full_redraw = needs_full_redraw_this_frame(
+            self.needs_full_redraw,
+            self.last_instance_count,
+            instances.len(),
+            self.last_text_count,
+            texts.len(),
+        );
+
+        // Only meaningful on a non-full-redraw frame — every primitive is
+        // drawn regardless of its dirty bit when `full_redraw` is true.
+        let scissor = if full_redraw {
+            None
+        } else {
+            compute_scissor(
+                texts,
+                &self.last_text_bounds,
+                self.scale_factor,
+                self.phys_w,
+                self.phys_h,
+            )
+        };
+
+        // Nothing to (re)draw into `persistent_color` this frame: not a full
+        // redraw, and no `TextLine` is dirty. The swapchain still gets a
+        // fresh copy of `persistent_color` below — just unchanged from last
+        // frame.
+        let should_draw = full_redraw || scissor.is_some();
+
         // ── Text prepare (before the render pass) ─────────────────────────────
-        let viewport_dirty = self.viewport_dirty;
-        self.text_pipeline.prepare(
-            &self.device,
-            &self.queue,
-            texts,
-            self.scale_factor,
-            viewport_dirty,
-        )?;
+        if should_draw {
+            let viewport_dirty = self.viewport_dirty;
+            self.text_pipeline.prepare(
+                &self.device,
+                &self.queue,
+                texts,
+                self.scale_factor,
+                viewport_dirty,
+            )?;
+        }
         self.viewport_dirty = false;
 
         // ── Command encoding ──────────────────────────────────────────────────
@@ -303,58 +503,363 @@ impl EncoderSubsystem {
                 label: Some("ByardCore - Frame Command Encoder"),
             });
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ByardCore - UI Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                // wgpu 28: new required field; None disables multiview rendering.
-                multiview_mask: None,
-            });
-
-            // ── SolidBox ──────────────────────────────────────────────────────
-            if !instances.is_empty() {
-                let instance_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("ByardCore - SolidBox Instance Buffer"),
-                            contents: bytemuck::cast_slice(instances),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &self.viewport_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.quad_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
-                // Safety: no UI frame will ever hold 2^32 instances. The cast is
-                // bounded by system memory (each BoxInstance is 48 bytes, so
-                // 2^32 would require 192 GiB of RAM before reaching this code).
-                #[allow(clippy::cast_possible_truncation)]
-                render_pass.draw(0..4, 0..instances.len() as u32);
-            }
-
-            // ── TextGlyph (same pass — TBDR optimisation) ─────────────────────
-            if !texts.is_empty() {
-                self.text_pipeline.render(&mut render_pass)?;
-            }
+        if should_draw {
+            draw_ui_pass(
+                &mut encoder,
+                &self.persistent_view,
+                &self.device,
+                &self.render_pipeline,
+                &self.clear_pipeline,
+                &self.viewport_bind_group,
+                &self.quad_buffer,
+                &mut self.text_pipeline,
+                full_redraw,
+                scissor,
+                instances,
+                texts,
+            )?;
         }
+
+        // ── Composite onto the swapchain image ────────────────────────────────
+        //
+        // Always a full, unscissored copy, every frame, regardless of
+        // `should_draw` — see `persistent_color`'s doc comment for why the
+        // swapchain's own previous contents can never be assumed valid.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.persistent_color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.phys_w,
+                height: self.phys_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        update_frame_bookkeeping(self, instances, texts);
 
         Ok(encoder.finish())
     }
 }
 
-/// Compiles the WGSL shader and assembles the `SolidBox` render pipeline.
+/// Updates the structural-change bookkeeping consulted by
+/// [`needs_full_redraw_this_frame`] and [`compute_scissor`] on the *next*
+/// `encode_frame` call.
+///
+/// Extracted out of `encode_frame` purely to keep that function under
+/// clippy's line-count threshold.
+fn update_frame_bookkeeping(
+    state: &mut EncoderSubsystem,
+    instances: &[BoxInstance],
+    texts: &[TextLine],
+) {
+    state.needs_full_redraw = false;
+    state.last_instance_count = instances.len();
+    state.last_text_count = texts.len();
+    // Recomputed for every line (not just dirty ones) — a clean line's
+    // bounds are unchanged from last frame anyway, so this is a no-op for
+    // it, and it keeps `last_text_bounds` positionally aligned with `texts`
+    // without needing a separate "did this line move" check.
+    state.last_text_bounds = texts.iter().map(text_line_bounds).collect();
+}
+
+/// Draws the UI render pass: a scissored clear quad (incremental frames
+/// only), every `SolidBox` instance, then every `TextLine` — see
+/// `EncoderSubsystem::encode_frame`'s doc comment for the full three-case
+/// behaviour this implements.
+///
+/// Extracted out of `encode_frame` purely to keep that function under
+/// clippy's line-count threshold. Every parameter here is a field
+/// `encode_frame` already owns or borrows — the long parameter list is
+/// mechanical (one argument per resource the pass needs), not a sign of
+/// fresh coupling between subsystems, so `too_many_arguments` is allowed
+/// rather than worked around with an ad-hoc bundling struct.
+#[allow(clippy::too_many_arguments)]
+fn draw_ui_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    persistent_view: &wgpu::TextureView,
+    device: &wgpu::Device,
+    render_pipeline: &wgpu::RenderPipeline,
+    clear_pipeline: &wgpu::RenderPipeline,
+    viewport_bind_group: &wgpu::BindGroup,
+    quad_buffer: &wgpu::Buffer,
+    text_pipeline: &mut TextGlyphPipeline,
+    full_redraw: bool,
+    scissor: Option<(Rect, u32, u32, u32, u32)>,
+    instances: &[BoxInstance],
+    texts: &[TextLine],
+) -> Result<(), ByardError> {
+    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("ByardCore - UI Render Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: persistent_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: if full_redraw {
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                } else {
+                    wgpu::LoadOp::Load
+                },
+                store: wgpu::StoreOp::Store,
+            },
+            // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        // wgpu 28: new required field; None disables multiview rendering.
+        multiview_mask: None,
+    });
+
+    // Restrict fragment writes to the dirty region on an incremental frame,
+    // and wipe exactly that region first — see
+    // `EncoderSubsystem::clear_pipeline`'s doc comment for why a clear pass
+    // is required before standard alpha-blended redraw can erase stale
+    // content. A full redraw draws unscissored and already cleared the
+    // whole target via `LoadOp::Clear` above, so no clear quad is needed in
+    // that case.
+    if let Some((bounds, x, y, w, h)) = scissor {
+        render_pass.set_scissor_rect(x, y, w, h);
+        draw_clear_quad(
+            &mut render_pass,
+            device,
+            clear_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            bounds,
+        );
+    }
+
+    // Drawn on every call to this function, not just a full redraw — the
+    // clear quad above can wipe a box's area on an incremental frame, so
+    // boxes must be repainted afterwards or they would stay erased. The
+    // active GPU scissor rect (set above, incremental frames only) bounds
+    // which pixels this actually touches, so the cost is still proportional
+    // to the dirty region, not the full instance list.
+    if !instances.is_empty() {
+        draw_solid_box_instances(
+            &mut render_pass,
+            device,
+            render_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            instances,
+        );
+    }
+
+    // Always the full, unfiltered `texts` slice (the `prepare` call before
+    // this pass began did too) — `TextGlyphPipeline`'s internal cache is
+    // positionally index-aligned with whatever slice it last saw, so
+    // slicing down to only the dirty lines here would silently associate a
+    // non-dirty line's cached glyph buffer with the wrong line. The scissor
+    // rect set above (on incremental frames) is what actually limits which
+    // pixels this call may write — not the slice contents.
+    if !texts.is_empty() {
+        text_pipeline.render(&mut render_pass)?;
+    }
+
+    Ok(())
+}
+
+/// Creates the persistent off-screen colour target and its view.
+///
+/// Shared by [`EncoderSubsystem::init`] and
+/// [`EncoderSubsystem::update_viewport`] so both call sites build the
+/// texture identically. `RENDER_ATTACHMENT` lets the UI render pass draw
+/// into it; `COPY_SRC` lets [`EncoderSubsystem::encode_frame`] copy its
+/// contents onto the swapchain image every frame.
+fn create_persistent_target(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    // wgpu textures must be at least 1×1; a window can in principle report
+    // a momentary zero-sized client area mid-resize.
+    let width = width.max(1);
+    let height = height.max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ByardCore - Persistent UI Colour Target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Deliberately generous (over-estimating) bounding box for a [`TextLine`],
+/// in logical pixels.
+///
+/// `TextLine` exposes no measured glyph extents — the shaped
+/// `glyphon::Buffer` is private to `TextGlyphPipeline` — so this estimates
+/// width from `font_size` and character count using a generous per-character
+/// advance and line-height multiplier. Over-estimating only wastes a little
+/// scissor-rect area (a little extra fragment-write bandwidth);
+/// under-estimating would visibly clip glyphs, which is a real correctness
+/// bug. See the "Scope decision" PR note. A measured-extent version is a
+/// natural Phase 2 follow-up once `TextLine` (or the Atlas) carries real
+/// shaped-glyph bounds.
+// A `TextLine` will never hold remotely enough characters (2^24 = 16M+) to
+// make this cast lossy in practice; the line's logical-pixel width would
+// exceed any real display by many orders of magnitude well before that.
+#[allow(clippy::cast_precision_loss)]
+fn text_line_bounds(line: &TextLine) -> Rect {
+    // Generous enough to cover the widest glyphs in typical Latin text.
+    const CHAR_WIDTH_FACTOR: f32 = 0.75;
+    // Generous enough to cover ascender + descender.
+    const LINE_HEIGHT_FACTOR: f32 = 1.5;
+
+    let char_count = line.text.chars().count() as f32;
+    let width = line.font_size * CHAR_WIDTH_FACTOR * char_count;
+    let height = line.font_size * LINE_HEIGHT_FACTOR;
+    Rect::new(line.x, line.y, width, height)
+}
+
+/// Computes the merged bounding box — RFC §3.3's "bounding box of the
+/// affected region" — over every **dirty** entry in `texts`, unioned with
+/// that same line's bounds from the *previous* frame (`previous`,
+/// positionally aligned with `texts`).
+///
+/// The previous-frame union matters because a line's bounds can shrink or
+/// move between frames (e.g. a reactive label whose text gets shorter):
+/// without it, the new (smaller) bounds would leave the line's old
+/// footprint entirely outside the computed scissor rect, and that old
+/// content would never be cleared — issue #31's visual-verification
+/// finding.
+///
+/// Returns `None` when no entry is dirty, the caller's signal to skip the
+/// incremental render pass entirely for this frame. Multiple simultaneously
+/// dirty lines are merged into a single bounding box via repeated
+/// [`Rect::union`] rather than issued as separate scissored sub-passes —
+/// one scissor + draw call instead of N, at the cost of a marginally larger
+/// over-draw region when the dirty lines are far apart on screen. See the
+/// "Scope decision: multi-rect merge policy" PR note for the full rationale.
+fn dirty_text_bounds(texts: &[TextLine], previous: &[Rect]) -> Option<Rect> {
+    texts
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.dirty)
+        .map(|(i, line)| {
+            let current = text_line_bounds(line);
+            match previous.get(i) {
+                Some(prev) => current.union(prev),
+                None => current,
+            }
+        })
+        .reduce(|acc, r| acc.union(&r))
+}
+
+/// Combines [`dirty_text_bounds`] and [`logical_rect_to_physical_scissor`]
+/// into the single result [`EncoderSubsystem::encode_frame`] needs to
+/// decide whether (and where) to scissor an incremental frame: the logical
+/// bounds (needed to size the clear quad) alongside the physical
+/// `(x, y, width, height)` tuple `wgpu::RenderPass::set_scissor_rect`
+/// expects.
+///
+/// Pure and unit-testable independent of any `wgpu` state, following the
+/// project's established pattern of extracting CPU-mirror decision logic
+/// into free functions (see `text_glyph::needs_reshape`). Returns `None`
+/// both when nothing is dirty and when the dirty bounds degenerate to a
+/// zero-size physical rect (wgpu rejects a zero-size scissor rect).
+fn compute_scissor(
+    texts: &[TextLine],
+    previous: &[Rect],
+    scale: f32,
+    max_w: u32,
+    max_h: u32,
+) -> Option<(Rect, u32, u32, u32, u32)> {
+    let bounds = dirty_text_bounds(texts, previous)?;
+    let (x, y, w, h) = logical_rect_to_physical_scissor(bounds, scale, max_w, max_h);
+    if w > 0 && h > 0 {
+        Some((bounds, x, y, w, h))
+    } else {
+        None
+    }
+}
+
+/// Converts a logical-pixel `Rect` into the `(x, y, width, height)` tuple
+/// expected by `wgpu::RenderPass::set_scissor_rect`, in physical pixels,
+/// clamped to `[0, max_w] × [0, max_h]`.
+///
+/// wgpu validates that a scissor rect lies entirely within the render
+/// target's bounds — a rect computed from logical coordinates can overshoot
+/// the physical target by a few pixels from rounding (`x * scale` truncation
+/// at the high end), so clamping here is required, not defensive cruft.
+// `max_w_f`/`max_h_f` are intentionally parallel names for parallel
+// quantities (the f32 form of `max_w`/`max_h`, used only for the `.min`
+// clamp below) — not a real ambiguity risk. The u32 → f32 cast is lossless
+// in practice: a physical surface dimension exceeding 2^24px (16M+) does
+// not exist on any real display.
+#[allow(clippy::similar_names, clippy::cast_precision_loss)]
+fn logical_rect_to_physical_scissor(
+    rect: Rect,
+    scale: f32,
+    max_w: u32,
+    max_h: u32,
+) -> (u32, u32, u32, u32) {
+    let x0 = (rect.x * scale).floor().max(0.0);
+    let y0 = (rect.y * scale).floor().max(0.0);
+    let x1 = ((rect.x + rect.width) * scale).ceil().max(x0);
+    let y1 = ((rect.y + rect.height) * scale).ceil().max(y0);
+
+    let max_w_f = max_w as f32;
+    let max_h_f = max_h as f32;
+
+    let x0 = x0.min(max_w_f);
+    let y0 = y0.min(max_h_f);
+    let x1 = x1.min(max_w_f);
+    let y1 = y1.min(max_h_f);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+/// Decides whether [`EncoderSubsystem::encode_frame`] must perform a full
+/// redraw this frame.
+///
+/// Pure and unit-testable independent of any `wgpu` state, following the
+/// project's established pattern of extracting CPU-mirror decision logic
+/// into free functions (see `text_glyph::needs_reshape`).
+///
+/// A full redraw is forced by `sticky` (set on construction and after a
+/// resize — see [`EncoderSubsystem::needs_full_redraw`]) OR by a structural
+/// change in the instance/text counts since the previous frame, since
+/// neither `BoxInstance` nor `TextLine` carries an "added this frame" bit —
+/// see the "Scope decision" PR note.
+fn needs_full_redraw_this_frame(
+    sticky: bool,
+    prev_instance_count: usize,
+    instance_count: usize,
+    prev_text_count: usize,
+    text_count: usize,
+) -> bool {
+    sticky || prev_instance_count != instance_count || prev_text_count != text_count
+}
+
+/// Compiles the WGSL shader and assembles a `SolidBox`-shaped render
+/// pipeline, parameterised by `blend` so the same shader and vertex layout
+/// can back both [`EncoderSubsystem::render_pipeline`] (alpha-blended) and
+/// [`EncoderSubsystem::clear_pipeline`] (`blend: None` — unconditional
+/// replace).
 ///
 /// Separated from [`EncoderSubsystem::init`] to keep that function under the
 /// 100-line lint threshold.
@@ -369,6 +874,8 @@ async fn build_solid_box_pipeline(
     bind_group_layout: &wgpu::BindGroupLayout,
     quad_layout: wgpu::VertexBufferLayout<'static>,
     surface_format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    debug_name: &str,
 ) -> Result<wgpu::RenderPipeline, ByardError> {
     // --- GPU VALIDATION ERROR SCOPE (RFC §8) ---
     // Covers create_pipeline_layout + create_shader_module + create_render_pipeline,
@@ -392,7 +899,7 @@ async fn build_solid_box_pipeline(
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("ByardCore - SolidBox Render Pipeline"),
+        label: Some(debug_name),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader_module,
@@ -405,7 +912,7 @@ async fn build_solid_box_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -427,12 +934,82 @@ async fn build_solid_box_pipeline(
 
     if let Some(error) = scope.pop().await {
         return Err(ByardError::PipelineCompilation {
-            pipeline: "SolidBox".to_string(),
+            pipeline: debug_name.to_string(),
             reason: error.to_string(),
         });
     }
 
     Ok(pipeline)
+}
+
+/// Draws a single fully transparent quad covering `bounds` (logical pixels)
+/// using `pipeline`'s no-blend state, so the fragment shader's output
+/// unconditionally **replaces** the destination instead of blending with
+/// it — see [`EncoderSubsystem::clear_pipeline`]'s doc comment for why this
+/// is required before an incremental redraw can erase stale content.
+///
+/// Must be called while `render_pass`'s active scissor rect already
+/// restricts writes to (at most) `bounds` — otherwise this would wipe
+/// unrelated content outside the dirty region.
+fn draw_clear_quad(
+    render_pass: &mut wgpu::RenderPass<'_>,
+    device: &wgpu::Device,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    quad_buffer: &wgpu::Buffer,
+    bounds: Rect,
+) {
+    let clear_instance = BoxInstance {
+        rect: [bounds.x, bounds.y, bounds.width, bounds.height],
+        color: [0.0, 0.0, 0.0, 0.0],
+        radii: [0.0; 4],
+    };
+    let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ByardCore - Clear Quad Instance Buffer"),
+        contents: bytemuck::bytes_of(&clear_instance),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    render_pass.set_pipeline(pipeline);
+    render_pass.set_bind_group(0, bind_group, &[]);
+    render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
+    render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+    render_pass.draw(0..4, 0..1);
+}
+
+/// Draws every `BoxInstance` in `instances` using `pipeline`'s alpha-blended
+/// state.
+///
+/// Extracted from [`EncoderSubsystem::encode_frame`] to keep that function
+/// under the 100-line lint threshold. On an incremental frame, the caller's
+/// active GPU scissor rect (not this function) is what actually bounds the
+/// pixels touched here, so calling this unconditionally on every
+/// `should_draw` frame is still proportional to the dirty region's
+/// bandwidth, not the full instance list's. See the "Scope decision" PR
+/// note's update.
+fn draw_solid_box_instances(
+    render_pass: &mut wgpu::RenderPass<'_>,
+    device: &wgpu::Device,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    quad_buffer: &wgpu::Buffer,
+    instances: &[BoxInstance],
+) {
+    let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ByardCore - SolidBox Instance Buffer"),
+        contents: bytemuck::cast_slice(instances),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    render_pass.set_pipeline(pipeline);
+    render_pass.set_bind_group(0, bind_group, &[]);
+    render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
+    render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+    // Safety: no UI frame will ever hold 2^32 instances. The cast is
+    // bounded by system memory (each BoxInstance is 48 bytes, so 2^32
+    // would require 192 GiB of RAM before reaching this code).
+    #[allow(clippy::cast_possible_truncation)]
+    render_pass.draw(0..4, 0..instances.len() as u32);
 }
 
 #[cfg(test)]
@@ -836,5 +1413,298 @@ mod tests {
             "total area = {} (expected 1.0)",
             a1 + a2
         );
+    }
+
+    // ── #31 scissor clipping: pure decision/heuristic functions ──────────────
+    //
+    // None of these touch wgpu — they're the CPU-mirror logic that decides
+    // *what* `encode_frame` will do, extracted so it's testable without a
+    // GPU device (project convention — see `text_glyph::needs_reshape`).
+
+    /// Tolerance-based f32 comparison, mirroring `engine.rs`'s test helper
+    /// of the same name — used in place of `assert_eq!` on raw floats to
+    /// satisfy `clippy::float_cmp` without losing the precision these
+    /// tests actually need (well under one logical pixel).
+    #[track_caller]
+    fn assert_f32_eq(actual: f32, expected: f32) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff < 0.001,
+            "expected {expected}, got {actual} (diff = {diff})"
+        );
+    }
+
+    fn line(x: f32, y: f32, text: &str, font_size: f32, dirty: bool) -> TextLine {
+        TextLine {
+            x,
+            y,
+            text: text.to_string(),
+            font_size,
+            color: [0.0, 0.0, 0.0, 1.0],
+            dirty,
+        }
+    }
+
+    #[test]
+    fn text_line_bounds_grows_with_character_count() {
+        let short = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let long = text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        assert!(
+            long.width > short.width,
+            "more characters must widen the bound"
+        );
+        // height depends only on font_size, not character count.
+        assert_f32_eq(short.height, long.height);
+    }
+
+    #[test]
+    fn text_line_bounds_grows_with_font_size() {
+        let small = text_line_bounds(&line(0.0, 0.0, "label", 12.0, false));
+        let large = text_line_bounds(&line(0.0, 0.0, "label", 48.0, false));
+        assert!(large.width > small.width);
+        assert!(large.height > small.height);
+    }
+
+    #[test]
+    fn text_line_bounds_is_positioned_at_the_line_origin() {
+        let r = text_line_bounds(&line(123.0, 45.0, "x", 16.0, false));
+        assert_f32_eq(r.x, 123.0);
+        assert_f32_eq(r.y, 45.0);
+    }
+
+    #[test]
+    fn text_line_bounds_never_yields_negative_dimensions() {
+        // Defensive: an empty string is a degenerate but legitimate TextLine.
+        let r = text_line_bounds(&line(0.0, 0.0, "", 16.0, false));
+        assert!(r.width >= 0.0);
+        assert!(r.height >= 0.0);
+    }
+
+    #[test]
+    fn dirty_text_bounds_is_none_when_nothing_is_dirty() {
+        let texts = [
+            line(0.0, 0.0, "a", 16.0, false),
+            line(50.0, 50.0, "b", 16.0, false),
+        ];
+        assert!(dirty_text_bounds(&texts, &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_text_bounds_is_none_for_empty_slice() {
+        assert!(dirty_text_bounds(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_text_bounds_ignores_non_dirty_lines() {
+        let dirty_line = line(10.0, 10.0, "dirty", 16.0, true);
+        let clean_line = line(1000.0, 1000.0, "clean", 16.0, false);
+        let bounds = dirty_text_bounds(&[dirty_line.clone(), clean_line], &[]).unwrap();
+        let expected = text_line_bounds(&dirty_line);
+        assert_eq!(bounds, expected, "clean line must not widen the union");
+    }
+
+    #[test]
+    fn dirty_text_bounds_merges_multiple_dirty_lines() {
+        let a = line(0.0, 0.0, "a", 16.0, true);
+        let b = line(200.0, 300.0, "b", 16.0, true);
+        let merged = dirty_text_bounds(&[a.clone(), b.clone()], &[]).unwrap();
+        let expected = text_line_bounds(&a).union(&text_line_bounds(&b));
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_with_previous_frame_bounds() {
+        // A line that shrinks between frames: its NEW bounds alone would
+        // leave the old (wider) footprint outside the scissor rect,
+        // exactly the bug behind issue #31's visual-verification finding.
+        let shrunk = line(0.0, 0.0, "a", 16.0, true);
+        let previous_bounds =
+            text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&shrunk), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&shrunk);
+        let expected = current.union(&previous_bounds);
+        assert_eq!(
+            bounds, expected,
+            "must cover both current and previous bounds for a dirty line"
+        );
+        assert!(
+            bounds.width >= previous_bounds.width,
+            "must not be narrower than the previous frame's footprint"
+        );
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_when_line_grows_between_frames() {
+        // The inverse of the shrink case above: when the new bounds fully
+        // contain the old ones, the union must still equal the new bounds
+        // (not be artificially clamped back down to the smaller, previous
+        // footprint).
+        let grown = line(0.0, 0.0, "a much longer string", 16.0, true);
+        let previous_bounds = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&grown), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&grown);
+        assert_eq!(
+            bounds, current,
+            "previous bounds are fully contained, so union must equal current bounds"
+        );
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_when_line_moves_without_resizing() {
+        // A line that translates (same size, new position) between frames —
+        // current and previous bounds do not overlap at all, so the union
+        // must be the bounding box that spans both, not just one of them.
+        let moved = line(500.0, 500.0, "a", 16.0, true);
+        let previous_bounds = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&moved), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&moved);
+        let expected = current.union(&previous_bounds);
+        assert_eq!(bounds, expected);
+        // Sanity: the union must still reach back to the old (top-left)
+        // position, not just the new one.
+        assert_f32_eq(bounds.x, 0.0);
+        assert_f32_eq(bounds.y, 0.0);
+    }
+
+    #[test]
+    fn dirty_text_bounds_handles_previous_shorter_than_texts() {
+        // `previous` is positionally aligned with `texts`, but a brand-new
+        // line added this frame has no corresponding entry from the last
+        // call (the slice is shorter than `texts`). `previous.get(i)` must
+        // return `None` for it rather than panicking on an out-of-bounds
+        // index, and the line's current bounds alone must be used.
+        let existing = line(0.0, 0.0, "a", 16.0, false);
+        let new_line = line(50.0, 50.0, "b", 16.0, true);
+        let previous = [text_line_bounds(&existing)];
+        let bounds = dirty_text_bounds(&[existing, new_line.clone()], &previous).unwrap();
+        let expected = text_line_bounds(&new_line);
+        assert_eq!(
+            bounds, expected,
+            "a newly added dirty line with no previous entry must use only its current bounds"
+        );
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_scales_by_dpi_factor() {
+        let rect = Rect::new(10.0, 20.0, 30.0, 40.0);
+        let scissor = logical_rect_to_physical_scissor(rect, 2.0, 10_000, 10_000);
+        assert_eq!(scissor, (20, 40, 60, 80));
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_clamps_to_target_bounds() {
+        // A rect that overshoots the physical target (e.g. from rounding,
+        // or a heuristic text bound near the edge of the window) must be
+        // clamped — wgpu rejects a scissor rect that exceeds the target.
+        let rect = Rect::new(90.0, 90.0, 50.0, 50.0);
+        let (scissor_x, scissor_y, scissor_w, scissor_h) =
+            logical_rect_to_physical_scissor(rect, 1.0, 100, 100);
+        assert_eq!(scissor_x, 90);
+        assert_eq!(scissor_y, 90);
+        assert_eq!(scissor_w, 10, "clamped to max_w - x");
+        assert_eq!(scissor_h, 10, "clamped to max_h - y");
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_handles_origin_outside_bounds() {
+        // A rect entirely past the target's edge collapses to a zero-size
+        // scissor rather than going negative-width.
+        let r = Rect::new(200.0, 200.0, 50.0, 50.0);
+        let (_, _, w, h) = logical_rect_to_physical_scissor(r, 1.0, 100, 100);
+        assert_eq!(w, 0);
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_sticky_flag_set() {
+        assert!(needs_full_redraw_this_frame(true, 3, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_false_when_nothing_changed_and_not_sticky() {
+        assert!(!needs_full_redraw_this_frame(false, 3, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_instance_count_changes() {
+        assert!(needs_full_redraw_this_frame(false, 3, 4, 3, 3));
+        assert!(needs_full_redraw_this_frame(false, 4, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_text_count_changes() {
+        assert!(needs_full_redraw_this_frame(false, 3, 3, 2, 3));
+        assert!(needs_full_redraw_this_frame(false, 3, 3, 3, 2));
+    }
+
+    // ── compute_scissor ───────────────────────────────────────────────────────
+    //
+    // `encode_frame` never calls `dirty_text_bounds` or
+    // `logical_rect_to_physical_scissor` directly on an incremental frame —
+    // it goes through `compute_scissor`, so the composition of the two
+    // (including the zero-size-rect rejection) needs its own coverage, not
+    // just each half in isolation.
+
+    #[test]
+    fn compute_scissor_is_none_when_nothing_is_dirty() {
+        let texts = [line(0.0, 0.0, "a", 16.0, false)];
+        assert!(compute_scissor(&texts, &[], 1.0, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn compute_scissor_is_none_for_empty_texts() {
+        assert!(compute_scissor(&[], &[], 1.0, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn compute_scissor_returns_physical_rect_for_a_dirty_line() {
+        let texts = [line(10.0, 20.0, "hello", 16.0, true)];
+        let (bounds, x, y, w, h) = compute_scissor(&texts, &[], 2.0, 1000, 1000).unwrap();
+        let expected_bounds = text_line_bounds(&texts[0]);
+        assert_eq!(bounds, expected_bounds, "logical bounds must be unscaled");
+        let (expected_x, expected_y, expected_w, expected_h) =
+            logical_rect_to_physical_scissor(expected_bounds, 2.0, 1000, 1000);
+        assert_eq!(
+            (x, y, w, h),
+            (expected_x, expected_y, expected_w, expected_h)
+        );
+    }
+
+    #[test]
+    // `previous_bounds.width.ceil() as u32` mirrors the same lossless-in-practice
+    // cast already allowed in `logical_rect_to_physical_scissor` (no real text
+    // bound is anywhere near 2^24 logical pixels wide).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn compute_scissor_unions_with_previous_bounds() {
+        // Mirrors `dirty_text_bounds_unions_with_previous_frame_bounds`, but
+        // through the full `compute_scissor` path that `encode_frame`
+        // actually calls — a shrinking line's stale footprint must still be
+        // covered by the resulting *physical* scissor rect, not just the
+        // logical bounds in isolation.
+        let shrunk = line(0.0, 0.0, "a", 16.0, true);
+        let previous_bounds =
+            text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        let texts = [shrunk];
+        let (bounds, _, _, w, _) =
+            compute_scissor(&texts, &[previous_bounds], 1.0, 1000, 1000).unwrap();
+        assert!(
+            bounds.width >= previous_bounds.width,
+            "logical union must retain the previous (wider) footprint"
+        );
+        assert!(
+            w >= previous_bounds.width.ceil() as u32,
+            "physical scissor width must be wide enough to cover the stale footprint"
+        );
+    }
+
+    #[test]
+    fn compute_scissor_is_none_when_dirty_rect_lies_entirely_outside_target() {
+        // The dirty bounds are non-empty but fall entirely past the
+        // physical target's edge, so `logical_rect_to_physical_scissor`
+        // collapses them to a zero-size rect — wgpu rejects a zero-size
+        // scissor, so `compute_scissor` must surface `None` rather than a
+        // degenerate `Some((..., 0, 0))`.
+        let texts = [line(2000.0, 2000.0, "offscreen", 16.0, true)];
+        assert!(compute_scissor(&texts, &[], 1.0, 100, 100).is_none());
     }
 }
