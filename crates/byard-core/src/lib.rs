@@ -7,8 +7,9 @@
 //! - [`evaluator`] — Reactive state (`Signal<T>`), per-view memory arenas (`ViewArena`),
 //!   and dirty-flag collection.
 //! - [`atlas`] — Layout computation via Taffy and spatial hit-testing via a hash grid.
-//! - [`encoder`] — Multi-pipeline `wgpu` command dispatch (`SolidBox`, `DecoratedBox`,
-//!   `TextGlyph`, `TextureSampler`).
+//! - [`encoder`] — Multi-pipeline `wgpu` command dispatch. `SolidBox` and
+//!   `TextGlyph` are implemented today; `DecoratedBox` and `TextureSampler`
+//!   are planned (RFC-0001 §3.1) but not yet built.
 //! - [`relay`] — Thread management, double-buffered frame swap, and async I/O pool.
 //!
 //! Cross-subsystem communication goes exclusively through the types defined in
