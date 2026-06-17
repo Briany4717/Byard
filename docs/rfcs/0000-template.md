@@ -30,7 +30,7 @@ The technical specification. Be precise. Include:
 - Algorithms and their complexity.
 - Interactions with existing subsystems.
 - Any WGSL shader changes (if applicable).
-- Any changes to the `bylang` grammar (if applicable).
+- Any changes to the `byld` grammar (if applicable).
 
 ## Drawbacks
 
