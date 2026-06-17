@@ -3,7 +3,7 @@ resolver = "2"
 # Crates will be added here as phases land.
 # Planned layout:
 #   crates/byard-core      — engine subsystems (render, spatial, logic, concurrency)
-#   crates/byard-compiler  — bylang lexer, parser, and AST interpreter
+#   crates/byard-compiler  — byld lexer, parser, and AST interpreter
 #   crates/byard-macro     — #[byard_controller] procedural macro
 #   crates/byard-platform  — PlatformHost implementations (winit, etc.)
 #   crates/byard           — public façade re-exporting the above
