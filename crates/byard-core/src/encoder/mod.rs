@@ -1414,4 +1414,297 @@ mod tests {
             a1 + a2
         );
     }
+
+    // ── #31 scissor clipping: pure decision/heuristic functions ──────────────
+    //
+    // None of these touch wgpu — they're the CPU-mirror logic that decides
+    // *what* `encode_frame` will do, extracted so it's testable without a
+    // GPU device (project convention — see `text_glyph::needs_reshape`).
+
+    /// Tolerance-based f32 comparison, mirroring `engine.rs`'s test helper
+    /// of the same name — used in place of `assert_eq!` on raw floats to
+    /// satisfy `clippy::float_cmp` without losing the precision these
+    /// tests actually need (well under one logical pixel).
+    #[track_caller]
+    fn assert_f32_eq(actual: f32, expected: f32) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff < 0.001,
+            "expected {expected}, got {actual} (diff = {diff})"
+        );
+    }
+
+    fn line(x: f32, y: f32, text: &str, font_size: f32, dirty: bool) -> TextLine {
+        TextLine {
+            x,
+            y,
+            text: text.to_string(),
+            font_size,
+            color: [0.0, 0.0, 0.0, 1.0],
+            dirty,
+        }
+    }
+
+    #[test]
+    fn text_line_bounds_grows_with_character_count() {
+        let short = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let long = text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        assert!(
+            long.width > short.width,
+            "more characters must widen the bound"
+        );
+        // height depends only on font_size, not character count.
+        assert_f32_eq(short.height, long.height);
+    }
+
+    #[test]
+    fn text_line_bounds_grows_with_font_size() {
+        let small = text_line_bounds(&line(0.0, 0.0, "label", 12.0, false));
+        let large = text_line_bounds(&line(0.0, 0.0, "label", 48.0, false));
+        assert!(large.width > small.width);
+        assert!(large.height > small.height);
+    }
+
+    #[test]
+    fn text_line_bounds_is_positioned_at_the_line_origin() {
+        let r = text_line_bounds(&line(123.0, 45.0, "x", 16.0, false));
+        assert_f32_eq(r.x, 123.0);
+        assert_f32_eq(r.y, 45.0);
+    }
+
+    #[test]
+    fn text_line_bounds_never_yields_negative_dimensions() {
+        // Defensive: an empty string is a degenerate but legitimate TextLine.
+        let r = text_line_bounds(&line(0.0, 0.0, "", 16.0, false));
+        assert!(r.width >= 0.0);
+        assert!(r.height >= 0.0);
+    }
+
+    #[test]
+    fn dirty_text_bounds_is_none_when_nothing_is_dirty() {
+        let texts = [
+            line(0.0, 0.0, "a", 16.0, false),
+            line(50.0, 50.0, "b", 16.0, false),
+        ];
+        assert!(dirty_text_bounds(&texts, &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_text_bounds_is_none_for_empty_slice() {
+        assert!(dirty_text_bounds(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_text_bounds_ignores_non_dirty_lines() {
+        let dirty_line = line(10.0, 10.0, "dirty", 16.0, true);
+        let clean_line = line(1000.0, 1000.0, "clean", 16.0, false);
+        let bounds = dirty_text_bounds(&[dirty_line.clone(), clean_line], &[]).unwrap();
+        let expected = text_line_bounds(&dirty_line);
+        assert_eq!(bounds, expected, "clean line must not widen the union");
+    }
+
+    #[test]
+    fn dirty_text_bounds_merges_multiple_dirty_lines() {
+        let a = line(0.0, 0.0, "a", 16.0, true);
+        let b = line(200.0, 300.0, "b", 16.0, true);
+        let merged = dirty_text_bounds(&[a.clone(), b.clone()], &[]).unwrap();
+        let expected = text_line_bounds(&a).union(&text_line_bounds(&b));
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_with_previous_frame_bounds() {
+        // A line that shrinks between frames: its NEW bounds alone would
+        // leave the old (wider) footprint outside the scissor rect,
+        // exactly the bug behind issue #31's visual-verification finding.
+        let shrunk = line(0.0, 0.0, "a", 16.0, true);
+        let previous_bounds =
+            text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&shrunk), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&shrunk);
+        let expected = current.union(&previous_bounds);
+        assert_eq!(
+            bounds, expected,
+            "must cover both current and previous bounds for a dirty line"
+        );
+        assert!(
+            bounds.width >= previous_bounds.width,
+            "must not be narrower than the previous frame's footprint"
+        );
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_when_line_grows_between_frames() {
+        // The inverse of the shrink case above: when the new bounds fully
+        // contain the old ones, the union must still equal the new bounds
+        // (not be artificially clamped back down to the smaller, previous
+        // footprint).
+        let grown = line(0.0, 0.0, "a much longer string", 16.0, true);
+        let previous_bounds = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&grown), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&grown);
+        assert_eq!(
+            bounds, current,
+            "previous bounds are fully contained, so union must equal current bounds"
+        );
+    }
+
+    #[test]
+    fn dirty_text_bounds_unions_when_line_moves_without_resizing() {
+        // A line that translates (same size, new position) between frames —
+        // current and previous bounds do not overlap at all, so the union
+        // must be the bounding box that spans both, not just one of them.
+        let moved = line(500.0, 500.0, "a", 16.0, true);
+        let previous_bounds = text_line_bounds(&line(0.0, 0.0, "a", 16.0, false));
+        let bounds = dirty_text_bounds(std::slice::from_ref(&moved), &[previous_bounds]).unwrap();
+        let current = text_line_bounds(&moved);
+        let expected = current.union(&previous_bounds);
+        assert_eq!(bounds, expected);
+        // Sanity: the union must still reach back to the old (top-left)
+        // position, not just the new one.
+        assert_f32_eq(bounds.x, 0.0);
+        assert_f32_eq(bounds.y, 0.0);
+    }
+
+    #[test]
+    fn dirty_text_bounds_handles_previous_shorter_than_texts() {
+        // `previous` is positionally aligned with `texts`, but a brand-new
+        // line added this frame has no corresponding entry from the last
+        // call (the slice is shorter than `texts`). `previous.get(i)` must
+        // return `None` for it rather than panicking on an out-of-bounds
+        // index, and the line's current bounds alone must be used.
+        let existing = line(0.0, 0.0, "a", 16.0, false);
+        let new_line = line(50.0, 50.0, "b", 16.0, true);
+        let previous = [text_line_bounds(&existing)];
+        let bounds = dirty_text_bounds(&[existing, new_line.clone()], &previous).unwrap();
+        let expected = text_line_bounds(&new_line);
+        assert_eq!(
+            bounds, expected,
+            "a newly added dirty line with no previous entry must use only its current bounds"
+        );
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_scales_by_dpi_factor() {
+        let rect = Rect::new(10.0, 20.0, 30.0, 40.0);
+        let scissor = logical_rect_to_physical_scissor(rect, 2.0, 10_000, 10_000);
+        assert_eq!(scissor, (20, 40, 60, 80));
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_clamps_to_target_bounds() {
+        // A rect that overshoots the physical target (e.g. from rounding,
+        // or a heuristic text bound near the edge of the window) must be
+        // clamped — wgpu rejects a scissor rect that exceeds the target.
+        let rect = Rect::new(90.0, 90.0, 50.0, 50.0);
+        let (scissor_x, scissor_y, scissor_w, scissor_h) =
+            logical_rect_to_physical_scissor(rect, 1.0, 100, 100);
+        assert_eq!(scissor_x, 90);
+        assert_eq!(scissor_y, 90);
+        assert_eq!(scissor_w, 10, "clamped to max_w - x");
+        assert_eq!(scissor_h, 10, "clamped to max_h - y");
+    }
+
+    #[test]
+    fn logical_rect_to_physical_scissor_handles_origin_outside_bounds() {
+        // A rect entirely past the target's edge collapses to a zero-size
+        // scissor rather than going negative-width.
+        let r = Rect::new(200.0, 200.0, 50.0, 50.0);
+        let (_, _, w, h) = logical_rect_to_physical_scissor(r, 1.0, 100, 100);
+        assert_eq!(w, 0);
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_sticky_flag_set() {
+        assert!(needs_full_redraw_this_frame(true, 3, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_false_when_nothing_changed_and_not_sticky() {
+        assert!(!needs_full_redraw_this_frame(false, 3, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_instance_count_changes() {
+        assert!(needs_full_redraw_this_frame(false, 3, 4, 3, 3));
+        assert!(needs_full_redraw_this_frame(false, 4, 3, 3, 3));
+    }
+
+    #[test]
+    fn needs_full_redraw_true_when_text_count_changes() {
+        assert!(needs_full_redraw_this_frame(false, 3, 3, 2, 3));
+        assert!(needs_full_redraw_this_frame(false, 3, 3, 3, 2));
+    }
+
+    // ── compute_scissor ───────────────────────────────────────────────────────
+    //
+    // `encode_frame` never calls `dirty_text_bounds` or
+    // `logical_rect_to_physical_scissor` directly on an incremental frame —
+    // it goes through `compute_scissor`, so the composition of the two
+    // (including the zero-size-rect rejection) needs its own coverage, not
+    // just each half in isolation.
+
+    #[test]
+    fn compute_scissor_is_none_when_nothing_is_dirty() {
+        let texts = [line(0.0, 0.0, "a", 16.0, false)];
+        assert!(compute_scissor(&texts, &[], 1.0, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn compute_scissor_is_none_for_empty_texts() {
+        assert!(compute_scissor(&[], &[], 1.0, 1000, 1000).is_none());
+    }
+
+    #[test]
+    fn compute_scissor_returns_physical_rect_for_a_dirty_line() {
+        let texts = [line(10.0, 20.0, "hello", 16.0, true)];
+        let (bounds, x, y, w, h) = compute_scissor(&texts, &[], 2.0, 1000, 1000).unwrap();
+        let expected_bounds = text_line_bounds(&texts[0]);
+        assert_eq!(bounds, expected_bounds, "logical bounds must be unscaled");
+        let (expected_x, expected_y, expected_w, expected_h) =
+            logical_rect_to_physical_scissor(expected_bounds, 2.0, 1000, 1000);
+        assert_eq!(
+            (x, y, w, h),
+            (expected_x, expected_y, expected_w, expected_h)
+        );
+    }
+
+    #[test]
+    // `previous_bounds.width.ceil() as u32` mirrors the same lossless-in-practice
+    // cast already allowed in `logical_rect_to_physical_scissor` (no real text
+    // bound is anywhere near 2^24 logical pixels wide).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn compute_scissor_unions_with_previous_bounds() {
+        // Mirrors `dirty_text_bounds_unions_with_previous_frame_bounds`, but
+        // through the full `compute_scissor` path that `encode_frame`
+        // actually calls — a shrinking line's stale footprint must still be
+        // covered by the resulting *physical* scissor rect, not just the
+        // logical bounds in isolation.
+        let shrunk = line(0.0, 0.0, "a", 16.0, true);
+        let previous_bounds =
+            text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
+        let texts = [shrunk];
+        let (bounds, _, _, w, _) =
+            compute_scissor(&texts, &[previous_bounds], 1.0, 1000, 1000).unwrap();
+        assert!(
+            bounds.width >= previous_bounds.width,
+            "logical union must retain the previous (wider) footprint"
+        );
+        assert!(
+            w >= previous_bounds.width.ceil() as u32,
+            "physical scissor width must be wide enough to cover the stale footprint"
+        );
+    }
+
+    #[test]
+    fn compute_scissor_is_none_when_dirty_rect_lies_entirely_outside_target() {
+        // The dirty bounds are non-empty but fall entirely past the
+        // physical target's edge, so `logical_rect_to_physical_scissor`
+        // collapses them to a zero-size rect — wgpu rejects a zero-size
+        // scissor, so `compute_scissor` must surface `None` rather than a
+        // degenerate `Some((..., 0, 0))`.
+        let texts = [line(2000.0, 2000.0, "offscreen", 16.0, true)];
+        assert!(compute_scissor(&texts, &[], 1.0, 100, 100).is_none());
+    }
 }
