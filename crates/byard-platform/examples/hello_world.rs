@@ -4,18 +4,17 @@
 //! This example is intentionally minimal: it implements [`PlatformHost`] and
 //! hands it to [`WinitHost`], drawing a mostly-static scene to confirm that
 //! the `SolidBox` pipeline, SDF border-radius shader, and NDC transform all
-//! produce correct output, plus a click-to-mutate label that exercises
-//! [`Engine`]'s Signal/`EvaluatorTick`/`LayoutAtlas` plumbing in production
-//! (RFC-0001's Phase 1 closure criterion). It used to drive `winit`'s
-//! `ApplicationHandler` directly inside `byard-core`; it now lives here
-//! because `byard-core` has zero direct references to `winit` (RFC-0001 §6)
-//! and this is the crate that owns the window.
+//! produce correct output, plus a click-to-mutate label that exercises the
+//! full RFC-0001 §5 concurrency model in production. `on_resume` calls
+//! [`Engine::start_logic`] to spawn the logic thread; `on_redraw` calls
+//! [`Engine::render_latest`] to render the latest frame published by that
+//! thread — the render path never blocks on the logic thread.
 //!
 //! Click anywhere in the window to mutate the reactive label's text via
 //! [`Engine::set_label_text`] — the only authored content for that label is
 //! the click count; everything about *how* the new text reaches the screen
-//! (Signal write → `EvaluatorTick::collect_dirty` → `LayoutAtlas::mark_dirty_all`
-//! → `TextLine::dirty`) happens inside [`Engine`], not here.
+//! (channel → Signal write → `EvaluatorTick` → `LayoutAtlas` → `TextLine::dirty`
+//! → `Relay::publish`) happens inside [`Engine`], not here.
 //!
 //! Run with:
 //! ```sh
@@ -41,20 +40,6 @@ fn main() {
 #[derive(Default)]
 struct App {
     engine: Option<Engine>,
-    /// Static scene: three shapes exercising radii, colour, and transparency.
-    ///
-    /// All coordinates are in **logical pixels** (density-independent units).
-    /// The engine converts to physical pixels internally using the window's
-    /// DPI scale factor, so this list renders identically on Retina and
-    /// non-HiDPI displays.
-    instances: Vec<BoxInstance>,
-    /// Static text overlay rendered in the same pass as `instances`.
-    ///
-    /// This does **not** include the engine's Signal-driven label — that one
-    /// lives inside [`Engine`] itself and is folded into the frame by
-    /// [`Engine::render_frame`]; this `Vec` is only the lines that genuinely
-    /// never change.
-    texts: Vec<TextLine>,
     /// Number of left-button clicks seen so far, used to author the
     /// reactive label's text in [`App::on_pointer_input`].
     click_count: u32,
@@ -67,7 +52,7 @@ impl PlatformHost for App {
         surface: wgpu::Surface<'static>,
         size: WindowSize,
     ) -> Result<(), ByardError> {
-        let engine = pollster::block_on(Engine::init(
+        let mut engine = pollster::block_on(Engine::init(
             instance,
             surface,
             size.width,
@@ -75,7 +60,7 @@ impl PlatformHost for App {
             size.scale_factor,
         ))?;
 
-        self.instances = vec![
+        let instances = vec![
             // Solid blue rectangle with uniform 16 px border-radius (logical).
             BoxInstance {
                 rect: [100.0, 100.0, 300.0, 200.0],
@@ -89,8 +74,6 @@ impl PlatformHost for App {
                 radii: [0.0, 32.0, 0.0, 32.0],
             },
             // White circle: radius == half of the square side (40 logical px).
-            // With all four corner radii equal to half_width == half_height the
-            // rounded-rect SDF degenerates to a perfect circle.
             BoxInstance {
                 rect: [340.0, 420.0, 80.0, 80.0],
                 color: [1.0, 1.0, 1.0, 0.85],
@@ -98,20 +81,20 @@ impl PlatformHost for App {
             },
         ];
 
-        self.texts = vec![
-            // Smaller label over the orange rectangle. The label over the
-            // blue rectangle is intentionally absent here — it's owned by
-            // `Engine`'s reactive `ReactiveLabel` and folded into the frame
-            // automatically by `Engine::render_frame`.
-            TextLine {
-                x: 510.0,
-                y: 190.0,
-                text: "TextGlyph".to_string(),
-                font_size: 14.0,
-                color: [0.1, 0.05, 0.0, 1.0],
-                dirty: false,
-            },
-        ];
+        // Static text rendered by the logic thread alongside Engine's own
+        // reactive label. The reactive label is Engine-internal; this vec
+        // holds only lines that never change.
+        let texts = vec![TextLine {
+            x: 510.0,
+            y: 190.0,
+            text: "TextGlyph".to_string(),
+            font_size: 14.0,
+            color: [0.1, 0.05, 0.0, 1.0],
+            dirty: false,
+        }];
+
+        // Spawn the logic thread and publish the first frame synchronously.
+        engine.start_logic(instances, texts)?;
 
         self.engine = Some(engine);
         Ok(())
@@ -127,7 +110,7 @@ impl PlatformHost for App {
 
     fn on_redraw(&mut self) -> Result<(), ByardError> {
         if let Some(engine) = self.engine.as_mut() {
-            engine.render_frame(&self.instances, &self.texts)?;
+            engine.render_latest()?;
         }
         Ok(())
     }

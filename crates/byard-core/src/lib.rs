@@ -60,7 +60,7 @@ pub enum ByardError {
     /// An unrecoverable error occurred while acquiring or presenting a surface texture.
     ///
     /// Transient surface losses (e.g. window minimise/restore) are handled
-    /// transparently by [`Engine::render_frame`] and never produce this variant.
+    /// transparently by [`Engine::render_latest`] and never produce this variant.
     RenderSurface(String),
 
     /// [`glyphon`] failed to upload shaped glyphs to the GPU atlas.

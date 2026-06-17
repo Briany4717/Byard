@@ -19,7 +19,7 @@
 //! RFC-0001 §5.1 says the Tokio pool "executes async I/O from Rust
 //! controllers" and "sends results back to the logic thread via
 //! `tokio::sync::mpsc`". No `#[byard_controller]` exists yet — that's a
-//! `bylang`-side feature for a later phase — so there is no concrete result
+//! `byld`-side feature for a later phase — so there is no concrete result
 //! type to name today. Making `Relay` generic over that type would force
 //! every call site (all 27 tests in this module included) to pin a type
 //! parameter for a feature none of them use yet, which is exactly the kind
@@ -58,14 +58,24 @@
 //! ("dropping the engine joins all threads cleanly") at the layer that can
 //! actually guarantee it.
 //!
-//! ## Engine integration is intentionally deferred
+//! ## Engine integration
 //!
-//! This module is fully self-contained and fully tested on its own. Wiring
-//! it into [`crate::engine::Engine`] is left for a focused follow-up commit
-//! rather than bundled here, per `CONTRIBUTING.md`'s "small, focused
-//! commits" guidance — the Atlas does not yet populate frames on a logic
-//! thread, so any `Engine` wiring today would be speculative glue code with
-//! no real producer behind it.
+//! [`crate::engine::Engine`] owns an `Arc<Relay>`, spawns the logic thread
+//! in [`Engine::start_logic`], and reads the latest frame via
+//! [`Relay::current`] in [`Engine::render_latest`]. `Engine`'s `Drop` impl
+//! calls [`Relay::request_shutdown`] and joins the logic thread before
+//! releasing the last `Arc<Relay>`.
+//!
+//! [`Engine::start_logic`] does not use [`Relay::spawn_logic_thread`]
+//! directly. The tick state it needs to capture — a `ReactiveLabel` — holds
+//! a [`crate::evaluator::Signal`], which is intentionally `!Send` per
+//! RFC-0001 §5.1 (signals are never accessed outside the logic thread; the
+//! compiler enforces this). A `FnMut + Send` closure therefore cannot
+//! capture `ReactiveLabel`. Instead, `start_logic` spawns via
+//! `std::thread::Builder` and constructs the `ReactiveLabel` inside the
+//! thread body, following the same `acquire_recycled → tick → publish →
+//! yield_now → is_shutdown` loop that [`Relay::spawn_logic_thread`] would
+//! have supplied.
 
 use std::any::Any;
 use std::sync::Arc;
