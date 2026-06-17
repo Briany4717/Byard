@@ -82,17 +82,16 @@ pub enum PointerState {
 /// type, which is what keeps `winit` (or any future backend) out of
 /// `byard-core`'s dependency tree (RFC-0001 §6).
 ///
-/// ## Scope: this trait drives an [`Engine`](crate::engine::Engine) directly
+/// ## Scope: this trait drives [`Engine`](crate::engine::Engine)
 ///
-/// `PlatformHost` calls an `Engine` the same way the original Phase 1
-/// example did by hand — it does not route frames through
-/// [`crate::relay::Relay`]. `Relay`'s own module documentation already
-/// states that wiring it into `Engine` is deliberately deferred until the
-/// Atlas actually populates frames on a logic thread; until that lands,
-/// having `PlatformHost` go through `Relay` would just be speculative glue
-/// with no producer behind it. A future issue can swap what's behind
-/// `on_redraw` from a direct `Engine::render_frame` call to
-/// `Relay::current()` without changing this trait's shape at all.
+/// `PlatformHost` owns an `Engine` and calls it in response to OS events.
+/// [`on_resume`](PlatformHost::on_resume) initialises the engine and calls
+/// [`Engine::start_logic`](crate::engine::Engine::start_logic) to spawn the
+/// logic thread; [`on_redraw`](PlatformHost::on_redraw) calls
+/// [`Engine::render_latest`](crate::engine::Engine::render_latest), which
+/// reads the latest [`RenderFrame`](crate::frame::RenderFrame) from the
+/// engine's [`Relay`](crate::relay::Relay) — the logic thread never blocks
+/// the render thread, per RFC-0001 §5.
 pub trait PlatformHost {
     /// Called once, after the host has created its window and `wgpu`
     /// surface, before the first redraw. Implementations typically call
@@ -126,14 +125,13 @@ pub trait PlatformHost {
     /// `WindowEvent::RedrawRequested`).
     ///
     /// Implementations typically call
-    /// [`Engine::render_frame`](crate::engine::Engine::render_frame) here.
+    /// [`Engine::render_latest`](crate::engine::Engine::render_latest) here.
     ///
     /// # Errors
     ///
-    /// Returns whatever [`ByardError`] frame rendering produces. Per
-    /// [`Engine::render_frame`]'s own documentation, transient surface loss
-    /// is already handled internally and never reaches this method as an
-    /// error — only unrecoverable surface errors do.
+    /// Returns whatever [`ByardError`] frame rendering produces. Transient
+    /// surface loss is already handled internally and never reaches this
+    /// method as an error — only unrecoverable surface errors do.
     fn on_redraw(&mut self) -> Result<(), ByardError>;
 
     /// Called when the user requests the window close (close button,
