@@ -317,7 +317,7 @@ impl EncoderSubsystem {
         )
         .await?;
 
-        let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format)?;
+        let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format).await?;
 
         let (persistent_color, persistent_view) =
             create_persistent_target(&device, surface_format, width, height);

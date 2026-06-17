@@ -175,21 +175,41 @@ impl TextGlyphPipeline {
     /// Creates the pipeline.
     ///
     /// Initialises all glyphon resources in the correct order:
-    /// `Cache` → `TextAtlas` → `Viewport` → `TextRenderer`.
+    /// `Cache` → `TextAtlas` → `Viewport` → `TextRenderer`. This sequence is
+    /// wrapped in a single `Device::push_error_scope` / `pop_error_scope`
+    /// pair (RFC §8) — glyphon's constructors are opaque to byard-core, but
+    /// an error scope captures any validation error raised on `device`
+    /// during the scope regardless of which crate triggered it, so the
+    /// guarantee holds even though byard-core never calls
+    /// `create_render_pipeline` itself here.
     ///
     /// # Errors
     ///
-    /// Currently infallible. Returns `Result` so callers already write `?` and
-    /// the signature stays stable when fallible GPU operations are added.
-    pub fn new(
+    /// Returns [`ByardError::PipelineCompilation`] if glyphon's internal
+    /// pipeline/shader construction fails GPU-side validation.
+    pub async fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
     ) -> Result<Self, ByardError> {
+        // --- GPU VALIDATION ERROR SCOPE (RFC §8) ---
+        // Covers Cache::new + TextAtlas::new + Viewport::new + TextRenderer::new.
+        // glyphon's pipeline/shader creation is opaque to byard-core, but the
+        // scope still captures any validation error wgpu raises on `device`
+        // while it runs.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
         let glyph_cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &glyph_cache, format);
         let viewport = Viewport::new(device, &glyph_cache);
         let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+
+        if let Some(error) = scope.pop().await {
+            return Err(ByardError::PipelineCompilation {
+                pipeline: "TextGlyph".to_string(),
+                reason: error.to_string(),
+            });
+        }
 
         Ok(Self {
             font_system: FontSystem::new(),
