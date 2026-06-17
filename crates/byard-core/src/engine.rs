@@ -1,11 +1,12 @@
 //! # Engine
 //!
-//! Top-level orchestrator that binds the encoder subsystem to a `wgpu` surface.
+//! Top-level orchestrator that binds the Relay, Encoder, and `wgpu` surface.
 //!
 //! [`Engine`] is the public entry point for platform code. The platform
-//! creates one `Engine` per window, notifies it of resize events via
+//! creates one `Engine` per window, calls [`Engine::start_logic`] once to
+//! spawn the logic thread, notifies it of resize events via
 //! [`Engine::on_resize`], and drives it frame-by-frame via
-//! [`Engine::render_frame`]. The engine never imports windowing primitives
+//! [`Engine::render_latest`]. The engine never imports windowing primitives
 //! (`winit`, `raw-window-handle`, etc.) — surface creation and window
 //! lifecycle are entirely the platform's responsibility (RFC-0001 §6).
 //!
@@ -19,38 +20,48 @@
 //! uniform, while keeping the `wgpu` surface in physical pixels as required
 //! by the API.
 //!
+//! ## Concurrency model (RFC-0001 §5)
+//!
 //! ```text
 //!   Platform (winit / etc.)                    byard-core
 //!   ──────────────────────                     ──────────────────────────────
-//!   window resize event (physical + scale) ──► Engine::on_resize(w, h, scale)
-//!   RedrawRequested event                  ──► Engine::render_frame(&instances)
-//!                                                  └─ EncoderSubsystem::encode_frame
+//!   on_resume                              ──► Engine::init + Engine::start_logic
+//!   resize / DPI change                    ──► Engine::on_resize
+//!   RedrawRequested                        ──► Engine::render_latest
+//!                                                  └─ Relay::current (lock-free)
+//!                                                  └─ EncoderSubsystem::encode_frame_from_relay
 //!                                                  └─ queue.submit + surface.present
+//!   [logic thread]                             acquire_recycled → tick → Relay::publish
 //! ```
 
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use crate::ByardError;
 use crate::atlas::{LayoutAtlas, LeafSize};
-use crate::encoder::text_glyph::TextLine;
-use crate::encoder::{BoxInstance, EncoderSubsystem};
+use crate::encoder::EncoderSubsystem;
 use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
-use crate::frame::{TargetId, TargetKind, Viewport};
+use crate::frame::{BoxInstance, TargetId, TargetKind, TextLine, Viewport};
+use crate::relay::Relay;
 
 /// The Byard rendering engine for a single window surface.
 ///
-/// Owns the GPU device, queue, compiled pipelines, and the `wgpu` surface.
-/// Constructed once at startup via [`Engine::init`]; thereafter the platform
-/// calls [`on_resize`](Engine::on_resize) and [`render_frame`](Engine::render_frame)
-/// in response to OS events.
+/// Owns the GPU device, queue, compiled pipelines, the `wgpu` surface, and the
+/// [`Relay`] that connects the logic and render threads. Construction is
+/// two-phase:
 ///
-/// `Engine` also owns one Signal-driven reactive text label ([`ReactiveLabel`]):
-/// every [`render_frame`](Engine::render_frame) call runs a real
-/// `Evaluator → Atlas` tick against it (not just the unit tests in
-/// `atlas/layout.rs`), and [`Engine::set_label_text`] is the production
-/// mutation path. This is what closes Phase 1's stated closure criterion —
-/// "the engine renders ... a reactive text label driven by a Signal" — by
-/// exercising Evaluator, Atlas, and Encoder together outside of test code.
+/// 1. [`Engine::init`] — selects the GPU adapter, compiles pipelines, and
+///    creates the `Relay`. Synchronous startup, no threads yet.
+/// 2. [`Engine::start_logic`] — spawns the logic thread (Evaluator + Atlas),
+///    publishes the first frame synchronously so `render_latest` has content
+///    on the very first redraw.
+///
+/// Thereafter the platform calls [`on_resize`](Engine::on_resize) on resize
+/// events and [`render_latest`](Engine::render_latest) on every
+/// `RedrawRequested` event.
+///
+/// Dropping `Engine` signals the logic thread to shut down and joins it
+/// before returning — no orphan threads after the window closes.
 pub struct Engine {
     encoder: EncoderSubsystem,
     surface: wgpu::Surface<'static>,
@@ -60,13 +71,16 @@ pub struct Engine {
     /// Cached scale factor so surface-loss recovery can recompute the logical
     /// viewport without additional platform input.
     scale_factor: f64,
-    /// The engine's one Signal-driven text label. See the struct doc above.
-    label: ReactiveLabel,
-    /// Reused per-frame scratch buffer for the combined text list (the
-    /// reactive label plus whatever static lines the caller supplies) —
-    /// avoids a per-frame allocation once warmed up, per RFC-0001's
-    /// deterministic-memory goals.
-    text_scratch: Vec<TextLine>,
+    /// Lock-free frame swap connecting the logic and render threads.
+    relay: Arc<Relay>,
+    /// Sender half of the label-text channel. `set_label_text` sends here;
+    /// the logic thread drains it each tick via `try_recv`.
+    label_tx: crossbeam_channel::Sender<String>,
+    /// Receiver half, taken by `start_logic` when the logic thread is spawned.
+    /// `None` after `start_logic` is called.
+    label_rx: Option<crossbeam_channel::Receiver<String>>,
+    /// Handle to the logic thread, taken and joined in `Drop`.
+    logic_handle: Option<JoinHandle<()>>,
 }
 
 /// Backing state for [`Engine`]'s one Signal-driven text label.
@@ -301,25 +315,33 @@ impl Engine {
             scale_f32,
         );
 
+        let relay = Arc::new(Relay::new()?);
+        let (label_tx, label_rx) = crossbeam_channel::unbounded::<String>();
+
         Ok(Self {
             encoder,
             surface,
             surface_config,
             scale_factor,
-            label: ReactiveLabel::new("Byard — Phase 1", 110.0, 110.0, 20.0, [1.0, 1.0, 1.0, 1.0]),
-            text_scratch: Vec::new(),
+            relay,
+            label_tx,
+            label_rx: Some(label_rx),
+            logic_handle: None,
         })
     }
 
     /// Replaces the engine's reactive label text.
     ///
-    /// The next [`Engine::render_frame`] call picks up the change, with the
-    /// resulting `TextLine`'s `dirty` bit set from the real Evaluator →
-    /// Atlas dirty-flag pipeline (RFC-0001 §2.2, §4.1) — this is the
-    /// production mutation path for Phase 1's "reactive text label driven
-    /// by a Signal" closure criterion.
+    /// Sends the new text to the logic thread via a lock-free channel; the
+    /// logic thread picks it up on its next tick, writes it to the `Signal`,
+    /// and the resulting `TextLine::dirty` bit propagates through the
+    /// Evaluator → Atlas pipeline — the full RFC-0001 §2.2/§4.1 path,
+    /// without any cross-thread `Signal` write.
     pub fn set_label_text(&self, text: impl Into<String>) {
-        self.label.set_text(text);
+        // Unbounded channel: send is always non-blocking. Ignore the error —
+        // it only fires when the logic thread has already exited, at which
+        // point delivering the text is moot.
+        let _ = self.label_tx.send(text.into());
     }
 
     /// Notifies the engine that the window surface has been resized.
@@ -350,43 +372,122 @@ impl Engine {
         );
     }
 
-    /// Renders one frame to the window surface.
+    /// Spawns the logic thread and publishes the first frame synchronously.
     ///
-    /// Acquires the next surface texture, encodes a render pass that draws
-    /// all `instances`, submits the command buffer to the GPU queue, and
-    /// presents the frame to the display.
+    /// Must be called exactly once, after [`Engine::init`] and before the first
+    /// [`Engine::render_latest`] call. `instances` and `texts` are the static
+    /// scene content authored by the platform; the engine appends its own
+    /// reactive label to `texts` each tick.
+    ///
+    /// The first frame is published synchronously (before this method returns)
+    /// so that [`render_latest`](Engine::render_latest) always finds a frame
+    /// ready on the very first `RedrawRequested` event.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same `Engine`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByardError::ThreadSpawn`] if the OS refuses to create the
+    /// logic thread.
+    pub fn start_logic(
+        &mut self,
+        instances: Vec<BoxInstance>,
+        texts: Vec<TextLine>,
+    ) -> Result<(), ByardError> {
+        let relay = Arc::clone(&self.relay);
+        let label_rx = self
+            .label_rx
+            .take()
+            .expect("start_logic must be called exactly once");
+
+        // Publish the first frame synchronously so render_latest has content
+        // on the very first RedrawRequested, before the thread has ticked.
+        {
+            let mut label =
+                ReactiveLabel::new("Byard — Phase 1", 110.0, 110.0, 20.0, [1.0, 1.0, 1.0, 1.0]);
+            let label_line = label.text_line()?;
+            let mut frame = relay.acquire_recycled();
+            frame.set_version(0);
+            for &inst in &instances {
+                frame.push_instance(inst);
+            }
+            for text in &texts {
+                frame.push_text(text.clone());
+            }
+            frame.push_text(label_line);
+            relay.publish(frame);
+        }
+
+        // Spawn the logic thread. `ReactiveLabel` is created inside the thread
+        // so it never needs to cross a thread boundary — `Signal<T>` is !Send
+        // by design (RFC-0001 §5.1). The closure only captures Send types:
+        // `relay: Arc<Relay>`, `label_rx: Receiver<String>`, and the
+        // plain-data `instances`/`texts` vecs.
+        let handle = std::thread::Builder::new()
+            .name("byard-logic-thread".to_string())
+            .spawn(move || {
+                let mut label =
+                    ReactiveLabel::new("Byard — Phase 1", 110.0, 110.0, 20.0, [1.0, 1.0, 1.0, 1.0]);
+                let mut current_version: u64 = 0;
+
+                while !relay.is_shutdown() {
+                    while let Ok(new_text) = label_rx.try_recv() {
+                        label.set_text(new_text);
+                    }
+                    let label_line = label
+                        .text_line()
+                        .expect("text_line never fails in logic loop");
+                    if label_line.dirty {
+                        current_version += 1;
+                    }
+                    let mut frame = relay.acquire_recycled();
+                    frame.set_version(current_version);
+                    for &inst in &instances {
+                        frame.push_instance(inst);
+                    }
+                    for text in &texts {
+                        frame.push_text(text.clone());
+                    }
+                    frame.push_text(label_line);
+                    relay.publish(frame);
+                    std::thread::yield_now();
+                }
+            })
+            .map_err(|e| ByardError::ThreadSpawn(e.to_string()))?;
+
+        self.logic_handle = Some(handle);
+        Ok(())
+    }
+
+    /// Renders the latest [`RenderFrame`](crate::frame::RenderFrame) published
+    /// by the logic thread to the window surface.
+    ///
+    /// Reads the latest frame from the [`Relay`] without blocking the logic
+    /// thread, then encodes and presents it. If no frame has been published yet
+    /// (i.e. [`start_logic`](Engine::start_logic) has not been called), this
+    /// returns `Ok(())` immediately and skips the frame.
     ///
     /// # Surface loss
     ///
     /// If the surface is lost or outdated (window minimise/restore, driver
     /// reset), the engine silently reconfigures it and returns `Ok(())`.
-    /// The next call to `render_frame` will produce output normally. The
-    /// platform does not need to handle surface loss explicitly.
+    /// The next call to `render_latest` will produce output normally.
     ///
     /// # Errors
     ///
     /// Returns [`ByardError::RenderSurface`] only on unrecoverable surface
     /// errors such as out-of-memory or GPU timeout.
-    pub fn render_frame(
-        &mut self,
-        instances: &[BoxInstance],
-        texts: &[TextLine],
-    ) -> Result<(), ByardError> {
-        // wgpu 29: get_current_texture() returns CurrentSurfaceTexture (an enum),
-        // replacing the old Result<SurfaceTexture, SurfaceError> API.
+    pub fn render_latest(&mut self) -> Result<(), ByardError> {
         let frame = match self.surface.get_current_texture() {
-            // Suboptimal: surface is valid but should be reconfigured (e.g. wrong
-            // DPI or format). Draw this frame and let the next on_resize fix it.
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            // Lost / Outdated: reconfigure with the last known dimensions and
-            // skip this frame. The surface will be healthy on the next call.
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface
                     .configure(self.encoder.device(), &self.surface_config);
                 return Ok(());
             }
-            // Timeout / Occluded: transient; skip frame, next will succeed.
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return Ok(());
             }
@@ -397,28 +498,35 @@ impl Engine {
             }
         };
 
-        // No `TextureView` is created here: per RFC §3.3's scissor-clipping
-        // design, `encode_frame` never draws directly onto the swapchain
-        // image — it only `copy_texture_to_texture`s into it, which needs
-        // the `wgpu::Texture` itself, not a view.
-
-        // Run one Evaluator → Atlas tick for the engine's reactive label
-        // and fold it into this frame's text list, ahead of whatever
-        // static lines the caller supplies. This is the production code
-        // path that exercises Signal/EvaluatorTick/LayoutAtlas — not just
-        // the unit tests in `atlas/layout.rs`.
-        let label_line = self.label.text_line()?;
-        self.text_scratch.clear();
-        self.text_scratch.push(label_line);
-        self.text_scratch.extend_from_slice(texts);
+        let Some(relay_frame) = self.relay.current() else {
+            return Ok(());
+        };
 
         let cmd = self
             .encoder
-            .encode_frame(&frame.texture, instances, &self.text_scratch)?;
+            .encode_frame_from_relay(&frame.texture, &relay_frame)?;
         self.encoder.submit(cmd);
         frame.present();
-
         Ok(())
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.relay.request_shutdown();
+        if let Some(handle) = self.logic_handle.take() {
+            match handle.join() {
+                Ok(()) => {}
+                // Resume the logic thread's panic unless we're already
+                // unwinding — resuming inside a panic would abort the process
+                // (double-panic), so skip re-raising in that case.
+                Err(payload) => {
+                    if !std::thread::panicking() {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+        }
     }
 }
 
