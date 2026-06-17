@@ -124,7 +124,7 @@ impl<'a> EvaluatorTick<'a> {
                 .iter()
                 .any(|s| std::ptr::addr_eq(s.slot_ptr, slot_ptr)),
             "Signal registered twice on the same EvaluatorTick — likely a \
-             bylang transpiler bug. The engine will deduplicate dirty \
+             byld transpiler bug. The engine will deduplicate dirty \
              targets at collect time, so this is not a correctness issue, \
              but each duplicate wastes a tracking slot.",
         );
