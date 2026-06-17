@@ -134,6 +134,29 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
+
+    /// Returns the smallest rectangle that fully covers both `self` and
+    /// `other`.
+    ///
+    /// Used by the Encoder (RFC-0001 §3.3) to merge several dirty-region
+    /// bounding boxes into the single bounding box passed to
+    /// `wgpu::RenderPass::set_scissor_rect` — see the "Scope decision" note
+    /// on multi-rect merging in the scissor-clipping PR. Degenerate
+    /// (zero-area) rects are handled the same as any other rect: the union
+    /// still expands to cover their `(x, y)` corner.
+    #[must_use]
+    pub fn union(&self, other: &Rect) -> Rect {
+        let min_x = self.x.min(other.x);
+        let min_y = self.y.min(other.y);
+        let max_x = (self.x + self.width).max(other.x + other.width);
+        let max_y = (self.y + self.height).max(other.y + other.height);
+        Rect {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x,
+            height: max_y - min_y,
+        }
+    }
 }
 
 /// Logical-pixel dimensions of the surface that hosts a layout.
@@ -281,6 +304,52 @@ mod tests {
     fn rect_does_not_contain_point_outside() {
         let r = Rect::new(10.0, 20.0, 100.0, 50.0);
         assert!(!r.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn rect_union_of_disjoint_rects_covers_both() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(100.0, 200.0, 10.0, 10.0);
+        let u = a.union(&b);
+        assert_eq!(u, Rect::new(0.0, 0.0, 110.0, 210.0));
+    }
+
+    #[test]
+    fn rect_union_with_self_is_identity() {
+        let a = Rect::new(5.0, 5.0, 20.0, 30.0);
+        assert_eq!(a.union(&a), a);
+    }
+
+    #[test]
+    fn rect_union_is_commutative() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(-5.0, 3.0, 4.0, 50.0);
+        assert_eq!(a.union(&b), b.union(&a));
+    }
+
+    #[test]
+    fn rect_union_where_one_fully_contains_the_other_returns_the_larger() {
+        let outer = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let inner = Rect::new(10.0, 10.0, 5.0, 5.0);
+        assert_eq!(outer.union(&inner), outer);
+        assert_eq!(inner.union(&outer), outer);
+    }
+
+    #[test]
+    fn rect_union_of_overlapping_rects_merges_correctly() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(5.0, 5.0, 10.0, 10.0);
+        assert_eq!(a.union(&b), Rect::new(0.0, 0.0, 15.0, 15.0));
+    }
+
+    #[test]
+    fn rect_union_of_zero_area_rects_covers_both_corners() {
+        // A degenerate (zero-size) rect can still arise from a TextLine whose
+        // heuristic bounds collapse to a point; union must not panic or
+        // silently drop it.
+        let a = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let b = Rect::new(50.0, 50.0, 0.0, 0.0);
+        assert_eq!(a.union(&b), Rect::new(0.0, 0.0, 50.0, 50.0));
     }
 
     #[test]
