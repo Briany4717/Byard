@@ -255,8 +255,16 @@ impl Engine {
             .unwrap_or(caps.formats[0]);
 
         // --- Surface configuration (physical pixels — wgpu requirement) ---
+        //
+        // COPY_DST is required in addition to RENDER_ATTACHMENT: per RFC §3.3's
+        // scissor-clipping implementation, `EncoderSubsystem::encode_frame`
+        // never draws directly onto the swapchain image — it draws onto a
+        // persistent off-screen target and `copy_texture_to_texture`s the
+        // result onto this surface's current texture every frame (the
+        // swapchain image's own previous contents are never assumed valid
+        // under multi-buffering). See `encoder::EncoderSubsystem::persistent_color`.
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format: surface_format,
             width,
             height,
@@ -277,6 +285,8 @@ impl Engine {
             Arc::clone(&queue),
             surface_format,
             scale_f32,
+            width,
+            height,
         )
         .await?;
 
@@ -387,9 +397,10 @@ impl Engine {
             }
         };
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // No `TextureView` is created here: per RFC §3.3's scissor-clipping
+        // design, `encode_frame` never draws directly onto the swapchain
+        // image — it only `copy_texture_to_texture`s into it, which needs
+        // the `wgpu::Texture` itself, not a view.
 
         // Run one Evaluator → Atlas tick for the engine's reactive label
         // and fold it into this frame's text list, ahead of whatever
@@ -403,7 +414,7 @@ impl Engine {
 
         let cmd = self
             .encoder
-            .encode_frame(&view, instances, &self.text_scratch)?;
+            .encode_frame(&frame.texture, instances, &self.text_scratch)?;
         self.encoder.submit(cmd);
         frame.present();
 
