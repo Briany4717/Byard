@@ -79,12 +79,23 @@
 //! ```text
 //! signals mutate  →  EvaluatorTick::collect_dirty()  →  Vec<TargetId>
 //!                                                       │
-//!                            ┌──────────────────────────┼──────────────┐
-//!                            ▼                          ▼              ▼
-//!                  atlas.mark_dirty_all(...)   encoder.mark_dirty_all(...)   ...
+//!                                                       ▼
+//!                                          atlas.mark_dirty_all(...)
+//!                                                       │
+//!                                                       ▼
+//!                                          atlas.recompute_dirty(...)
+//!                                                       │
+//!                                                       ▼
+//!                              per-target `dirty` bit, read off the
+//!                              resolved [`TargetId`] and copied onto the
+//!                              matching `TextLine`/`BoxInstance` in
+//!                              `RenderFrame` — the Atlas is the only
+//!                              subsystem that calls `mark_dirty_all`; the
+//!                              encoder never broadcasts, it only reads the
+//!                              dirty bit already attached to each primitive.
 //! ```
 //!
-//! Each subsystem filters the broadcast by [`TargetKind`](crate::frame::TargetKind)
+//! The Atlas filters the broadcast by [`TargetKind`](crate::frame::TargetKind)
 //! and ignores foreign or stale entries. See [`LayoutAtlas::mark_dirty_all`]
 //! for the filtering rules.
 
