@@ -10,7 +10,7 @@
 
 > **Project status: pre-alpha — design phase.**
 > Byard is currently a set of design documents and an architectural plan. There is
-> no usable build yet. The public interface, the `bylang` DSL syntax, and the
+> no usable build yet. The public interface, the `byld` DSL syntax, and the
 > crate layout are all expected to change. This README describes the **intended**
 > system; see [the RFCs](docs/rfcs/) for the authoritative design.
 
@@ -19,7 +19,7 @@
 Byard is a UI framework built around a single idea: **the declarative layer and the
 systems layer should never live in the same file.**
 
-- **`bylang`** — a statically-typed DSL used *exclusively* to declare UI structure,
+- **`byld`** — a statically-typed DSL used *exclusively* to declare UI structure,
   styling, and visual reactivity.
 - **Rust** — used *exclusively* for business logic: networking, disk, cryptography,
   OS integration, and anything that touches the real world.
@@ -49,7 +49,7 @@ performance**: stable frame times, no GC pauses, no VRAM spikes.
 
 ## Design principles
 
-1. **Strict domain separation.** `bylang` is for design; Rust is for logic. They are
+1. **Strict domain separation.** `byld` is for design; Rust is for logic. They are
    never mixed in one file.
 2. **Zero garbage collector.** Memory is managed through Rust ownership and
    component-scoped memory arenas.
@@ -72,13 +72,13 @@ The engine is four concurrent subsystems:
   Tokio pool for async I/O.
 
 The full design — memory model, the multi-pipeline renderer, the spatial hit-testing
-grid, the threading model, and the `bylang` compiler pipeline — is specified in
+grid, the threading model, and the `byld` compiler pipeline — is specified in
 [**RFC-0001: Core Architecture**](docs/rfcs/0001-core-architecture.md).
 
-## A taste of `bylang`
+## A taste of `byld`
 
 ```
-// Conceptual bylang — syntax is not final.
+// Conceptual byld — syntax is not final.
 View UserCard() {
     signal clicks = 0
     inject AppEnvironment as env
@@ -102,11 +102,11 @@ Byard is being built in phases.
   integration, the spatial hash grid, and the double-buffered threading model.
   Scope and progress tracked in the
   [Phase 1 milestone](https://github.com/Briany4717/byard/milestones).
-- **Phase 2 — `bylang` compiler** — `logos` lexer, hand-written recursive descent
+- **Phase 2 — `byld` compiler** — `logos` lexer, hand-written recursive descent
   parser, and the dev-mode AST interpreter.
-- **Phase 3 — Rust ↔ `bylang` bridge** — the `#[byard_controller]` macro and LSP
+- **Phase 3 — Rust ↔ `byld` bridge** — the `#[byard_controller]` macro and LSP
   metadata generation.
-- **Phase 4 — Production transpiler** — `bylang` → native Rust for AOT builds.
+- **Phase 4 — Production transpiler** — `byld` → native Rust for AOT builds.
 
 Roadmap items will be tracked as
 [GitHub milestones](https://github.com/Briany4717/byard/milestones) as the project moves

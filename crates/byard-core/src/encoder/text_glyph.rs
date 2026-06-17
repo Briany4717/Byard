@@ -16,7 +16,7 @@
 //!   bit (or `viewport_dirty`) is set — zero hashing, zero extra CPU cost
 //!   for static text. Debug builds additionally compute an `FxHasher`
 //!   content hash as a secondary safety net and panic if it disagrees with
-//!   the upstream flag, catching dependency-tracking bugs in the bylang
+//!   the upstream flag, catching dependency-tracking bugs in the byld
 //!   transpiler before they reach production. See [`needs_reshape`] and
 //!   [`assert_dirty_flag_consistency`].
 //! - **Three-pass borrow pattern** — `prepare` splits work across three
@@ -43,32 +43,10 @@ use crate::ByardError;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
-/// A single line of text to be rendered in a frame.
-///
-/// All fields are primitives — no glyphon types are exposed at the public API
-/// boundary. The pipeline owns all GPU-side state internally.
-///
-/// Coordinates are in **logical pixels**, consistent with [`BoxInstance`](super::BoxInstance).
-#[derive(Debug, Clone)]
-pub struct TextLine {
-    /// X position of the text baseline in logical pixels.
-    pub x: f32,
-    /// Y position of the text baseline in logical pixels.
-    pub y: f32,
-    /// Text content.
-    pub text: String,
-    /// Font size in logical pixels.
-    pub font_size: f32,
-    /// Text colour: `[r, g, b, a]` in linear space, each component 0–1.
-    pub color: [f32; 4],
-    /// Whether this line's content changed since the last tick.
-    ///
-    /// Set upstream by the Evaluator → Atlas → `RenderFrame` pipeline (see
-    /// [`RenderFrame::dirty`](crate::frame::RenderFrame::dirty)) — never
-    /// derived locally by this pipeline. `prepare` trusts this bit
-    /// completely in `--release` builds; see the module documentation.
-    pub dirty: bool,
-}
+/// Re-exported from [`crate::frame`] — the canonical definition now lives
+/// there so the Logic thread can populate [`RenderFrame::texts`] without
+/// importing from a subsystem that it must not depend on (RFC-0001 §9).
+pub use crate::frame::TextLine;
 
 // ── Internal cache entry ──────────────────────────────────────────────────────
 
@@ -142,7 +120,7 @@ fn needs_reshape(viewport_dirty: bool, line_dirty: bool) -> bool {
 fn assert_dirty_flag_consistency(hash_changed: bool, line_dirty: bool) {
     assert!(
         !hash_changed || line_dirty,
-        "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the bylang transpiler dependency tracking."
+        "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the byld transpiler dependency tracking."
     );
 }
 
@@ -466,7 +444,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(
-        expected = "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the bylang transpiler dependency tracking."
+        expected = "State mutation undetected! A text primitive content changed but its upstream dirty flag was not set. This is a bug in the byld transpiler dependency tracking."
     )]
     fn consistency_check_panics_when_hash_changed_but_dirty_was_not_set() {
         assert_dirty_flag_consistency(true, false);

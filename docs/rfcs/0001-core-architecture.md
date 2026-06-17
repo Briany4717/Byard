@@ -12,9 +12,9 @@
 This RFC defines the foundational architecture of Byard: a high-performance,
 cross-platform, direct-GPU-rendering UI framework built on `wgpu` and `winit`,
 with a zero-garbage-collector memory model and a companion declarative DSL called
-`bylang`. It covers the four engine subsystems, the memory arena model, the
+`byld`. It covers the four engine subsystems, the memory arena model, the
 multi-pipeline renderer, the spatial hit-testing grid, the multi-threaded
-concurrency design, and the `bylang` compiler pipeline.
+concurrency design, and the `byld` compiler pipeline.
 
 ---
 
@@ -49,18 +49,18 @@ the declarative layer never owns complex Rust lifetimes.
 
 A Byard application consists of exactly two kinds of files:
 
-- **`.by` files** — written in `bylang`. These describe UI structure, styling,
+- **`.byd` files** — written in `byld`. These describe UI structure, styling,
   and visual reactivity. They contain no network calls, no file I/O, and no
   business logic.
 - **`.rs` files** — written in Rust. These implement controllers: networking,
   disk, cryptography, OS integration, and application state that outlives a
   single view. Controllers are declared with `#[byard_controller]` and exposed
-  to `bylang` through a zero-cost, compile-time-generated boundary.
+  to `byld` through a zero-cost, compile-time-generated boundary.
 
 The two are never mixed in a single file. This is a hard architectural rule,
 not a style guideline.
 
-### `bylang` at a glance
+### `byld` at a glance
 
 ```
 View UserCard() {
@@ -93,7 +93,7 @@ impl NetworkController {
 ```
 
 `#[byard_controller]` generates shared-memory bindings and a typed metadata
-file consumed by the `bylang` LSP, giving the developer full autocompletion
+file consumed by the `byld` LSP, giving the developer full autocompletion
 across the language boundary without a serialization round-trip.
 
 ---
@@ -217,7 +217,7 @@ compile time, giving zero-cost abstraction at runtime.
 This design also allows the engine to be embedded as a pure rendering backend
 with no windowing layer at all (the planned *Coreolis* use-case).
 
-### 7. `bylang` compiler pipeline
+### 7. `byld` compiler pipeline
 
 #### 7.1 Lexer
 
@@ -238,7 +238,7 @@ prioritises:
 | Mode | Mechanism | Use-case |
 |------|-----------|----------|
 | **Dev** | AST interpreter | Hot-reload: changes are picked up without recompilation |
-| **Prod** | Transpiler → Rust | AOT: `bylang` compiles to native Rust that generates GPU primitives directly |
+| **Prod** | Transpiler → Rust | AOT: `byld` compiles to native Rust that generates GPU primitives directly |
 
 ### 8. GPU error handling
 
@@ -303,7 +303,7 @@ be resolved before merging.
 sustained discipline to extend without introducing regressions. Grammar changes
 are more expensive than with a generated parser.
 
-**Multi-language overhead.** Developers must context-switch between `.by` and
+**Multi-language overhead.** Developers must context-switch between `.byd` and
 `.rs` files. This is mitigated by the LSP providing seamless cross-language
 navigation, but the initial learning curve is real for developers used to
 single-file component models (e.g. Svelte, Vue SFCs).
@@ -324,7 +324,7 @@ project in this space.
 
 **Why hand-written parser and not `pest` / `chumsky`?** Error quality. Parser
 combinator and PEG frameworks produce adequate errors for simple grammars but
-struggle with the contextual hints (`bylang` intends to produce SwiftUI-quality
+struggle with the contextual hints (`byld` intends to produce SwiftUI-quality
 diagnostics). The maintenance cost is real but the developer experience benefit
 justifies it.
 
@@ -348,7 +348,7 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
   fine-grained reactivity are the main differences from Byard's signal model.
 - **Bevy UI.** ECS-based UI in a game engine. Excellent concurrency, but the ECS
   model is not ergonomic for application UI trees.
-- **SwiftUI.** The DX reference for `bylang`. Declarative, property-chain styling,
+- **SwiftUI.** The DX reference for `byld`. Declarative, property-chain styling,
   environment injection. Byard's DSL is directly inspired by it.
 - **Solid.js signals.** The fine-grained reactivity reference: mutations touch
   only the affected DOM nodes, never re-run the whole component. Byard's `Signal`
@@ -375,7 +375,7 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
 - [ ] **Testing strategy.** The double-buffered multi-threaded model is hard to
   test with standard `#[test]`. What is the approach — headless wgpu, snapshot
   tests of render output, deterministic frame replay?
-- [ ] **`bylang` syntax stabilisation.** The syntax shown in this RFC is
+- [ ] **`byld` syntax stabilisation.** The syntax shown in this RFC is
   conceptual. A grammar RFC must be written before the parser is implemented.
 - [ ] **MSRV policy.** How aggressively do we track stable Rust? This affects
   `wgpu` version selection and feature availability.
@@ -392,6 +392,6 @@ layout engine is a multi-year distraction from the differentiated parts of Byard
   make this possible.
 - **Native mobile targets.** The `PlatformHost` abstraction covers Android and
   iOS; a mobile platform implementation is a natural Phase N deliverable.
-- **`bylang` → native widgets.** A backend that maps `bylang` views to OS-native
+- **`byld` → native widgets.** A backend that maps `byld` views to OS-native
   controls (AppKit, Win32, GTK) for accessibility and system integration, as an
   alternative to the GPU path.

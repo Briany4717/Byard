@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         For **architectural changes** (new subsystem, change to the memory model,
-        changes to `bylang` semantics), please write an RFC instead of filing
+        changes to `byld` semantics), please write an RFC instead of filing
         an issue. See [`docs/rfcs/0000-template.md`](../../docs/rfcs/0000-template.md).
 
         For smaller, scoped additions, this template is the right place.
@@ -44,8 +44,8 @@ body:
         - Spatial subsystem (layout / hit-testing)
         - Logic subsystem (signals / arenas)
         - Concurrency subsystem (threading / double-buffer)
-        - bylang (DSL syntax / compiler)
-        - Rust ↔ bylang bridge (byard_controller macro)
+        - byld (DSL syntax / compiler)
+        - Rust ↔ byld bridge (byard_controller macro)
         - PlatformHost / windowing
         - Documentation
         - Other

@@ -4,7 +4,7 @@ Thanks for your interest in Byard. Contributions are welcome from day one.
 
 Byard is in **Phase 1 — Engine core**. Phase 0 (design) is complete, and the
 engine core is now being built piece by piece. The codebase builds, tests run,
-and CI is green. The `bylang` DSL and the public engine API are still expected
+and CI is green. The `byld` DSL and the public engine API are still expected
 to change as Phase 1 evolves, but the foundations are in place.
 
 ## Ways to contribute
