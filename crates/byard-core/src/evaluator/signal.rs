@@ -316,6 +316,64 @@ impl<'a, T: 'static> Signal<'a, T> {
     pub(crate) fn slot_ptr(self) -> *const () {
         self.slot.as_ptr().cast()
     }
+
+    /// Erases this handle's arena lifetime, asserting that the caller will
+    /// keep the backing arena alive for as long as the returned handle (or
+    /// any copy of it) is used.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that the [`ViewArena`] this signal was
+    /// allocated from is not dropped before every copy of the returned
+    /// handle has gone out of use. This is intended for self-referential
+    /// owner types that bundle a heap-allocated (`Box`ed) arena together
+    /// with signals allocated from it, then drop both together — e.g.
+    /// [`crate::engine::Engine`]'s reactive label state. Boxing the arena
+    /// first is what makes this sound: the arena's heap address (and
+    /// therefore the signal's slot pointer) stays stable even if the
+    /// owning struct itself is moved, and `Signal<'a, T>`'s only real
+    /// payload is that address — `'a` exists purely for the borrow
+    /// checker, not the runtime representation, so erasing it is a
+    /// zero-cost, layout-preserving operation.
+    #[must_use]
+    pub(crate) unsafe fn erase_lifetime(self) -> Signal<'static, T> {
+        Signal {
+            slot: self.slot,
+            _arena: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl<T: 'static> Signal<'static, T> {
+    /// Allocates a signal inside `arena` and returns a `'static` handle to
+    /// it in one step, with the `unsafe` lifetime erasure already performed
+    /// inside this function.
+    ///
+    /// This is the safe entry point for the self-referential
+    /// arena-plus-signal pattern documented on [`Signal::erase_lifetime`]:
+    /// callers outside this module (e.g. [`crate::engine::Engine`]'s
+    /// reactive label state) never need to write `unsafe` themselves, and
+    /// the workspace's project-wide `#[deny(unsafe_code)]` lint stays
+    /// satisfied outside the evaluator subsystem's own files, which is
+    /// where this project keeps every `unsafe` block auditable.
+    ///
+    /// Takes `arena` as a plain `&ViewArena` (not `&Box<ViewArena>` —
+    /// `clippy::borrowed_box` rightly flags the latter as a pointless extra
+    /// indirection in a parameter type). The caller is still responsible
+    /// for the same contract [`Signal::erase_lifetime`] documents: the
+    /// `ViewArena` this reference points to must itself live at a stable,
+    /// heap-allocated address (i.e. the caller boxed it) and must not be
+    /// dropped before every copy of the returned handle goes out of use.
+    /// This function only performs the erasure soundly for the instant it
+    /// runs; it cannot enforce either half of that on its own.
+    #[must_use]
+    pub(crate) fn new_in_boxed(arena: &ViewArena, initial: T) -> Self {
+        // SAFETY: the caller is responsible for `arena` living at a stable,
+        // heap-allocated address and outliving every copy of the returned
+        // handle — see the doc above.
+        unsafe { Signal::new_in(arena, initial).erase_lifetime() }
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +384,33 @@ mod tests {
     fn read_returns_initial_value() {
         let arena = ViewArena::new();
         let signal = Signal::new_in(&arena, 42_u32);
+        assert_eq!(signal.read(|v| *v), 42);
+    }
+
+    #[test]
+    fn erased_lifetime_signal_reads_and_writes_normally() {
+        // Mirrors the self-referential pattern `Engine`'s reactive label
+        // uses: box the arena so its heap address is stable, then erase
+        // the signal's lifetime. Both are dropped together at the end of
+        // this scope, with no use of `signal` after `arena` is gone.
+        let arena = Box::new(ViewArena::new());
+        let signal: Signal<'static, u32> = unsafe { Signal::new_in(&arena, 1).erase_lifetime() };
+
+        assert_eq!(signal.read(|v| *v), 1);
+        signal.write(|v| *v += 41);
+        assert_eq!(signal.read(|v| *v), 42);
+    }
+
+    #[test]
+    fn new_in_boxed_reads_and_writes_normally_without_unsafe_at_the_call_site() {
+        // Same pattern as `erased_lifetime_signal_reads_and_writes_normally`,
+        // but through the safe wrapper that `engine::ReactiveLabel` actually
+        // calls — no `unsafe` block needed here.
+        let arena = Box::new(ViewArena::new());
+        let signal: Signal<'static, u32> = Signal::new_in_boxed(&arena, 1);
+
+        assert_eq!(signal.read(|v| *v), 1);
+        signal.write(|v| *v += 41);
         assert_eq!(signal.read(|v| *v), 42);
     }
 

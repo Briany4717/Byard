@@ -1,19 +1,31 @@
-//! Phase 1 visual verification — renders two `SolidBox` instances to a window.
+//! Phase 1 visual verification — renders three `SolidBox` instances and two
+//! text labels to a window, one of which is a Signal-driven reactive label.
 //!
 //! This example is intentionally minimal: it implements [`PlatformHost`] and
-//! hands it to [`WinitHost`], drawing a static scene to confirm that the
-//! `SolidBox` pipeline, SDF border-radius shader, and NDC transform all
-//! produce correct output. It used to drive `winit`'s `ApplicationHandler`
-//! directly inside `byard-core`; it now lives here because `byard-core` has
-//! zero direct references to `winit` (RFC-0001 §6) and this is the crate
-//! that owns the window.
+//! hands it to [`WinitHost`], drawing a mostly-static scene to confirm that
+//! the `SolidBox` pipeline, SDF border-radius shader, and NDC transform all
+//! produce correct output, plus a click-to-mutate label that exercises
+//! [`Engine`]'s Signal/`EvaluatorTick`/`LayoutAtlas` plumbing in production
+//! (RFC-0001's Phase 1 closure criterion). It used to drive `winit`'s
+//! `ApplicationHandler` directly inside `byard-core`; it now lives here
+//! because `byard-core` has zero direct references to `winit` (RFC-0001 §6)
+//! and this is the crate that owns the window.
+//!
+//! Click anywhere in the window to mutate the reactive label's text via
+//! [`Engine::set_label_text`] — the only authored content for that label is
+//! the click count; everything about *how* the new text reaches the screen
+//! (Signal write → `EvaluatorTick::collect_dirty` → `LayoutAtlas::mark_dirty_all`
+//! → `TextLine::dirty`) happens inside [`Engine`], not here.
 //!
 //! Run with:
 //! ```sh
 //! cargo run --example hello_world
 //! ```
 
-use byard_core::{BoxInstance, ByardError, Engine, PlatformHost, TextLine, WindowSize};
+use byard_core::{
+    BoxInstance, ByardError, Engine, PlatformHost, PointerButton, PointerState, TextLine,
+    WindowSize,
+};
 use byard_platform::WinitHost;
 
 fn main() {
@@ -37,7 +49,15 @@ struct App {
     /// non-HiDPI displays.
     instances: Vec<BoxInstance>,
     /// Static text overlay rendered in the same pass as `instances`.
+    ///
+    /// This does **not** include the engine's Signal-driven label — that one
+    /// lives inside [`Engine`] itself and is folded into the frame by
+    /// [`Engine::render_frame`]; this `Vec` is only the lines that genuinely
+    /// never change.
     texts: Vec<TextLine>,
+    /// Number of left-button clicks seen so far, used to author the
+    /// reactive label's text in [`App::on_pointer_input`].
+    click_count: u32,
 }
 
 impl PlatformHost for App {
@@ -79,19 +99,10 @@ impl PlatformHost for App {
         ];
 
         self.texts = vec![
-            // Label over the blue rounded rectangle.
-            TextLine {
-                x: 110.0,
-                y: 110.0,
-                text: "Byard — Phase 1".to_string(),
-                font_size: 20.0,
-                color: [1.0, 1.0, 1.0, 1.0],
-                // Static label: never mutated after this first frame, so it
-                // never needs `dirty: true` on a later tick. `prepare`
-                // shapes it once regardless, since it's new to the cache.
-                dirty: false,
-            },
-            // Smaller label over the orange rectangle.
+            // Smaller label over the orange rectangle. The label over the
+            // blue rectangle is intentionally absent here — it's owned by
+            // `Engine`'s reactive `ReactiveLabel` and folded into the frame
+            // automatically by `Engine::render_frame`.
             TextLine {
                 x: 510.0,
                 y: 190.0,
@@ -119,5 +130,21 @@ impl PlatformHost for App {
             engine.render_frame(&self.instances, &self.texts)?;
         }
         Ok(())
+    }
+
+    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState) {
+        if button != PointerButton::Left || state != PointerState::Pressed {
+            return;
+        }
+
+        self.click_count += 1;
+
+        if let Some(engine) = self.engine.as_ref() {
+            // Engine handles every step from here: writing the Signal,
+            // running `EvaluatorTick::collect_dirty`, marking the Atlas
+            // node dirty, and recomputing it — this call only supplies the
+            // new text.
+            engine.set_label_text(format!("Byard — clicked {} time(s)", self.click_count));
+        }
     }
 }

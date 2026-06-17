@@ -18,6 +18,7 @@
 //!   window + surface created  ──────────────►   PlatformHost::on_resume
 //!   resize / DPI change       ──────────────►   PlatformHost::on_resize
 //!   RedrawRequested            ──────────────►   PlatformHost::on_redraw
+//!   mouse button press/release ──────────────►   PlatformHost::on_pointer_input
 //!   close button / Cmd+Q       ──────────────►   PlatformHost::on_close_requested
 //! ```
 //!
@@ -43,6 +44,34 @@ pub struct WindowSize {
     pub height: u32,
     /// OS DPI scale factor (`1.0` on non-`HiDPI`, `2.0` on Retina, etc.).
     pub scale_factor: f64,
+}
+
+/// A mouse/pointer button, expressed without depending on any windowing
+/// crate's types — mirrors the variants `winit::event::MouseButton` exposes
+/// today, since that is the only host that currently exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    /// The primary (usually left) button.
+    Left,
+    /// The secondary (usually right) button.
+    Right,
+    /// The middle/wheel button.
+    Middle,
+    /// A "navigate back" side button, where the device has one.
+    Back,
+    /// A "navigate forward" side button, where the device has one.
+    Forward,
+    /// Any other, vendor-specific button, identified by its raw code.
+    Other(u16),
+}
+
+/// A pointer button's transition state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerState {
+    /// The button was just pressed down.
+    Pressed,
+    /// The button was just released.
+    Released,
 }
 
 /// Application hooks driven by a concrete platform host.
@@ -117,6 +146,14 @@ pub trait PlatformHost {
     fn on_close_requested(&mut self) -> bool {
         true
     }
+
+    /// Called when a pointer (mouse) button changes state over the window.
+    ///
+    /// Defaults to a no-op. This is the hook a click-driven mutation (e.g.
+    /// [`Engine::set_label_text`](crate::engine::Engine::set_label_text))
+    /// implements; the host is responsible for requesting a redraw
+    /// afterwards so the resulting `on_redraw` picks up the change.
+    fn on_pointer_input(&mut self, _button: PointerButton, _state: PointerState) {}
 }
 
 #[cfg(test)]
@@ -149,6 +186,29 @@ mod tests {
     fn on_close_requested_defaults_to_true() {
         let mut host = DefaultsOnlyHost;
         assert!(host.on_close_requested());
+    }
+
+    #[test]
+    fn on_pointer_input_default_is_a_no_op() {
+        let mut host = DefaultsOnlyHost;
+        // Must not panic for any button/state combination.
+        host.on_pointer_input(PointerButton::Left, PointerState::Pressed);
+        host.on_pointer_input(PointerButton::Other(7), PointerState::Released);
+    }
+
+    #[test]
+    fn pointer_button_and_state_are_copy_clone_eq_and_debug() {
+        let a = PointerButton::Left;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(PointerButton::Left, PointerButton::Right);
+        assert_eq!(PointerButton::Other(3), PointerButton::Other(3));
+        assert_ne!(PointerButton::Other(3), PointerButton::Other(4));
+        let _ = format!("{a:?}");
+
+        let pressed = PointerState::Pressed;
+        assert_ne!(pressed, PointerState::Released);
+        let _ = format!("{pressed:?}");
     }
 
     #[test]

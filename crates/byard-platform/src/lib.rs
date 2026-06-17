@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
-use byard_core::{ByardError, PlatformHost, WindowSize};
+use byard_core::{ByardError, PlatformHost, PointerButton, PointerState, WindowSize};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -193,6 +193,12 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
                 }
             }
 
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.host
+                    .on_pointer_input(to_pointer_button(button), to_pointer_state(state));
+                window.request_redraw();
+            }
+
             _ => {}
         }
     }
@@ -208,6 +214,31 @@ fn to_window_size(size: PhysicalSize<u32>, scale_factor: f64) -> WindowSize {
         width: size.width,
         height: size.height,
         scale_factor,
+    }
+}
+
+/// Converts a `winit` mouse button into the plain, windowing-crate-agnostic
+/// [`PointerButton`] that crosses into `byard-core`.
+///
+/// Extracted as a pure function for the same reason as [`to_window_size`] —
+/// testable without a real event loop.
+fn to_pointer_button(button: MouseButton) -> PointerButton {
+    match button {
+        MouseButton::Left => PointerButton::Left,
+        MouseButton::Right => PointerButton::Right,
+        MouseButton::Middle => PointerButton::Middle,
+        MouseButton::Back => PointerButton::Back,
+        MouseButton::Forward => PointerButton::Forward,
+        MouseButton::Other(code) => PointerButton::Other(code),
+    }
+}
+
+/// Converts a `winit` element state into the plain [`PointerState`] that
+/// crosses into `byard-core`.
+fn to_pointer_state(state: ElementState) -> PointerState {
+    match state {
+        ElementState::Pressed => PointerState::Pressed,
+        ElementState::Released => PointerState::Released,
     }
 }
 
@@ -233,5 +264,36 @@ mod tests {
         assert_eq!(size.width, 800);
         assert_eq!(size.height, 600);
         assert!((size.scale_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn to_pointer_button_maps_every_winit_variant() {
+        assert_eq!(to_pointer_button(MouseButton::Left), PointerButton::Left);
+        assert_eq!(to_pointer_button(MouseButton::Right), PointerButton::Right);
+        assert_eq!(
+            to_pointer_button(MouseButton::Middle),
+            PointerButton::Middle
+        );
+        assert_eq!(to_pointer_button(MouseButton::Back), PointerButton::Back);
+        assert_eq!(
+            to_pointer_button(MouseButton::Forward),
+            PointerButton::Forward
+        );
+        assert_eq!(
+            to_pointer_button(MouseButton::Other(9)),
+            PointerButton::Other(9)
+        );
+    }
+
+    #[test]
+    fn to_pointer_state_maps_both_winit_variants() {
+        assert_eq!(
+            to_pointer_state(ElementState::Pressed),
+            PointerState::Pressed
+        );
+        assert_eq!(
+            to_pointer_state(ElementState::Released),
+            PointerState::Released
+        );
     }
 }
