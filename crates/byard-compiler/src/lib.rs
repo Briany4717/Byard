@@ -18,6 +18,7 @@
 )]
 
 pub mod diagnostics;
+pub mod infer;
 pub mod lexer;
 pub mod parser;
 pub mod symbol;

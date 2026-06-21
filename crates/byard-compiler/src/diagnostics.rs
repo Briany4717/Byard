@@ -73,6 +73,26 @@ pub enum CompileError {
         /// Source range of the offending string literal.
         span: Span,
     },
+    /// A required type annotation is missing (D9: `View` params and `fn`
+    /// signatures must be annotated).
+    MissingAnnotation {
+        /// Source range of the under-annotated item.
+        span: Span,
+        /// What needs an annotation (e.g. "view parameter", "function return").
+        what: String,
+    },
+    /// A `var`/`let` initializer cannot be inferred and has no annotation
+    /// (D9: the empty array `[]`, or a heterogeneous array).
+    CannotInfer {
+        /// Source range of the un-inferable initializer.
+        span: Span,
+    },
+    /// `Text` was used where a type is expected; `Text` is the text *view*, the
+    /// scalar string type is `Str` (D9, INV-7).
+    TextUsedAsType {
+        /// Source range of the offending annotation.
+        span: Span,
+    },
 }
 
 impl CompileError {
@@ -83,7 +103,10 @@ impl CompileError {
             Self::UnexpectedChar { span }
             | Self::UnexpectedToken { span, .. }
             | Self::StringNestingTooDeep { span }
-            | Self::UnterminatedString { span } => *span,
+            | Self::UnterminatedString { span }
+            | Self::MissingAnnotation { span, .. }
+            | Self::CannotInfer { span }
+            | Self::TextUsedAsType { span } => *span,
         }
     }
 
@@ -99,6 +122,15 @@ impl CompileError {
                 "string interpolation nested deeper than 3 levels".to_string()
             }
             Self::UnterminatedString { .. } => "unterminated string literal".to_string(),
+            Self::MissingAnnotation { what, .. } => {
+                format!("missing type annotation on {what}")
+            }
+            Self::CannotInfer { .. } => {
+                "cannot infer a type; add an explicit annotation".to_string()
+            }
+            Self::TextUsedAsType { .. } => {
+                "`Text` is a view, not a type; use `Str` for strings".to_string()
+            }
         }
     }
 
