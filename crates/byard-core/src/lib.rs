@@ -34,6 +34,12 @@ pub use encoder::text_glyph::TextLine;
 pub use engine::Engine;
 pub use platform::{PlatformHost, PointerButton, PointerState, WindowSize};
 
+/// Trait representing a logic tick execution runner.
+pub trait LogicRuntime {
+    /// Evaluates a single logic tick, updating the `RenderFrame` and processing dirty target IDs.
+    fn evaluate_tick(&mut self, frame: &mut frame::RenderFrame, dirty_targets: &[frame::TargetId]);
+}
+
 use std::fmt;
 
 /// Errors produced by the Byard engine.

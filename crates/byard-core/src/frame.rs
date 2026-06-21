@@ -294,23 +294,23 @@ impl RenderFrame {
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
-    pub(crate) fn push_rect(&mut self, rect: Rect, dirty: bool) {
+    pub fn push_rect(&mut self, rect: Rect, dirty: bool) {
         self.rects.push(rect);
         self.dirty.push(dirty);
     }
 
     /// Appends a [`BoxInstance`] to the frame.
-    pub(crate) fn push_instance(&mut self, instance: BoxInstance) {
+    pub fn push_instance(&mut self, instance: BoxInstance) {
         self.instances.push(instance);
     }
 
     /// Appends a [`TextLine`] to the frame.
-    pub(crate) fn push_text(&mut self, text: TextLine) {
+    pub fn push_text(&mut self, text: TextLine) {
         self.texts.push(text);
     }
 
     /// Sets the frame's version counter.
-    pub(crate) fn set_version(&mut self, version: u64) {
+    pub fn set_version(&mut self, version: u64) {
         self.version = version;
     }
 

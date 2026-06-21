@@ -88,6 +88,8 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::ByardError;
+use crate::LogicRuntime;
+use crate::evaluator::ViewArena;
 use crate::frame::RenderFrame;
 
 /// A type-erased result delivered from the async I/O pool back to the
@@ -320,6 +322,52 @@ impl Relay {
                 while !relay.is_shutdown() {
                     let mut frame = relay.acquire_recycled();
                     tick(&mut frame);
+                    relay.publish(frame);
+                    thread::yield_now();
+                }
+            })
+            .map_err(|e| ByardError::ThreadSpawn(e.to_string()))
+    }
+
+    /// Spawns the logic thread from a `build` factory that constructs a
+    /// [`LogicRuntime`] **inside** the thread, then drives it
+    /// `acquire_recycled → evaluate_tick → publish` until shutdown
+    /// (RFC-0002 §"Integration with Engine", RFC-0003 §8).
+    ///
+    /// This is the generalization of [`Relay::spawn_logic_thread`] for a
+    /// stateful interpreter: the running runtime holds `!Send` data
+    /// (`Signal`s, a `ViewArena`, a logic-thread-local reactive scope), so it
+    /// can never cross a thread boundary. Only the **factory** is bounded
+    /// `Send + 'static` (INV-6) — it closes over plain owned data (a
+    /// `CompiledView`) and is moved into the thread, where it builds the arena
+    /// and the borrowing runtime in place. The `for<'a>` HRTB ties the
+    /// runtime's borrow to the thread-local arena's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByardError::ThreadSpawn`] if the OS refuses to create the
+    /// thread.
+    pub fn spawn_logic_from_view<F>(
+        relay: &Arc<Relay>,
+        build: F,
+    ) -> Result<JoinHandle<()>, ByardError>
+    where
+        F: for<'a> FnOnce(&'a ViewArena) -> Box<dyn LogicRuntime + 'a> + Send + 'static,
+    {
+        let relay = Arc::clone(relay);
+        thread::Builder::new()
+            .name("byard-logic-thread".to_string())
+            .spawn(move || {
+                // The arena and the runtime that borrows it both live for the
+                // thread body only; neither is ever observed off this thread.
+                let arena = ViewArena::new();
+                let mut runtime = build(&arena);
+                while !relay.is_shutdown() {
+                    let mut frame = relay.acquire_recycled();
+                    // The reactive interpreter computes its own dirty set; the
+                    // engine-level dirty-target plumbing is wired in a later
+                    // phase, so pass an empty slice for now.
+                    runtime.evaluate_tick(&mut frame, &[]);
                     relay.publish(frame);
                     thread::yield_now();
                 }
@@ -807,5 +855,58 @@ mod tests {
 
         assert!(a.current().is_some());
         assert!(b.current().is_none());
+    }
+
+    // ── spawn_logic_from_view: the !Send-runtime / Send-factory contract ──
+
+    /// A minimal `!Send` `LogicRuntime`: it holds a [`Signal`] (which is `!Send`
+    /// by construction, RFC-0001 §5.1), proving a stateful interpreter can run
+    /// on the logic thread without ever crossing a thread boundary.
+    struct CounterRuntime<'a> {
+        signal: crate::evaluator::Signal<'a, i64>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl LogicRuntime for CounterRuntime<'_> {
+        fn evaluate_tick(&mut self, frame: &mut RenderFrame, _dirty: &[crate::frame::TargetId]) {
+            self.signal.write(|v| *v += 1);
+            #[allow(clippy::cast_sign_loss)]
+            frame.set_version(self.signal.read(|v| *v as u64));
+            self.hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn spawn_logic_from_view_builds_a_non_send_runtime_and_ticks() {
+        let relay = Arc::new(Relay::new().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_factory = Arc::clone(&hits);
+
+        // The factory is `Send` (it captures only an `Arc<AtomicUsize>`); the
+        // runtime it builds borrows the thread-local arena and is `!Send`.
+        let handle = Relay::spawn_logic_from_view(&relay, move |arena| {
+            Box::new(CounterRuntime {
+                signal: crate::evaluator::Signal::new_in(arena, 0_i64),
+                hits: hits_factory,
+            })
+        })
+        .expect("thread spawn should succeed in tests");
+
+        // Wait until at least one tick has run.
+        let start = Instant::now();
+        while hits.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        relay.request_shutdown();
+        handle.join().expect("logic thread must not panic");
+
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "the !Send runtime must have ticked at least once"
+        );
+        assert!(
+            relay.current().is_some(),
+            "ticking must have published at least one frame"
+        );
     }
 }
