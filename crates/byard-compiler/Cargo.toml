@@ -16,6 +16,7 @@ byard-core = { path = "../byard-core" }
 
 [dev-dependencies]
 proptest = "1"
+byard-core = { path = "../byard-core" }
 
 [lints]
 workspace = true

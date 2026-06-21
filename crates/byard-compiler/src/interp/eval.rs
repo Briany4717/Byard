@@ -256,6 +256,67 @@ impl Interpreter {
         }
     }
 
+    /// Walks a render tree, projecting it into a `byard-core` [`RenderFrame`]
+    /// with a minimal vertical-stack layout (the full Taffy layout lives in
+    /// `byard-core`; Phase 2's interpreter uses this simple stacking to prove
+    /// the end-to-end path). Reactive `Text` content is read from its binding.
+    pub fn render(&self, tree: &[RenderNode], frame: &mut byard_core::frame::RenderFrame) {
+        let mut y = 0.0_f32;
+        for node in tree {
+            y += self.render_node(node, 0.0, y, frame);
+        }
+    }
+
+    fn render_node(
+        &self,
+        node: &RenderNode,
+        x: f32,
+        y: f32,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) -> f32 {
+        const PAD: f32 = 8.0;
+        const LINE: f32 = 20.0;
+        const WIDTH: f32 = 240.0;
+        match node {
+            RenderNode::Box {
+                bg,
+                radius,
+                children,
+            } => {
+                let mut cy = y + PAD;
+                for child in children {
+                    cy += self.render_node(child, x + PAD, cy, frame);
+                }
+                let height = (cy - y) + PAD;
+                if let Some(color) = bg {
+                    #[allow(clippy::cast_precision_loss)]
+                    frame.push_instance(byard_core::BoxInstance {
+                        rect: [x, y, WIDTH, height],
+                        color: super::intrinsics::color_to_rgba(*color, false),
+                        radii: [*radius as f32; 4],
+                    });
+                }
+                height
+            }
+            RenderNode::Text { content } => {
+                let text = match self.binding_value(*content) {
+                    Some(Value::Str(s)) => s,
+                    other => other.map_or_else(String::new, |v| format!("{v:?}")),
+                };
+                frame.push_text(byard_core::TextLine {
+                    x,
+                    y,
+                    text,
+                    font_size: 16.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    dirty: true,
+                });
+                LINE
+            }
+            RenderNode::Spacer => PAD,
+        }
+    }
+
     /// Processes a whole `View`: its declarations first (so bindings can resolve
     /// names), then lowers its top-level elements into a render tree.
     pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {

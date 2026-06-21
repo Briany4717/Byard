@@ -1,0 +1,12 @@
+// Byard Phase 2 — the RFC-0001 thesis in `byld`:
+// a reactive view (solid rounded rect + Signal-driven text) authored entirely
+// in the declarative surface, replacing the hand-written Rust view.
+
+View HelloWorld() {
+    var count = 0
+
+    Column #[bg: 0x222222, radius: 16, p: 20] {
+        Text("Count: {count}")
+        Button("+") => count++
+    }
+}
