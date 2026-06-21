@@ -9,3 +9,4 @@ pub mod env;
 pub mod eval;
 pub mod intrinsics;
 pub mod reactive;
+pub mod style;

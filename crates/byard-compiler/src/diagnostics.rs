@@ -164,6 +164,12 @@ pub enum CompileError {
         /// The intrinsic name.
         name: String,
     },
+    /// A `style { }` block read a `var`; Phase 2 styles are static (RFC-0002
+    /// D5/D8).
+    DynamicStyleForbidden {
+        /// Source range of the offending value.
+        span: Span,
+    },
 }
 
 impl CompileError {
@@ -185,7 +191,8 @@ impl CompileError {
             | Self::WrongAttributeSeparator { span, .. }
             | Self::ArityMismatch { span, .. }
             | Self::AttributeTypeMismatch { span, .. }
-            | Self::UnexpectedChildren { span, .. } => *span,
+            | Self::UnexpectedChildren { span, .. }
+            | Self::DynamicStyleForbidden { span } => *span,
         }
     }
 
@@ -242,6 +249,9 @@ impl CompileError {
             }
             Self::UnexpectedChildren { name, .. } => {
                 format!("`{name}` takes no children")
+            }
+            Self::DynamicStyleForbidden { .. } => {
+                "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()
             }
         }
     }
