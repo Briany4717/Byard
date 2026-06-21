@@ -19,6 +19,7 @@
 
 pub mod diagnostics;
 pub mod lexer;
+pub mod parser;
 pub mod symbol;
 
 pub use diagnostics::{CompileError, Span};
