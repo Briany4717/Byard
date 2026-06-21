@@ -6,3 +6,4 @@
 //! intrinsics, style, events, and hot-reload follow.
 
 pub mod env;
+pub mod reactive;

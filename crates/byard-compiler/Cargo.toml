@@ -10,7 +10,11 @@ rust-version.workspace = true
 
 [dependencies]
 logos = "0.14"
+smallvec = "1"
 byard-core = { path = "../byard-core" }
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true

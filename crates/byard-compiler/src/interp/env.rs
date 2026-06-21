@@ -50,6 +50,35 @@ pub enum Value {
     Unit,
 }
 
+impl Value {
+    /// Returns the `i64` if this is an [`Value::Int`].
+    #[must_use]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Returns the `bool` if this is a [`Value::Bool`].
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Returns the elements if this is a [`Value::List`].
+    #[must_use]
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(xs) => Some(xs),
+            _ => None,
+        }
+    }
+}
+
 /// A per-`View` binding environment, optionally linked to its enclosing View's
 /// environment for `inject` resolution.
 ///
