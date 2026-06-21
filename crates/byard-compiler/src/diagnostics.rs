@@ -63,6 +63,16 @@ pub enum CompileError {
         /// Human-readable description of what was expected.
         expected: String,
     },
+    /// A string literal nested interpolated strings deeper than 3 levels (D12).
+    StringNestingTooDeep {
+        /// Source range at the point the limit was exceeded.
+        span: Span,
+    },
+    /// A string literal was opened but never closed before end of input.
+    UnterminatedString {
+        /// Source range of the offending string literal.
+        span: Span,
+    },
 }
 
 impl CompileError {
@@ -70,7 +80,10 @@ impl CompileError {
     #[must_use]
     pub fn span(&self) -> Span {
         match self {
-            Self::UnexpectedChar { span } | Self::UnexpectedToken { span, .. } => *span,
+            Self::UnexpectedChar { span }
+            | Self::UnexpectedToken { span, .. }
+            | Self::StringNestingTooDeep { span }
+            | Self::UnterminatedString { span } => *span,
         }
     }
 
@@ -82,6 +95,10 @@ impl CompileError {
             Self::UnexpectedToken { expected, .. } => {
                 format!("unexpected token, expected {expected}")
             }
+            Self::StringNestingTooDeep { .. } => {
+                "string interpolation nested deeper than 3 levels".to_string()
+            }
+            Self::UnterminatedString { .. } => "unterminated string literal".to_string(),
         }
     }
 
