@@ -271,7 +271,7 @@ pub enum Expr {
     /// A parenthesized tuple `(a, b, ...)` — used for `Len` pairs/quads such as
     /// `p: (8, 16)` (RFC-0005 §1). A single parenthesized expression is *not* a
     /// tuple; it parses to the inner expression directly.
-    Tuple(Vec<Expr>, Span),
+    Tuple(Vec<Arg>, Span),
     /// A leading-dot class reference, e.g. the `.title` in `#[style: .title]`
     /// (RFC-0002 §"Grammar" `style_rule`; resolved against the View's style map
     /// in M11).

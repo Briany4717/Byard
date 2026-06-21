@@ -68,6 +68,18 @@ const LAYOUT: &[(&str, PropType)] = &[
     ("gap", PropType::Int),
     ("p", PropType::Len),
     ("m", PropType::Len),
+    ("px", PropType::Len),
+    ("py", PropType::Len),
+    ("pt", PropType::Len),
+    ("pr", PropType::Len),
+    ("pb", PropType::Len),
+    ("pl", PropType::Len),
+    ("mx", PropType::Len),
+    ("my", PropType::Len),
+    ("mt", PropType::Len),
+    ("mr", PropType::Len),
+    ("mb", PropType::Len),
+    ("ml", PropType::Len),
     ("align", PropType::Enum(ALIGN)),
     ("justify", PropType::Enum(JUSTIFY)),
     ("grow", PropType::Int),
@@ -119,6 +131,30 @@ pub struct Intrinsic {
     pub interactive: bool,
     props: HashMap<&'static str, PropType>,
     events: HashSet<&'static str>,
+}
+
+impl Intrinsic {
+    /// Returns the type of property `name`, if recognized.
+    #[must_use]
+    pub fn property_type(&self, name: &str) -> Option<PropType> {
+        self.props.get(name).copied()
+    }
+
+    /// Returns `true` if `name` is a recognized event.
+    #[must_use]
+    pub fn has_event(&self, name: &str) -> bool {
+        self.events.contains(name)
+    }
+
+    /// Returns an iterator over all recognized property names and their types.
+    pub fn properties(&self) -> impl Iterator<Item = (&'static str, PropType)> + '_ {
+        self.props.iter().map(|(&k, &v)| (k, v))
+    }
+
+    /// Returns an iterator over all recognized event names.
+    pub fn events(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.events.iter().copied()
+    }
 }
 
 fn props_from(groups: &[&[(&'static str, PropType)]]) -> HashMap<&'static str, PropType> {

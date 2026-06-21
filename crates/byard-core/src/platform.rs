@@ -74,6 +74,59 @@ pub enum PointerState {
     Released,
 }
 
+/// The event kinds the Phase-2 router models.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EventKind {
+    /// A pointer press.
+    PointerDown,
+    /// A pointer release.
+    PointerUp,
+    /// A qualifying tap (down+up within thresholds).
+    Tap,
+    /// Continuous pointer movement.
+    PointerMove,
+    /// Continuous scroll.
+    Scroll,
+    /// Continuous wheel.
+    Wheel,
+    /// A value change from a value-carrying intrinsic.
+    Change,
+}
+
+impl EventKind {
+    /// Whether this is a continuous (coalescible) event.
+    #[must_use]
+    pub fn is_continuous(self) -> bool {
+        matches!(self, Self::PointerMove | Self::Scroll | Self::Wheel)
+    }
+}
+
+/// A simple payload for input events.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputPayload {
+    /// A string payload (e.g. text input value).
+    Str(String),
+    /// A boolean payload (e.g. toggle state).
+    Bool(bool),
+    /// A float payload (e.g. slider position).
+    Float(f32),
+}
+
+/// A normalized, `Send`-able input event produced by the platform thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputEvent {
+    /// The event kind.
+    pub kind: EventKind,
+    /// Absolute cursor position (logical px).
+    pub pos: (f32, f32),
+    /// Incremental delta for continuous events.
+    pub delta: (f32, f32),
+    /// The new value for a `Change` event (write-back payload).
+    pub payload: Option<InputPayload>,
+    /// Event time in milliseconds (for the tap interval).
+    pub time_ms: u64,
+}
+
 /// Application hooks driven by a concrete platform host.
 ///
 /// Implement this trait once per application; a host (e.g. `WinitHost` from
@@ -145,13 +198,16 @@ pub trait PlatformHost {
         true
     }
 
-    /// Called when a pointer (mouse) button changes state over the window.
+    /// Called when a pointer (mouse) button changes state over the window at coordinates (x, y).
     ///
-    /// Defaults to a no-op. This is the hook a click-driven mutation (e.g.
-    /// [`Engine::set_label_text`](crate::engine::Engine::set_label_text))
-    /// implements; the host is responsible for requesting a redraw
-    /// afterwards so the resulting `on_redraw` picks up the change.
-    fn on_pointer_input(&mut self, _button: PointerButton, _state: PointerState) {}
+    /// Defaults to a no-op.
+    fn on_pointer_input(&mut self, _button: PointerButton, _state: PointerState, _x: f32, _y: f32) {
+    }
+
+    /// Called when the cursor moves to coordinates (x, y).
+    ///
+    /// Defaults to a no-op.
+    fn on_cursor_moved(&mut self, _x: f32, _y: f32) {}
 }
 
 #[cfg(test)]
@@ -190,8 +246,9 @@ mod tests {
     fn on_pointer_input_default_is_a_no_op() {
         let mut host = DefaultsOnlyHost;
         // Must not panic for any button/state combination.
-        host.on_pointer_input(PointerButton::Left, PointerState::Pressed);
-        host.on_pointer_input(PointerButton::Other(7), PointerState::Released);
+        host.on_pointer_input(PointerButton::Left, PointerState::Pressed, 0.0, 0.0);
+        host.on_pointer_input(PointerButton::Other(7), PointerState::Released, 10.0, 20.0);
+        host.on_cursor_moved(15.0, 25.0);
     }
 
     #[test]

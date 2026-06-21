@@ -88,6 +88,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::ByardError;
+use crate::InputEvent;
 use crate::LogicRuntime;
 use crate::evaluator::ViewArena;
 use crate::frame::RenderFrame;
@@ -135,6 +136,8 @@ pub struct Relay {
     // it once per tick), so it does not reintroduce blocking in any
     // meaningful sense.
     io_result_rx: Mutex<UnboundedReceiver<IoResult>>,
+    input_tx: crossbeam_channel::Sender<InputEvent>,
+    input_rx: crossbeam_channel::Receiver<InputEvent>,
 }
 
 impl Relay {
@@ -166,6 +169,7 @@ impl Relay {
             .map_err(|e| ByardError::RuntimeCreation(e.to_string()))?;
 
         let (io_result_tx, io_result_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
 
         Ok(Self {
             latest: ArcSwapOption::from(None),
@@ -175,7 +179,14 @@ impl Relay {
             io_runtime,
             io_result_tx,
             io_result_rx: Mutex::new(io_result_rx),
+            input_tx,
+            input_rx,
         })
+    }
+
+    /// Pushes an input event into the logic queue.
+    pub fn push_input(&self, event: InputEvent) {
+        let _ = self.input_tx.send(event);
     }
 
     /// Returns a frame ready to be populated, preferring a recycled buffer
@@ -364,10 +375,14 @@ impl Relay {
                 let mut runtime = build(&arena);
                 while !relay.is_shutdown() {
                     let mut frame = relay.acquire_recycled();
+                    let mut inputs = Vec::new();
+                    while let Ok(ev) = relay.input_rx.try_recv() {
+                        inputs.push(ev);
+                    }
                     // The reactive interpreter computes its own dirty set; the
                     // engine-level dirty-target plumbing is wired in a later
                     // phase, so pass an empty slice for now.
-                    runtime.evaluate_tick(&mut frame, &[]);
+                    runtime.evaluate_tick(&mut frame, &inputs, &[]);
                     relay.publish(frame);
                     thread::yield_now();
                 }
@@ -868,7 +883,12 @@ mod tests {
     }
 
     impl LogicRuntime for CounterRuntime<'_> {
-        fn evaluate_tick(&mut self, frame: &mut RenderFrame, _dirty: &[crate::frame::TargetId]) {
+        fn evaluate_tick(
+            &mut self,
+            frame: &mut RenderFrame,
+            _input_events: &[InputEvent],
+            _dirty: &[crate::frame::TargetId],
+        ) {
             self.signal.write(|v| *v += 1);
             #[allow(clippy::cast_sign_loss)]
             frame.set_version(self.signal.read(|v| *v as u64));

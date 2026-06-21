@@ -19,6 +19,7 @@
 //!   it is [`CompileError::NotAssignable`].
 
 use super::env::{Env, SignalId, Value};
+use super::events::Action;
 use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
@@ -28,21 +29,24 @@ use crate::parser::ast::{
 use crate::symbol::Symbol;
 
 /// A lowered render-tree node: the interpreter's plan for one element. Reactive
-/// fields are reactive-scope ids the engine reads each tick (M14); static
-/// fields (a literal `bg`, `radius`) are resolved at lowering time.
+/// fields are reactive-scope ids the engine reads each tick (M14).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderNode {
-    /// A box-like container (`Box`/`Column`/`Row`/`Button` background).
+    /// A box-like container.
     Box {
-        /// Static background color (`0xRRGGBB`), if a literal `bg:` was given.
-        bg: Option<i64>,
-        /// Static corner radius.
-        radius: i64,
+        /// The element intrinsic name.
+        name: Symbol,
+        /// Styling attributes.
+        attrs: Vec<Attr>,
         /// Child render nodes.
         children: Vec<RenderNode>,
+        /// Event shorthand action.
+        action: Option<Expr>,
     },
-    /// A text run; `content` is the value binding projecting its string.
+    /// A text run.
     Text {
+        /// Styling attributes.
+        attrs: Vec<Attr>,
         /// The reactive scope projecting the text content.
         content: ScopeId,
     },
@@ -52,6 +56,11 @@ pub enum RenderNode {
 
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
+
+thread_local! {
+    /// Thread-local storage holding the active payload of the event currently being processed.
+    pub static CURRENT_PAYLOAD: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+}
 
 /// The Dev-mode interpreter for one `View` instance: a reactive context plus
 /// the View's binding environment.
@@ -64,6 +73,13 @@ pub struct Interpreter {
     /// `var` name → its `Signal`, so a hot-reload can preserve state by
     /// rebinding instead of re-initializing (RFC-0004 §11).
     var_sigs: std::collections::HashMap<Symbol, SignalId>,
+    /// Incremental LayoutAtlas.
+    pub atlas: byard_core::atlas::layout::LayoutAtlas,
+    /// Interactive events router.
+    pub router: crate::interp::events::EventRouter,
+    /// Glyph-accurate text measurer, created lazily on first layout so the
+    /// non-rendering paths (parsing, reactivity tests) never load fonts.
+    text_measurer: Option<byard_core::text::TextMeasurer>,
 }
 
 impl Interpreter {
@@ -102,6 +118,14 @@ impl Interpreter {
         let t = FrameTarget(self.next_target);
         self.next_target += 1;
         t
+    }
+
+    /// Glyph-accurate `(width, height)` of `text` at `font_size`, lazily
+    /// initializing the font system on first use.
+    fn measure_text(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        self.text_measurer
+            .get_or_insert_with(byard_core::text::TextMeasurer::new)
+            .measure(text, font_size)
     }
 
     // ── declarations ────────────────────────────────────────────────────
@@ -201,7 +225,7 @@ impl Interpreter {
 
     /// `let y = init` (and `fn`) — open a computed memo.
     pub fn define_let(&mut self, name: Symbol, init: &Expr) -> ScopeId {
-        let compute = self.lower_expr(init);
+        let compute = self.lower_expr(init, None);
         let scope = self.ctx.open_memo(compute);
         self.env.push(name, Value::Memo(scope));
         scope
@@ -211,7 +235,7 @@ impl Interpreter {
     /// (used by intrinsics, M10, and by tests).
     pub fn bind_value(&mut self, expr: &Expr) -> ScopeId {
         let target = self.next_target();
-        let compute = self.lower_expr(expr);
+        let compute = self.lower_expr(expr, None);
         self.ctx.open_value_binding(target, compute)
     }
 
@@ -228,12 +252,19 @@ impl Interpreter {
                 if el.name.as_str() == "Button" {
                     // A Button is a decorated box wrapping its label.
                     RenderNode::Box {
-                        bg: static_color(&el.attrs, "bg"),
-                        radius: static_len(&el.attrs, "radius"),
-                        children: vec![RenderNode::Text { content }],
+                        name: Symbol::intern("Button"),
+                        attrs: el.attrs.clone(),
+                        children: vec![RenderNode::Text {
+                            attrs: Vec::new(),
+                            content,
+                        }],
+                        action: el.action.clone(),
                     }
                 } else {
-                    RenderNode::Text { content }
+                    RenderNode::Text {
+                        attrs: el.attrs.clone(),
+                        content,
+                    }
                 }
             }
             "Spacer" => RenderNode::Spacer,
@@ -248,72 +279,544 @@ impl Interpreter {
                     })
                     .collect();
                 RenderNode::Box {
-                    bg: static_color(&el.attrs, "bg"),
-                    radius: static_len(&el.attrs, "radius"),
+                    name: el.name.clone(),
+                    attrs: el.attrs.clone(),
                     children,
+                    action: el.action.clone(),
                 }
             }
         }
     }
 
     /// Walks a render tree, projecting it into a `byard-core` [`RenderFrame`]
-    /// with a minimal vertical-stack layout (the full Taffy layout lives in
-    /// `byard-core`; Phase 2's interpreter uses this simple stacking to prove
-    /// the end-to-end path). Reactive `Text` content is read from its binding.
-    pub fn render(&self, tree: &[RenderNode], frame: &mut byard_core::frame::RenderFrame) {
-        let mut y = 0.0_f32;
+    /// using Taffy layout via `byard-core`'s [`LayoutAtlas`].
+    #[allow(clippy::similar_names)]
+    pub fn render(
+        &mut self,
+        tree: &[RenderNode],
+        frame: &mut byard_core::frame::RenderFrame,
+        width: f32,
+        height: f32,
+    ) {
+        use byard_core::frame::Viewport;
+
+        self.atlas.clear();
+        self.router = crate::interp::events::EventRouter::new();
+        let mut flat_ids = Vec::new();
+
+        let mut root_children = Vec::new();
         for node in tree {
-            y += self.render_node(node, 0.0, y, frame);
+            if let Ok(id) = self.build_layout_tree(node, &mut flat_ids) {
+                root_children.push(id);
+            }
+        }
+
+        if !root_children.is_empty() {
+            let root_style =
+                byard_core::atlas::layout::ContainerStyle::new(Some(width), Some(height))
+                    .with_direction(byard_core::atlas::layout::FlexDir::Column);
+            if let Ok(root_id) = self.atlas.add_container(root_style, &root_children) {
+                self.atlas.set_root(root_id).unwrap();
+                self.atlas.compute(Viewport::new(width, height)).unwrap();
+
+                // Populate frame layout bounds
+                self.atlas.populate_frame(frame, &[]);
+
+                // Emit instances and text lines at computed positions
+                let mut flat_idx = 0;
+                let parent_rect = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
+                for (i, node) in tree.iter().enumerate() {
+                    let node_id = root_children[i];
+                    self.render_node_with_atlas(
+                        node,
+                        node_id,
+                        frame,
+                        &flat_ids,
+                        &mut flat_idx,
+                        parent_rect,
+                    );
+                }
+            }
         }
     }
 
-    fn render_node(
-        &self,
+    fn build_layout_tree(
+        &mut self,
         node: &RenderNode,
-        x: f32,
-        y: f32,
-        frame: &mut byard_core::frame::RenderFrame,
-    ) -> f32 {
-        const PAD: f32 = 8.0;
-        const LINE: f32 = 20.0;
-        const WIDTH: f32 = 240.0;
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
+        use byard_core::atlas::layout::LeafSize;
         match node {
-            RenderNode::Box {
-                bg,
-                radius,
-                children,
-            } => {
-                let mut cy = y + PAD;
-                for child in children {
-                    cy += self.render_node(child, x + PAD, cy, frame);
-                }
-                let height = (cy - y) + PAD;
-                if let Some(color) = bg {
-                    #[allow(clippy::cast_precision_loss)]
-                    frame.push_instance(byard_core::BoxInstance {
-                        rect: [x, y, WIDTH, height],
-                        color: super::intrinsics::color_to_rgba(*color, false),
-                        radii: [*radius as f32; 4],
-                    });
-                }
-                height
+            RenderNode::Spacer => {
+                let id = self.atlas.add_leaf(LeafSize::new(0.0, 12.0))?;
+                flat_ids.push(id);
+                Ok(id)
             }
-            RenderNode::Text { content } => {
+            RenderNode::Text { attrs, content } => {
                 let text = match self.binding_value(*content) {
                     Some(Value::Str(s)) => s,
                     other => other.map_or_else(String::new, |v| format!("{v:?}")),
                 };
-                frame.push_text(byard_core::TextLine {
-                    x,
-                    y,
-                    text,
-                    font_size: 16.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    dirty: true,
-                });
-                LINE
+                #[allow(clippy::cast_precision_loss)]
+                let font_size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+                let (w, h) = self.measure_text(&text, font_size);
+                let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                flat_ids.push(id);
+                Ok(id)
             }
-            RenderNode::Spacer => PAD,
+            RenderNode::Box {
+                name,
+                attrs,
+                children,
+                ..
+            } => {
+                let mut child_ids = Vec::with_capacity(children.len());
+                let mut temp_flat = Vec::new();
+                for child in children {
+                    let child_id = self.build_layout_tree(child, &mut temp_flat)?;
+                    child_ids.push(child_id);
+                }
+                let style = self.eval_container_style(name.as_str(), attrs);
+                let id = self.atlas.add_container(style, &child_ids)?;
+                flat_ids.push(id);
+                flat_ids.extend(temp_flat);
+                Ok(id)
+            }
+        }
+    }
+
+    #[allow(clippy::similar_names)]
+    fn render_node_with_atlas(
+        &mut self,
+        node: &RenderNode,
+        atlas_node: byard_core::atlas::layout::AtlasNodeId,
+        frame: &mut byard_core::frame::RenderFrame,
+        flat_ids: &[byard_core::atlas::layout::AtlasNodeId],
+        flat_idx: &mut usize,
+        parent_rect: crate::interp::intrinsics::Rect,
+    ) {
+        debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
+        *flat_idx += 1;
+
+        match node {
+            RenderNode::Spacer => {}
+            RenderNode::Text { attrs, content } => {
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    let text = match self.binding_value(*content) {
+                        Some(Value::Str(s)) => s,
+                        other => other.map_or_else(String::new, |v| format!("{v:?}")),
+                    };
+                    let color = self.eval_color_prop(attrs, "color").unwrap_or(0x00ff_ffff);
+                    let size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+                    frame.push_text(byard_core::TextLine {
+                        x: rect.x,
+                        y: rect.y,
+                        text,
+                        font_size: size,
+                        color: super::intrinsics::color_to_rgba(color, false),
+                        dirty: true,
+                    });
+
+                    let has_events = attrs
+                        .iter()
+                        .any(|a| matches!(a.kind, AttrKind::Event { .. }));
+                    if has_events {
+                        let self_rect = crate::interp::intrinsics::Rect::new(
+                            rect.x,
+                            rect.y,
+                            rect.width,
+                            rect.height,
+                        );
+                        let hit_rect =
+                            crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect);
+                        for attr in attrs {
+                            if let AttrKind::Event { payload, action } = &attr.kind {
+                                let event_kind = match attr.name.as_str() {
+                                    "tap" => crate::interp::events::EventKind::Tap,
+                                    "pointer_down" => crate::interp::events::EventKind::PointerDown,
+                                    "pointer_up" => crate::interp::events::EventKind::PointerUp,
+                                    "pointer_move" => crate::interp::events::EventKind::PointerMove,
+                                    "scroll" => crate::interp::events::EventKind::Scroll,
+                                    "wheel" => crate::interp::events::EventKind::Wheel,
+                                    "change" => crate::interp::events::EventKind::Change,
+                                    _ => continue,
+                                };
+                                if let Ok(action_closure) =
+                                    self.lower_action(action, payload.clone())
+                                {
+                                    if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
+                                        self.router.on(
+                                            elem_idx,
+                                            hit_rect,
+                                            event_kind,
+                                            action_closure,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            RenderNode::Box {
+                name,
+                attrs,
+                children,
+                action,
+            } => {
+                let mut current_rect = parent_rect;
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    current_rect = crate::interp::intrinsics::Rect::new(
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                    );
+                    let bg = self.eval_color_prop(attrs, "bg");
+                    let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
+                    if let Some(color) = bg {
+                        frame.push_instance(byard_core::BoxInstance {
+                            rect: [rect.x, rect.y, rect.width, rect.height],
+                            color: super::intrinsics::color_to_rgba(color, false),
+                            radii: [radius; 4],
+                        });
+                    }
+
+                    let element_name = name.as_str();
+                    let has_event_attrs = attrs
+                        .iter()
+                        .any(|a| matches!(a.kind, AttrKind::Event { .. }));
+                    let is_interactive =
+                        matches!(element_name, "Button" | "TextField" | "Toggle" | "Slider")
+                            || has_event_attrs
+                            || action.is_some();
+
+                    if is_interactive {
+                        let hit_rect =
+                            crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
+                        for attr in attrs {
+                            if let AttrKind::Event { payload, action } = &attr.kind {
+                                let event_kind = match attr.name.as_str() {
+                                    "tap" => crate::interp::events::EventKind::Tap,
+                                    "pointer_down" => crate::interp::events::EventKind::PointerDown,
+                                    "pointer_up" => crate::interp::events::EventKind::PointerUp,
+                                    "pointer_move" => crate::interp::events::EventKind::PointerMove,
+                                    "scroll" => crate::interp::events::EventKind::Scroll,
+                                    "wheel" => crate::interp::events::EventKind::Wheel,
+                                    "change" => crate::interp::events::EventKind::Change,
+                                    _ => continue,
+                                };
+                                if let Ok(action_closure) =
+                                    self.lower_action(action, payload.clone())
+                                {
+                                    if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
+                                        self.router.on(
+                                            elem_idx,
+                                            hit_rect,
+                                            event_kind,
+                                            action_closure,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(action_expr) = action {
+                            if let Ok(action_closure) = self.lower_action(action_expr, None) {
+                                if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
+                                    self.router.on(
+                                        elem_idx,
+                                        hit_rect,
+                                        crate::interp::events::EventKind::Tap,
+                                        action_closure,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for child in children {
+                    let child_id = flat_ids[*flat_idx];
+                    self.render_node_with_atlas(
+                        child,
+                        child_id,
+                        frame,
+                        flat_ids,
+                        flat_idx,
+                        current_rect,
+                    );
+                }
+            }
+        }
+    }
+
+    fn eval_color_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    let val = self.eval_pure(value);
+                    return val.as_int();
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_int_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    let val = self.eval_pure(value);
+                    return val.as_int();
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_container_style(
+        &mut self,
+        element_name: &str,
+        attrs: &[Attr],
+    ) -> byard_core::atlas::layout::ContainerStyle {
+        use byard_core::atlas::layout::{Align, ContainerStyle, FlexDir, Justify};
+
+        let val_to_f32 = |v: &Value| -> Option<f32> {
+            match v {
+                Value::Int(n) => Some(*n as f32),
+                Value::Float(f) => Some(*f as f32),
+                _ => None,
+            }
+        };
+
+        let mut style = ContainerStyle::default();
+        style.direction = match element_name {
+            "Row" => FlexDir::Row,
+            _ => FlexDir::Column,
+        };
+        for attr in attrs {
+            if let AttrKind::Prop { value } = &attr.kind {
+                let val = self.eval_pure(value);
+                match attr.name.as_str() {
+                    "width" => style.width = val.as_int().map(|n| n as f32),
+                    "height" => style.height = val.as_int().map(|n| n as f32),
+                    "direction" => {
+                        if let Value::Str(s) = &val {
+                            style.direction = match s.as_str() {
+                                "column" => FlexDir::Column,
+                                _ => FlexDir::Row,
+                            };
+                        }
+                    }
+                    "gap" => {
+                        if let Some(n) = val.as_int() {
+                            style.gap = n as f32;
+                        }
+                    }
+                    "p" | "padding" => {
+                        style.padding = self.eval_spacing(&val);
+                    }
+                    "pt" | "padding_top" | "padding-top" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.top = v;
+                        }
+                    }
+                    "pr" | "padding_right" | "padding-right" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.right = v;
+                        }
+                    }
+                    "pb" | "padding_bottom" | "padding-bottom" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.bottom = v;
+                        }
+                    }
+                    "pl" | "padding_left" | "padding-left" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.left = v;
+                        }
+                    }
+                    "px" | "padding_x" | "padding_horizontal" | "padding-horizontal" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.left = v;
+                            style.padding.right = v;
+                        }
+                    }
+                    "py" | "padding_y" | "padding_vertical" | "padding-vertical" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.padding.top = v;
+                            style.padding.bottom = v;
+                        }
+                    }
+                    "m" | "margin" => {
+                        style.margin = self.eval_spacing(&val);
+                    }
+                    "mt" | "margin_top" | "margin-top" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.top = v;
+                        }
+                    }
+                    "mr" | "margin_right" | "margin-right" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.right = v;
+                        }
+                    }
+                    "mb" | "margin_bottom" | "margin-bottom" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.bottom = v;
+                        }
+                    }
+                    "ml" | "margin_left" | "margin-left" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.left = v;
+                        }
+                    }
+                    "mx" | "margin_x" | "margin_horizontal" | "margin-horizontal" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.left = v;
+                            style.margin.right = v;
+                        }
+                    }
+                    "my" | "margin_y" | "margin_vertical" | "margin-vertical" => {
+                        if let Some(v) = val_to_f32(&val) {
+                            style.margin.top = v;
+                            style.margin.bottom = v;
+                        }
+                    }
+                    "align" => {
+                        if let Value::Str(s) = &val {
+                            style.align = match s.as_str() {
+                                "start" => Align::Start,
+                                "center" => Align::Center,
+                                "end" => Align::End,
+                                _ => Align::Stretch,
+                            };
+                        }
+                    }
+                    "justify" => {
+                        if let Value::Str(s) = &val {
+                            style.justify = match s.as_str() {
+                                "center" => Justify::Center,
+                                "end" => Justify::End,
+                                "between" => Justify::Between,
+                                "around" => Justify::Around,
+                                "evenly" => Justify::Evenly,
+                                _ => Justify::Start,
+                            };
+                        }
+                    }
+                    "grow" => {
+                        if let Some(n) = val.as_int() {
+                            style.grow = n as f32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        style
+    }
+
+    fn eval_spacing(&mut self, val: &Value) -> byard_core::atlas::layout::Spacing {
+        use byard_core::atlas::layout::Spacing;
+        let val_to_f32 = |v: &Value| -> f32 {
+            match v {
+                Value::Int(n) => *n as f32,
+                Value::Float(f) => *f as f32,
+                _ => 0.0,
+            }
+        };
+
+        match val {
+            Value::Int(n) => Spacing::all(*n as f32),
+            Value::Float(f) => Spacing::all(*f as f32),
+            Value::Tuple(items) => {
+                let has_names = items.iter().any(|(name, _)| name.is_some());
+                if has_names {
+                    let mut s = Spacing::default();
+                    for (name, item_val) in items {
+                        let v = val_to_f32(item_val);
+                        if let Some(sym) = name {
+                            match sym.as_str() {
+                                "top" | "t" => s.top = v,
+                                "right" | "r" => s.right = v,
+                                "bottom" | "b" => s.bottom = v,
+                                "left" | "l" => s.left = v,
+                                "horizontal" | "h" | "x" | "px" | "mx" => {
+                                    s.left = v;
+                                    s.right = v;
+                                }
+                                "vertical" | "v" | "y" | "py" | "my" => {
+                                    s.top = v;
+                                    s.bottom = v;
+                                }
+                                "all" | "a" => {
+                                    s.top = v;
+                                    s.right = v;
+                                    s.bottom = v;
+                                    s.left = v;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    s
+                } else {
+                    match items.len() {
+                        1 => Spacing::all(val_to_f32(&items[0].1)),
+                        2 => {
+                            let vertical = val_to_f32(&items[0].1);
+                            let horizontal = val_to_f32(&items[1].1);
+                            Spacing::symmetric(vertical, horizontal)
+                        }
+                        3 => {
+                            let top = val_to_f32(&items[0].1);
+                            let horizontal = val_to_f32(&items[1].1);
+                            let bottom = val_to_f32(&items[2].1);
+                            Spacing {
+                                top,
+                                right: horizontal,
+                                bottom,
+                                left: horizontal,
+                            }
+                        }
+                        4 => Spacing {
+                            top: val_to_f32(&items[0].1),
+                            right: val_to_f32(&items[1].1),
+                            bottom: val_to_f32(&items[2].1),
+                            left: val_to_f32(&items[3].1),
+                        },
+                        _ => Spacing::default(),
+                    }
+                }
+            }
+            Value::List(items) => match items.len() {
+                1 => Spacing::all(val_to_f32(&items[0])),
+                2 => {
+                    let vertical = val_to_f32(&items[0]);
+                    let horizontal = val_to_f32(&items[1]);
+                    Spacing::symmetric(vertical, horizontal)
+                }
+                3 => {
+                    let top = val_to_f32(&items[0]);
+                    let horizontal = val_to_f32(&items[1]);
+                    let bottom = val_to_f32(&items[2]);
+                    Spacing {
+                        top,
+                        right: horizontal,
+                        bottom,
+                        left: horizontal,
+                    }
+                }
+                4 => Spacing {
+                    top: val_to_f32(&items[0]),
+                    right: val_to_f32(&items[1]),
+                    bottom: val_to_f32(&items[2]),
+                    left: val_to_f32(&items[3]),
+                },
+                _ => Spacing::default(),
+            },
+            _ => Spacing::default(),
         }
     }
 
@@ -333,7 +836,7 @@ impl Interpreter {
     // ── lowering ────────────────────────────────────────────────────────
 
     /// Lowers `expr` to a reactive computation against the current environment.
-    fn lower_expr(&self, expr: &Expr) -> Lowered {
+    fn lower_expr(&self, expr: &Expr, payload_name: Option<&Symbol>) -> Lowered {
         match expr {
             Expr::IntLit(n, _) => {
                 let n = *n;
@@ -343,18 +846,34 @@ impl Interpreter {
                 let f = *f;
                 Box::new(move |_| Value::Float(f))
             }
-            Expr::StrLit(parts, _) => self.lower_strlit(parts),
-            Expr::Ident(name, _) => self.lower_ident(name),
-            Expr::Array(elems, _) | Expr::Tuple(elems, _) => {
-                let mut cs: Vec<Lowered> = elems.iter().map(|e| self.lower_expr(e)).collect();
+            Expr::StrLit(parts, _) => self.lower_strlit(parts, payload_name),
+            Expr::Ident(name, _) => self.lower_ident(name, payload_name),
+            Expr::Array(elems, _) => {
+                let mut cs: Vec<Lowered> = elems
+                    .iter()
+                    .map(|e| self.lower_expr(e, payload_name))
+                    .collect();
                 Box::new(move |ctx| Value::List(cs.iter_mut().map(|c| c(ctx)).collect()))
+            }
+            Expr::Tuple(elems, _) => {
+                let mut cs: Vec<(Option<Symbol>, Lowered)> = elems
+                    .iter()
+                    .map(|arg| (arg.name.clone(), self.lower_expr(&arg.value, payload_name)))
+                    .collect();
+                Box::new(move |ctx| {
+                    Value::Tuple(
+                        cs.iter_mut()
+                            .map(|(name, c)| (name.clone(), c(ctx)))
+                            .collect(),
+                    )
+                })
             }
             Expr::Ternary {
                 cond, then, els, ..
             } => {
-                let mut cc = self.lower_expr(cond);
-                let mut tc = self.lower_expr(then);
-                let mut ec = self.lower_expr(els);
+                let mut cc = self.lower_expr(cond, payload_name);
+                let mut tc = self.lower_expr(then, payload_name);
+                let mut ec = self.lower_expr(els, payload_name);
                 Box::new(move |ctx| {
                     if cc(ctx).as_bool().unwrap_or(false) {
                         tc(ctx)
@@ -363,19 +882,70 @@ impl Interpreter {
                     }
                 })
             }
-            Expr::Call { callee, args, .. } => self.lower_call(callee, args),
+            Expr::Call { callee, args, .. } => self.lower_call(callee, args, payload_name),
             Expr::ClassRef(class, _) => {
                 let s = format!(".{class}");
                 Box::new(move |_| Value::Str(s.clone()))
             }
+            Expr::Postfix { target, op, span } => {
+                if let Ok(sig) = self.resolve_var(target, *span) {
+                    let op = *op;
+                    Box::new(move |ctx| {
+                        let cur = ctx.peek_signal(sig).as_int().unwrap_or(0);
+                        let new = match op {
+                            PostfixOp::Inc => cur + 1,
+                            PostfixOp::Dec => cur - 1,
+                        };
+                        ctx.write_signal(sig, Value::Int(new));
+                        Value::Unit
+                    })
+                } else {
+                    Box::new(|_| Value::Unit)
+                }
+            }
+            Expr::Assign {
+                target,
+                op,
+                value,
+                span,
+            } => {
+                if let Ok(sig) = self.resolve_var(target, *span) {
+                    let op = *op;
+                    let mut rhs = self.lower_expr(value, payload_name);
+                    Box::new(move |ctx| {
+                        let val = rhs(ctx);
+                        let new = match op {
+                            AssignOp::Assign => val,
+                            AssignOp::Add => {
+                                let cur = ctx.peek_signal(sig).as_int().unwrap_or(0);
+                                Value::Int(cur + val.as_int().unwrap_or(0))
+                            }
+                            AssignOp::Sub => {
+                                let cur = ctx.peek_signal(sig).as_int().unwrap_or(0);
+                                Value::Int(cur - val.as_int().unwrap_or(0))
+                            }
+                        };
+                        ctx.write_signal(sig, new);
+                        Value::Unit
+                    })
+                } else {
+                    Box::new(|_| Value::Unit)
+                }
+            }
             // Member access needs controller metadata (not modeled in Phase 2);
             // lambdas/assignments are actions, not projected values.
             Expr::Member { .. } | Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
-            Expr::Assign { .. } | Expr::Postfix { .. } => Box::new(|_| Value::Unit),
         }
     }
 
-    fn lower_ident(&self, name: &Symbol) -> Lowered {
+    fn lower_ident(&self, name: &Symbol, payload_name: Option<&Symbol>) -> Lowered {
+        if let Some(pname) = payload_name {
+            if pname == name {
+                return Box::new(move |_| {
+                    CURRENT_PAYLOAD.with(|cell| cell.borrow().clone().unwrap_or(Value::Unit))
+                });
+            }
+        }
         match name.as_str() {
             "true" => return Box::new(|_| Value::Bool(true)),
             "false" => return Box::new(|_| Value::Bool(false)),
@@ -403,7 +973,7 @@ impl Interpreter {
         }
     }
 
-    fn lower_strlit(&self, parts: &[StrPart]) -> Lowered {
+    fn lower_strlit(&self, parts: &[StrPart], payload_name: Option<&Symbol>) -> Lowered {
         enum Part {
             Text(String),
             Interp(Lowered),
@@ -412,7 +982,7 @@ impl Interpreter {
             .iter()
             .map(|p| match p {
                 StrPart::Text(t) => Part::Text(t.clone()),
-                StrPart::Interp(e) => Part::Interp(self.lower_expr(e)),
+                StrPart::Interp(e) => Part::Interp(self.lower_expr(e, payload_name)),
             })
             .collect();
         Box::new(move |ctx| {
@@ -427,12 +997,17 @@ impl Interpreter {
         })
     }
 
-    fn lower_call(&self, callee: &Expr, args: &[crate::parser::ast::Arg]) -> Lowered {
+    fn lower_call(
+        &self,
+        callee: &Expr,
+        args: &[crate::parser::ast::Arg],
+        payload_name: Option<&Symbol>,
+    ) -> Lowered {
         // `untrack(expr)` — the reserved escape hatch (D2).
         if let Expr::Ident(name, _) = callee {
             if name.as_str() == "untrack" {
                 if let Some(arg) = args.first() {
-                    let mut inner = self.lower_expr(&arg.value);
+                    let mut inner = self.lower_expr(&arg.value, payload_name);
                     return Box::new(move |ctx| untrack(|| inner(ctx)));
                 }
             }
@@ -496,7 +1071,7 @@ impl Interpreter {
     /// Evaluates `expr` once, immediately, with no scope active (so nothing
     /// subscribes). Used to seed `var`s and to evaluate action operands.
     fn eval_pure(&mut self, expr: &Expr) -> Value {
-        let mut compute = self.lower_expr(expr);
+        let mut compute = self.lower_expr(expr, None);
         compute(&mut self.ctx)
     }
 
@@ -508,37 +1083,65 @@ impl Interpreter {
         }
         Err(CompileError::NotAssignable { span })
     }
-}
 
-/// Finds a static (literal) `Color` attribute value, if present.
-fn static_color(attrs: &[Attr], name: &str) -> Option<i64> {
-    attrs
-        .iter()
-        .find_map(|a| match (&a.kind, a.name.as_str() == name) {
-            (
-                AttrKind::Prop {
-                    value: Expr::IntLit(n, _),
-                },
-                true,
-            ) => Some(*n),
-            _ => None,
-        })
-}
+    /// Lowers an action expression to an event handler closure, capturing any optional payload bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CompileError`] if variable resolution or assignment validation fails.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn lower_action(
+        &self,
+        expr: &Expr,
+        payload_name: Option<Symbol>,
+    ) -> Result<Action, CompileError> {
+        let mut compute = self.lower_expr(expr, payload_name.as_ref());
+        Ok(Box::new(move |ctx, payload| {
+            CURRENT_PAYLOAD.with(|cell| {
+                *cell.borrow_mut() = payload.cloned();
+            });
+            let _ = compute(ctx);
+            CURRENT_PAYLOAD.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        }))
+    }
 
-/// Finds a static (literal) scalar `Len` attribute value, defaulting to `0`.
-fn static_len(attrs: &[Attr], name: &str) -> i64 {
-    attrs
-        .iter()
-        .find_map(|a| match (&a.kind, a.name.as_str() == name) {
-            (
-                AttrKind::Prop {
-                    value: Expr::IntLit(n, _),
-                },
-                true,
-            ) => Some(*n),
-            _ => None,
-        })
-        .unwrap_or(0)
+    /// Converts winit-sourced input events to interpreter event payloads and dispatches them to the `EventRouter`.
+    pub fn dispatch_events(&mut self, events: &[byard_core::InputEvent]) {
+        use crate::interp::events::{EventKind as CompKind, InputEvent as CompEvent};
+        use byard_core::platform::{EventKind as CoreKind, InputPayload};
+
+        let comp_events: Vec<CompEvent> = events
+            .iter()
+            .map(|ev| {
+                let kind = match ev.kind {
+                    CoreKind::PointerDown => CompKind::PointerDown,
+                    CoreKind::PointerUp => CompKind::PointerUp,
+                    CoreKind::Tap => CompKind::Tap,
+                    CoreKind::PointerMove => CompKind::PointerMove,
+                    CoreKind::Scroll => CompKind::Scroll,
+                    CoreKind::Wheel => CompKind::Wheel,
+                    CoreKind::Change => CompKind::Change,
+                };
+                let value = ev.payload.as_ref().map(|p| match p {
+                    InputPayload::Str(s) => Value::Str(s.clone()),
+                    InputPayload::Bool(b) => Value::Bool(*b),
+                    InputPayload::Float(f) => Value::Float(f64::from(*f)),
+                });
+                CompEvent {
+                    kind,
+                    pos: ev.pos,
+                    delta: ev.delta,
+                    value,
+                    time_ms: ev.time_ms,
+                }
+            })
+            .collect();
+
+        self.router
+            .dispatch_tick(&mut self.ctx, Some(&self.atlas), comp_events);
+    }
 }
 
 /// Renders a value for string interpolation (`"Count: {count}"`).
@@ -553,6 +1156,7 @@ fn display_value(v: &Value) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::parser::ast::ElementNode;
@@ -668,17 +1272,17 @@ mod tests {
         // One top-level Column box with the literal bg/radius and one Text child.
         assert_eq!(tree.len(), 1);
         let RenderNode::Box {
-            bg,
-            radius,
-            children,
+            attrs, children, ..
         } = &tree[0]
         else {
             panic!("expected a Box, got {:?}", tree[0]);
         };
-        assert_eq!(*bg, Some(0x0022_2222));
-        assert_eq!(*radius, 16);
+        let bg = interp.eval_color_prop(attrs, "bg");
+        let radius = interp.eval_int_prop(attrs, "radius");
+        assert_eq!(bg, Some(0x0022_2222));
+        assert_eq!(radius, Some(16));
         assert_eq!(children.len(), 1);
-        let RenderNode::Text { content } = &children[0] else {
+        let RenderNode::Text { content, .. } = &children[0] else {
             panic!("expected a Text child");
         };
 
@@ -714,5 +1318,173 @@ mod tests {
             interp.eval_action(action).unwrap_err(),
             CompileError::NotAssignable { .. }
         ));
+    }
+
+    #[test]
+    fn spacing_convenience_parses_correctly() {
+        use byard_core::atlas::layout::Spacing;
+
+        let test_cases = vec![
+            // 1-value positional
+            ("View C() { Column #[p: (10)] {} }", Spacing::all(10.0)),
+            // 2-value positional
+            (
+                "View C() { Column #[p: (2, 3)] {} }",
+                Spacing::symmetric(2.0, 3.0),
+            ),
+            // 3-value positional: top, horizontal, bottom
+            (
+                "View C() { Column #[p: (10, 20, 30)] {} }",
+                Spacing {
+                    top: 10.0,
+                    right: 20.0,
+                    bottom: 30.0,
+                    left: 20.0,
+                },
+            ),
+            // 4-value positional: top, right, bottom, left
+            (
+                "View C() { Column #[p: (1, 2, 3, 4)] {} }",
+                Spacing {
+                    top: 1.0,
+                    right: 2.0,
+                    bottom: 3.0,
+                    left: 4.0,
+                },
+            ),
+            // Named top
+            (
+                "View C() { Column #[p: (top: 10)] {} }",
+                Spacing {
+                    top: 10.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                },
+            ),
+            // Named bottom
+            (
+                "View C() { Column #[p: (bottom: 2)] {} }",
+                Spacing {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 2.0,
+                    left: 0.0,
+                },
+            ),
+            // Named mixed
+            (
+                "View C() { Column #[p: (left: 5, bottom: 3)] {} }",
+                Spacing {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 3.0,
+                    left: 5.0,
+                },
+            ),
+            // Named abbreviations (t, r, b, l)
+            (
+                "View C() { Column #[p: (t: 10, r: 8, b: 6, l: 4)] {} }",
+                Spacing {
+                    top: 10.0,
+                    right: 8.0,
+                    bottom: 6.0,
+                    left: 4.0,
+                },
+            ),
+            // Named horizontal / vertical / all / x / y shorthands
+            (
+                "View C() { Column #[p: (x: 5, y: 7)] {} }",
+                Spacing {
+                    top: 7.0,
+                    right: 5.0,
+                    bottom: 7.0,
+                    left: 5.0,
+                },
+            ),
+            (
+                "View C() { Column #[p: (h: 12, v: 14)] {} }",
+                Spacing {
+                    top: 14.0,
+                    right: 12.0,
+                    bottom: 14.0,
+                    left: 12.0,
+                },
+            ),
+            ("View C() { Column #[p: (all: 42)] {} }", Spacing::all(42.0)),
+            ("View C() { Column #[p: (a: 9)] {} }", Spacing::all(9.0)),
+        ];
+
+        for (source, expected_spacing) in test_cases {
+            let parsed = parse(source);
+            assert!(
+                parsed.errors.is_empty(),
+                "Failed to parse: {}\nErrors: {:?}",
+                source,
+                parsed.errors
+            );
+            let view = &parsed.views[0];
+            let mut interp = Interpreter::new();
+            let tree = interp.lower_view(view, &[]);
+            let RenderNode::Box { name, attrs, .. } = &tree[0] else {
+                panic!("expected a Box");
+            };
+            let style = interp.eval_container_style(name.as_str(), attrs);
+            assert_eq!(
+                style.padding.top, expected_spacing.top,
+                "top mismatch for source: {}",
+                source
+            );
+            assert_eq!(
+                style.padding.right, expected_spacing.right,
+                "right mismatch for source: {}",
+                source
+            );
+            assert_eq!(
+                style.padding.bottom, expected_spacing.bottom,
+                "bottom mismatch for source: {}",
+                source
+            );
+            assert_eq!(
+                style.padding.left, expected_spacing.left,
+                "left mismatch for source: {}",
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn individual_margin_padding_properties_override() {
+        use byard_core::atlas::layout::Spacing;
+
+        let parsed = parse("View C() { Column #[p: (10), pt: 2, pb: 4, ml: 5, mt: 1] {} }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        let RenderNode::Box { name, attrs, .. } = &tree[0] else {
+            panic!("expected a Box");
+        };
+        let style = interp.eval_container_style(name.as_str(), attrs);
+        // padding.top overridden to 2, padding.bottom overridden to 4, others stay 10
+        assert_eq!(
+            style.padding,
+            Spacing {
+                top: 2.0,
+                right: 10.0,
+                bottom: 4.0,
+                left: 10.0
+            }
+        );
+        // margins
+        assert_eq!(
+            style.margin,
+            Spacing {
+                top: 1.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 5.0
+            }
+        );
     }
 }

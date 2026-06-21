@@ -207,24 +207,23 @@ impl Parser<'_> {
             return Expr::Tuple(Vec::new(), self.span_from(start));
         }
 
-        let mut items = vec![self.parse_expr(0)];
-        while self.eat(&Token::Comma) {
-            if matches!(self.cur(), Some(Token::RParen)) {
-                break;
-            }
-            items.push(self.parse_expr(0));
-        }
+        let args = self.parse_arg_list(&Token::RParen);
         self.expect(&Token::RParen, "')'");
 
         // `(a, b) => body` — the items were really lambda parameters.
         if self.eat(&Token::Arrow) {
-            let params = items
+            let params = args
                 .iter()
-                .map(|e| match e {
-                    Expr::Ident(sym, _) => sym.clone(),
-                    other => {
-                        self.error_at(other.span(), "a lambda parameter name");
-                        Symbol::intern("")
+                .map(|a| {
+                    if a.name.is_some() {
+                        self.error_at(a.value.span(), "a lambda parameter name");
+                    }
+                    match &a.value {
+                        Expr::Ident(sym, _) => sym.clone(),
+                        other => {
+                            self.error_at(other.span(), "a lambda parameter name");
+                            Symbol::intern("")
+                        }
                     }
                 })
                 .collect();
@@ -236,11 +235,11 @@ impl Parser<'_> {
             };
         }
 
-        if items.len() == 1 {
+        if args.len() == 1 && args[0].name.is_none() {
             // Grouped expression — unwrap to the inner node.
-            items.pop().unwrap()
+            args[0].value.clone()
         } else {
-            Expr::Tuple(items, self.span_from(start))
+            Expr::Tuple(args, self.span_from(start))
         }
     }
 

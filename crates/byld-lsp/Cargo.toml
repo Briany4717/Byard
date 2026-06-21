@@ -1,0 +1,20 @@
+[package]
+name = "byld-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byard-compiler = { path = "../byard-compiler" }
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+url = "2.5.8"
+
+[lints]
+workspace = true

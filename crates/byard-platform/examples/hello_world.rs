@@ -115,7 +115,7 @@ impl PlatformHost for App {
         Ok(())
     }
 
-    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState) {
+    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState, _x: f32, _y: f32) {
         if button != PointerButton::Left || state != PointerState::Pressed {
             return;
         }

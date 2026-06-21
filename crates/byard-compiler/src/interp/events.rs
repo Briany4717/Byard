@@ -79,7 +79,7 @@ pub const TAP_MS: u64 = 500;
 
 /// A handler's reactive action. Receives the context (for `var` mutation) and
 /// an optional payload (the `Change` value).
-type Action = Box<dyn FnMut(&mut ReactiveCtx, Option<&Value>)>;
+pub type Action = Box<dyn FnMut(&mut ReactiveCtx, Option<&Value>)>;
 
 struct Handler {
     elem: u32,
@@ -144,7 +144,12 @@ impl EventRouter {
     /// Drains one tick's events: coalesces continuous ones (E7), dispatches in
     /// order (E4 ordering, E1 write-back, E3 focus) — marking only. The caller
     /// runs the single pull afterwards (§8).
-    pub fn dispatch_tick(&mut self, ctx: &mut ReactiveCtx, events: Vec<InputEvent>) {
+    pub fn dispatch_tick(
+        &mut self,
+        ctx: &mut ReactiveCtx,
+        atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
+        events: Vec<InputEvent>,
+    ) {
         // E7 — coalesce continuous events per (kind, element); keep discrete in
         // FIFO order.
         let mut ordered: Vec<InputEvent> = Vec::new();
@@ -152,7 +157,7 @@ impl EventRouter {
         let mut coalesced: Vec<((EventKind, Option<u32>), usize)> = Vec::new();
         for ev in events {
             if ev.kind.is_continuous() {
-                let elem = self.hit_any(ev.pos);
+                let elem = self.hit_any(atlas, ev.pos);
                 let key = (ev.kind, elem);
                 if let Some((_, idx)) = coalesced.iter().find(|(k, _)| *k == key) {
                     let slot = &mut ordered[*idx];
@@ -169,30 +174,35 @@ impl EventRouter {
         }
 
         for ev in ordered {
-            self.dispatch(ctx, &ev);
+            self.dispatch(ctx, atlas, &ev);
         }
     }
 
-    fn dispatch(&mut self, ctx: &mut ReactiveCtx, ev: &InputEvent) {
+    fn dispatch(
+        &mut self,
+        ctx: &mut ReactiveCtx,
+        atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
+        ev: &InputEvent,
+    ) {
         match ev.kind {
             EventKind::PointerDown => {
-                let elem = self.hit_any(ev.pos);
+                let elem = self.hit_any(atlas, ev.pos);
                 self.down = Some(DownState {
                     elem,
                     pos: ev.pos,
                     time_ms: ev.time_ms,
                 });
-                self.fire(ctx, EventKind::PointerDown, ev.pos, None);
+                self.fire(ctx, atlas, EventKind::PointerDown, ev.pos, None);
                 // A press on a focusable steals focus (E3).
-                if let Some(f) = self.focusable_at(ev.pos) {
+                if let Some(f) = self.focusable_at(atlas, ev.pos) {
                     self.steal_focus(ctx, Some(f));
                 }
             }
             EventKind::PointerUp => {
                 // E4 precedence: pointer_up fires before tap.
-                self.fire(ctx, EventKind::PointerUp, ev.pos, None);
+                self.fire(ctx, atlas, EventKind::PointerUp, ev.pos, None);
                 if let Some(down) = self.down.take() {
-                    let up_elem = self.hit_any(ev.pos);
+                    let up_elem = self.hit_any(atlas, ev.pos);
                     let dx = ev.pos.0 - down.pos.0;
                     let dy = ev.pos.1 - down.pos.1;
                     let moved = (dx * dx + dy * dy).sqrt();
@@ -202,17 +212,17 @@ impl EventRouter {
                         && moved < TAP_SLOP
                         && elapsed < TAP_MS
                     {
-                        self.fire(ctx, EventKind::Tap, ev.pos, None);
+                        self.fire(ctx, atlas, EventKind::Tap, ev.pos, None);
                     }
                 }
             }
             EventKind::Change => {
-                self.fire(ctx, EventKind::Change, ev.pos, ev.value.as_ref());
+                self.fire(ctx, atlas, EventKind::Change, ev.pos, ev.value.as_ref());
             }
             EventKind::PointerMove | EventKind::Scroll | EventKind::Wheel => {
-                self.fire(ctx, ev.kind, ev.pos, None);
+                self.fire(ctx, atlas, ev.kind, ev.pos, None);
             }
-            EventKind::Tap => self.fire(ctx, EventKind::Tap, ev.pos, None),
+            EventKind::Tap => self.fire(ctx, atlas, EventKind::Tap, ev.pos, None),
         }
     }
 
@@ -220,11 +230,14 @@ impl EventRouter {
     fn fire(
         &mut self,
         ctx: &mut ReactiveCtx,
+        atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
         kind: EventKind,
         pos: (f32, f32),
         payload: Option<&Value>,
     ) {
-        let Some(i) = self.hit(pos, kind) else { return };
+        let Some(i) = self.hit(atlas, pos, kind) else {
+            return;
+        };
         // Take the action out to avoid aliasing `self` while it runs.
         let mut action = std::mem::replace(&mut self.handlers[i].action, Box::new(|_, _| {}));
         action(ctx, payload);
@@ -249,8 +262,17 @@ impl EventRouter {
         self.focused = new;
     }
 
-    fn hit(&self, pos: (f32, f32), kind: EventKind) -> Option<usize> {
-        // Topmost wins: last registered covering rect of this kind.
+    /// Finds the topmost handler of `kind` whose registered (inflated, E8) hit
+    /// rect contains `pos`. The inflated rects are the authoritative hit areas
+    /// (RFC-0003 §4.2/E8) — there is **no** ancestor bubbling (§7) and no
+    /// catch-all fallback, so a click outside every handler's rect fires
+    /// nothing.
+    fn hit(
+        &self,
+        _atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
+        pos: (f32, f32),
+        kind: EventKind,
+    ) -> Option<usize> {
         self.handlers
             .iter()
             .enumerate()
@@ -259,7 +281,13 @@ impl EventRouter {
             .map(|(i, _)| i)
     }
 
-    fn hit_any(&self, pos: (f32, f32)) -> Option<u32> {
+    /// The element id of the topmost handler whose hit rect contains `pos`
+    /// (used to match a tap's down/up element and to key event coalescing).
+    fn hit_any(
+        &self,
+        _atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
+        pos: (f32, f32),
+    ) -> Option<u32> {
         self.handlers
             .iter()
             .rev()
@@ -267,12 +295,26 @@ impl EventRouter {
             .map(|h| h.elem)
     }
 
-    fn focusable_at(&self, pos: (f32, f32)) -> Option<u32> {
+    fn focusable_at(
+        &self,
+        _atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
+        pos: (f32, f32),
+    ) -> Option<u32> {
         self.focusables
             .iter()
             .rev()
             .find(|f| contains(f.rect, pos))
             .map(|f| f.elem)
+    }
+
+    /// Test/inspection accessor: the `(elem, kind, rect)` of every registered
+    /// handler, so a hit-test can be asserted against real bounds.
+    #[must_use]
+    pub fn handler_rects(&self) -> Vec<(u32, EventKind, Rect)> {
+        self.handlers
+            .iter()
+            .map(|h| (h.elem, h.kind, h.rect))
+            .collect()
     }
 }
 
@@ -328,6 +370,7 @@ mod tests {
 
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![
                 InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
                 InputEvent::pointer(EventKind::PointerUp, (6.0, 6.0), 100),
@@ -360,6 +403,7 @@ mod tests {
 
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![
                 InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
                 InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 50),
@@ -391,7 +435,7 @@ mod tests {
                 time_ms: i,
             })
             .collect();
-        router.dispatch_tick(&mut ctx, moves);
+        router.dispatch_tick(&mut ctx, None, moves);
         assert_eq!(*calls.borrow(), 1, "100 moves coalesce to a single walk");
         let _ = sum;
     }
@@ -406,6 +450,7 @@ mod tests {
         // Physical typing of "a".
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![InputEvent {
                 kind: EventKind::Change,
                 pos: (5.0, 5.0),
@@ -421,6 +466,7 @@ mod tests {
         let writes_before = peek_writes(&ctx, query);
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![InputEvent {
                 kind: EventKind::Change,
                 pos: (5.0, 5.0),
@@ -464,6 +510,7 @@ mod tests {
         // Press element B → A blurs, B focuses, same tick.
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![InputEvent::pointer(EventKind::PointerDown, (60.0, 10.0), 0)],
         );
         assert_eq!(ctx.peek_signal(fa), Value::Bool(false), "A blurred");
@@ -480,6 +527,7 @@ mod tests {
         // Moved > 8px between down and up: not a tap.
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![
                 InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
                 InputEvent::pointer(EventKind::PointerUp, (40.0, 5.0), 100),
@@ -494,6 +542,7 @@ mod tests {
         // Over 500 ms: not a tap.
         router.dispatch_tick(
             &mut ctx,
+            None,
             vec![
                 InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
                 InputEvent::pointer(EventKind::PointerUp, (6.0, 5.0), 800),
@@ -504,5 +553,42 @@ mod tests {
             Value::Int(0),
             "slow press is not a tap"
         );
+    }
+
+    #[test]
+    fn tap_bubbles_to_parent_handler_in_atlas() {
+        use byard_core::atlas::layout::{ContainerStyle, LayoutAtlas, LeafSize};
+        use byard_core::frame::Viewport;
+
+        let mut ctx = ReactiveCtx::new();
+        let count = ctx.create_signal(Value::Int(0));
+
+        let mut atlas = LayoutAtlas::new();
+        // Child: index 0 (leaf)
+        let child = atlas.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
+        // Parent: index 1 (container)
+        let parent = atlas
+            .add_container(ContainerStyle::new(Some(100.0), Some(100.0)), &[child])
+            .unwrap();
+        atlas.set_root(parent).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let parent_idx = atlas.node_index(parent).unwrap();
+
+        let mut router = EventRouter::new();
+        // Register handler on the parent element (index 1)
+        router.on(parent_idx, rect(), EventKind::Tap, inc(count));
+
+        // Click directly on the child (which is at layout coords (0,0)-(20,20))
+        router.dispatch_tick(
+            &mut ctx,
+            Some(&atlas),
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 100),
+            ],
+        );
+
+        assert_eq!(ctx.peek_signal(count), Value::Int(1));
     }
 }

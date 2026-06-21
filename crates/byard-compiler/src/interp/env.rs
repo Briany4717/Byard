@@ -43,6 +43,8 @@ pub enum Value {
     Str(String),
     /// `List<T>`.
     List(Vec<Value>),
+    /// A tuple of (optionally named) values, e.g. `(left: 5, bottom: 3)`.
+    Tuple(Vec<(Option<Symbol>, Value)>),
     /// A lambda, referenced by its AST id (not a Rust closure).
     Fn(AstId),
     /// A reactive source (`var`), referenced by its `Signal` id.
@@ -77,6 +79,15 @@ impl Value {
     pub fn as_list(&self) -> Option<&[Value]> {
         match self {
             Value::List(xs) => Some(xs),
+            _ => None,
+        }
+    }
+
+    /// Returns the elements if this is a [`Value::Tuple`].
+    #[must_use]
+    pub fn as_tuple(&self) -> Option<&[(Option<Symbol>, Value)]> {
+        match self {
+            Value::Tuple(xs) => Some(xs),
             _ => None,
         }
     }

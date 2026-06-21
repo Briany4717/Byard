@@ -69,6 +69,7 @@ impl WinitHost {
             width: self.width,
             height: self.height,
             fatal: None,
+            cursor_pos: (0.0, 0.0),
         };
 
         event_loop
@@ -98,6 +99,7 @@ struct WinitApp<H: PlatformHost> {
     /// `WinitHost::run` checks this after the event loop exits and surfaces
     /// it to its own caller.
     fatal: Option<ByardError>,
+    cursor_pos: (f32, f32),
 }
 
 impl<H: PlatformHost> WinitApp<H> {
@@ -193,9 +195,26 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale_factor = window.scale_factor();
+                let logical = position.to_logical::<f64>(scale_factor);
+                #[allow(clippy::cast_possible_truncation)]
+                let x = logical.x as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let y = logical.y as f32;
+                self.cursor_pos = (x, y);
+                self.host.on_cursor_moved(x, y);
+                window.request_redraw();
+            }
+
             WindowEvent::MouseInput { state, button, .. } => {
-                self.host
-                    .on_pointer_input(to_pointer_button(button), to_pointer_state(state));
+                let (x, y) = self.cursor_pos;
+                self.host.on_pointer_input(
+                    to_pointer_button(button),
+                    to_pointer_state(state),
+                    x,
+                    y,
+                );
                 window.request_redraw();
             }
 

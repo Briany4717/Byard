@@ -100,9 +100,8 @@ fn reads_var(expr: &Expr, vars: &[Symbol]) -> Option<crate::diagnostics::Span> {
     match expr {
         Expr::Ident(name, span) if vars.contains(name) => Some(*span),
         Expr::Member { base, .. } => reads_var(base, vars),
-        Expr::Array(items, _) | Expr::Tuple(items, _) => {
-            items.iter().find_map(|e| reads_var(e, vars))
-        }
+        Expr::Array(items, _) => items.iter().find_map(|e| reads_var(e, vars)),
+        Expr::Tuple(items, _) => items.iter().find_map(|a| reads_var(&a.value, vars)),
         Expr::Call { callee, args, .. } => {
             reads_var(callee, vars).or_else(|| args.iter().find_map(|a| reads_var(&a.value, vars)))
         }

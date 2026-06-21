@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::{CompileError, Span};
+use crate::interp::style::check_static;
 use crate::parser::ast::{Expr, Member, Param, Type, ViewDecl};
 use crate::symbol::Symbol;
 
@@ -94,7 +95,21 @@ impl Checker<'_> {
                 self.fns.insert(name.clone(), ty);
             }
         }
+        // Collect var names for static style checks (M11)
+        let mut vars = Vec::new();
+        for member in &view.body {
+            if let Member::Var { name, .. } = member {
+                vars.push(name.clone());
+            }
+        }
         self.check_members(&view.body, true);
+        // Run style check for all style blocks (M11)
+        for member in &view.body {
+            if let Member::Style { rules, .. } = member {
+                let style_errors = check_static(rules, &vars);
+                self.errors.extend(style_errors);
+            }
+        }
     }
 
     fn check_param(&mut self, param: &Param, what: &str) {
@@ -420,5 +435,15 @@ mod tests {
             let errs = errors_of(src);
             assert!(errs.is_empty(), "{src}\n→ {errs:?}");
         }
+    }
+
+    #[test]
+    fn dynamic_style_in_style_block_is_forbidden_during_type_checking() {
+        let errs = errors_of("View V() {\n var c = 1\n style { .a #[bg: c] }\n}");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::DynamicStyleForbidden { .. })),
+            "expected DynamicStyleForbidden, got {errs:?}"
+        );
     }
 }

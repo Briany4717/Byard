@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::ByardError;
+use crate::InputEvent;
 use crate::atlas::{LayoutAtlas, LeafSize};
 use crate::encoder::EncoderSubsystem;
 use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
@@ -342,6 +343,11 @@ impl Engine {
         // it only fires when the logic thread has already exited, at which
         // point delivering the text is moot.
         let _ = self.label_tx.send(text.into());
+    }
+
+    /// Pushes an input event into the engine's logic queue.
+    pub fn push_input(&self, event: InputEvent) {
+        self.relay.push_input(event);
     }
 
     /// Notifies the engine that the window surface has been resized.

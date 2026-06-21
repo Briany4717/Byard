@@ -58,7 +58,7 @@ fn hello_world_renders_reacts_and_hot_reloads() {
 
     // ── initial render ─────────────────────────────────────────────────
     let mut frame = RenderFrame::new();
-    interp.render(&tree, &mut frame);
+    interp.render(&tree, &mut frame, 800.0, 600.0);
     let snapshot = texts(&frame);
     assert!(
         snapshot.iter().any(|s| s == "Count: 0"),
@@ -74,7 +74,7 @@ fn hello_world_renders_reacts_and_hot_reloads() {
     interp.eval_action(button_action(&view)).unwrap();
     interp.tick();
     let mut frame2 = RenderFrame::new();
-    interp.render(&tree, &mut frame2);
+    interp.render(&tree, &mut frame2, 800.0, 600.0);
     assert!(
         texts(&frame2).iter().any(|s| s == "Count: 1"),
         "after the click the reactive text re-projected: {:?}",
@@ -83,7 +83,7 @@ fn hello_world_renders_reacts_and_hot_reloads() {
 
     // ── hot-reload (case-1 body edit) preserves `count` ────────────────
     let edited = parse(
-        "View HelloWorld() {\n var count = 0\n Column #[bg: 0x222222] {\n Text(\"Total: {count}\")\n }\n}",
+        "View HelloWorld() {\n var count = 0\n var textVal = \"Initial\"\n var isToggled = true\n var sliderVal = 0.5\n Column #[bg: 0x222222] {\n Text(\"Total: {count}\")\n }\n}",
     );
     let new_view = &edited.views[0];
     let kind = diff_view(&view, new_view);
