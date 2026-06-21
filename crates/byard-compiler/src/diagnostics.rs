@@ -93,6 +93,13 @@ pub enum CompileError {
         /// Source range of the offending annotation.
         span: Span,
     },
+    /// An `inject T as name` found no ambient `T` in any ancestor scope.
+    UnresolvedInject {
+        /// Source range of the `inject` statement.
+        span: Span,
+        /// The injected type name that could not be resolved.
+        name: String,
+    },
 }
 
 impl CompileError {
@@ -106,7 +113,8 @@ impl CompileError {
             | Self::UnterminatedString { span }
             | Self::MissingAnnotation { span, .. }
             | Self::CannotInfer { span }
-            | Self::TextUsedAsType { span } => *span,
+            | Self::TextUsedAsType { span }
+            | Self::UnresolvedInject { span, .. } => *span,
         }
     }
 
@@ -130,6 +138,9 @@ impl CompileError {
             }
             Self::TextUsedAsType { .. } => {
                 "`Text` is a view, not a type; use `Str` for strings".to_string()
+            }
+            Self::UnresolvedInject { name, .. } => {
+                format!("no ambient `{name}` is provided by any ancestor view")
             }
         }
     }
