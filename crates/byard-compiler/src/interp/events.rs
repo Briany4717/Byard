@@ -117,6 +117,16 @@ impl EventRouter {
         Self::default()
     }
 
+    /// Clears the registered handlers and focusables (so they can be rebuilt
+    /// from a fresh layout each tick) while **preserving** the transient gesture
+    /// state — the in-flight `down` press and the current `focused` element.
+    /// A `tap` spans two ticks (down then up) with a re-render between, so that
+    /// state must survive the rebuild (RFC-0003 E4).
+    pub fn clear_handlers(&mut self) {
+        self.handlers.clear();
+        self.focusables.clear();
+    }
+
     /// Registers a handler for `kind` on element `elem`'s `rect`.
     pub fn on(&mut self, elem: u32, rect: Rect, kind: EventKind, action: Action) {
         self.handlers.push(Handler {

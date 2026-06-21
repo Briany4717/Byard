@@ -40,6 +40,9 @@ struct ByldRuntime {
     tree: Vec<RenderNode>,
     width_bits: Arc<AtomicU32>,
     height_bits: Arc<AtomicU32>,
+    /// The `count` signal, so the e2e debug trace can show it react.
+    count_sig: Option<byard_compiler::interp::env::SignalId>,
+    debug: bool,
 }
 
 impl LogicRuntime for ByldRuntime {
@@ -49,8 +52,29 @@ impl LogicRuntime for ByldRuntime {
         input_events: &[byard_core::platform::InputEvent],
         _dirty: &[TargetId],
     ) {
+        // ── e2e debug trace (run with BYARD_DEBUG=1) ──────────────────────
+        // Confirms link by link that winit events reach the interpreter and
+        // that hit-testing fires the button: every input event is logged with
+        // its logical position, and `count` is printed whenever it changes.
+        if self.debug {
+            for ev in input_events {
+                eprintln!("[input] {:?} @ ({:.1}, {:.1})", ev.kind, ev.pos.0, ev.pos.1);
+            }
+        }
+        let before = self.count_sig.map(|s| self.interp.peek(s));
+
         self.interp.dispatch_events(input_events);
         self.interp.tick();
+
+        if self.debug {
+            if let (Some(sig), Some(b)) = (self.count_sig, before) {
+                let now = self.interp.peek(sig);
+                if now != b {
+                    eprintln!("[react] count: {b:?} -> {now:?}");
+                }
+            }
+        }
+
         let w = f32::from_bits(self.width_bits.load(Ordering::Relaxed));
         let h = f32::from_bits(self.height_bits.load(Ordering::Relaxed));
         self.interp.render(&self.tree, frame, w, h);
@@ -97,15 +121,19 @@ impl PlatformHost for App {
         let w_clone = Arc::clone(&width_bits);
         let h_clone = Arc::clone(&height_bits);
 
+        let debug = std::env::var_os("BYARD_DEBUG").is_some();
         engine.start_logic_from_view(move |_arena| {
             let mut interp = Interpreter::new();
             let tree = interp.lower_view(&view, &[]);
             interp.tick();
+            let count_sig = interp.var_signal(&byard_compiler::symbol::Symbol::intern("count"));
             Box::new(ByldRuntime {
                 interp,
                 tree,
                 width_bits: w_clone,
                 height_bits: h_clone,
+                count_sig,
+                debug,
             })
         })?;
 

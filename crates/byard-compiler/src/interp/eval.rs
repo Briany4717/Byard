@@ -301,7 +301,10 @@ impl Interpreter {
         use byard_core::frame::Viewport;
 
         self.atlas.clear();
-        self.router = crate::interp::events::EventRouter::new();
+        // Rebuild the handler set from the fresh layout, but keep the in-flight
+        // gesture state (a pending `down`, the focused element) so a tap that
+        // spans this re-render is still recognized (RFC-0003 E4).
+        self.router.clear_handlers();
         let mut flat_ids = Vec::new();
 
         let mut root_children = Vec::new();
