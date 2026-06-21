@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 logos = "0.14"
 smallvec = "1"
+crossbeam-channel = "0.5"
 byard-core = { path = "../byard-core" }
 
 [dev-dependencies]

@@ -10,4 +10,5 @@ pub mod eval;
 pub mod events;
 pub mod intrinsics;
 pub mod reactive;
+pub mod reload;
 pub mod style;

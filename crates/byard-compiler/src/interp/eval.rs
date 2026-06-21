@@ -61,6 +61,9 @@ pub struct Interpreter {
     env: Env<'static>,
     next_target: u32,
     errors: Vec<CompileError>,
+    /// `var` name → its `Signal`, so a hot-reload can preserve state by
+    /// rebinding instead of re-initializing (RFC-0004 §11).
+    var_sigs: std::collections::HashMap<Symbol, SignalId>,
 }
 
 impl Interpreter {
@@ -139,8 +142,61 @@ impl Interpreter {
     pub fn define_var(&mut self, name: Symbol, init: &Expr) -> SignalId {
         let initial = self.eval_pure(init);
         let sig = self.ctx.create_signal(initial);
-        self.env.push(name, Value::Signal(sig));
+        self.env.push(name.clone(), Value::Signal(sig));
+        self.var_sigs.insert(name, sig);
         sig
+    }
+
+    /// The `Signal` backing the `var` named `name`, if any.
+    #[must_use]
+    pub fn var_signal(&self, name: &Symbol) -> Option<SignalId> {
+        self.var_sigs.get(name).copied()
+    }
+
+    /// Writes a value to a `Signal` (a controller result or test driver), running
+    /// the mark cascade.
+    pub fn write_var(&mut self, sig: SignalId, value: Value) {
+        self.ctx.write_signal(sig, value);
+    }
+
+    /// Reads a `Signal`'s current value without tracking.
+    #[must_use]
+    pub fn peek(&self, sig: SignalId) -> Value {
+        self.ctx.peek_signal(sig)
+    }
+
+    /// Applies a hot-reload patch (RFC-0002 §"Hot-reload boundary", RFC-0004
+    /// §11). On a [`reactive-compatible`](super::reload::ReloadKind) patch the
+    /// existing `Signal`s are **kept** (matched by name) so state survives; on a
+    /// structure-incompatible patch every `var` is re-initialized from the new
+    /// AST (state resets). The reactive scopes are rebuilt from the new AST
+    /// either way — read-tracking re-derives the dependency graph (§11).
+    pub fn reload(&mut self, new_view: &ViewDecl, kind: super::reload::ReloadKind) {
+        use super::reload::ReloadKind;
+        let old = std::mem::take(&mut self.var_sigs);
+        self.env = Env::new();
+        for member in &new_view.body {
+            match member {
+                Member::Var { name, init, .. } => {
+                    if matches!(kind, ReloadKind::ReactiveCompatible) {
+                        if let Some(&sig) = old.get(name) {
+                            // Keep the live Signal (and its value).
+                            self.env.push(name.clone(), Value::Signal(sig));
+                            self.var_sigs.insert(name.clone(), sig);
+                            continue;
+                        }
+                    }
+                    self.define_var(name.clone(), init);
+                }
+                Member::Let { name, init, .. }
+                | Member::Fn {
+                    name, body: init, ..
+                } => {
+                    self.define_let(name.clone(), init);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `let y = init` (and `fn`) — open a computed memo.
