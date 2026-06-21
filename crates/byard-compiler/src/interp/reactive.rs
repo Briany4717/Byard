@@ -321,6 +321,14 @@ impl ReactiveCtx {
 
     // ── mutation: the mark cascade (§4) ─────────────────────────────────
 
+    /// Reads a signal's current value **without** tracking — for mutation
+    /// l-values (`count++`) and other actions that are not reactive
+    /// projections.
+    #[must_use]
+    pub fn peek_signal(&self, sig: SignalId) -> Value {
+        self.signals[sig.0 as usize].value.clone()
+    }
+
     /// Writes a new value to a signal and runs the synchronous mark cascade
     /// (the mutation entry point).
     pub fn write_signal(&mut self, sig: SignalId, value: Value) {

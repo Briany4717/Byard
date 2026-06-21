@@ -23,6 +23,7 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 pub mod symbol;
+pub mod util;
 
 pub use diagnostics::{CompileError, Span};
 pub use lexer::Token;

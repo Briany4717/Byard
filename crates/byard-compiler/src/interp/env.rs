@@ -12,6 +12,7 @@
 //! ambient value provided for `T`, or [`CompileError::UnresolvedInject`] if no
 //! ancestor provides one.
 
+use super::reactive::ScopeId;
 use crate::diagnostics::{CompileError, Span};
 use crate::symbol::Symbol;
 
@@ -46,6 +47,8 @@ pub enum Value {
     Fn(AstId),
     /// A reactive source (`var`), referenced by its `Signal` id.
     Signal(SignalId),
+    /// A computed memo (`let`/`fn`), referenced by its reactive scope id.
+    Memo(ScopeId),
     /// The unit value (e.g. the result of a mutation).
     Unit,
 }

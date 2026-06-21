@@ -100,6 +100,62 @@ pub enum CompileError {
         /// The injected type name that could not be resolved.
         name: String,
     },
+    /// A mutation (`=`, `+=`, `++`, …) targeted something that is not an
+    /// assignable `var` l-value (M9; RFC-0003 §6).
+    NotAssignable {
+        /// Source range of the offending target.
+        span: Span,
+    },
+    /// An element name is neither a known intrinsic nor a `ViewDecl` in scope
+    /// (RFC-0002 D4); `hint` carries a Levenshtein "did you mean …?".
+    UnknownView {
+        /// Source range of the element name.
+        span: Span,
+        /// The unknown name.
+        name: String,
+        /// The closest known name, if any.
+        hint: Option<String>,
+    },
+    /// An intrinsic did not recognize an attribute name (RFC-0002 D4, never
+    /// silently ignored).
+    UnknownAttribute {
+        /// Source range of the attribute.
+        span: Span,
+        /// The unknown attribute name.
+        name: String,
+        /// The closest recognized attribute, if any.
+        hint: Option<String>,
+    },
+    /// An attribute used the wrong separator for its kind — a property given
+    /// `=>`, or an event given `:` (RFC-0003 D4-bis).
+    WrongAttributeSeparator {
+        /// Source range of the attribute.
+        span: Span,
+        /// The attribute name.
+        name: String,
+        /// Whether the attribute *should* be a property (`:`) — else an event.
+        expected_property: bool,
+    },
+    /// An intrinsic received the wrong number of positional `(...)` content
+    /// arguments (RFC-0005 §5).
+    ArityMismatch {
+        /// Source range of the element.
+        span: Span,
+        /// The intrinsic name.
+        name: String,
+        /// How many content arguments were expected.
+        expected: usize,
+        /// How many were supplied.
+        found: usize,
+    },
+    /// An attribute value (or content value) had the wrong scalar type for the
+    /// intrinsic's contract (RFC-0005 §5).
+    AttributeTypeMismatch {
+        /// Source range of the value.
+        span: Span,
+        /// A short description of what was expected (e.g. "a length", "a color").
+        expected: String,
+    },
 }
 
 impl CompileError {
@@ -114,7 +170,13 @@ impl CompileError {
             | Self::MissingAnnotation { span, .. }
             | Self::CannotInfer { span }
             | Self::TextUsedAsType { span }
-            | Self::UnresolvedInject { span, .. } => *span,
+            | Self::UnresolvedInject { span, .. }
+            | Self::NotAssignable { span }
+            | Self::UnknownView { span, .. }
+            | Self::UnknownAttribute { span, .. }
+            | Self::WrongAttributeSeparator { span, .. }
+            | Self::ArityMismatch { span, .. }
+            | Self::AttributeTypeMismatch { span, .. } => *span,
         }
     }
 
@@ -141,6 +203,33 @@ impl CompileError {
             }
             Self::UnresolvedInject { name, .. } => {
                 format!("no ambient `{name}` is provided by any ancestor view")
+            }
+            Self::NotAssignable { .. } => "this is not an assignable `var`".to_string(),
+            Self::UnknownView { name, hint, .. } => {
+                with_hint(format!("unknown view `{name}`"), hint.as_deref())
+            }
+            Self::UnknownAttribute { name, hint, .. } => {
+                with_hint(format!("unknown attribute `{name}`"), hint.as_deref())
+            }
+            Self::WrongAttributeSeparator {
+                name,
+                expected_property,
+                ..
+            } => {
+                if *expected_property {
+                    format!("`{name}` is a property; use `:` not `=>`")
+                } else {
+                    format!("`{name}` is an event; use `=>` not `:`")
+                }
+            }
+            Self::ArityMismatch {
+                name,
+                expected,
+                found,
+                ..
+            } => format!("`{name}` takes {expected} content argument(s), found {found}"),
+            Self::AttributeTypeMismatch { expected, .. } => {
+                format!("expected {expected}")
             }
         }
     }
@@ -175,6 +264,14 @@ impl CompileError {
             headline = self.headline(),
             col1 = col + 1,
         )
+    }
+}
+
+/// Appends a "did you mean …?" suffix to a headline if a hint is present.
+fn with_hint(message: String, hint: Option<&str>) -> String {
+    match hint {
+        Some(h) => format!("{message} (did you mean `{h}`?)"),
+        None => message,
     }
 }
 
