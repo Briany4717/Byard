@@ -268,6 +268,14 @@ pub enum Expr {
     Ident(Symbol, Span),
     /// An array literal `[a, b, ...]`.
     Array(Vec<Expr>, Span),
+    /// A parenthesized tuple `(a, b, ...)` — used for `Len` pairs/quads such as
+    /// `p: (8, 16)` (RFC-0005 §1). A single parenthesized expression is *not* a
+    /// tuple; it parses to the inner expression directly.
+    Tuple(Vec<Expr>, Span),
+    /// A leading-dot class reference, e.g. the `.title` in `#[style: .title]`
+    /// (RFC-0002 §"Grammar" `style_rule`; resolved against the View's style map
+    /// in M11).
+    ClassRef(Symbol, Span),
     /// Member access `base.field`.
     Member {
         /// The receiver expression.
@@ -341,6 +349,8 @@ impl Expr {
             | Self::StrLit(_, span)
             | Self::Ident(_, span)
             | Self::Array(_, span)
+            | Self::Tuple(_, span)
+            | Self::ClassRef(_, span)
             | Self::Member { span, .. }
             | Self::Call { span, .. }
             | Self::Lambda { span, .. }

@@ -88,7 +88,10 @@ pub enum Token {
     /// `logos` longest-match makes `3.14` a float, `3` an int.
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
     FloatLit(f64),
-    /// An integer literal (`i64`; D9).
+    /// An integer literal (`i64`; D9), decimal or hex (`0xRRGGBB` colors,
+    /// RFC-0005 §1). Hex is listed first so `0x1E` is one hex int, not `0`
+    /// followed by an identifier.
+    #[regex(r"0x[0-9a-fA-F]+", |lex| i64::from_str_radix(&lex.slice()[2..], 16).ok())]
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     IntLit(i64),
     /// A raw string literal (possibly interpolated). The slice (via its span)
@@ -196,13 +199,21 @@ fn lex_string(lex: &mut Lexer<Token>) -> Result<(), LexError> {
 
     for c in lex.remainder().chars() {
         consumed += c.len_utf8();
+        // Escapes are honored in *both* states: a `\"` inside an interpolation
+        // (which is itself inside this string) is an escaped quote, a literal —
+        // it must not toggle string/brace state. D12's nesting cap still counts
+        // genuinely nested *un-escaped* strings via the two-state stack below.
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
         match stack[sp - 1] {
             StrState::InString => {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
+                if c == '"' {
                     sp -= 1;
                     string_depth -= 1;
                     if sp == 0 {
