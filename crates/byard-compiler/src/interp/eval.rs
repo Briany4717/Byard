@@ -19,10 +19,36 @@
 //!   it is [`CompileError::NotAssignable`].
 
 use super::env::{Env, SignalId, Value};
+use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
-use crate::parser::ast::{AssignOp, Expr, Member, PostfixOp, StrPart, ViewDecl};
+use crate::parser::ast::{
+    AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StrPart, ViewDecl,
+};
 use crate::symbol::Symbol;
+
+/// A lowered render-tree node: the interpreter's plan for one element. Reactive
+/// fields are reactive-scope ids the engine reads each tick (M14); static
+/// fields (a literal `bg`, `radius`) are resolved at lowering time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenderNode {
+    /// A box-like container (`Box`/`Column`/`Row`/`Button` background).
+    Box {
+        /// Static background color (`0xRRGGBB`), if a literal `bg:` was given.
+        bg: Option<i64>,
+        /// Static corner radius.
+        radius: i64,
+        /// Child render nodes.
+        children: Vec<RenderNode>,
+    },
+    /// A text run; `content` is the value binding projecting its string.
+    Text {
+        /// The reactive scope projecting the text content.
+        content: ScopeId,
+    },
+    /// A flexible gap (layout-only).
+    Spacer,
+}
 
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
@@ -131,6 +157,60 @@ impl Interpreter {
         let target = self.next_target();
         let compute = self.lower_expr(expr);
         self.ctx.open_value_binding(target, compute)
+    }
+
+    // ── element lowering (RFC-0005) ─────────────────────────────────────
+
+    /// Lowers an element to a [`RenderNode`], validating it against the §5
+    /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
+    /// `known_views` are user `ViewDecl` names in scope.
+    pub fn lower_element(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
+        self.errors.extend(validate_element(el, known_views));
+        match el.name.as_str() {
+            "Text" | "Button" if !el.content.is_empty() => {
+                let content = self.bind_value(&el.content[0].value);
+                if el.name.as_str() == "Button" {
+                    // A Button is a decorated box wrapping its label.
+                    RenderNode::Box {
+                        bg: static_color(&el.attrs, "bg"),
+                        radius: static_len(&el.attrs, "radius"),
+                        children: vec![RenderNode::Text { content }],
+                    }
+                } else {
+                    RenderNode::Text { content }
+                }
+            }
+            "Spacer" => RenderNode::Spacer,
+            _ => {
+                // Box / Column / Row / ScrollView and any other container.
+                let children = el
+                    .children
+                    .iter()
+                    .filter_map(|m| match m {
+                        Member::Element(e) => Some(self.lower_element(e, known_views)),
+                        _ => None,
+                    })
+                    .collect();
+                RenderNode::Box {
+                    bg: static_color(&el.attrs, "bg"),
+                    radius: static_len(&el.attrs, "radius"),
+                    children,
+                }
+            }
+        }
+    }
+
+    /// Processes a whole `View`: its declarations first (so bindings can resolve
+    /// names), then lowers its top-level elements into a render tree.
+    pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {
+        self.eval_view_decls(view);
+        view.body
+            .iter()
+            .filter_map(|m| match m {
+                Member::Element(e) => Some(self.lower_element(e, known_views)),
+                _ => None,
+            })
+            .collect()
     }
 
     // ── lowering ────────────────────────────────────────────────────────
@@ -313,6 +393,37 @@ impl Interpreter {
     }
 }
 
+/// Finds a static (literal) `Color` attribute value, if present.
+fn static_color(attrs: &[Attr], name: &str) -> Option<i64> {
+    attrs
+        .iter()
+        .find_map(|a| match (&a.kind, a.name.as_str() == name) {
+            (
+                AttrKind::Prop {
+                    value: Expr::IntLit(n, _),
+                },
+                true,
+            ) => Some(*n),
+            _ => None,
+        })
+}
+
+/// Finds a static (literal) scalar `Len` attribute value, defaulting to `0`.
+fn static_len(attrs: &[Attr], name: &str) -> i64 {
+    attrs
+        .iter()
+        .find_map(|a| match (&a.kind, a.name.as_str() == name) {
+            (
+                AttrKind::Prop {
+                    value: Expr::IntLit(n, _),
+                },
+                true,
+            ) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 /// Renders a value for string interpolation (`"Count: {count}"`).
 fn display_value(v: &Value) -> String {
     match v {
@@ -423,6 +534,57 @@ mod tests {
         let action = element(&view.body[2]).action.as_ref().unwrap();
         let err = interp.eval_action(action).unwrap_err();
         assert!(matches!(err, CompileError::NotAssignable { .. }));
+    }
+
+    #[test]
+    fn lower_view_emits_expected_render_tree() {
+        let parsed = parse(
+            "View C() {\n var count = 0\n Column #[bg: 0x222222, radius: 16] {\n Text(\"Count: {count}\")\n }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        // One top-level Column box with the literal bg/radius and one Text child.
+        assert_eq!(tree.len(), 1);
+        let RenderNode::Box {
+            bg,
+            radius,
+            children,
+        } = &tree[0]
+        else {
+            panic!("expected a Box, got {:?}", tree[0]);
+        };
+        assert_eq!(*bg, Some(0x0022_2222));
+        assert_eq!(*radius, 16);
+        assert_eq!(children.len(), 1);
+        let RenderNode::Text { content } = &children[0] else {
+            panic!("expected a Text child");
+        };
+
+        // The Text projects the reactive count.
+        interp.tick();
+        assert_eq!(
+            interp.binding_value(*content),
+            Some(Value::Str("Count: 0".to_string()))
+        );
+    }
+
+    #[test]
+    fn lowering_an_unknown_element_records_unknown_view() {
+        let parsed = parse("View C() { Colunm #[gap: 8] {} }");
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let _ = interp.lower_view(view, &[]);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownView { .. }))
+        );
     }
 
     #[test]

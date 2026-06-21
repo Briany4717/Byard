@@ -156,6 +156,14 @@ pub enum CompileError {
         /// A short description of what was expected (e.g. "a length", "a color").
         expected: String,
     },
+    /// Children were given to a childless intrinsic (`Text`, `Spacer`, `Image`,
+    /// `TextField`, `Toggle`, `Slider`) — RFC-0005 §5 rule 8.
+    UnexpectedChildren {
+        /// Source range of the element.
+        span: Span,
+        /// The intrinsic name.
+        name: String,
+    },
 }
 
 impl CompileError {
@@ -176,7 +184,8 @@ impl CompileError {
             | Self::UnknownAttribute { span, .. }
             | Self::WrongAttributeSeparator { span, .. }
             | Self::ArityMismatch { span, .. }
-            | Self::AttributeTypeMismatch { span, .. } => *span,
+            | Self::AttributeTypeMismatch { span, .. }
+            | Self::UnexpectedChildren { span, .. } => *span,
         }
     }
 
@@ -230,6 +239,9 @@ impl CompileError {
             } => format!("`{name}` takes {expected} content argument(s), found {found}"),
             Self::AttributeTypeMismatch { expected, .. } => {
                 format!("expected {expected}")
+            }
+            Self::UnexpectedChildren { name, .. } => {
+                format!("`{name}` takes no children")
             }
         }
     }

@@ -32,7 +32,10 @@ pub fn closest_match<'a>(
         .into_iter()
         .map(|c| (levenshtein(name, c), c))
         .filter(|(d, _)| *d <= threshold)
-        .min_by_key(|(d, _)| *d)
+        // Tie-break by the candidate name so the suggestion is deterministic
+        // regardless of iteration order (e.g. `gp` → `gap`, not the equally
+        // close `p`).
+        .min_by_key(|(d, c)| (*d, *c))
         .map(|(_, c)| c)
 }
 
