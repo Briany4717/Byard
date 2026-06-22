@@ -161,6 +161,54 @@ impl<T> LatestWins<T> {
     }
 }
 
+// ── M25: Notify file watcher ──────────────────────────────────────────────────
+
+/// Parsed file result delivered by the file-watcher thread.
+pub struct ParsedFile {
+    /// The parsed views (may be empty on a parse error, preserving last good).
+    pub views: Vec<crate::parser::ast::ViewDecl>,
+    /// Diagnostics from the last parse attempt.
+    pub errors: Vec<crate::diagnostics::CompileError>,
+}
+
+/// Spawns a background OS thread that watches `path` with `notify` and publishes
+/// fresh [`ParsedFile`]s to `channel` on every change (IMPL-23, M25).
+///
+/// A parse error keeps `views` empty so the caller retains the last-good view.
+/// Returns the watcher handle — drop it to stop watching.
+///
+/// # Errors
+///
+/// Returns an error if `notify` fails to initialize the watcher or to register
+/// the path (e.g. file does not exist).
+pub fn start_watcher(
+    path: &std::path::Path,
+    channel: std::sync::Arc<LatestWins<ParsedFile>>,
+) -> Result<notify::RecommendedWatcher, notify::Error> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    let watcher_path = path.to_path_buf();
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    // Re-read and re-parse the file on every change event.
+                    if let Ok(src) = std::fs::read_to_string(&watcher_path) {
+                        let parsed = crate::parser::parse(&src);
+                        channel.publish(ParsedFile {
+                            views: parsed.views,
+                            errors: parsed.errors,
+                        });
+                    }
+                }
+            }
+        },
+        notify::Config::default(),
+    )?;
+    watcher.watch(path, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

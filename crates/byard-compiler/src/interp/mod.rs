@@ -12,3 +12,4 @@ pub mod intrinsics;
 pub mod reactive;
 pub mod reload;
 pub mod style;
+pub mod theme;

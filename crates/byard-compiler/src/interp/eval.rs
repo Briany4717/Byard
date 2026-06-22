@@ -42,6 +42,8 @@ pub enum RenderNode {
         children: Vec<RenderNode>,
         /// Event shorthand action.
         action: Option<Expr>,
+        /// The `var` signal bound via `bind:` or `value:` (M16: value widgets).
+        bound_sig: Option<super::env::SignalId>,
     },
     /// A text run.
     Text {
@@ -52,6 +54,13 @@ pub enum RenderNode {
     },
     /// A flexible gap (layout-only).
     Spacer,
+    /// A texture-sampled image (M21).
+    Image {
+        /// Styling attributes (width, height, fit, radii, opacity, …).
+        attrs: Vec<Attr>,
+        /// The reactive scope that evaluates to the image source path/URL.
+        src: ScopeId,
+    },
 }
 
 /// A lowered reactive computation (see the module docs).
@@ -80,6 +89,11 @@ pub struct Interpreter {
     /// Glyph-accurate text measurer, created lazily on first layout so the
     /// non-rendering paths (parsing, reactivity tests) never load fonts.
     text_measurer: Option<byard_core::text::TextMeasurer>,
+    /// Active design-token theme (M22, D5 layer 1).
+    pub theme: super::theme::Theme,
+    /// Parameterized fn definitions: `fn f(params) => body` stored as
+    /// `(param names, body expr)`, indexed by `AstId` (M25).
+    fn_table: Vec<(Vec<Symbol>, Expr)>,
 }
 
 impl Interpreter {
@@ -147,17 +161,43 @@ impl Interpreter {
             Member::Let { name, init, .. } => {
                 self.define_let(name.clone(), init);
             }
-            Member::Fn { name, body, .. } => {
-                // Phase 2: a `fn` lowers to a memo of its body (params are bound
-                // at call sites in a later milestone).
-                self.define_let(name.clone(), body);
+            Member::Fn {
+                name, params, body, ..
+            } => {
+                if params.is_empty() {
+                    // No-param fn: lower body to a memo (existing behavior).
+                    self.define_let(name.clone(), body);
+                } else {
+                    // Parameterized fn (M25): store params+body in fn_table,
+                    // bind Value::Fn(AstId) in env.
+                    let id = crate::interp::env::AstId(
+                        u32::try_from(self.fn_table.len()).unwrap_or(u32::MAX),
+                    );
+                    let param_names: Vec<Symbol> = params.iter().map(|p| p.name.clone()).collect();
+                    self.fn_table.push((param_names, body.clone()));
+                    self.env.push(name.clone(), Value::Fn(id));
+                }
             }
             Member::Expr(e) => {
                 if let Err(err) = self.eval_action(e) {
                     self.errors.push(err);
                 }
             }
-            // inject / elements / control flow / style are wired in M9.x/M10+.
+            Member::Inject { ty, name, span } => {
+                // Resolve `inject T as name` from the ambient environment chain (M23).
+                let ty_name = match ty {
+                    crate::parser::ast::Type::Named { name: n, .. } => n.clone(),
+                    crate::parser::ast::Type::Function { .. } => Symbol::intern("?"),
+                };
+                match self.env.resolve_inject(&ty_name).cloned() {
+                    Some(val) => self.env.push(name.clone(), val),
+                    None => self.errors.push(CompileError::UnresolvedInject {
+                        span: *span,
+                        name: ty_name.as_str().to_string(),
+                    }),
+                }
+            }
+            // elements / control flow / style handled in lower_members.
             _ => {}
         }
     }
@@ -187,6 +227,29 @@ impl Interpreter {
     #[must_use]
     pub fn peek(&self, sig: SignalId) -> Value {
         self.ctx.peek_signal(sig)
+    }
+
+    // ── M23: Controller boundary ─────────────────────────────────────────
+
+    /// Provides an ambient value keyed by `ty` to this view and its
+    /// descendants (`inject T as name` resolution, RFC-0002 §inject).
+    /// Call before [`lower_view`](Self::lower_view) so the environment is
+    /// ready when the view body is evaluated.
+    pub fn inject_provider(&mut self, ty: &str, value: Value) {
+        self.env.provide(Symbol::intern(ty), value);
+    }
+
+    /// Applies a batch of pending I/O results from the async controller pool
+    /// (RFC-0001 §5.1). Each callback receives a mutable reference to `self`
+    /// and writes to whatever `var` signals it needs via [`write_var`](Self::write_var).
+    /// Results are drained before the next [`tick`](Self::tick).
+    pub fn apply_io_results(
+        &mut self,
+        results: impl IntoIterator<Item = Box<dyn FnOnce(&mut Self) + Send>>,
+    ) {
+        for f in results {
+            f(self);
+        }
     }
 
     /// Applies a hot-reload patch (RFC-0002 §"Hot-reload boundary", RFC-0004
@@ -241,6 +304,26 @@ impl Interpreter {
 
     // ── element lowering (RFC-0005) ─────────────────────────────────────
 
+    /// Resolves the `bind:` or `value:` attribute of a value widget to a
+    /// `SignalId`. Returns `None` if no such attribute exists or it doesn't
+    /// name a `var` (M16).
+    fn resolve_bind_sig(&self, attrs: &[Attr]) -> Option<super::env::SignalId> {
+        use crate::parser::ast::Expr;
+        for attr in attrs {
+            if matches!(attr.name.as_str(), "bind" | "value") {
+                if let AttrKind::Prop {
+                    value: Expr::Ident(name, _),
+                } = &attr.kind
+                {
+                    if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
+                        return Some(*sig);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Lowers an element to a [`RenderNode`], validating it against the §5
     /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
     /// `known_views` are user `ViewDecl` names in scope.
@@ -259,6 +342,7 @@ impl Interpreter {
                             content,
                         }],
                         action: el.action.clone(),
+                        bound_sig: None,
                     }
                 } else {
                     RenderNode::Text {
@@ -268,23 +352,98 @@ impl Interpreter {
                 }
             }
             "Spacer" => RenderNode::Spacer,
+            // Image intrinsic → TextureSampler pipeline (M21).
+            // Syntax: Image("path.jpg") #[fit: .cover, width: 200, height: 150]
+            "Image" => {
+                let src_expr = el.content.first().map_or_else(
+                    || Expr::StrLit(vec![], crate::diagnostics::Span::new(0, 0)),
+                    |c| c.value.clone(),
+                );
+                let src = self.bind_value(&src_expr);
+                RenderNode::Image {
+                    attrs: el.attrs.clone(),
+                    src,
+                }
+            }
+            // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
+            "Toggle" | "Slider" | "TextField" => {
+                let bound_sig = self.resolve_bind_sig(&el.attrs);
+                RenderNode::Box {
+                    name: el.name.clone(),
+                    attrs: el.attrs.clone(),
+                    children: Vec::new(),
+                    action: el.action.clone(),
+                    bound_sig,
+                }
+            }
             _ => {
                 // Box / Column / Row / ScrollView and any other container.
-                let children = el
-                    .children
-                    .iter()
-                    .filter_map(|m| match m {
-                        Member::Element(e) => Some(self.lower_element(e, known_views)),
-                        _ => None,
-                    })
-                    .collect();
+                let children = self.lower_members(&el.children, known_views);
                 RenderNode::Box {
                     name: el.name.clone(),
                     attrs: el.attrs.clone(),
                     children,
                     action: el.action.clone(),
+                    bound_sig: None,
                 }
             }
+        }
+    }
+
+    /// Lowers a slice of `Member`s into child `RenderNode`s, handling
+    /// `Element`, `When`, and `For` (M20).
+    fn lower_members(&mut self, members: &[Member], known_views: &[&str]) -> Vec<RenderNode> {
+        let mut nodes = Vec::new();
+        for m in members {
+            self.lower_member_into(m, known_views, &mut nodes);
+        }
+        nodes
+    }
+
+    fn lower_member_into(
+        &mut self,
+        member: &Member,
+        known_views: &[&str],
+        out: &mut Vec<RenderNode>,
+    ) {
+        match member {
+            Member::Element(e) => {
+                out.push(self.lower_element(e, known_views));
+            }
+            Member::When {
+                cond, then, els, ..
+            } => {
+                let val = self.eval_pure(cond);
+                let body = if val.as_bool().unwrap_or(false) {
+                    then.as_slice()
+                } else {
+                    match els {
+                        Some(els) => els.as_slice(),
+                        None => return,
+                    }
+                };
+                for m in body {
+                    self.lower_member_into(m, known_views, out);
+                }
+            }
+            Member::For {
+                var, iter, body, ..
+            } => {
+                let list = self.eval_pure(iter);
+                if let Value::List(items) = list {
+                    for item in items {
+                        let snapshot = self.env.len();
+                        // Create a one-tick signal to hold the item value.
+                        let item_sig = self.ctx.create_signal(item);
+                        self.env.push(var.clone(), Value::Signal(item_sig));
+                        for m in body.as_slice() {
+                            self.lower_member_into(m, known_views, out);
+                        }
+                        self.env.truncate(snapshot);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -355,13 +514,27 @@ impl Interpreter {
                 flat_ids.push(id);
                 Ok(id)
             }
+            RenderNode::Image { attrs, .. } => {
+                let w = self.eval_int_prop(attrs, "width").unwrap_or(100) as f32;
+                let h = self.eval_int_prop(attrs, "height").unwrap_or(100) as f32;
+                let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                flat_ids.push(id);
+                Ok(id)
+            }
             RenderNode::Text { attrs, content } => {
                 let text = match self.binding_value(*content) {
                     Some(Value::Str(s)) => s,
                     other => other.map_or_else(String::new, |v| format!("{v:?}")),
                 };
+                let typo_size = self
+                    .eval_str_prop(attrs, "typo")
+                    .and_then(|t| super::theme::resolve_typo(&t))
+                    .map(|s| s as i64);
                 #[allow(clippy::cast_precision_loss)]
-                let font_size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+                let font_size = self
+                    .eval_int_prop(attrs, "size")
+                    .or(typo_size)
+                    .unwrap_or(self.theme.font_size as i64) as f32;
                 let (w, h) = self.measure_text(&text, font_size);
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
                 flat_ids.push(id);
@@ -373,6 +546,31 @@ impl Interpreter {
                 children,
                 ..
             } => {
+                // Value widgets are leaf nodes with intrinsic default sizes (M16/M19).
+                match name.as_str() {
+                    "Toggle" => {
+                        let w = self.eval_int_prop(attrs, "width").unwrap_or(50) as f32;
+                        let h = self.eval_int_prop(attrs, "height").unwrap_or(30) as f32;
+                        let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                        flat_ids.push(id);
+                        return Ok(id);
+                    }
+                    "Slider" => {
+                        let w = self.eval_int_prop(attrs, "width").unwrap_or(200) as f32;
+                        let h = self.eval_int_prop(attrs, "height").unwrap_or(24) as f32;
+                        let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                        flat_ids.push(id);
+                        return Ok(id);
+                    }
+                    "TextField" => {
+                        let w = self.eval_int_prop(attrs, "width").unwrap_or(200) as f32;
+                        let h = self.eval_int_prop(attrs, "height").unwrap_or(36) as f32;
+                        let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                        flat_ids.push(id);
+                        return Ok(id);
+                    }
+                    _ => {}
+                }
                 let mut child_ids = Vec::with_capacity(children.len());
                 let mut temp_flat = Vec::new();
                 for child in children {
@@ -409,8 +607,19 @@ impl Interpreter {
                         Some(Value::Str(s)) => s,
                         other => other.map_or_else(String::new, |v| format!("{v:?}")),
                     };
-                    let color = self.eval_color_prop(attrs, "color").unwrap_or(0x00ff_ffff);
-                    let size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+                    // M22: fall back to theme on-surface color when unset.
+                    let color = self
+                        .eval_color_prop(attrs, "color")
+                        .unwrap_or(self.theme.on_surface);
+                    // M22: resolve `typo:` token to font size; inline `size:` overrides.
+                    let typo_size = self
+                        .eval_str_prop(attrs, "typo")
+                        .and_then(|t| super::theme::resolve_typo(&t))
+                        .map(|s| s as i64);
+                    let size =
+                        self.eval_int_prop(attrs, "size")
+                            .or(typo_size)
+                            .unwrap_or(self.theme.font_size as i64) as f32;
                     frame.push_text(byard_core::TextLine {
                         x: rect.x,
                         y: rect.y,
@@ -432,32 +641,8 @@ impl Interpreter {
                         );
                         let hit_rect =
                             crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect);
-                        for attr in attrs {
-                            if let AttrKind::Event { payload, action } = &attr.kind {
-                                let event_kind = match attr.name.as_str() {
-                                    "tap" => crate::interp::events::EventKind::Tap,
-                                    "pointer_down" => crate::interp::events::EventKind::PointerDown,
-                                    "pointer_up" => crate::interp::events::EventKind::PointerUp,
-                                    "pointer_move" => crate::interp::events::EventKind::PointerMove,
-                                    "scroll" => crate::interp::events::EventKind::Scroll,
-                                    "wheel" => crate::interp::events::EventKind::Wheel,
-                                    "change" => crate::interp::events::EventKind::Change,
-                                    _ => continue,
-                                };
-                                if let Ok(action_closure) =
-                                    self.lower_action(action, payload.clone())
-                                {
-                                    if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
-                                        self.router.on(
-                                            elem_idx,
-                                            hit_rect,
-                                            event_kind,
-                                            action_closure,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        let elem_idx = self.atlas.node_index(atlas_node);
+                        self.register_event_attrs(attrs, hit_rect, elem_idx);
                     }
                 }
             }
@@ -466,6 +651,7 @@ impl Interpreter {
                 attrs,
                 children,
                 action,
+                bound_sig,
             } => {
                 let mut current_rect = parent_rect;
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
@@ -477,65 +663,124 @@ impl Interpreter {
                     );
                     let bg = self.eval_color_prop(attrs, "bg");
                     let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
+                    let border_color = self.eval_color_prop(attrs, "border_color");
+                    let border_width =
+                        self.eval_int_prop(attrs, "border_width").unwrap_or(0) as f32;
+                    let shadow_dx = self
+                        .eval_float_prop(attrs, "shadow_dx")
+                        .map_or(0.0, |v| v as f32);
+                    let shadow_dy = self
+                        .eval_float_prop(attrs, "shadow_dy")
+                        .map_or(0.0, |v| v as f32);
+                    let shadow_blur = self
+                        .eval_float_prop(attrs, "shadow_blur")
+                        .map_or(0.0, |v| v as f32);
+                    let shadow_color = self.eval_color_prop(attrs, "shadow_color");
+                    let opacity = self
+                        .eval_float_prop(attrs, "opacity")
+                        .map_or(1.0, |v| v as f32);
+                    let is_decorated = border_width > 0.0
+                        || shadow_blur > 0.0
+                        || shadow_dx.abs() > 0.0
+                        || shadow_dy.abs() > 0.0
+                        || (opacity - 1.0).abs() > f32::EPSILON;
                     if let Some(color) = bg {
-                        frame.push_instance(byard_core::BoxInstance {
+                        let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
                             radii: [radius; 4],
-                        });
+                        };
+                        if is_decorated || border_color.is_some() {
+                            frame.push_decorated(byard_core::frame::DecoratedBox {
+                                base,
+                                border_width,
+                                border_color: border_color.map_or([0.0; 4], |c| {
+                                    super::intrinsics::color_to_rgba(c, false)
+                                }),
+                                shadow_dx,
+                                shadow_dy,
+                                shadow_blur,
+                                shadow_color: shadow_color.map_or([0.0; 4], |c| {
+                                    super::intrinsics::color_to_rgba(c, false)
+                                }),
+                                opacity,
+                            });
+                        } else {
+                            frame.push_instance(base);
+                        }
                     }
 
                     let element_name = name.as_str();
-                    let has_event_attrs = attrs
-                        .iter()
-                        .any(|a| matches!(a.kind, AttrKind::Event { .. }));
-                    let is_interactive =
-                        matches!(element_name, "Button" | "TextField" | "Toggle" | "Slider")
-                            || has_event_attrs
-                            || action.is_some();
+                    let hit_rect =
+                        crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
+                    let elem_idx = self.atlas.node_index(atlas_node);
 
-                    if is_interactive {
-                        let hit_rect =
-                            crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
-                        for attr in attrs {
-                            if let AttrKind::Event { payload, action } = &attr.kind {
-                                let event_kind = match attr.name.as_str() {
-                                    "tap" => crate::interp::events::EventKind::Tap,
-                                    "pointer_down" => crate::interp::events::EventKind::PointerDown,
-                                    "pointer_up" => crate::interp::events::EventKind::PointerUp,
-                                    "pointer_move" => crate::interp::events::EventKind::PointerMove,
-                                    "scroll" => crate::interp::events::EventKind::Scroll,
-                                    "wheel" => crate::interp::events::EventKind::Wheel,
-                                    "change" => crate::interp::events::EventKind::Change,
-                                    _ => continue,
-                                };
-                                if let Ok(action_closure) =
-                                    self.lower_action(action, payload.clone())
-                                {
-                                    if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
-                                        self.router.on(
-                                            elem_idx,
-                                            hit_rect,
-                                            event_kind,
-                                            action_closure,
-                                        );
+                    // ── Widget-specific visual lowering & handler registration (M16/M19) ──
+                    match element_name {
+                        "Toggle" => {
+                            self.render_toggle(
+                                *bound_sig,
+                                attrs,
+                                current_rect,
+                                hit_rect,
+                                elem_idx,
+                                frame,
+                            );
+                        }
+                        "Slider" => {
+                            self.render_slider(
+                                *bound_sig,
+                                attrs,
+                                current_rect,
+                                hit_rect,
+                                elem_idx,
+                                frame,
+                            );
+                        }
+                        "TextField" => {
+                            self.render_text_field(
+                                *bound_sig,
+                                attrs,
+                                current_rect,
+                                hit_rect,
+                                elem_idx,
+                                frame,
+                            );
+                        }
+                        _ => {
+                            // General interactive elements: register event-attr handlers.
+                            let has_event_attrs = attrs
+                                .iter()
+                                .any(|a| matches!(a.kind, AttrKind::Event { .. }));
+                            let is_interactive = matches!(element_name, "Button")
+                                || has_event_attrs
+                                || action.is_some();
+
+                            if is_interactive {
+                                self.register_event_attrs(attrs, hit_rect, elem_idx);
+
+                                if let Some(action_expr) = action {
+                                    if let Ok(action_closure) = self.lower_action(action_expr, None)
+                                    {
+                                        if let Some(idx) = elem_idx {
+                                            self.router.on(
+                                                idx,
+                                                hit_rect,
+                                                crate::interp::events::EventKind::Tap,
+                                                action_closure,
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
 
-                        if let Some(action_expr) = action {
-                            if let Ok(action_closure) = self.lower_action(action_expr, None) {
-                                if let Some(elem_idx) = self.atlas.node_index(atlas_node) {
-                                    self.router.on(
-                                        elem_idx,
-                                        hit_rect,
-                                        crate::interp::events::EventKind::Tap,
-                                        action_closure,
-                                    );
-                                }
-                            }
-                        }
+                    // ── `focused:` reflected prop → register as focusable (M16/M18) ──
+                    // TextFields register their own focusable inside render_text_field
+                    // to avoid double-registration.
+                    if element_name != "TextField" {
+                        self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
                 for child in children {
@@ -549,6 +794,331 @@ impl Interpreter {
                         current_rect,
                     );
                 }
+            }
+            RenderNode::Image { attrs, src } => {
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    let src_val = self
+                        .binding_value(*src)
+                        .and_then(|v| if let Value::Str(s) = v { Some(s) } else { None })
+                        .unwrap_or_default();
+                    let fit = self.eval_fit_prop(attrs);
+                    let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
+                    let opacity = self
+                        .eval_float_prop(attrs, "opacity")
+                        .map_or(1.0, |v| v as f32);
+                    frame.push_texture(byard_core::frame::TextureSampler {
+                        rect: [rect.x, rect.y, rect.width, rect.height],
+                        src: src_val,
+                        fit,
+                        radii: [radius; 4],
+                        opacity,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Widget rendering helpers (M16/M19) ─────────────────────────────
+
+    /// Renders a `Toggle` widget: track + thumb (M19), and registers a Tap
+    /// handler to flip the bound bool (M16).
+    #[allow(clippy::too_many_arguments)]
+    fn render_toggle(
+        &mut self,
+        bound_sig: Option<super::env::SignalId>,
+        _attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
+
+        // Track
+        let track_h = 14.0_f32;
+        let track_y = rect.y + (rect.h - track_h) / 2.0;
+        let track_color = if is_on {
+            [0.18_f32, 0.58, 0.22, 1.0]
+        } else {
+            [0.35, 0.35, 0.35, 1.0]
+        };
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [rect.x, track_y, rect.w, track_h],
+            color: track_color,
+            radii: [7.0; 4],
+        });
+
+        // Thumb
+        let thumb_size = rect.h.min(rect.w / 2.0).min(22.0);
+        let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
+        let thumb_x = if is_on {
+            rect.x + rect.w - thumb_size
+        } else {
+            rect.x
+        };
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [thumb_x, thumb_y, thumb_size, thumb_size],
+            color: [1.0, 1.0, 1.0, 1.0],
+            radii: [thumb_size / 2.0; 4],
+        });
+
+        // Tap handler to flip the bool (M16).
+        if let (Some(sig), Some(idx)) = (bound_sig, elem_idx) {
+            let flip: super::events::Action = Box::new(move |ctx, _| {
+                let cur = ctx.peek_signal(sig).as_bool().unwrap_or(false);
+                ctx.write_signal(sig, Value::Bool(!cur));
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::Tap, flip);
+        }
+    }
+
+    /// Renders a `Slider` widget: track + fill + thumb (M19), and registers
+    /// PointerDown + PointerDrag handlers to write the value (M16).
+    #[allow(clippy::too_many_arguments)]
+    fn render_slider(
+        &mut self,
+        bound_sig: Option<super::env::SignalId>,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let min = self.eval_float_prop(attrs, "min").unwrap_or(0.0) as f32;
+        let max = self.eval_float_prop(attrs, "max").unwrap_or(1.0) as f32;
+        let step = self.eval_float_prop(attrs, "step").map(|v| v as f32);
+        let cur_val = bound_sig.map_or(min, |s| match self.ctx.peek_signal(s) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => min,
+        });
+        let t = if (max - min).abs() > f32::EPSILON {
+            ((cur_val - min) / (max - min)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Track
+        let track_h = 6.0_f32;
+        let track_y = rect.y + (rect.h - track_h) / 2.0;
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [rect.x, track_y, rect.w, track_h],
+            color: [0.3, 0.3, 0.3, 1.0],
+            radii: [3.0; 4],
+        });
+
+        // Fill
+        let fill_w = t * rect.w;
+        if fill_w > 0.0 {
+            frame.push_instance(byard_core::BoxInstance {
+                rect: [rect.x, track_y, fill_w, track_h],
+                color: [0.18, 0.58, 1.0, 1.0],
+                radii: [3.0; 4],
+            });
+        }
+
+        // Thumb
+        let thumb_size = 16.0_f32;
+        let thumb_x = rect.x + t * (rect.w - thumb_size);
+        let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [thumb_x, thumb_y, thumb_size, thumb_size],
+            color: [1.0, 1.0, 1.0, 1.0],
+            radii: [thumb_size / 2.0; 4],
+        });
+
+        // Handlers: PointerDown + PointerDrag (M16).
+        if let (Some(sig), Some(idx)) = (bound_sig, elem_idx) {
+            let track_x = rect.x;
+            let track_w = rect.w;
+            let make_drag_action =
+                |min: f32, max: f32, step: Option<f32>| -> super::events::Action {
+                    Box::new(move |ctx, _| {
+                        let pos = super::events::CURRENT_EVENT_POS.with(std::cell::Cell::get);
+                        let t = ((pos.0 - track_x) / track_w).clamp(0.0, 1.0);
+                        let raw = min + t * (max - min);
+                        let val = step.map_or(raw, |s| (raw / s).round() * s);
+                        ctx.write_signal(sig, Value::Float(f64::from(val)));
+                    })
+                };
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::PointerDown,
+                make_drag_action(min, max, step),
+            );
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::PointerDrag,
+                make_drag_action(min, max, step),
+            );
+        }
+    }
+
+    /// Renders a `TextField` widget: background box + text/placeholder (M19),
+    /// and registers keyboard handlers for text input (M16/M17).
+    #[allow(clippy::too_many_arguments)]
+    fn render_text_field(
+        &mut self,
+        bound_sig: Option<super::env::SignalId>,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let placeholder = self.eval_str_prop(attrs, "placeholder").unwrap_or_default();
+        let cur_text = bound_sig
+            .map(|s| match self.ctx.peek_signal(s) {
+                Value::Str(t) => t,
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        let (display_text, is_placeholder) = if cur_text.is_empty() {
+            (placeholder, true)
+        } else {
+            (cur_text, false)
+        };
+
+        let text_color = if is_placeholder {
+            0x0088_8888_i64
+        } else {
+            0x00ff_ffff_i64
+        };
+        let font_size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+
+        if !display_text.is_empty() {
+            frame.push_text(byard_core::TextLine {
+                x: rect.x + 8.0,
+                y: rect.y + (rect.h - font_size) / 2.0,
+                text: display_text,
+                font_size,
+                color: super::intrinsics::color_to_rgba(text_color, false),
+                dirty: true,
+            });
+        }
+
+        // Handlers: TextInput appends, KeyDown handles Backspace/Enter/Tab (M16/M17).
+        if let (Some(sig), Some(idx)) = (bound_sig, elem_idx) {
+            // TextInput: append typed text
+            let text_input: super::events::Action = Box::new(move |ctx, payload| {
+                if let Some(Value::Str(ch)) = payload {
+                    let cur = match ctx.peek_signal(sig) {
+                        Value::Str(s) => s,
+                        _ => String::new(),
+                    };
+                    ctx.write_signal(sig, Value::Str(cur + ch.as_str()));
+                }
+            });
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::TextInput,
+                text_input,
+            );
+
+            // KeyDown: Backspace deletes, Enter/Escape handled (submit fires via Change)
+            let key_down: super::events::Action = Box::new(move |ctx, payload| {
+                if let Some(Value::Str(key)) = payload {
+                    match key.as_str() {
+                        "Backspace" => {
+                            let cur = match ctx.peek_signal(sig) {
+                                Value::Str(s) => s,
+                                _ => String::new(),
+                            };
+                            let mut s = cur;
+                            s.pop();
+                            ctx.write_signal(sig, Value::Str(s));
+                        }
+                        "Delete" => {
+                            ctx.write_signal(sig, Value::Str(String::new()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::KeyDown, key_down);
+
+            // Change event: write-back from platform (E1).
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::Change,
+                super::events::write_back_action(sig),
+            );
+
+            // Register as focusable so Tab and click steal focus (M18).
+            // TextField uses its own focused-var if provided via `focused:` attr;
+            // otherwise we create a dummy signal just for the focusable registry.
+            let focused_sig = self.resolve_focused_sig(attrs);
+            let fsig = focused_sig.unwrap_or_else(|| self.ctx.create_signal(Value::Bool(false)));
+            self.router.focusable(idx, hit_rect, fsig);
+        }
+    }
+
+    /// Resolves the `focused:` attribute to a `SignalId`, if present.
+    fn resolve_focused_sig(&self, attrs: &[Attr]) -> Option<super::env::SignalId> {
+        use crate::parser::ast::Expr;
+        for attr in attrs {
+            if attr.name.as_str() == "focused" {
+                if let AttrKind::Prop {
+                    value: Expr::Ident(name, _),
+                } = &attr.kind
+                {
+                    if let Some(Value::Signal(sig)) = self.env.lookup(name) {
+                        return Some(*sig);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Registers handlers for all event-kind attrs (`#[tap => …]`, etc.).
+    fn register_event_attrs(
+        &mut self,
+        attrs: &[Attr],
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+    ) {
+        for attr in attrs {
+            if let AttrKind::Event { payload, action } = &attr.kind {
+                let event_kind = match attr.name.as_str() {
+                    "tap" => super::events::EventKind::Tap,
+                    "pointer_down" => super::events::EventKind::PointerDown,
+                    "pointer_up" => super::events::EventKind::PointerUp,
+                    "pointer_move" => super::events::EventKind::PointerMove,
+                    "scroll" => super::events::EventKind::Scroll,
+                    "wheel" => super::events::EventKind::Wheel,
+                    "change" => super::events::EventKind::Change,
+                    "key_down" => super::events::EventKind::KeyDown,
+                    "key_up" => super::events::EventKind::KeyUp,
+                    "text_input" => super::events::EventKind::TextInput,
+                    _ => continue,
+                };
+                if let Ok(closure) = self.lower_action(action, payload.clone()) {
+                    if let Some(idx) = elem_idx {
+                        self.router.on(idx, hit_rect, event_kind, closure);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers an element as focusable if it has a `focused:` prop attr (M16/M18).
+    fn register_focusable(
+        &mut self,
+        attrs: &[Attr],
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+    ) {
+        if let Some(sig) = self.resolve_focused_sig(attrs) {
+            if let Some(idx) = elem_idx {
+                self.router.focusable(idx, hit_rect, sig);
             }
         }
     }
@@ -575,6 +1145,46 @@ impl Interpreter {
             }
             None
         })
+    }
+
+    fn eval_float_prop(&mut self, attrs: &[Attr], name: &str) -> Option<f64> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    let val = self.eval_pure(value);
+                    return match val {
+                        Value::Float(f) => Some(f),
+                        Value::Int(n) => Some(n as f64),
+                        _ => None,
+                    };
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_str_prop(&mut self, attrs: &[Attr], name: &str) -> Option<String> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    let val = self.eval_pure(value);
+                    return match val {
+                        Value::Str(s) => Some(s),
+                        _ => None,
+                    };
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_fit_prop(&mut self, attrs: &[Attr]) -> byard_core::frame::ImageFit {
+        match self.eval_str_prop(attrs, "fit").as_deref() {
+            Some("contain") => byard_core::frame::ImageFit::Contain,
+            Some("cover") => byard_core::frame::ImageFit::Cover,
+            Some("none") => byard_core::frame::ImageFit::None,
+            _ => byard_core::frame::ImageFit::Fill,
+        }
     }
 
     fn eval_container_style(
@@ -824,22 +1434,17 @@ impl Interpreter {
     }
 
     /// Processes a whole `View`: its declarations first (so bindings can resolve
-    /// names), then lowers its top-level elements into a render tree.
+    /// names), then lowers its top-level elements into a render tree, handling
+    /// `when`/`for` structural members (M20).
     pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {
         self.eval_view_decls(view);
-        view.body
-            .iter()
-            .filter_map(|m| match m {
-                Member::Element(e) => Some(self.lower_element(e, known_views)),
-                _ => None,
-            })
-            .collect()
+        self.lower_members(&view.body, known_views)
     }
 
     // ── lowering ────────────────────────────────────────────────────────
 
     /// Lowers `expr` to a reactive computation against the current environment.
-    fn lower_expr(&self, expr: &Expr, payload_name: Option<&Symbol>) -> Lowered {
+    fn lower_expr(&mut self, expr: &Expr, payload_name: Option<&Symbol>) -> Lowered {
         match expr {
             Expr::IntLit(n, _) => {
                 let n = *n;
@@ -976,7 +1581,7 @@ impl Interpreter {
         }
     }
 
-    fn lower_strlit(&self, parts: &[StrPart], payload_name: Option<&Symbol>) -> Lowered {
+    fn lower_strlit(&mut self, parts: &[StrPart], payload_name: Option<&Symbol>) -> Lowered {
         enum Part {
             Text(String),
             Interp(Lowered),
@@ -1001,7 +1606,7 @@ impl Interpreter {
     }
 
     fn lower_call(
-        &self,
+        &mut self,
         callee: &Expr,
         args: &[crate::parser::ast::Arg],
         payload_name: Option<&Symbol>,
@@ -1018,6 +1623,25 @@ impl Interpreter {
             if let Some(Value::Memo(scope)) = self.env.lookup(name) {
                 let m = *scope;
                 return Box::new(move |ctx| ctx.read_memo(m));
+            }
+            // Parameterized fn call (M25): inline the body with args bound as memos.
+            if let Some(Value::Fn(id)) = self.env.lookup(name).cloned() {
+                if (id.0 as usize) < self.fn_table.len() {
+                    let (params, body) = self.fn_table[id.0 as usize].clone();
+                    // Bind each arg as a reactive memo so signal reads inside the
+                    // fn body are tracked by the enclosing scope.
+                    let snapshot = self.env.len();
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        let arg_lowered = self.lower_expr(&arg.value, payload_name);
+                        let scope = self.ctx.open_memo(arg_lowered);
+                        self.env.push(param.clone(), Value::Memo(scope));
+                    }
+                    // Lower the body with arg bindings in scope.
+                    let body_lowered = self.lower_expr(&body, payload_name);
+                    // Restore env.
+                    self.env.truncate(snapshot);
+                    return body_lowered;
+                }
             }
         }
         Box::new(|_| Value::Unit)
@@ -1094,7 +1718,7 @@ impl Interpreter {
     /// Returns a [`CompileError`] if variable resolution or assignment validation fails.
     #[allow(clippy::needless_pass_by_value)]
     pub fn lower_action(
-        &self,
+        &mut self,
         expr: &Expr,
         payload_name: Option<Symbol>,
     ) -> Result<Action, CompileError> {
@@ -1126,11 +1750,21 @@ impl Interpreter {
                     CoreKind::Scroll => CompKind::Scroll,
                     CoreKind::Wheel => CompKind::Wheel,
                     CoreKind::Change => CompKind::Change,
+                    CoreKind::KeyDown => CompKind::KeyDown,
+                    CoreKind::KeyUp => CompKind::KeyUp,
+                    CoreKind::TextInput => CompKind::TextInput,
+                    CoreKind::PointerEnter => CompKind::PointerEnter,
+                    CoreKind::PointerExit => CompKind::PointerExit,
+                    CoreKind::Hover => CompKind::Hover,
+                    CoreKind::LongPress => CompKind::LongPress,
+                    CoreKind::DoubleTap => CompKind::DoubleTap,
+                    CoreKind::Secondary => CompKind::Secondary,
                 };
                 let value = ev.payload.as_ref().map(|p| match p {
                     InputPayload::Str(s) => Value::Str(s.clone()),
                     InputPayload::Bool(b) => Value::Bool(*b),
                     InputPayload::Float(f) => Value::Float(f64::from(*f)),
+                    InputPayload::Key(k) => Value::Str(k.clone()),
                 });
                 CompEvent {
                     kind,
@@ -1489,5 +2123,548 @@ mod tests {
                 left: 5.0
             }
         );
+    }
+
+    // ── M16: Toggle/Slider/TextField write-back ──────────────────────────
+
+    #[test]
+    fn toggle_tap_flips_bound_var() {
+        let parsed = parse("View C() {\n var on = false\n Toggle #[bind: on]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("on"))
+            .unwrap();
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Bool(false));
+
+        // Simulate a render so handlers are registered.
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Tap inside the Toggle rect.
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 50,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(sig),
+            Value::Bool(true),
+            "toggle flipped to true"
+        );
+
+        // Second tap flips back — gap > DOUBLE_TAP_MS (300ms) so it's a plain tap.
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 400,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 450,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Bool(false), "toggle flipped back");
+    }
+
+    #[test]
+    fn slider_drag_sets_float_value() {
+        let parsed = parse(
+            "View C() {\n var vol = 0.0\n Slider #[bind: vol, min: 0, max: 1, width: 100]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("vol"))
+            .unwrap();
+        interp.tick();
+
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // PointerDown at ~50% of track (x=50 on a 100px track starting at x=0).
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerDown,
+            pos: (50.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+
+        let val = match interp.peek(sig) {
+            Value::Float(f) => f,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        assert!(
+            (val - 0.5).abs() < 0.1,
+            "slider at 50% should be ~0.5, got {val}"
+        );
+    }
+
+    #[test]
+    fn text_field_change_event_round_trips() {
+        let parsed = parse("View C() {\n var query = \"\"\n TextField #[bind: query]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("query"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Change event with new value.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::Change,
+            pos: (5.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Str("hello".to_string())),
+            time_ms: 0,
+        }]);
+        assert_eq!(interp.peek(sig), Value::Str("hello".to_string()));
+
+        // Re-delivering the same value is deduped (E1).
+        let before = interp.peek(sig);
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::Change,
+            pos: (5.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Str("hello".to_string())),
+            time_ms: 1,
+        }]);
+        assert_eq!(interp.peek(sig), before, "equal value deduped");
+    }
+
+    #[test]
+    fn bind_to_non_var_produces_no_bound_sig() {
+        // `let y = 0` is not a var → resolve_bind_sig returns None.
+        let parsed = parse("View C() {\n let y = 0\n Toggle #[bind: y]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        // No error expected at lowering; just bound_sig is None (non-var silently ignored).
+        let RenderNode::Box { bound_sig, .. } = &tree[0] else {
+            panic!("expected Box");
+        };
+        assert!(bound_sig.is_none(), "let binding yields no bound_sig");
+    }
+
+    // ── M17: Keyboard delivery ───────────────────────────────────────────
+
+    #[test]
+    fn text_field_receives_keyboard_text_input() {
+        let parsed2 = parse("View C() {\n var text = \"\"\n TextField #[bind: text]\n}");
+        assert!(parsed2.errors.is_empty(), "{:?}", parsed2.errors);
+        let view2 = &parsed2.views[0];
+        let mut interp2 = Interpreter::new();
+        let tree2 = interp2.lower_view(view2, &[]);
+        let sig = interp2
+            .var_signal(&crate::symbol::Symbol::intern("text"))
+            .unwrap();
+        interp2.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp2.render(&tree2, &mut frame, 400.0, 300.0);
+
+        // Focus the TextField by tapping it first.
+        interp2.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 50,
+            },
+        ]);
+        interp2.tick();
+        interp2.render(&tree2, &mut frame, 400.0, 300.0);
+
+        // Type "ab".
+        interp2.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::TextInput,
+            pos: (5.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key("a".to_string())),
+            time_ms: 100,
+        }]);
+        interp2.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::TextInput,
+            pos: (5.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key("b".to_string())),
+            time_ms: 200,
+        }]);
+        interp2.tick();
+        assert_eq!(
+            interp2.peek(sig),
+            Value::Str("ab".to_string()),
+            "typed 'ab'"
+        );
+
+        // Backspace removes last char.
+        interp2.render(&tree2, &mut frame, 400.0, 300.0);
+        interp2.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::KeyDown,
+            pos: (5.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key(
+                "Backspace".to_string(),
+            )),
+            time_ms: 300,
+        }]);
+        interp2.tick();
+        assert_eq!(
+            interp2.peek(sig),
+            Value::Str("a".to_string()),
+            "backspace deleted 'b'"
+        );
+    }
+
+    // ── M18: Tab focus traversal ─────────────────────────────────────────
+
+    #[test]
+    fn tab_key_advances_focus_through_text_fields() {
+        // Two TextFields — Tab should cycle between them.
+        let parsed = parse(
+            "View C() {\n var fa = false\n var fb = false\n TextField #[bind: fa, focused: fa]\n TextField #[bind: fb, focused: fb]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let fa = interp
+            .var_signal(&crate::symbol::Symbol::intern("fa"))
+            .unwrap();
+        let fb = interp
+            .var_signal(&crate::symbol::Symbol::intern("fb"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Tab: should focus the first field (none focused yet → index 0).
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::KeyDown,
+            pos: (0.0, 0.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key("Tab".to_string())),
+            time_ms: 0,
+        }]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(fa),
+            Value::Bool(true),
+            "first field focused after Tab"
+        );
+        assert_eq!(interp.peek(fb), Value::Bool(false));
+
+        // Second Tab: advances to second field.
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::KeyDown,
+            pos: (0.0, 0.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key("Tab".to_string())),
+            time_ms: 100,
+        }]);
+        interp.tick();
+        assert_eq!(interp.peek(fa), Value::Bool(false), "first field blurred");
+        assert_eq!(interp.peek(fb), Value::Bool(true), "second field focused");
+    }
+
+    // ── M20: Structural for/when in render tree ──────────────────────────
+
+    #[test]
+    fn when_true_includes_then_branch() {
+        let parsed = parse("View C() {\n var show = true\n when show { Text(\"visible\") }\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        // `when true { ... }` → one Text node in the tree
+        assert_eq!(tree.len(), 1, "when=true emits one node");
+        assert!(matches!(tree[0], RenderNode::Text { .. }));
+    }
+
+    #[test]
+    fn when_false_emits_nothing_without_else() {
+        let parsed = parse("View C() {\n var hide = false\n when hide { Text(\"hidden\") }\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert!(tree.is_empty(), "when=false emits no nodes");
+    }
+
+    #[test]
+    fn for_loop_emits_one_node_per_item() {
+        let parsed =
+            parse("View C() {\n var items = [1, 2, 3]\n for item in items { Text(\"{item}\") }\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(tree.len(), 3, "for over 3 items emits 3 nodes");
+    }
+
+    // ── M23: Controller boundary ─────────────────────────────────────────
+
+    #[test]
+    fn inject_provider_is_visible_to_view() {
+        let parsed = parse("View C() {\n inject AppEnv as env\n Text(\"{env}\")\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        // Provide the ambient value before lowering.
+        interp.inject_provider("AppEnv", Value::Str("prod".to_string()));
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // The Text should contain the injected value.
+        assert_eq!(frame.texts()[0].text, "prod");
+    }
+
+    #[test]
+    fn apply_io_results_writes_to_var_and_ticks() {
+        let parsed = parse("View C() {\n var data = \"\"\n Text(\"{data}\")\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let _tree = interp.lower_view(view, &[]);
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("data"))
+            .unwrap();
+        interp.tick();
+
+        // Simulate an async I/O result writing to the `data` var.
+        interp.apply_io_results([Box::new(move |interp: &mut Interpreter| {
+            interp.write_var(sig, Value::Str("loaded".to_string()));
+        }) as Box<dyn FnOnce(&mut Interpreter) + Send>]);
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Str("loaded".to_string()));
+    }
+
+    // ── M25: Parameterized fn call sites ─────────────────────────────────
+
+    #[test]
+    fn parameterized_fn_call_binds_args() {
+        // fn identity(n: Int) => n  →  let y = identity(42)  →  Text renders "42"
+        let src = "View C() {\n fn identity(n: Int) => n\n var x = 42\n let y = identity(x)\n Text(\"{y}\")\n}";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(frame.texts()[0].text, "42", "identity(42) == 42");
+    }
+
+    #[test]
+    fn parameterized_fn_reacts_to_signal_arg() {
+        // fn greet(name: Str) => "Hi {name}"  →  reactive on `greeting` signal
+        let src = "View C() {\n fn greet(name: Str) => \"Hi {name}\"\n var greeting = \"Alice\"\n let msg = greet(greeting)\n Text(\"{msg}\")\n}";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("greeting"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(frame.texts()[0].text, "Hi Alice");
+
+        // Change greeting → "Bob": msg should become "Hi Bob".
+        interp.write_var(sig, Value::Str("Bob".into()));
+        interp.tick();
+        frame.clear();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(
+            frame.texts()[0].text,
+            "Hi Bob",
+            "greet reacts to signal change"
+        );
+    }
+
+    // ── M21: DecoratedBox / TextureSampler ───────────────────────────────
+
+    #[test]
+    fn image_lowers_to_texture_sampler_in_frame() {
+        let parsed = parse(
+            "View C() {\n Image(\"photo.jpg\") #[fit: \"cover\", width: 200, height: 150]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert!(
+            matches!(tree[0], RenderNode::Image { .. }),
+            "Image element lowers to RenderNode::Image"
+        );
+
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.textures().len(), 1, "one TextureSampler in frame");
+        let tex = &frame.textures()[0];
+        assert_eq!(tex.src, "photo.jpg");
+        assert_eq!(tex.fit, byard_core::frame::ImageFit::Cover);
+    }
+
+    #[test]
+    fn image_fit_defaults_to_fill() {
+        let parsed = parse("View C() {\n Image(\"img.png\")\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(frame.textures()[0].fit, byard_core::frame::ImageFit::Fill);
+    }
+
+    #[test]
+    fn box_with_border_becomes_decorated_box() {
+        let parsed =
+            parse("View C() {\n Box #[bg: 0xffffff, border_width: 1, border_color: 0x000000]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.decorated().len(), 1, "border box → DecoratedBox");
+        assert_eq!(frame.instances().len(), 0, "not a plain BoxInstance");
+        assert!((frame.decorated()[0].border_width - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ── M22: Theme system ────────────────────────────────────────────────
+
+    #[test]
+    fn text_without_color_uses_theme_on_surface() {
+        let parsed = parse("View C() {\n Text(\"hi\")\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let expected_color =
+            crate::interp::intrinsics::color_to_rgba(interp.theme.on_surface, false);
+        assert_eq!(
+            frame.texts()[0].color,
+            expected_color,
+            "no-color Text gets theme on_surface"
+        );
+    }
+
+    #[test]
+    fn typo_token_resolves_to_concrete_size() {
+        let parsed = parse("View C() {\n Text(\"hi\") #[typo: \"titleLarge\"]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert!(
+            (frame.texts()[0].font_size - 22.0).abs() < f32::EPSILON,
+            "titleLarge → 22pt, got {}",
+            frame.texts()[0].font_size
+        );
+    }
+
+    #[test]
+    fn inline_size_overrides_typo_token() {
+        let parsed = parse("View C() {\n Text(\"hi\") #[typo: \"titleLarge\", size: 30]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert!(
+            (frame.texts()[0].font_size - 30.0).abs() < f32::EPSILON,
+            "inline size: 30 overrides typo token"
+        );
+    }
+
+    #[test]
+    fn plain_box_stays_as_box_instance() {
+        let parsed = parse("View C() {\n Box #[bg: 0x111111]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.instances().len(), 1, "plain box → BoxInstance");
+        assert_eq!(frame.decorated().len(), 0);
     }
 }

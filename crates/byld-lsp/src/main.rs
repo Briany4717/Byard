@@ -14,10 +14,11 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{HoverRequest, Request as _};
+use lsp_types::request::{Completion, GotoDefinition, HoverRequest, Request as _};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, Hover, HoverContents, HoverProviderCapability, MarkupContent,
-    MarkupKind, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
+    CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DiagnosticSeverity,
+    GotoDefinitionResponse, Hover, HoverContents, HoverProviderCapability, MarkupContent,
+    MarkupKind, OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncKind, Uri,
 };
 
@@ -29,6 +30,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_capabilities = serde_json::to_value(&ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        completion_provider: Some(lsp_types::CompletionOptions {
+            resolve_provider: Some(false),
+            trigger_characters: Some(vec![
+                "#".to_string(),
+                "[".to_string(),
+                ":".to_string(),
+                ".".to_string(),
+                " ".to_string(),
+            ]),
+            ..Default::default()
+        }),
+        definition_provider: Some(OneOf::Left(true)),
         ..Default::default()
     })?;
 
@@ -63,7 +76,37 @@ fn main_loop(
                         } else {
                             Response::new_ok(id, None::<Hover>)
                         };
-                        connection.sender.send(Message::Response(response))?;
+                        let _ = connection.sender.send(Message::Response(response));
+                    }
+                } else if req.method == Completion::METHOD {
+                    if let Ok((id, params)) = cast_request::<Completion>(req) {
+                        let uri = params.text_document_position.text_document.uri;
+                        let pos = params.text_document_position.position;
+
+                        let response = if let Some(content) = documents.get(&uri) {
+                            let completion_info = handle_completion(content, pos);
+                            Response::new_ok(id, completion_info)
+                        } else {
+                            Response::new_ok(id, None::<CompletionResponse>)
+                        };
+                        let _ = connection.sender.send(Message::Response(response));
+                    }
+                } else if req.method == GotoDefinition::METHOD {
+                    if let Ok((id, params)) = cast_request::<GotoDefinition>(req) {
+                        let uri = params
+                            .text_document_position_params
+                            .text_document
+                            .uri
+                            .clone();
+                        let pos = params.text_document_position_params.position;
+
+                        let response = if let Some(content) = documents.get(&uri) {
+                            let definition_info = handle_definition(content, pos, uri);
+                            Response::new_ok(id, definition_info)
+                        } else {
+                            Response::new_ok(id, None::<GotoDefinitionResponse>)
+                        };
+                        let _ = connection.sender.send(Message::Response(response));
                     }
                 }
             }
@@ -235,6 +278,7 @@ fn byte_offset_to_lsp_pos(source: &str, offset: usize) -> Position {
     Position::new(line, char_idx)
 }
 
+#[allow(dead_code)]
 enum HoverTarget {
     Intrinsic {
         name: String,
@@ -373,6 +417,11 @@ fn find_in_members(
                         return Some(HoverTarget::Intrinsic {
                             name: el.name.to_string(),
                         });
+                    }
+                    for arg in &el.content {
+                        if let Some(target) = find_in_expr(&arg.value, offset) {
+                            return Some(target);
+                        }
                     }
                     for attr in &el.attrs {
                         if span_contains(attr.span, offset) {
@@ -606,5 +655,868 @@ fn format_ty(ty: &byard_compiler::infer::Ty) -> String {
         }
         Ty::Named(sym) => sym.as_str().to_string(),
         Ty::Unknown => "Unknown".to_string(),
+    }
+}
+
+const STYLE_PROPS: &[(&str, &str)] = &[
+    ("width", "Int (logical pixels)"),
+    ("height", "Int (logical pixels)"),
+    ("gap", "Int (logical pixels spacing)"),
+    ("p", "Len (padding on all sides)"),
+    ("m", "Len (margin on all sides)"),
+    ("px", "Len (horizontal padding)"),
+    ("py", "Len (vertical padding)"),
+    ("pt", "Len (top padding)"),
+    ("pr", "Len (right padding)"),
+    ("pb", "Len (bottom padding)"),
+    ("pl", "Len (left padding)"),
+    ("mx", "Len (horizontal margin)"),
+    ("my", "Len (vertical margin)"),
+    ("mt", "Len (top margin)"),
+    ("mr", "Len (right margin)"),
+    ("mb", "Len (bottom margin)"),
+    ("ml", "Len (left margin)"),
+    ("align", "Enum: start | center | end | stretch | justify"),
+    (
+        "justify",
+        "Enum: start | center | end | between | around | evenly",
+    ),
+    ("grow", "Int (flex grow factor)"),
+    ("basis", "Int (flex basis size)"),
+    ("bg", "Color (background color hex)"),
+    ("radius", "Len (border radius)"),
+    ("opacity", "Float (0.0 to 1.0)"),
+    ("border", "Color (border color)"),
+    ("shadow", "Str (shadow specification)"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttributeContext {
+    StyleRule,
+    Element(String),
+}
+
+fn is_style_rule_before_attr(content: &str, attr_start: usize) -> bool {
+    let bytes = content.as_bytes();
+    let mut i = attr_start;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b'.' {
+        return true;
+    }
+    false
+}
+
+fn find_element_name_before_attr(content: &str, attr_start: usize) -> Option<String> {
+    let bytes = content.as_bytes();
+    let mut i = attr_start;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    if bytes[i - 1] == b')' {
+        i -= 1;
+        let mut paren_depth = 1;
+        while i > 0 && paren_depth > 0 {
+            i -= 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i] == b')' {
+                paren_depth += 1;
+            } else if bytes[i] == b'(' {
+                paren_depth -= 1;
+            }
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    let name_end = i;
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    if i < name_end {
+        let name = &content[i..name_end];
+        if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn find_active_attribute_context(content: &str, offset: usize) -> Option<AttributeContext> {
+    let mut bracket_depth = 0;
+    let mut found_attr_start = None;
+    let mut i = offset;
+    let bytes = content.as_bytes();
+    while i > 0 {
+        i -= 1;
+        if i >= bytes.len() {
+            continue;
+        }
+        let c = bytes[i];
+        if c == b']' {
+            bracket_depth += 1;
+        } else if c == b'[' {
+            if i > 0 && bytes[i - 1] == b'#' {
+                if bracket_depth == 0 {
+                    found_attr_start = Some(i - 1);
+                    break;
+                } else {
+                    bracket_depth -= 1;
+                }
+            }
+        }
+    }
+
+    let start_offset = found_attr_start?;
+
+    if is_style_rule_before_attr(content, start_offset) {
+        return Some(AttributeContext::StyleRule);
+    }
+
+    if let Some(el_name) = find_element_name_before_attr(content, start_offset) {
+        return Some(AttributeContext::Element(el_name));
+    }
+
+    let parsed = parse(content);
+    for view in &parsed.views {
+        if !span_contains(view.span, start_offset) {
+            continue;
+        }
+        for member in &view.body {
+            if let Member::Style { rules, span } = member {
+                if span_contains(*span, start_offset) {
+                    for rule in rules {
+                        if span_contains(rule.span, start_offset) {
+                            return Some(AttributeContext::StyleRule);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(name) = find_element_at_offset(&view.body, start_offset) {
+            return Some(AttributeContext::Element(name));
+        }
+    }
+    None
+}
+
+fn find_element_at_offset(members: &[Member], offset: usize) -> Option<String> {
+    for member in members {
+        match member {
+            Member::Element(el) => {
+                if span_contains(el.span, offset) {
+                    if let Some(child_name) = find_element_at_offset(&el.children, offset) {
+                        return Some(child_name);
+                    }
+                    return Some(el.name.to_string());
+                }
+            }
+            Member::For { body, span, .. } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_element_at_offset(body, offset) {
+                        return Some(name);
+                    }
+                }
+            }
+            Member::When {
+                then, els, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_element_at_offset(then, offset) {
+                        return Some(name);
+                    }
+                    if let Some(els_members) = els {
+                        if let Some(name) = find_element_at_offset(els_members, offset) {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn collect_locals_in_members(
+    members: &[Member],
+    offset: usize,
+    locals: &mut Vec<(String, CompletionItemKind, String)>,
+) {
+    for member in members {
+        match member {
+            Member::Var { name, .. } => {
+                locals.push((
+                    name.to_string(),
+                    CompletionItemKind::VARIABLE,
+                    "Variable (Signal)".to_string(),
+                ));
+            }
+            Member::Let { name, .. } => {
+                locals.push((
+                    name.to_string(),
+                    CompletionItemKind::VARIABLE,
+                    "Computed Value (Memo)".to_string(),
+                ));
+            }
+            Member::Fn { name, .. } => {
+                locals.push((
+                    name.to_string(),
+                    CompletionItemKind::FUNCTION,
+                    "Helper Function".to_string(),
+                ));
+            }
+            Member::Inject { name, ty, .. } => {
+                locals.push((
+                    name.to_string(),
+                    CompletionItemKind::VARIABLE,
+                    format!("Injected Value: {:?}", ty),
+                ));
+            }
+            Member::For {
+                var, body, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    locals.push((
+                        var.to_string(),
+                        CompletionItemKind::VARIABLE,
+                        "Loop Item".to_string(),
+                    ));
+                    collect_locals_in_members(body, offset, locals);
+                }
+            }
+            Member::When {
+                then, els, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    collect_locals_in_members(then, offset, locals);
+                    if let Some(els_members) = els {
+                        collect_locals_in_members(els_members, offset, locals);
+                    }
+                }
+            }
+            Member::Element(el) => {
+                if span_contains(el.span, offset) {
+                    collect_locals_in_members(&el.children, offset, locals);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn handle_completion(content: &str, pos: Position) -> Option<CompletionResponse> {
+    let offset = lsp_pos_to_byte_offset(content, pos.line, pos.character)?;
+
+    if let Some(attr_context) = find_active_attribute_context(content, offset) {
+        let mut items = Vec::new();
+        match attr_context {
+            AttributeContext::StyleRule => {
+                for &(prop, desc) in STYLE_PROPS {
+                    items.push(CompletionItem {
+                        label: prop.to_string(),
+                        kind: Some(CompletionItemKind::PROPERTY),
+                        detail: Some(desc.to_string()),
+                        insert_text: Some(format!("{}: ", prop)),
+                        ..Default::default()
+                    });
+                }
+            }
+            AttributeContext::Element(el_name) => {
+                if let Some(info) = byard_compiler::interp::intrinsics::lookup(&el_name) {
+                    for (prop, ty) in info.properties() {
+                        items.push(CompletionItem {
+                            label: prop.to_string(),
+                            kind: Some(CompletionItemKind::PROPERTY),
+                            detail: Some(format!("Property ({:?})", ty)),
+                            insert_text: Some(format!("{}: ", prop)),
+                            ..Default::default()
+                        });
+                    }
+                    for event in info.events() {
+                        items.push(CompletionItem {
+                            label: event.to_string(),
+                            kind: Some(CompletionItemKind::EVENT),
+                            detail: Some("Event Callback".to_string()),
+                            insert_text: Some(format!("{} => ", event)),
+                            ..Default::default()
+                        });
+                    }
+                } else {
+                    let parsed = parse(content);
+                    if let Some(view) = parsed.views.iter().find(|v| v.name.as_str() == el_name) {
+                        for param in &view.params {
+                            items.push(CompletionItem {
+                                label: param.name.to_string(),
+                                kind: Some(CompletionItemKind::PROPERTY),
+                                detail: Some("View Parameter".to_string()),
+                                insert_text: Some(format!("{}: ", param.name)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return Some(CompletionResponse::Array(items));
+    }
+
+    let mut items = Vec::new();
+
+    let keywords = &[
+        "var", "let", "fn", "inject", "for", "in", "when", "else", "style",
+    ];
+    for kw in keywords {
+        items.push(CompletionItem {
+            label: kw.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        });
+    }
+
+    for intrinsic in byard_compiler::interp::intrinsics::INTRINSIC_NAMES {
+        items.push(CompletionItem {
+            label: intrinsic.to_string(),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some("Intrinsic Component".to_string()),
+            ..Default::default()
+        });
+    }
+
+    let parsed = parse(content);
+
+    for view in &parsed.views {
+        items.push(CompletionItem {
+            label: view.name.to_string(),
+            kind: Some(CompletionItemKind::INTERFACE),
+            detail: Some("User View".to_string()),
+            ..Default::default()
+        });
+    }
+
+    if let Some(active_view) = parsed.views.iter().find(|v| span_contains(v.span, offset)) {
+        let mut locals = Vec::new();
+        for param in &active_view.params {
+            locals.push((
+                param.name.to_string(),
+                CompletionItemKind::VARIABLE,
+                "Parameter".to_string(),
+            ));
+        }
+        collect_locals_in_members(&active_view.body, offset, &mut locals);
+
+        for (name, kind, detail) in locals {
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(kind),
+                detail: Some(detail),
+                ..Default::default()
+            });
+        }
+    }
+
+    Some(CompletionResponse::Array(items))
+}
+
+fn find_element_ref_at_offset(views: &[ViewDecl], offset: usize) -> Option<String> {
+    for view in views {
+        if !span_contains(view.span, offset) {
+            continue;
+        }
+        if let Some(name) = find_element_ref_in_members(&view.body, offset) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn find_element_ref_in_members(members: &[Member], offset: usize) -> Option<String> {
+    for member in members {
+        match member {
+            Member::Element(el) => {
+                let name_len = el.name.as_str().len();
+                let name_span = Span::new(el.span.start, el.span.start + name_len as u32);
+                if span_contains(name_span, offset) {
+                    return Some(el.name.to_string());
+                }
+                if let Some(name) = find_element_ref_in_members(&el.children, offset) {
+                    return Some(name);
+                }
+            }
+            Member::For { body, span, .. } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_element_ref_in_members(body, offset) {
+                        return Some(name);
+                    }
+                }
+            }
+            Member::When {
+                then, els, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_element_ref_in_members(then, offset) {
+                        return Some(name);
+                    }
+                    if let Some(els_members) = els {
+                        if let Some(name) = find_element_ref_in_members(els_members, offset) {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_local_declaration_span(members: &[Member], var_name: &str, offset: usize) -> Option<Span> {
+    for member in members {
+        match member {
+            Member::Var { name, span, .. } => {
+                if name.as_str() == var_name {
+                    return Some(*span);
+                }
+            }
+            Member::Let { name, span, .. } => {
+                if name.as_str() == var_name {
+                    return Some(*span);
+                }
+            }
+            Member::Fn { name, span, .. } => {
+                if name.as_str() == var_name {
+                    return Some(*span);
+                }
+            }
+            Member::Inject { name, span, .. } => {
+                if name.as_str() == var_name {
+                    return Some(*span);
+                }
+            }
+            Member::For {
+                var, body, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    if var.as_str() == var_name {
+                        return Some(Span::new(
+                            span.start,
+                            span.start + 4 + var.as_str().len() as u32,
+                        ));
+                    }
+                    if let Some(s) = find_local_declaration_span(body, var_name, offset) {
+                        return Some(s);
+                    }
+                }
+            }
+            Member::When {
+                then, els, span, ..
+            } => {
+                if span_contains(*span, offset) {
+                    if let Some(s) = find_local_declaration_span(then, var_name, offset) {
+                        return Some(s);
+                    }
+                    if let Some(els_members) = els {
+                        if let Some(s) = find_local_declaration_span(els_members, var_name, offset)
+                        {
+                            return Some(s);
+                        }
+                    }
+                }
+            }
+            Member::Element(el) => {
+                if span_contains(el.span, offset) {
+                    if let Some(s) = find_local_declaration_span(&el.children, var_name, offset) {
+                        return Some(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_class_ref_at_offset(views: &[ViewDecl], offset: usize) -> Option<String> {
+    for view in views {
+        if !span_contains(view.span, offset) {
+            continue;
+        }
+        if let Some(name) = find_class_ref_in_members(&view.body, offset) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn find_class_ref_in_members(members: &[Member], offset: usize) -> Option<String> {
+    for member in members {
+        match member {
+            Member::Element(el) => {
+                for attr in &el.attrs {
+                    match &attr.kind {
+                        AttrKind::Prop { value } => {
+                            if let Some(name) = find_class_ref_in_expr(value, offset) {
+                                return Some(name);
+                            }
+                        }
+                        AttrKind::Event { action, .. } => {
+                            if let Some(name) = find_class_ref_in_expr(action, offset) {
+                                return Some(name);
+                            }
+                        }
+                    }
+                }
+                if let Some(action) = &el.action {
+                    if let Some(name) = find_class_ref_in_expr(action, offset) {
+                        return Some(name);
+                    }
+                }
+                if let Some(name) = find_class_ref_in_members(&el.children, offset) {
+                    return Some(name);
+                }
+            }
+            Member::Var { init, .. } | Member::Let { init, .. } => {
+                if let Some(name) = find_class_ref_in_expr(init, offset) {
+                    return Some(name);
+                }
+            }
+            Member::Fn { body, .. } => {
+                if let Some(name) = find_class_ref_in_expr(body, offset) {
+                    return Some(name);
+                }
+            }
+            Member::For {
+                var: _,
+                iter,
+                body,
+                span,
+            } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_class_ref_in_expr(iter, offset) {
+                        return Some(name);
+                    }
+                    if let Some(name) = find_class_ref_in_members(body, offset) {
+                        return Some(name);
+                    }
+                }
+            }
+            Member::When {
+                cond,
+                then,
+                els,
+                span,
+            } => {
+                if span_contains(*span, offset) {
+                    if let Some(name) = find_class_ref_in_expr(cond, offset) {
+                        return Some(name);
+                    }
+                    if let Some(name) = find_class_ref_in_members(then, offset) {
+                        return Some(name);
+                    }
+                    if let Some(els_members) = els {
+                        if let Some(name) = find_class_ref_in_members(els_members, offset) {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+            Member::Expr(expr) => {
+                if let Some(name) = find_class_ref_in_expr(expr, offset) {
+                    return Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_class_ref_in_expr(expr: &Expr, offset: usize) -> Option<String> {
+    if !span_contains(expr.span(), offset) {
+        return None;
+    }
+    match expr {
+        Expr::ClassRef(sym, span) => {
+            if span_contains(*span, offset) {
+                return Some(sym.as_str().to_string());
+            }
+            None
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                if let Some(name) = find_class_ref_in_expr(item, offset) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        Expr::Tuple(args, _) => {
+            for arg in args {
+                if let Some(name) = find_class_ref_in_expr(&arg.value, offset) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        Expr::Member { base, .. } => find_class_ref_in_expr(base, offset),
+        Expr::Call { callee, args, .. } => {
+            if let Some(name) = find_class_ref_in_expr(callee, offset) {
+                return Some(name);
+            }
+            for arg in args {
+                if let Some(name) = find_class_ref_in_expr(&arg.value, offset) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        Expr::Lambda { body, .. } => find_class_ref_in_expr(body, offset),
+        Expr::Assign { target, value, .. } => {
+            if let Some(name) = find_class_ref_in_expr(target, offset) {
+                return Some(name);
+            }
+            find_class_ref_in_expr(value, offset)
+        }
+        Expr::Postfix { target, .. } => find_class_ref_in_expr(target, offset),
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            if let Some(name) = find_class_ref_in_expr(cond, offset) {
+                return Some(name);
+            }
+            if let Some(name) = find_class_ref_in_expr(then, offset) {
+                return Some(name);
+            }
+            find_class_ref_in_expr(els, offset)
+        }
+        _ => None,
+    }
+}
+
+fn handle_definition(
+    content: &str,
+    pos: Position,
+    uri: Uri,
+) -> Option<lsp_types::GotoDefinitionResponse> {
+    let offset = lsp_pos_to_byte_offset(content, pos.line, pos.character)?;
+    let parsed = parse(content);
+
+    if let Some(view_ref_name) = find_element_ref_at_offset(&parsed.views, offset) {
+        if let Some(target_view) = parsed
+            .views
+            .iter()
+            .find(|v| v.name.as_str() == view_ref_name)
+        {
+            let range = Range::new(
+                byte_offset_to_lsp_pos(content, target_view.span.start as usize),
+                byte_offset_to_lsp_pos(content, target_view.span.end as usize),
+            );
+            return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                lsp_types::Location::new(uri, range),
+            ));
+        }
+    }
+
+    let target = find_hover_target(&parsed.views, offset)?;
+    match target {
+        HoverTarget::VarIdent { name, .. } => {
+            let enclosing_view = parsed
+                .views
+                .iter()
+                .find(|v| span_contains(v.span, offset))?;
+
+            for param in &enclosing_view.params {
+                if param.name.as_str() == name {
+                    let range = Range::new(
+                        byte_offset_to_lsp_pos(content, param.span.start as usize),
+                        byte_offset_to_lsp_pos(content, param.span.end as usize),
+                    );
+                    return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                        lsp_types::Location::new(uri, range),
+                    ));
+                }
+            }
+
+            if let Some(def_span) = find_local_declaration_span(&enclosing_view.body, &name, offset)
+            {
+                let range = Range::new(
+                    byte_offset_to_lsp_pos(content, def_span.start as usize),
+                    byte_offset_to_lsp_pos(content, def_span.end as usize),
+                );
+                return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                    lsp_types::Location::new(uri, range),
+                ));
+            }
+
+            if let Some(target_view) = parsed.views.iter().find(|v| v.name.as_str() == name) {
+                let range = Range::new(
+                    byte_offset_to_lsp_pos(content, target_view.span.start as usize),
+                    byte_offset_to_lsp_pos(content, target_view.span.end as usize),
+                );
+                return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                    lsp_types::Location::new(uri, range),
+                ));
+            }
+        }
+        HoverTarget::Attribute {
+            element_name,
+            attr_name,
+        } => {
+            let target_view = parsed
+                .views
+                .iter()
+                .find(|v| v.name.as_str() == element_name)?;
+            let param = target_view
+                .params
+                .iter()
+                .find(|p| p.name.as_str() == attr_name)?;
+            let range = Range::new(
+                byte_offset_to_lsp_pos(content, param.span.start as usize),
+                byte_offset_to_lsp_pos(content, param.span.end as usize),
+            );
+            return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                lsp_types::Location::new(uri, range),
+            ));
+        }
+        HoverTarget::Intrinsic { .. } => {}
+    }
+
+    if let Some(class_name) = find_class_ref_at_offset(&parsed.views, offset) {
+        let enclosing_view = parsed
+            .views
+            .iter()
+            .find(|v| span_contains(v.span, offset))?;
+        for member in &enclosing_view.body {
+            if let Member::Style { rules, .. } = member {
+                for rule in rules {
+                    if rule.class.as_str() == class_name {
+                        let range = Range::new(
+                            byte_offset_to_lsp_pos(content, rule.span.start as usize),
+                            byte_offset_to_lsp_pos(content, rule.span.end as usize),
+                        );
+                        return Some(lsp_types::GotoDefinitionResponse::Scalar(
+                            lsp_types::Location::new(uri, range),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_keywords_and_intrinsics() {
+        let content = "View Main {\n  Column {\n  }\n}";
+        // Position at line 2, character 2 (inside the Column children area)
+        let pos = Position::new(2, 2);
+        let resp = handle_completion(content, pos).unwrap();
+        if let CompletionResponse::Array(items) = resp {
+            assert!(items.iter().any(|item| item.label == "Column"));
+            assert!(items.iter().any(|item| item.label == "Button"));
+            assert!(items.iter().any(|item| item.label == "var"));
+            assert!(items.iter().any(|item| item.label == "Main"));
+        } else {
+            panic!("Expected Array completion response");
+        }
+    }
+
+    #[test]
+    fn test_completion_attributes_intrinsic() {
+        let content = "View Main {\n  Column #[wi] {\n  }\n}";
+        // Position inside `#[wi]`
+        let pos = Position::new(1, 11);
+        let resp = handle_completion(content, pos).unwrap();
+        if let CompletionResponse::Array(items) = resp {
+            assert!(items.iter().any(|item| item.label == "width"));
+            assert!(items.iter().any(|item| item.label == "height"));
+            assert!(items.iter().any(|item| item.label == "align"));
+            assert!(!items.iter().any(|item| item.label == "var")); // shouldn't show keywords
+        } else {
+            panic!("Expected Array completion response");
+        }
+    }
+
+    #[test]
+    fn test_completion_attributes_style_rule() {
+        let content = "View Main {\n  style {\n    .title #[ra] {}\n  }\n}";
+        // Position inside `#[ra]`
+        let pos = Position::new(2, 13);
+        let resp = handle_completion(content, pos).unwrap();
+        if let CompletionResponse::Array(items) = resp {
+            assert!(items.iter().any(|item| item.label == "radius"));
+            assert!(items.iter().any(|item| item.label == "bg"));
+            assert!(items.iter().any(|item| item.label == "width"));
+            assert!(!items.iter().any(|item| item.label == "Button")); // no elements/intrinsics in styling rules
+        } else {
+            panic!("Expected Array completion response");
+        }
+    }
+
+    #[test]
+    fn test_completion_locals() {
+        let content = "View Main(title: Str) {\n  var my_var = 10\n  let my_let = \"hello\"\n  \n}";
+        // Position in view body
+        let pos = Position::new(3, 2);
+        let resp = handle_completion(content, pos).unwrap();
+        if let CompletionResponse::Array(items) = resp {
+            assert!(items.iter().any(|item| item.label == "title"));
+            assert!(items.iter().any(|item| item.label == "my_var"));
+            assert!(items.iter().any(|item| item.label == "my_let"));
+        } else {
+            panic!("Expected Array completion response");
+        }
+    }
+
+    #[test]
+    fn test_definition_local_variable() {
+        let content = "View Main {\n  var my_var = 10\n  Text(my_var)\n}";
+        // Position on the usage of my_var inside Text (line 2, char 8)
+        let pos = Position::new(2, 8);
+        let uri: Uri = "file:///dummy.byd".parse().unwrap();
+        let resp = handle_definition(content, pos, uri.clone()).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = resp {
+            assert_eq!(loc.uri, uri);
+            // Definition of my_var is on line 1: `var my_var = 10`
+            assert_eq!(loc.range.start.line, 1);
+        } else {
+            panic!("Expected Scalar definition response");
+        }
+    }
+
+    #[test]
+    fn test_definition_user_view() {
+        let content = "View Child {}\nView Main {\n  Child {}\n}";
+        // Position on the Child tag inside Main (line 2, char 3)
+        let pos = Position::new(2, 3);
+        let uri: Uri = "file:///dummy.byd".parse().unwrap();
+        let resp = handle_definition(content, pos, uri.clone()).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = resp {
+            assert_eq!(loc.uri, uri);
+            // Definition of View Child is on line 0
+            assert_eq!(loc.range.start.line, 0);
+        } else {
+            panic!("Expected Scalar definition response");
+        }
     }
 }

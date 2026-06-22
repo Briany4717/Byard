@@ -91,6 +91,25 @@ pub enum EventKind {
     Wheel,
     /// A value change from a value-carrying intrinsic.
     Change,
+    /// A keyboard key press; key name in `InputEvent.payload` as `InputPayload::Key`.
+    KeyDown,
+    /// A keyboard key release; key name in `InputEvent.payload` as `InputPayload::Key`.
+    KeyUp,
+    /// Printable text input (character key or IME commit); text in `InputEvent.payload` as `InputPayload::Key`.
+    TextInput,
+    // ── M24: remaining event catalog ─────────────────────────────────────
+    /// Cursor entered an element's hit rect (synthesized by the router).
+    PointerEnter,
+    /// Cursor left an element's hit rect (synthesized by the router).
+    PointerExit,
+    /// Pointer hovering inside an element (fires on PointerMove while inside, no button).
+    Hover,
+    /// Press held > 500 ms without significant movement.
+    LongPress,
+    /// Two qualifying taps within `DOUBLE_TAP_MS` ms.
+    DoubleTap,
+    /// Secondary (right) button tap.
+    Secondary,
 }
 
 impl EventKind {
@@ -110,6 +129,8 @@ pub enum InputPayload {
     Bool(bool),
     /// A float payload (e.g. slider position).
     Float(f32),
+    /// A key name or printable text (keyboard events, M17).
+    Key(String),
 }
 
 /// A normalized, `Send`-able input event produced by the platform thread.
@@ -208,6 +229,20 @@ pub trait PlatformHost {
     ///
     /// Defaults to a no-op.
     fn on_cursor_moved(&mut self, _x: f32, _y: f32) {}
+
+    /// Called when a keyboard key is pressed or released.
+    ///
+    /// `key` is the logical key name (e.g. `"a"`, `"Enter"`, `"Backspace"`,
+    /// `"Tab"`). `pressed` is `true` for key-down, `false` for key-up.
+    ///
+    /// Defaults to a no-op.
+    fn on_key(&mut self, _key: &str, _pressed: bool) {}
+
+    /// Called when printable text is committed (character keys, IME commit).
+    ///
+    /// `text` is the committed string (usually one character but may be more
+    /// for IME). Defaults to a no-op.
+    fn on_text(&mut self, _text: &str) {}
 }
 
 #[cfg(test)]

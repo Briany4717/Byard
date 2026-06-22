@@ -202,6 +202,13 @@ impl<'p> Env<'p> {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    /// Truncates the binding list to `len`, discarding any bindings pushed
+    /// after that snapshot. Used by `for`-loop lowering to restore scope
+    /// boundaries (M20).
+    pub fn truncate(&mut self, len: usize) {
+        self.bindings.truncate(len);
+    }
 }
 
 #[cfg(test)]

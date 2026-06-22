@@ -193,4 +193,33 @@ impl PlatformHost for App {
             });
         }
     }
+
+    fn on_key(&mut self, key: &str, pressed: bool) {
+        if let Some(engine) = &self.engine {
+            let kind = if pressed {
+                byard_core::platform::EventKind::KeyDown
+            } else {
+                byard_core::platform::EventKind::KeyUp
+            };
+            engine.push_input(byard_core::platform::InputEvent {
+                kind,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(key.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_text(&mut self, text: &str) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::TextInput,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(text.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
 }

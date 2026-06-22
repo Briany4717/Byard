@@ -85,15 +85,17 @@ fn tap_across_frames_increments_count() {
     );
 
     // A second tap, also split across frames.
+    // Gap from first UP (150ms) must be > DOUBLE_TAP_MS (300ms) so it's a
+    // plain single tap, not a double-tap.
     frame(
         &mut interp,
         &tree,
-        &[pointer(EventKind::PointerDown, center, 300)],
+        &[pointer(EventKind::PointerDown, center, 500)],
     );
     frame(
         &mut interp,
         &tree,
-        &[pointer(EventKind::PointerUp, center, 350)],
+        &[pointer(EventKind::PointerUp, center, 550)],
     );
     assert_eq!(interp.peek(count), Value::Int(2));
 }

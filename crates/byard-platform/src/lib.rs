@@ -17,6 +17,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// A `winit`-backed [`PlatformHost`] driver.
@@ -218,6 +219,21 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
                 window.request_redraw();
             }
 
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                let key_str = key_to_str(&event.logical_key);
+                if !key_str.is_empty() {
+                    self.host.on_key(&key_str, pressed);
+                }
+                // Fire text input only for printable characters on press
+                if pressed {
+                    if let Key::Character(s) = &event.logical_key {
+                        self.host.on_text(s.as_str());
+                    }
+                }
+                window.request_redraw();
+            }
+
             _ => {}
         }
     }
@@ -258,6 +274,30 @@ fn to_pointer_state(state: ElementState) -> PointerState {
     match state {
         ElementState::Pressed => PointerState::Pressed,
         ElementState::Released => PointerState::Released,
+    }
+}
+
+/// Converts a `winit` logical key to a string key name.
+///
+/// Returns an empty string for keys we don't model (so the caller can skip).
+fn key_to_str(key: &Key) -> String {
+    match key {
+        Key::Character(s) => s.to_string(),
+        Key::Named(named) => match named {
+            NamedKey::Backspace => "Backspace".to_string(),
+            NamedKey::Delete => "Delete".to_string(),
+            NamedKey::Enter => "Enter".to_string(),
+            NamedKey::Tab => "Tab".to_string(),
+            NamedKey::Escape => "Escape".to_string(),
+            NamedKey::ArrowLeft => "ArrowLeft".to_string(),
+            NamedKey::ArrowRight => "ArrowRight".to_string(),
+            NamedKey::ArrowUp => "ArrowUp".to_string(),
+            NamedKey::ArrowDown => "ArrowDown".to_string(),
+            NamedKey::Home => "Home".to_string(),
+            NamedKey::End => "End".to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
     }
 }
 

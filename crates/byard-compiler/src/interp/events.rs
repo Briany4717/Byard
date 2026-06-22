@@ -27,12 +27,35 @@ pub enum EventKind {
     Tap,
     /// Continuous pointer movement.
     PointerMove,
+    /// Pointer drag: synthesized by the router from PointerMove while the button
+    /// is held (M16). Used by Slider to track the drag position.
+    PointerDrag,
     /// Continuous scroll.
     Scroll,
     /// Continuous wheel.
     Wheel,
     /// A value change from a value-carrying intrinsic.
     Change,
+    /// A keyboard key press; key name is in `InputEvent.value` (M17).
+    KeyDown,
+    /// A keyboard key release; key name is in `InputEvent.value` (M17).
+    KeyUp,
+    /// Printable text input; the text is in `InputEvent.value` (M17).
+    TextInput,
+    // ── M24: remaining event catalog ─────────────────────────────────────
+    /// Cursor entered an element's rect (synthesized from PointerMove).
+    PointerEnter,
+    /// Cursor left an element's rect (synthesized from PointerMove).
+    PointerExit,
+    /// Hovering over an element (continuous; synthesized from PointerMove while
+    /// the pointer is inside and no button is held).
+    Hover,
+    /// A press held for > 500 ms without moving more than `TAP_SLOP` px.
+    LongPress,
+    /// Two taps within `DOUBLE_TAP_MS` (E4 double-tap threshold).
+    DoubleTap,
+    /// A secondary (right) button tap.
+    Secondary,
 }
 
 impl EventKind {
@@ -76,6 +99,17 @@ impl InputEvent {
 pub const TAP_SLOP: f32 = 8.0;
 /// Tap interval upper bound (ms) — E4.
 pub const TAP_MS: u64 = 500;
+/// Long-press hold threshold (ms) — M24.
+pub const LONG_PRESS_MS: u64 = 500;
+/// Double-tap interval upper bound (ms) — M24 E4.
+pub const DOUBLE_TAP_MS: u64 = 300;
+
+thread_local! {
+    /// The position of the event currently being dispatched, for use by
+    /// handlers that need cursor position (e.g. Slider drag, M16).
+    pub static CURRENT_EVENT_POS: std::cell::Cell<(f32, f32)> =
+        const { std::cell::Cell::new((0.0, 0.0)) };
+}
 
 /// A handler's reactive action. Receives the context (for `var` mutation) and
 /// an optional payload (the `Change` value).
@@ -99,6 +133,8 @@ struct DownState {
     elem: Option<u32>,
     pos: (f32, f32),
     time_ms: u64,
+    /// True when the secondary (right) button initiated the press.
+    secondary: bool,
 }
 
 /// Routes input events to registered handlers, on the logic thread.
@@ -108,6 +144,10 @@ pub struct EventRouter {
     focusables: Vec<Focusable>,
     down: Option<DownState>,
     focused: Option<u32>,
+    /// Element currently under the pointer (for enter/exit synthesis, M24).
+    hovered: Option<u32>,
+    /// Time and element of the most recent tap (for double-tap detection, M24).
+    last_tap: Option<(u64, Option<u32>)>,
 }
 
 impl EventRouter {
@@ -194,15 +234,24 @@ impl EventRouter {
         atlas: Option<&byard_core::atlas::layout::LayoutAtlas>,
         ev: &InputEvent,
     ) {
+        // Expose position to handlers (e.g. Slider drag).
+        CURRENT_EVENT_POS.with(|c| c.set(ev.pos));
+
         match ev.kind {
             EventKind::PointerDown => {
                 let elem = self.hit_any(atlas, ev.pos);
+                let secondary = matches!(ev.value, Some(Value::Bool(true)));
                 self.down = Some(DownState {
                     elem,
                     pos: ev.pos,
                     time_ms: ev.time_ms,
+                    secondary,
                 });
-                self.fire(ctx, atlas, EventKind::PointerDown, ev.pos, None);
+                if secondary {
+                    self.fire(ctx, atlas, EventKind::Secondary, ev.pos, None);
+                } else {
+                    self.fire(ctx, atlas, EventKind::PointerDown, ev.pos, None);
+                }
                 // A press on a focusable steals focus (E3).
                 if let Some(f) = self.focusable_at(atlas, ev.pos) {
                     self.steal_focus(ctx, Some(f));
@@ -221,8 +270,29 @@ impl EventRouter {
                         && down.elem == up_elem
                         && moved < TAP_SLOP
                         && elapsed < TAP_MS
+                        && !down.secondary
                     {
-                        self.fire(ctx, atlas, EventKind::Tap, ev.pos, None);
+                        // Double-tap detection (M24).
+                        let is_double = self.last_tap.is_some_and(|(t, elem)| {
+                            ev.time_ms.saturating_sub(t) < DOUBLE_TAP_MS && elem == up_elem
+                        });
+                        if is_double {
+                            self.fire(ctx, atlas, EventKind::DoubleTap, ev.pos, None);
+                            self.last_tap = None;
+                        } else {
+                            self.fire(ctx, atlas, EventKind::Tap, ev.pos, None);
+                            self.last_tap = Some((ev.time_ms, up_elem));
+                        }
+                    } else {
+                        // Check long press (held > LONG_PRESS_MS without much movement).
+                        if down.elem.is_some()
+                            && down.elem == self.hit_any(atlas, ev.pos)
+                            && moved < TAP_SLOP
+                            && elapsed >= LONG_PRESS_MS
+                        {
+                            self.fire(ctx, atlas, EventKind::LongPress, ev.pos, None);
+                        }
+                        self.last_tap = None;
                     }
                 }
             }
@@ -231,9 +301,96 @@ impl EventRouter {
             }
             EventKind::PointerMove | EventKind::Scroll | EventKind::Wheel => {
                 self.fire(ctx, atlas, ev.kind, ev.pos, None);
+                if ev.kind == EventKind::PointerMove {
+                    // Synthesize PointerDrag when the button is held (M16: Slider).
+                    if self.down.is_some() {
+                        self.fire(ctx, atlas, EventKind::PointerDrag, ev.pos, None);
+                    } else {
+                        // Enter / Exit / Hover (M24): compare new hovered elem to prev.
+                        let new_hover = self.hit_any(atlas, ev.pos);
+                        if new_hover != self.hovered {
+                            if self.hovered.is_some() {
+                                // Fire PointerExit on the element we left.
+                                if let Some(old_pos) = self.hovered.map(|_| ev.pos) {
+                                    self.fire_on_elem(
+                                        ctx,
+                                        self.hovered,
+                                        EventKind::PointerExit,
+                                        old_pos,
+                                        None,
+                                    );
+                                }
+                            }
+                            self.hovered = new_hover;
+                            if new_hover.is_some() {
+                                self.fire_on_elem(
+                                    ctx,
+                                    new_hover,
+                                    EventKind::PointerEnter,
+                                    ev.pos,
+                                    None,
+                                );
+                            }
+                        }
+                        // Hover fires every move while inside (like mousemove).
+                        if new_hover.is_some() {
+                            self.fire_on_elem(ctx, new_hover, EventKind::Hover, ev.pos, None);
+                        }
+                    }
+                }
             }
-            EventKind::Tap => self.fire(ctx, atlas, EventKind::Tap, ev.pos, None),
+            EventKind::Tap
+            | EventKind::PointerDrag
+            | EventKind::PointerEnter
+            | EventKind::PointerExit
+            | EventKind::Hover
+            | EventKind::LongPress
+            | EventKind::DoubleTap
+            | EventKind::Secondary => {
+                self.fire(ctx, atlas, ev.kind, ev.pos, None);
+            }
+            // Keyboard events are routed to the focused element (M17/M18).
+            EventKind::KeyDown => {
+                // Tab key cycles focus (M18).
+                if let Some(Value::Str(key)) = &ev.value {
+                    if key == "Tab" {
+                        self.tab_focus(ctx, false);
+                        return;
+                    }
+                }
+                self.fire_focused(ctx, EventKind::KeyDown, ev.value.as_ref());
+            }
+            EventKind::KeyUp => {
+                self.fire_focused(ctx, EventKind::KeyUp, ev.value.as_ref());
+            }
+            EventKind::TextInput => {
+                self.fire_focused(ctx, EventKind::TextInput, ev.value.as_ref());
+            }
         }
+    }
+
+    /// Fires a handler of `kind` on a specific element `elem_id` (for enter/exit/hover).
+    fn fire_on_elem(
+        &mut self,
+        ctx: &mut ReactiveCtx,
+        elem_id: Option<u32>,
+        kind: EventKind,
+        pos: (f32, f32),
+        payload: Option<&Value>,
+    ) {
+        let Some(target) = elem_id else { return };
+        let i = self
+            .handlers
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, h)| h.kind == kind && h.elem == target)
+            .map(|(i, _)| i);
+        let Some(i) = i else { return };
+        let _ = pos;
+        let mut action = std::mem::replace(&mut self.handlers[i].action, Box::new(|_, _| {}));
+        action(ctx, payload);
+        self.handlers[i].action = action;
     }
 
     /// Fires the topmost handler of `kind` covering `pos` (no bubbling; §7).
@@ -315,6 +472,57 @@ impl EventRouter {
             .rev()
             .find(|f| contains(f.rect, pos))
             .map(|f| f.elem)
+    }
+
+    /// Fires the handler of `kind` registered on the currently focused element,
+    /// if any (M17/M18 keyboard routing).
+    fn fire_focused(&mut self, ctx: &mut ReactiveCtx, kind: EventKind, payload: Option<&Value>) {
+        let Some(focused) = self.focused else {
+            return;
+        };
+        let i = self
+            .handlers
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, h)| h.kind == kind && h.elem == focused)
+            .map(|(i, _)| i);
+        let Some(i) = i else {
+            return;
+        };
+        let mut action = std::mem::replace(&mut self.handlers[i].action, Box::new(|_, _| {}));
+        action(ctx, payload);
+        self.handlers[i].action = action;
+    }
+
+    /// Advances keyboard focus to the next (or previous) focusable element
+    /// (M18, Tab traversal).
+    fn tab_focus(&mut self, ctx: &mut ReactiveCtx, reverse: bool) {
+        if self.focusables.is_empty() {
+            return;
+        }
+        let n = self.focusables.len();
+        let cur_idx = self
+            .focused
+            .and_then(|elem| self.focusables.iter().position(|f| f.elem == elem));
+        let next_idx = match cur_idx {
+            Some(i) => {
+                if reverse {
+                    (i + n - 1) % n
+                } else {
+                    (i + 1) % n
+                }
+            }
+            None => {
+                if reverse {
+                    n - 1
+                } else {
+                    0
+                }
+            }
+        };
+        let next_elem = self.focusables[next_idx].elem;
+        self.steal_focus(ctx, Some(next_elem));
     }
 
     /// Test/inspection accessor: the `(elem, kind, rect)` of every registered
@@ -600,5 +808,158 @@ mod tests {
         );
 
         assert_eq!(ctx.peek_signal(count), Value::Int(1));
+    }
+
+    // ── M24: remaining event catalog ─────────────────────────────────────
+
+    #[test]
+    fn double_tap_fires_within_threshold_and_not_beyond() {
+        let mut ctx = ReactiveCtx::new();
+        let taps = ctx.create_signal(Value::Int(0));
+        let doubles = ctx.create_signal(Value::Int(0));
+        let mut router = EventRouter::new();
+        router.on(1, rect(), EventKind::Tap, inc(taps));
+        router.on(1, rect(), EventKind::DoubleTap, inc(doubles));
+
+        // First tap.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 50),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(taps), Value::Int(1));
+        assert_eq!(ctx.peek_signal(doubles), Value::Int(0));
+
+        // Second tap within DOUBLE_TAP_MS → double.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 100),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 150),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(doubles), Value::Int(1), "double-tap fired");
+
+        // Third tap — gap since last confirmed single tap, reset tracker.
+        // last_tap was cleared after double, so next tap is a fresh single.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 600),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 650),
+            ],
+        );
+        assert_eq!(
+            ctx.peek_signal(taps),
+            Value::Int(2),
+            "single tap after reset"
+        );
+    }
+
+    #[test]
+    fn long_press_fires_after_hold_threshold() {
+        let mut ctx = ReactiveCtx::new();
+        let lp = ctx.create_signal(Value::Int(0));
+        let mut router = EventRouter::new();
+        router.on(1, rect(), EventKind::LongPress, inc(lp));
+
+        // Hold for > LONG_PRESS_MS (500ms).
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 600),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(lp), Value::Int(1), "long press fired");
+    }
+
+    #[test]
+    fn long_press_does_not_fire_below_threshold() {
+        let mut ctx = ReactiveCtx::new();
+        let lp = ctx.create_signal(Value::Int(0));
+        let mut router = EventRouter::new();
+        router.on(1, rect(), EventKind::LongPress, inc(lp));
+
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 200),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(lp), Value::Int(0), "long press not fired");
+    }
+
+    #[test]
+    fn pointer_enter_and_exit_fire_on_crossing_boundary() {
+        let mut ctx = ReactiveCtx::new();
+        let enters = ctx.create_signal(Value::Int(0));
+        let exits = ctx.create_signal(Value::Int(0));
+        let mut router = EventRouter::new();
+        router.on(1, rect(), EventKind::PointerEnter, inc(enters));
+        router.on(1, rect(), EventKind::PointerExit, inc(exits));
+
+        // Move into the rect.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![InputEvent::pointer(EventKind::PointerMove, (50.0, 50.0), 0)],
+        );
+        assert_eq!(ctx.peek_signal(enters), Value::Int(1), "entered");
+        assert_eq!(ctx.peek_signal(exits), Value::Int(0));
+
+        // Move to a different spot inside — no new enter/exit.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![InputEvent::pointer(
+                EventKind::PointerMove,
+                (60.0, 60.0),
+                10,
+            )],
+        );
+        assert_eq!(ctx.peek_signal(enters), Value::Int(1));
+
+        // Move outside the rect.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![InputEvent::pointer(
+                EventKind::PointerMove,
+                (200.0, 200.0),
+                20,
+            )],
+        );
+        assert_eq!(ctx.peek_signal(exits), Value::Int(1), "exited");
+    }
+
+    #[test]
+    fn secondary_fires_on_secondary_down_event() {
+        let mut ctx = ReactiveCtx::new();
+        let sec = ctx.create_signal(Value::Int(0));
+        let mut router = EventRouter::new();
+        router.on(1, rect(), EventKind::Secondary, inc(sec));
+
+        // Secondary press: payload = Bool(true).
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![InputEvent {
+                kind: EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                value: Some(Value::Bool(true)), // marks secondary button
+                time_ms: 0,
+            }],
+        );
+        assert_eq!(ctx.peek_signal(sec), Value::Int(1), "secondary fired");
     }
 }
