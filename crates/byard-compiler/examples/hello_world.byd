@@ -1,49 +1,83 @@
-// Byard Phase 2 — Advanced Demo (hello_world.byd)
-// Demonstrates layout (flex columns/rows, gap, grow, padding, margin, alignment)
-// styling (background colors, border radius) and interactive events (tap, change).
+// hello_world.byd — a single screen exercising every engine capability
+// available so far: reactive `var`/`let`, parameterized `fn`, string
+// interpolation, ternaries, the full intrinsic catalog, two-way `bind:`,
+// keyboard focus + Tab, structural `for`/`when … else`, themed typography,
+// the four `Len` padding forms, decoration (radius/border/shadow/opacity),
+// and a textured `Image`. Run with: `byard dev` (or the example runner).
 
-View HelloWorld() {
+View Main() {
+    // ── Reactive state (Int / Bool / Float / Str) ───────────────────────────
     var count = 0
-    var textVal = "Initial"
-    var isToggled = true
-    var sliderVal = 0.5
+    var liked = true
+    var volume = 0.5
+    var name = ""
+    var note = ""
 
-    Column #[bg: 0x1E1E24, radius: 24, p: 32, gap: 20, width: 500, height: 450, align: center, justify: center] {
-        // Title block
-        Row #[gap: 12, align: center] {
-            Image("logo") #[width: 36, height: 36, radius: 18]
-            Text("Byard Control Panel") #[color: 0xFFFFFF, size: 24, weight: bold]
-        }
+    // A parameterized `fn` + a derived `let` consuming it (declared before use).
+    fn describe(n: Int) => "the counter is {n}"
+    let summary = describe(count)
 
-        // Horizontal layout with reactive status
-        Row #[bg: 0x2A2A35, radius: 12, p: 16, gap: 20, width: 440, align: center, justify: between] {
-            Text("Count: {count}") #[color: 0x10B981, size: 20, weight: bold]
+    Column #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 20, width: 540] {
 
-            // Styled Button with custom bg, radius, padding and click action
-            Button("+") #[bg: 0x3B82F6, radius: 8, p: (vertical: 8, horizontal: 16), color: 0xFFFFFF, weight: bold] => count++
-        }
-
-        // Form elements block
-        Column #[bg: 0x2A2A35, radius: 12, p: 16, gap: 16, width: 440] {
-            Row #[align: center, justify: between] {
-                Text("Toggle Option") #[color: 0x9CA3AF, size: 14]
-                Toggle #[bg: 0x10B981, width: 50, height: 28, radius: 14, bind: isToggled]
-            }
-
-            Row #[align: center, justify: between] {
-                Text("Slider (Value: {sliderVal})") #[color: 0x9CA3AF, size: 14]
-                Slider #[bg: 0xEF4444, width: 120, height: 16, radius: 8, min: 0.0, max: 1.0, step: 0.1, bind: sliderVal]
-            }
-
-            Row #[align: center, justify: between] {
-                Text("Text Input") #[color: 0x9CA3AF, size: 14]
-                TextField #[bg: 0x374151, width: 150, height: 32, radius: 6, p: (horizontal: 8), color: 0xFFFFFF, bind: textVal]
+        // ── Header: textured Image + themed typography ───────────────────────
+        Row #[gap: 16, align: center] {
+            Image("logo.png") #[width: 56, height: 56, radius: 14, fit: cover]
+            Column #[gap: 2] {
+                Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
+                Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
             }
         }
 
-        // Footer status bar
-        Row #[width: 440, justify: center] {
-            Text("Status: Active | Input: {textVal}") #[color: 0x6B7280, size: 12]
+        // ── Counter card: events (=>), ternary, fn + interpolation ───────────
+        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 12, border: 0x2C2C3C, shadow: "md"] {
+            Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
+            Row #[gap: 12, align: center] {
+                Button("-") #[bg: 0x3A3A4D, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
+                Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
+                Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
+                Spacer
+                Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
+            }
+        }
+
+        // ── Interactive widgets bound two-way to the vars above ──────────────
+        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 16, border: 0x2C2C3C] {
+            Row #[align: center, justify: between] {
+                Text("Favourite") #[color: 0x9AA0AC, size: 15]
+                Toggle #[bind: liked, width: 52, height: 30]
+            }
+            Row #[align: center, justify: between, gap: 16] {
+                Text("Volume {volume}") #[color: 0x9AA0AC, size: 15]
+                Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
+            }
+            // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
+            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x2A2A38, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            TextField #[bind: note, placeholder: "a quick note…", bg: 0x2A2A38, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            Text("Hi {name}") #[color: 0x10B981, size: 14]
+        }
+
+        // ── Structural: when … else, and a for-loop over a list ──────────────
+        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 8, border: 0x2C2C3C] {
+            when liked {
+                Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
+            } else {
+                Text("tap the toggle to favourite") #[color: 0xEF4444, weight: medium]
+            }
+            Row #[gap: 8] {
+                for tag in ["reactive", "typed", "native"] {
+                    Box #[bg: 0x2C2C3C, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                        Text("{tag}") #[color: 0xC9C9D4, size: 13]
+                    }
+                }
+            }
+        }
+
+        // ── Decoration showcase: radius / border / shadow / opacity ──────────
+        Row #[gap: 16] {
+            Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
+            Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
+            Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
+            Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
         }
     }
 }

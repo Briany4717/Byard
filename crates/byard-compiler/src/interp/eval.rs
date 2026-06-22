@@ -663,28 +663,31 @@ impl Interpreter {
                     );
                     let bg = self.eval_color_prop(attrs, "bg");
                     let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
-                    let border_color = self.eval_color_prop(attrs, "border_color");
-                    let border_width =
-                        self.eval_int_prop(attrs, "border_width").unwrap_or(0) as f32;
-                    let shadow_dx = self
-                        .eval_float_prop(attrs, "shadow_dx")
-                        .map_or(0.0, |v| v as f32);
-                    let shadow_dy = self
-                        .eval_float_prop(attrs, "shadow_dy")
-                        .map_or(0.0, |v| v as f32);
-                    let shadow_blur = self
-                        .eval_float_prop(attrs, "shadow_blur")
-                        .map_or(0.0, |v| v as f32);
-                    let shadow_color = self.eval_color_prop(attrs, "shadow_color");
+                    // `border` is a Color (catalog DECORATION); a present border
+                    // draws a 2px ring of that colour.
+                    let border_color = self.eval_color_prop(attrs, "border");
+                    let border_width = if border_color.is_some() { 2.0 } else { 0.0 };
+                    // `shadow` is a token (`sm`/`md`/`lg`) → an offset+blur drop
+                    // shadow; any other non-empty value falls back to `md`.
+                    let (shadow_dy, shadow_blur, shadow_color) =
+                        match self.eval_str_prop(attrs, "shadow").as_deref() {
+                            Some("sm") => (1.0_f32, 3.0_f32, Some(0x4400_0000_i64)),
+                            Some("lg") => (6.0, 16.0, Some(0x6600_0000)),
+                            Some("none") | None => (0.0, 0.0, None),
+                            Some(_) => (3.0, 8.0, Some(0x5500_0000)),
+                        };
+                    let shadow_dx = 0.0_f32;
                     let opacity = self
                         .eval_float_prop(attrs, "opacity")
                         .map_or(1.0, |v| v as f32);
                     let is_decorated = border_width > 0.0
                         || shadow_blur > 0.0
-                        || shadow_dx.abs() > 0.0
-                        || shadow_dy.abs() > 0.0
                         || (opacity - 1.0).abs() > f32::EPSILON;
-                    if let Some(color) = bg {
+                    // `Toggle`/`Slider` own their visuals (track/fill/thumb) and
+                    // treat `bg` as the *accent* colour, not a full-rect fill —
+                    // painting the rect here would draw a slab behind the control.
+                    let owns_visuals = matches!(name.as_str(), "Toggle" | "Slider");
+                    if let (false, Some(color)) = (owns_visuals, bg) {
                         let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
@@ -701,7 +704,7 @@ impl Interpreter {
                                 shadow_dy,
                                 shadow_blur,
                                 shadow_color: shadow_color.map_or([0.0; 4], |c| {
-                                    super::intrinsics::color_to_rgba(c, false)
+                                    super::intrinsics::color_to_rgba(c, true)
                                 }),
                                 opacity,
                             });
@@ -826,7 +829,7 @@ impl Interpreter {
     fn render_toggle(
         &mut self,
         bound_sig: Option<super::env::SignalId>,
-        _attrs: &[Attr],
+        attrs: &[Attr],
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
@@ -834,27 +837,31 @@ impl Interpreter {
     ) {
         let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
 
-        // Track
-        let track_h = 14.0_f32;
-        let track_y = rect.y + (rect.h - track_h) / 2.0;
+        // The full-height pill track. `bg` is the ON accent (default: theme
+        // primary); OFF is a muted surface tint.
+        let accent = self
+            .eval_color_prop(attrs, "bg")
+            .unwrap_or(self.theme.primary);
         let track_color = if is_on {
-            [0.18_f32, 0.58, 0.22, 1.0]
+            super::intrinsics::color_to_rgba(accent, false)
         } else {
-            [0.35, 0.35, 0.35, 1.0]
+            [0.40_f32, 0.42, 0.48, 1.0]
         };
+        let radius = rect.h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
-            rect: [rect.x, track_y, rect.w, track_h],
+            rect: [rect.x, rect.y, rect.w, rect.h],
             color: track_color,
-            radii: [7.0; 4],
+            radii: [radius; 4],
         });
 
-        // Thumb
-        let thumb_size = rect.h.min(rect.w / 2.0).min(22.0);
-        let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
+        // Thumb: a white circle inset from the track edges, sliding L↔R.
+        let pad = (rect.h * 0.12).max(2.0);
+        let thumb_size = (rect.h - pad * 2.0).max(2.0);
+        let thumb_y = rect.y + pad;
         let thumb_x = if is_on {
-            rect.x + rect.w - thumb_size
+            rect.x + rect.w - thumb_size - pad
         } else {
-            rect.x
+            rect.x + pad
         };
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
@@ -899,33 +906,48 @@ impl Interpreter {
             0.0
         };
 
-        // Track
-        let track_h = 6.0_f32;
+        // `bg` is the fill accent (default: theme primary); the unfilled track
+        // is a muted tint.
+        let accent = self
+            .eval_color_prop(attrs, "bg")
+            .unwrap_or(self.theme.primary);
+        let accent_rgba = super::intrinsics::color_to_rgba(accent, false);
+
+        // Track (unfilled remainder).
+        let track_h = (rect.h * 0.28).clamp(4.0, 8.0);
         let track_y = rect.y + (rect.h - track_h) / 2.0;
+        let track_r = track_h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [rect.x, track_y, rect.w, track_h],
-            color: [0.3, 0.3, 0.3, 1.0],
-            radii: [3.0; 4],
+            color: [0.40, 0.42, 0.48, 1.0],
+            radii: [track_r; 4],
         });
 
-        // Fill
+        // Fill up to the thumb.
         let fill_w = t * rect.w;
         if fill_w > 0.0 {
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, track_y, fill_w, track_h],
-                color: [0.18, 0.58, 1.0, 1.0],
-                radii: [3.0; 4],
+                color: accent_rgba,
+                radii: [track_r; 4],
             });
         }
 
-        // Thumb
-        let thumb_size = 16.0_f32;
+        // Thumb: white circle with a thin accent ring (drawn as accent disc
+        // under a slightly smaller white disc).
+        let thumb_size = (rect.h * 0.85).clamp(14.0, 22.0);
         let thumb_x = rect.x + t * (rect.w - thumb_size);
         let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: accent_rgba,
             radii: [thumb_size / 2.0; 4],
+        });
+        let inner = thumb_size - 5.0;
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
+            color: [1.0, 1.0, 1.0, 1.0],
+            radii: [inner / 2.0; 4],
         });
 
         // Handlers: PointerDown + PointerDrag (M16).
@@ -989,15 +1011,44 @@ impl Interpreter {
             0x00ff_ffff_i64
         };
         let font_size = self.eval_int_prop(attrs, "size").unwrap_or(16) as f32;
+        let is_focused = elem_idx.is_some_and(|i| self.router.is_focused(i));
 
+        // Focus underline (Material-style): a thin accent bar along the bottom
+        // edge when the field holds focus.
+        if is_focused {
+            let bar_h = 2.0_f32;
+            frame.push_instance(byard_core::BoxInstance {
+                rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
+                color: super::intrinsics::color_to_rgba(self.theme.primary, false),
+                radii: [0.0; 4],
+            });
+        }
+
+        let pad_x = 10.0_f32;
+        let text_x = rect.x + pad_x;
+        let text_y = rect.y + (rect.h - font_size) / 2.0;
         if !display_text.is_empty() {
             frame.push_text(byard_core::TextLine {
-                x: rect.x + 8.0,
-                y: rect.y + (rect.h - font_size) / 2.0,
-                text: display_text,
+                x: text_x,
+                y: text_y,
+                text: display_text.clone(),
                 font_size,
                 color: super::intrinsics::color_to_rgba(text_color, false),
                 dirty: true,
+            });
+        }
+
+        // Caret at the end of the entered text while focused (M17/M19, IMPL-33).
+        if is_focused {
+            let measured = if is_placeholder {
+                0.0
+            } else {
+                self.measure_text(&display_text, font_size).0
+            };
+            frame.push_instance(byard_core::BoxInstance {
+                rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
+                color: [1.0, 1.0, 1.0, 1.0],
+                radii: [0.0; 4],
             });
         }
 
@@ -2320,6 +2371,50 @@ mod tests {
     // ── M16: Toggle/Slider/TextField write-back ──────────────────────────
 
     #[test]
+    fn toggle_with_bg_has_no_background_slab() {
+        // Regression: `bg` on a Toggle is the ON accent, not a full-rect fill
+        // painted behind the control (that stray slab made widgets look "off").
+        let parsed = parse(
+            "View C() {\n var on = true\n Toggle #[bind: on, bg: 0x10B981, width: 52, height: 30]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // Exactly track + thumb — no extra background rectangle, no DecoratedBox.
+        assert_eq!(
+            frame.instances().len(),
+            2,
+            "toggle should emit only track + thumb"
+        );
+        assert_eq!(frame.decorated().len(), 0);
+    }
+
+    #[test]
+    fn slider_with_bg_has_no_background_slab() {
+        // Regression: `bg` on a Slider is the fill accent, not a full-rect fill.
+        let parsed = parse(
+            "View C() {\n var v = 0.5\n Slider #[bind: v, bg: 0xEF4444, min: 0.0, max: 1.0, width: 200, height: 24]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // track + fill + thumb(accent disc) + thumb(white inner) = 4; no slab.
+        assert_eq!(
+            frame.instances().len(),
+            4,
+            "slider should emit track + fill + thumb (2 discs), no slab"
+        );
+    }
+
+    #[test]
     fn toggle_tap_flips_bound_var() {
         let parsed = parse("View C() {\n var on = false\n Toggle #[bind: on]\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -2773,19 +2868,40 @@ mod tests {
 
     #[test]
     fn box_with_border_becomes_decorated_box() {
-        let parsed =
-            parse("View C() {\n Box #[bg: 0xffffff, border_width: 1, border_color: 0x000000]\n}");
+        // `border` is the catalog Color attr; it yields a 2px ring (IMPL-32).
+        let parsed = parse("View C() {\n Box #[bg: 0xffffff, border: 0x000000]\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let view = &parsed.views[0];
         let mut interp = Interpreter::new();
         let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
         interp.tick();
         let mut frame = byard_core::frame::RenderFrame::new();
         interp.render(&tree, &mut frame, 400.0, 300.0);
 
         assert_eq!(frame.decorated().len(), 1, "border box → DecoratedBox");
         assert_eq!(frame.instances().len(), 0, "not a plain BoxInstance");
-        assert!((frame.decorated()[0].border_width - 1.0).abs() < f32::EPSILON);
+        assert!((frame.decorated()[0].border_width - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn box_with_shadow_token_becomes_decorated_box() {
+        let parsed = parse("View C() {\n Box #[bg: 0x222222, shadow: \"md\"]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.decorated().len(), 1, "shadowed box → DecoratedBox");
+        assert!(frame.decorated()[0].shadow_blur > 0.0);
+        assert!(
+            frame.decorated()[0].shadow_color[3] > 0.0,
+            "shadow is translucent"
+        );
     }
 
     // ── M22: Theme system ────────────────────────────────────────────────

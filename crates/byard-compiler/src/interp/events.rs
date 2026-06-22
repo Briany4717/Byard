@@ -186,6 +186,14 @@ impl EventRouter {
         });
     }
 
+    /// Whether `elem` is the currently focused element (for focus-indicator
+    /// visuals, M19). Reflects the focus state carried across the per-tick
+    /// handler rebuild (IMPL-27).
+    #[must_use]
+    pub fn is_focused(&self, elem: u32) -> bool {
+        self.focused == Some(elem)
+    }
+
     /// Sets the initially-focused element and its `var`.
     pub fn set_focus(&mut self, ctx: &mut ReactiveCtx, elem: u32) {
         self.steal_focus(ctx, Some(elem));
