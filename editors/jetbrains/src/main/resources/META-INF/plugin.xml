@@ -1,0 +1,27 @@
+<idea-plugin>
+    <id>com.byld.plugin</id>
+    <name>Byld Language Support</name>
+    <vendor email="support@byld.dev" url="https://byld.dev">Byld Contributors</vendor>
+
+    <description><![CDATA[
+    Syntax highlighting and LSP integration for the Byld (.byd) UI layout language.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Register file type -->
+        <fileType name="Byld File"
+                  implementationClass="com.byld.plugin.ByldFileType"
+                  fieldName="INSTANCE"
+                  language="Byld"
+                  extensions="byd"/>
+
+        <!-- Register syntax highlighter -->
+        <syntaxHighlighterFactory language="Byld"
+                                  implementationClass="com.byld.plugin.ByldSyntaxHighlighterFactory"/>
+
+        <!-- Register LSP server provider -->
+        <platform.lsp.serverSupportProvider implementation="com.byld.plugin.ByldLspServerSupportProvider"/>
+    </extensions>
+</idea-plugin>

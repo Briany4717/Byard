@@ -20,7 +20,7 @@ View HelloWorld() {
             Text("Count: {count}") #[color: 0x10B981, size: 20, weight: bold]
 
             // Styled Button with custom bg, radius, padding and click action
-            Button("+") #[bg: 0x3B82F6, radius: 8, px: 16, py: 8, color: 0xFFFFFF, weight: bold] => count++
+            Button("+") #[bg: 0x3B82F6, radius: 8, p: (vertical: 8, horizontal: 16), color: 0xFFFFFF, weight: bold] => count++
         }
 
         // Form elements block
@@ -37,7 +37,7 @@ View HelloWorld() {
 
             Row #[align: center, justify: between] {
                 Text("Text Input") #[color: 0x9CA3AF, size: 14]
-                TextField #[bg: 0x374151, width: 150, height: 32, radius: 6, px: 8, color: 0xFFFFFF, bind: textVal]
+                TextField #[bg: 0x374151, width: 150, height: 32, radius: 6, p: (horizontal: 8), color: 0xFFFFFF, bind: textVal]
             }
         }
 

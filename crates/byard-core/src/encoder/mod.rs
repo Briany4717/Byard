@@ -24,7 +24,9 @@
 //! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
 
+pub mod decorated_box;
 pub mod text_glyph;
+pub mod texture_sampler;
 
 use std::sync::Arc;
 
@@ -113,6 +115,17 @@ pub struct EncoderSubsystem {
     viewport_bind_group: wgpu::BindGroup,
     /// Text rendering pipeline — shares the UI render pass with `SolidBox`.
     text_pipeline: TextGlyphPipeline,
+    /// `DecoratedBox` pipeline (M21) — border/shadow/opacity boxes. Shares the
+    /// viewport bind group (group 0) with `SolidBox`.
+    decorated_pipeline: wgpu::RenderPipeline,
+    /// `TextureSampler` pipeline (M21) — `Image` quads.
+    texture_pipeline: wgpu::RenderPipeline,
+    /// Texture+sampler bind group layout (group 1) for `texture_pipeline`.
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    /// Shared linear sampler for all sampled images.
+    image_sampler: wgpu::Sampler,
+    /// Path-keyed cache of decoded image textures (M21, IMPL-32).
+    texture_cache: texture_sampler::TextureCache,
     /// DPI scale factor, derived once per resize from the OS-reported value.
     ///
     /// Stored here so `encode_frame` can pass it to `TextGlyphPipeline::prepare`
@@ -222,6 +235,11 @@ impl EncoderSubsystem {
     ///
     /// - [`ByardError::PipelineCompilation`] — the WGSL shader or the pipeline
     ///   descriptor failed GPU-side validation.
+    // A resource-wiring constructor: it allocates the quad/viewport buffers,
+    // five pipelines, the persistent target and the texture cache. Splitting it
+    // further would scatter one cohesive setup across helpers with no clarity
+    // gain, so the line-count lint is allowed here specifically.
+    #[allow(clippy::too_many_lines)]
     pub async fn init(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
@@ -313,6 +331,10 @@ impl EncoderSubsystem {
 
         let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format).await?;
 
+        // M21 pipelines (RFC-0001 §3.1).
+        let (decorated_pipeline, texture_pipeline, texture_bind_group_layout, image_sampler) =
+            build_m21_pipelines(&device, &bind_group_layout, surface_format).await?;
+
         let (persistent_color, persistent_view) =
             create_persistent_target(&device, surface_format, width, height);
 
@@ -325,6 +347,11 @@ impl EncoderSubsystem {
             viewport_buffer,
             viewport_bind_group,
             text_pipeline,
+            decorated_pipeline,
+            texture_pipeline,
+            texture_bind_group_layout,
+            image_sampler,
+            texture_cache: texture_sampler::TextureCache::default(),
             scale_factor,
             viewport_dirty: false,
             persistent_color,
@@ -450,13 +477,45 @@ impl EncoderSubsystem {
         instances: &[BoxInstance],
         texts: &[TextLine],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
-        let full_redraw = needs_full_redraw_this_frame(
+        self.encode_frame_with_decorations(target, instances, texts, &[], &[])
+    }
+
+    /// Full encode path including the M21 `DecoratedBox`/`TextureSampler`
+    /// primitives. [`encode_frame`](Self::encode_frame) forwards here with empty
+    /// decoration slices, keeping the common (solid + text) path byte-identical.
+    pub fn encode_frame_with_decorations(
+        &mut self,
+        target: &wgpu::Texture,
+        instances: &[BoxInstance],
+        texts: &[TextLine],
+        decorated: &[crate::frame::DecoratedBox],
+        textures: &[crate::frame::TextureSampler],
+    ) -> Result<wgpu::CommandBuffer, ByardError> {
+        // Decode/upload any new image sources before the render pass (queue
+        // texture writes are illegal inside an active pass).
+        for t in textures {
+            self.texture_cache.ensure(
+                &self.device,
+                &self.queue,
+                &self.texture_bind_group_layout,
+                &self.image_sampler,
+                &t.src,
+            );
+        }
+
+        let mut full_redraw = needs_full_redraw_this_frame(
             self.needs_full_redraw,
             self.last_instance_count,
             instances.len(),
             self.last_text_count,
             texts.len(),
         );
+        // Decorated boxes and textures carry no per-primitive dirty tracking, so
+        // any frame that contains them is drawn in full (correctness over the
+        // incremental-scissor optimization; the common empty case is unaffected).
+        if !decorated.is_empty() || !textures.is_empty() {
+            full_redraw = true;
+        }
 
         // Only meaningful on a non-full-redraw frame — every primitive is
         // drawn regardless of its dirty bit when `full_redraw` is true.
@@ -503,15 +562,24 @@ impl EncoderSubsystem {
                 &mut encoder,
                 &self.persistent_view,
                 &self.device,
-                &self.render_pipeline,
-                &self.clear_pipeline,
+                &DrawPipelines {
+                    solid: &self.render_pipeline,
+                    clear: &self.clear_pipeline,
+                    decorated: &self.decorated_pipeline,
+                    texture: &self.texture_pipeline,
+                },
                 &self.viewport_bind_group,
                 &self.quad_buffer,
                 &mut self.text_pipeline,
                 full_redraw,
                 scissor,
-                instances,
-                texts,
+                &DrawPrimitives {
+                    instances,
+                    texts,
+                    decorated,
+                    textures,
+                    texture_cache: &self.texture_cache,
+                },
             )?;
         }
 
@@ -584,11 +652,23 @@ impl EncoderSubsystem {
                     ..t.clone()
                 })
                 .collect();
-            let cmd = self.encode_frame(target, frame.instances(), &texts_dirty)?;
+            let cmd = self.encode_frame_with_decorations(
+                target,
+                frame.instances(),
+                &texts_dirty,
+                frame.decorated(),
+                frame.textures(),
+            )?;
             self.last_relay_version = frame.version();
             return Ok(cmd);
         }
-        let cmd = self.encode_frame(target, frame.instances(), frame.texts())?;
+        let cmd = self.encode_frame_with_decorations(
+            target,
+            frame.instances(),
+            frame.texts(),
+            frame.decorated(),
+            frame.textures(),
+        )?;
         self.last_relay_version = frame.version();
         Ok(cmd)
     }
@@ -626,21 +706,52 @@ fn update_frame_bookkeeping(
 /// mechanical (one argument per resource the pass needs), not a sign of
 /// fresh coupling between subsystems, so `too_many_arguments` is allowed
 /// rather than worked around with an ad-hoc bundling struct.
+/// The four UI pipelines `draw_ui_pass` needs, bundled to keep its argument
+/// count within the lint threshold (mechanical grouping, not fresh coupling).
+#[derive(Clone, Copy)]
+struct DrawPipelines<'a> {
+    solid: &'a wgpu::RenderPipeline,
+    clear: &'a wgpu::RenderPipeline,
+    decorated: &'a wgpu::RenderPipeline,
+    texture: &'a wgpu::RenderPipeline,
+}
+
+/// The per-frame primitive lists `draw_ui_pass` draws, similarly bundled.
+#[derive(Clone, Copy)]
+struct DrawPrimitives<'a> {
+    instances: &'a [BoxInstance],
+    texts: &'a [TextLine],
+    decorated: &'a [crate::frame::DecoratedBox],
+    textures: &'a [crate::frame::TextureSampler],
+    texture_cache: &'a texture_sampler::TextureCache,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_ui_pass(
     encoder: &mut wgpu::CommandEncoder,
     persistent_view: &wgpu::TextureView,
     device: &wgpu::Device,
-    render_pipeline: &wgpu::RenderPipeline,
-    clear_pipeline: &wgpu::RenderPipeline,
+    pipelines: &DrawPipelines<'_>,
     viewport_bind_group: &wgpu::BindGroup,
     quad_buffer: &wgpu::Buffer,
     text_pipeline: &mut TextGlyphPipeline,
     full_redraw: bool,
     scissor: Option<(Rect, u32, u32, u32, u32)>,
-    instances: &[BoxInstance],
-    texts: &[TextLine],
+    primitives: &DrawPrimitives<'_>,
 ) -> Result<(), ByardError> {
+    let DrawPipelines {
+        solid: render_pipeline,
+        clear: clear_pipeline,
+        decorated: decorated_pipeline,
+        texture: texture_pipeline,
+    } = *pipelines;
+    let DrawPrimitives {
+        instances,
+        texts,
+        decorated,
+        textures,
+        texture_cache,
+    } = *primitives;
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("ByardCore - UI Render Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -699,6 +810,26 @@ fn draw_ui_pass(
             instances,
         );
     }
+
+    // M21: decorated boxes (border/shadow/opacity), then textured images, drawn
+    // above the solid fills and below the text, sharing the same pass/scissor.
+    decorated_box::draw(
+        &mut render_pass,
+        device,
+        decorated_pipeline,
+        viewport_bind_group,
+        quad_buffer,
+        decorated,
+    );
+    texture_sampler::draw(
+        &mut render_pass,
+        device,
+        texture_pipeline,
+        viewport_bind_group,
+        quad_buffer,
+        texture_cache,
+        textures,
+    );
 
     // Always the full, unfiltered `texts` slice (the `prepare` call before
     // this pass began did too) — `TextGlyphPipeline`'s internal cache is
@@ -912,6 +1043,54 @@ fn needs_full_redraw_this_frame(
 /// single `push_error_scope` / `pop_error_scope` pair so that any GPU-side
 /// validation failure is captured and returned as
 /// [`ByardError::PipelineCompilation`].
+/// Builds the M21 `DecoratedBox` and `TextureSampler` pipelines plus the texture
+/// bind-group layout and shared sampler. Extracted from
+/// [`EncoderSubsystem::init`] to keep that function under the line-count lint.
+async fn build_m21_pipelines(
+    device: &wgpu::Device,
+    viewport_layout: &wgpu::BindGroupLayout,
+    surface_format: wgpu::TextureFormat,
+) -> Result<
+    (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::BindGroupLayout,
+        wgpu::Sampler,
+    ),
+    ByardError,
+> {
+    let quad = || wgpu::VertexBufferLayout {
+        array_stride: 8,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        }],
+    };
+
+    let decorated_pipeline =
+        decorated_box::build_pipeline(device, viewport_layout, quad(), surface_format).await?;
+
+    let texture_bind_group_layout = texture_sampler::bind_group_layout(device);
+    let image_sampler = texture_sampler::sampler(device);
+    let texture_pipeline = texture_sampler::build_pipeline(
+        device,
+        viewport_layout,
+        &texture_bind_group_layout,
+        quad(),
+        surface_format,
+    )
+    .await?;
+
+    Ok((
+        decorated_pipeline,
+        texture_pipeline,
+        texture_bind_group_layout,
+        image_sampler,
+    ))
+}
+
 async fn build_solid_box_pipeline(
     device: &wgpu::Device,
     bind_group_layout: &wgpu::BindGroupLayout,

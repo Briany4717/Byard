@@ -102,7 +102,7 @@ pub enum EventKind {
     PointerEnter,
     /// Cursor left an element's hit rect (synthesized by the router).
     PointerExit,
-    /// Pointer hovering inside an element (fires on PointerMove while inside, no button).
+    /// Pointer hovering inside an element (fires on `PointerMove` while inside, no button).
     Hover,
     /// Press held > 500 ms without significant movement.
     LongPress,

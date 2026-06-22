@@ -534,6 +534,13 @@ impl EventRouter {
             .map(|h| (h.elem, h.kind, h.rect))
             .collect()
     }
+
+    /// Returns `true` while a pointer is held down (between `PointerDown` and
+    /// `PointerUp`).  Used by the hot-reload gesture gate (RFC-0006 §3.2, E5).
+    #[must_use]
+    pub fn is_pointer_pressed(&self) -> bool {
+        self.down.is_some()
+    }
 }
 
 /// Reflected write-back with value-dedup (E1): builds a `Change` action that

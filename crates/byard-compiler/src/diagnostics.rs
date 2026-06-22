@@ -170,6 +170,15 @@ pub enum CompileError {
         /// Source range of the offending value.
         span: Span,
     },
+    /// A `p`/`m` spacing tuple named a side more than once, combined an axis
+    /// shorthand (`horizontal`/`vertical`) with one of its component sides, or
+    /// mixed named and positional fields (RFC-0005 §1 `Len` erratum; IMPL-30).
+    ConflictingSpacingField {
+        /// Source range of the offending tuple or element.
+        span: Span,
+        /// Human-readable description of the conflict.
+        message: String,
+    },
 }
 
 impl CompileError {
@@ -192,7 +201,33 @@ impl CompileError {
             | Self::ArityMismatch { span, .. }
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
-            | Self::DynamicStyleForbidden { span } => *span,
+            | Self::DynamicStyleForbidden { span }
+            | Self::ConflictingSpacingField { span, .. } => *span,
+        }
+    }
+
+    /// A short, stable slug naming this error class, used for the rustc-style
+    /// `error[kind]:` prefix in `byard check` output (RFC-0006 §5, C7).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::UnexpectedChar { .. } => "UnexpectedChar",
+            Self::UnexpectedToken { .. } => "UnexpectedToken",
+            Self::StringNestingTooDeep { .. } => "StringNestingTooDeep",
+            Self::UnterminatedString { .. } => "UnterminatedString",
+            Self::MissingAnnotation { .. } => "MissingAnnotation",
+            Self::CannotInfer { .. } => "CannotInfer",
+            Self::TextUsedAsType { .. } => "TextUsedAsType",
+            Self::UnresolvedInject { .. } => "UnresolvedInject",
+            Self::NotAssignable { .. } => "NotAssignable",
+            Self::UnknownView { .. } => "UnknownView",
+            Self::UnknownAttribute { .. } => "UnknownAttribute",
+            Self::WrongAttributeSeparator { .. } => "WrongAttributeSeparator",
+            Self::ArityMismatch { .. } => "ArityMismatch",
+            Self::AttributeTypeMismatch { .. } => "AttributeTypeMismatch",
+            Self::UnexpectedChildren { .. } => "UnexpectedChildren",
+            Self::DynamicStyleForbidden { .. } => "DynamicStyleForbidden",
+            Self::ConflictingSpacingField { .. } => "ConflictingSpacingField",
         }
     }
 
@@ -253,6 +288,7 @@ impl CompileError {
             Self::DynamicStyleForbidden { .. } => {
                 "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()
             }
+            Self::ConflictingSpacingField { message, .. } => message.clone(),
         }
     }
 

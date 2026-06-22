@@ -9,3 +9,9 @@ Cargo.lock
 .vscode
 .codegraph
 .antigravitycli
+# Node / editor extension build artifacts
+node_modules/
+editors/vscode/dist/
+# Gradle (JetBrains plugin) caches & build output
+.gradle/
+editors/jetbrains/build/

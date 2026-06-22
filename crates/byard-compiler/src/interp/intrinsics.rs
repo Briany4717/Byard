@@ -68,8 +68,6 @@ const LAYOUT: &[(&str, PropType)] = &[
     ("gap", PropType::Int),
     ("p", PropType::Len),
     ("m", PropType::Len),
-    ("px", PropType::Len),
-    ("py", PropType::Len),
     ("pt", PropType::Len),
     ("pr", PropType::Len),
     ("pb", PropType::Len),

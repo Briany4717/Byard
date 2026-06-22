@@ -29,6 +29,11 @@ pub struct WinitHost {
     title: String,
     width: u32,
     height: u32,
+    /// When `true`, uses `ControlFlow::Poll` so the event loop spins
+    /// continuously and new `RenderFrame`s are presented without waiting
+    /// for a user input event. Intended for `byard dev` where hot-reload
+    /// must appear immediately after a file save.
+    poll: bool,
 }
 
 impl WinitHost {
@@ -39,7 +44,19 @@ impl WinitHost {
             title: title.into(),
             width,
             height,
+            poll: false,
         }
+    }
+
+    /// Switches the event loop to `ControlFlow::Poll` — redraws are requested
+    /// on every iteration instead of waiting for the next OS event.
+    ///
+    /// Use this for dev tools (e.g. `byard dev`) where file-change frames must
+    /// appear without requiring a mouse event to unblock the event loop.
+    #[must_use]
+    pub fn with_poll(mut self) -> Self {
+        self.poll = true;
+        self
     }
 
     /// Runs the `winit` event loop until the window closes, dispatching
@@ -60,8 +77,13 @@ impl WinitHost {
     /// errors are captured internally and surfaced here once the loop exits.
     pub fn run<H: PlatformHost>(self, host: H) -> Result<(), ByardError> {
         let event_loop = EventLoop::new().map_err(|e| ByardError::Platform(e.to_string()))?;
-        // Wait: sleep until the OS sends an event; no busy-loop for a static scene.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // Poll mode for live-reload dev tools; Wait mode for shipped applications
+        // (waits for OS events, no busy-loop — saves battery on static scenes).
+        if self.poll {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
 
         let mut app = WinitApp {
             host,
@@ -71,6 +93,7 @@ impl WinitHost {
             height: self.height,
             fatal: None,
             cursor_pos: (0.0, 0.0),
+            poll: self.poll,
         };
 
         event_loop
@@ -101,6 +124,10 @@ struct WinitApp<H: PlatformHost> {
     /// it to its own caller.
     fatal: Option<ByardError>,
     cursor_pos: (f32, f32),
+    /// Mirror of [`WinitHost::poll`]: when `true`, `about_to_wait` requests
+    /// a redraw on every event-loop iteration so hot-reload frames appear
+    /// immediately without waiting for the next user input event.
+    poll: bool,
 }
 
 impl<H: PlatformHost> WinitApp<H> {
@@ -235,6 +262,17 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
             }
 
             _ => {}
+        }
+    }
+
+    /// In poll mode, request a redraw after every event-loop iteration so
+    /// the logic thread's latest `RenderFrame` is presented without waiting
+    /// for the next user input event (needed for hot-reload in `byard dev`).
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.poll {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 }

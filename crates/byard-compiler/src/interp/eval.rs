@@ -24,7 +24,7 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StrPart, ViewDecl,
+    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StrPart, ViewDecl,
 };
 use crate::symbol::Symbol;
 
@@ -1227,7 +1227,7 @@ impl Interpreter {
                         }
                     }
                     "p" | "padding" => {
-                        style.padding = self.eval_spacing(&val);
+                        style.padding = self.resolve_spacing(value, "p");
                     }
                     "pt" | "padding_top" | "padding-top" => {
                         if let Some(v) = val_to_f32(&val) {
@@ -1249,20 +1249,8 @@ impl Interpreter {
                             style.padding.left = v;
                         }
                     }
-                    "px" | "padding_x" | "padding_horizontal" | "padding-horizontal" => {
-                        if let Some(v) = val_to_f32(&val) {
-                            style.padding.left = v;
-                            style.padding.right = v;
-                        }
-                    }
-                    "py" | "padding_y" | "padding_vertical" | "padding-vertical" => {
-                        if let Some(v) = val_to_f32(&val) {
-                            style.padding.top = v;
-                            style.padding.bottom = v;
-                        }
-                    }
                     "m" | "margin" => {
-                        style.margin = self.eval_spacing(&val);
+                        style.margin = self.resolve_spacing(value, "m");
                     }
                     "mt" | "margin_top" | "margin-top" => {
                         if let Some(v) = val_to_f32(&val) {
@@ -1330,106 +1318,145 @@ impl Interpreter {
         style
     }
 
-    fn eval_spacing(&mut self, val: &Value) -> byard_core::atlas::layout::Spacing {
+    /// Resolves a `Len`-typed `p`/`m` attribute value into a `Spacing` quad
+    /// (RFC-0005 §1 erratum; IMPL-30), emitting span-anchored `CompileError`s
+    /// for the four error classes:
+    ///
+    /// - an unknown side name → [`CompileError::UnknownAttribute`] with a hint;
+    /// - a side set twice, an axis shorthand plus one of its component sides, or
+    ///   a tuple mixing named and positional fields →
+    ///   [`CompileError::ConflictingSpacingField`];
+    /// - a non-numeric side value → [`CompileError::AttributeTypeMismatch`];
+    /// - a positional tuple of arity 3 or > 4 → [`CompileError::ArityMismatch`].
+    ///
+    /// Accepted forms: scalar (`p: 5`), inferred pair (`p: (vertical, horizontal)`),
+    /// inferred quad CSS `(top, right, bottom, left)`, and the verbose named form
+    /// (`p: (top: 4, horizontal: 8)`). A single parenthesized value parses to the
+    /// inner expression, so it arrives as a scalar.
+    fn resolve_spacing(&mut self, expr: &Expr, prop: &str) -> byard_core::atlas::layout::Spacing {
         use byard_core::atlas::layout::Spacing;
-        let val_to_f32 = |v: &Value| -> f32 {
-            match v {
-                Value::Int(n) => *n as f32,
-                Value::Float(f) => *f as f32,
-                _ => 0.0,
-            }
-        };
-
-        match val {
-            Value::Int(n) => Spacing::all(*n as f32),
-            Value::Float(f) => Spacing::all(*f as f32),
-            Value::Tuple(items) => {
-                let has_names = items.iter().any(|(name, _)| name.is_some());
-                if has_names {
-                    let mut s = Spacing::default();
-                    for (name, item_val) in items {
-                        let v = val_to_f32(item_val);
-                        if let Some(sym) = name {
-                            match sym.as_str() {
-                                "top" | "t" => s.top = v,
-                                "right" | "r" => s.right = v,
-                                "bottom" | "b" => s.bottom = v,
-                                "left" | "l" => s.left = v,
-                                "horizontal" | "h" | "x" | "px" | "mx" => {
-                                    s.left = v;
-                                    s.right = v;
-                                }
-                                "vertical" | "v" | "y" | "py" | "my" => {
-                                    s.top = v;
-                                    s.bottom = v;
-                                }
-                                "all" | "a" => {
-                                    s.top = v;
-                                    s.right = v;
-                                    s.bottom = v;
-                                    s.left = v;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    s
+        match expr {
+            Expr::Tuple(args, span) => {
+                let any_named = args.iter().any(|a| a.name.is_some());
+                let all_named = args.iter().all(|a| a.name.is_some());
+                if any_named && !all_named {
+                    self.errors.push(CompileError::ConflictingSpacingField {
+                        span: *span,
+                        message: "a spacing tuple cannot mix named and positional fields"
+                            .to_string(),
+                    });
+                    return Spacing::default();
+                }
+                if all_named {
+                    self.resolve_named_spacing(args)
                 } else {
-                    match items.len() {
-                        1 => Spacing::all(val_to_f32(&items[0].1)),
-                        2 => {
-                            let vertical = val_to_f32(&items[0].1);
-                            let horizontal = val_to_f32(&items[1].1);
-                            Spacing::symmetric(vertical, horizontal)
-                        }
-                        3 => {
-                            let top = val_to_f32(&items[0].1);
-                            let horizontal = val_to_f32(&items[1].1);
-                            let bottom = val_to_f32(&items[2].1);
-                            Spacing {
-                                top,
-                                right: horizontal,
-                                bottom,
-                                left: horizontal,
-                            }
-                        }
-                        4 => Spacing {
-                            top: val_to_f32(&items[0].1),
-                            right: val_to_f32(&items[1].1),
-                            bottom: val_to_f32(&items[2].1),
-                            left: val_to_f32(&items[3].1),
-                        },
-                        _ => Spacing::default(),
-                    }
+                    self.resolve_positional_spacing(args, *span, prop)
                 }
             }
-            Value::List(items) => match items.len() {
-                1 => Spacing::all(val_to_f32(&items[0])),
-                2 => {
-                    let vertical = val_to_f32(&items[0]);
-                    let horizontal = val_to_f32(&items[1]);
-                    Spacing::symmetric(vertical, horizontal)
+            other => {
+                let val = self.eval_pure(other);
+                if let Some(v) = spacing_value(&val) {
+                    Spacing::all(v)
+                } else {
+                    self.errors.push(CompileError::AttributeTypeMismatch {
+                        span: other.span(),
+                        expected: "a length (an integer)".to_string(),
+                    });
+                    Spacing::default()
                 }
-                3 => {
-                    let top = val_to_f32(&items[0]);
-                    let horizontal = val_to_f32(&items[1]);
-                    let bottom = val_to_f32(&items[2]);
-                    Spacing {
-                        top,
-                        right: horizontal,
-                        bottom,
-                        left: horizontal,
-                    }
+            }
+        }
+    }
+
+    /// Verbose named spacing form (`p: (top: 4, horizontal: 8)`).
+    fn resolve_named_spacing(&mut self, args: &[Arg]) -> byard_core::atlas::layout::Spacing {
+        use byard_core::atlas::layout::Spacing;
+        const SIDES: &[&str] = &["top", "bottom", "left", "right", "horizontal", "vertical"];
+
+        let (mut top, mut right, mut bottom, mut left) = (None, None, None, None);
+        for arg in args {
+            // `all_named` guarantees a name is present.
+            let Some(name) = &arg.name else { continue };
+            let span = arg.value.span();
+            let val = self.eval_pure(&arg.value);
+            let Some(v) = spacing_value(&val) else {
+                self.errors.push(CompileError::AttributeTypeMismatch {
+                    span,
+                    expected: "a length (an integer)".to_string(),
+                });
+                continue;
+            };
+            match name.as_str() {
+                "top" => assign_side(&mut top, v, "top", span, &mut self.errors),
+                "bottom" => assign_side(&mut bottom, v, "bottom", span, &mut self.errors),
+                "left" => assign_side(&mut left, v, "left", span, &mut self.errors),
+                "right" => assign_side(&mut right, v, "right", span, &mut self.errors),
+                "horizontal" => {
+                    assign_side(&mut left, v, "left", span, &mut self.errors);
+                    assign_side(&mut right, v, "right", span, &mut self.errors);
                 }
-                4 => Spacing {
-                    top: val_to_f32(&items[0]),
-                    right: val_to_f32(&items[1]),
-                    bottom: val_to_f32(&items[2]),
-                    left: val_to_f32(&items[3]),
-                },
-                _ => Spacing::default(),
+                "vertical" => {
+                    assign_side(&mut top, v, "top", span, &mut self.errors);
+                    assign_side(&mut bottom, v, "bottom", span, &mut self.errors);
+                }
+                unknown => {
+                    let hint = crate::util::closest_match(unknown, SIDES.iter().copied())
+                        .map(str::to_string);
+                    self.errors.push(CompileError::UnknownAttribute {
+                        span,
+                        name: unknown.to_string(),
+                        hint,
+                    });
+                }
+            }
+        }
+        Spacing {
+            top: top.unwrap_or(0.0),
+            right: right.unwrap_or(0.0),
+            bottom: bottom.unwrap_or(0.0),
+            left: left.unwrap_or(0.0),
+        }
+    }
+
+    /// Inferred positional spacing forms: pair `(vertical, horizontal)` or quad
+    /// CSS `(top, right, bottom, left)`. Any other arity is an error.
+    fn resolve_positional_spacing(
+        &mut self,
+        args: &[Arg],
+        span: Span,
+        prop: &str,
+    ) -> byard_core::atlas::layout::Spacing {
+        use byard_core::atlas::layout::Spacing;
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            let val = self.eval_pure(&arg.value);
+            if let Some(v) = spacing_value(&val) {
+                vals.push(v);
+            } else {
+                self.errors.push(CompileError::AttributeTypeMismatch {
+                    span: arg.value.span(),
+                    expected: "a length (an integer)".to_string(),
+                });
+                vals.push(0.0);
+            }
+        }
+        match vals.len() {
+            2 => Spacing::symmetric(vals[0], vals[1]),
+            4 => Spacing {
+                top: vals[0],
+                right: vals[1],
+                bottom: vals[2],
+                left: vals[3],
             },
-            _ => Spacing::default(),
+            n => {
+                self.errors.push(CompileError::ArityMismatch {
+                    span,
+                    name: prop.to_string(),
+                    expected: 4,
+                    found: n,
+                });
+                Spacing::default()
+            }
         }
     }
 
@@ -1782,6 +1809,37 @@ impl Interpreter {
 }
 
 /// Renders a value for string interpolation (`"Count: {count}"`).
+/// Coerces a spacing side/scalar value to `f32`; only numeric values are valid
+/// `Len`s (IMPL-30 — a non-numeric side is a `TypeMismatch`).
+fn spacing_value(v: &Value) -> Option<f32> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    match v {
+        Value::Int(n) => Some(*n as f32),
+        Value::Float(f) => Some(*f as f32),
+        _ => None,
+    }
+}
+
+/// Assigns one resolved side of a named spacing tuple, recording a
+/// [`CompileError::ConflictingSpacingField`] if the side was already set (either
+/// directly or via an axis shorthand) — IMPL-30.
+fn assign_side(
+    slot: &mut Option<f32>,
+    v: f32,
+    side: &str,
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) {
+    if slot.is_some() {
+        errors.push(CompileError::ConflictingSpacingField {
+            span,
+            message: format!("spacing side `{side}` was set more than once"),
+        });
+    } else {
+        *slot = Some(v);
+    }
+}
+
 fn display_value(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
@@ -1969,17 +2027,7 @@ mod tests {
                 "View C() { Column #[p: (2, 3)] {} }",
                 Spacing::symmetric(2.0, 3.0),
             ),
-            // 3-value positional: top, horizontal, bottom
-            (
-                "View C() { Column #[p: (10, 20, 30)] {} }",
-                Spacing {
-                    top: 10.0,
-                    right: 20.0,
-                    bottom: 30.0,
-                    left: 20.0,
-                },
-            ),
-            // 4-value positional: top, right, bottom, left
+            // 4-value positional: CSS order top, right, bottom, left (IMPL-30)
             (
                 "View C() { Column #[p: (1, 2, 3, 4)] {} }",
                 Spacing {
@@ -1989,7 +2037,7 @@ mod tests {
                     left: 4.0,
                 },
             ),
-            // Named top
+            // Named top only — unspecified sides default to 0 (IMPL-30)
             (
                 "View C() { Column #[p: (top: 10)] {} }",
                 Spacing {
@@ -1999,17 +2047,17 @@ mod tests {
                     left: 0.0,
                 },
             ),
-            // Named bottom
+            // Named bottom only
             (
-                "View C() { Column #[p: (bottom: 2)] {} }",
+                "View C() { Column #[p: (bottom: 7)] {} }",
                 Spacing {
                     top: 0.0,
                     right: 0.0,
-                    bottom: 2.0,
+                    bottom: 7.0,
                     left: 0.0,
                 },
             ),
-            // Named mixed
+            // Named mixed sides
             (
                 "View C() { Column #[p: (left: 5, bottom: 3)] {} }",
                 Spacing {
@@ -2019,37 +2067,16 @@ mod tests {
                     left: 5.0,
                 },
             ),
-            // Named abbreviations (t, r, b, l)
+            // Verbose axis shorthands (the only accepted shorthands; IMPL-30)
             (
-                "View C() { Column #[p: (t: 10, r: 8, b: 6, l: 4)] {} }",
+                "View C() { Column #[p: (horizontal: 10, vertical: 5)] {} }",
                 Spacing {
-                    top: 10.0,
-                    right: 8.0,
-                    bottom: 6.0,
-                    left: 4.0,
+                    top: 5.0,
+                    right: 10.0,
+                    bottom: 5.0,
+                    left: 10.0,
                 },
             ),
-            // Named horizontal / vertical / all / x / y shorthands
-            (
-                "View C() { Column #[p: (x: 5, y: 7)] {} }",
-                Spacing {
-                    top: 7.0,
-                    right: 5.0,
-                    bottom: 7.0,
-                    left: 5.0,
-                },
-            ),
-            (
-                "View C() { Column #[p: (h: 12, v: 14)] {} }",
-                Spacing {
-                    top: 14.0,
-                    right: 12.0,
-                    bottom: 14.0,
-                    left: 12.0,
-                },
-            ),
-            ("View C() { Column #[p: (all: 42)] {} }", Spacing::all(42.0)),
-            ("View C() { Column #[p: (a: 9)] {} }", Spacing::all(9.0)),
         ];
 
         for (source, expected_spacing) in test_cases {
@@ -2122,6 +2149,171 @@ mod tests {
                 bottom: 0.0,
                 left: 5.0
             }
+        );
+    }
+
+    // ── M25 / IMPL-30: `Len` padding/margin forms ────────────────────────
+
+    /// Lowers a single-`Box` view and returns the resolved padding plus any
+    /// errors raised during style resolution.
+    fn resolve_padding(src: &str) -> (byard_core::atlas::layout::Spacing, Vec<CompileError>) {
+        let parsed = parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        let RenderNode::Box { name, attrs, .. } = &tree[0] else {
+            panic!("expected a Box");
+        };
+        let style = interp.eval_container_style(name.as_str(), attrs);
+        (style.padding, interp.errors().to_vec())
+    }
+
+    #[test]
+    fn impl30_scalar_sets_all_sides() {
+        use byard_core::atlas::layout::Spacing;
+        let (p, errs) = resolve_padding("View C() { Column #[p: 5] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(p, Spacing::all(5.0));
+    }
+
+    #[test]
+    fn impl30_pair_is_vertical_horizontal() {
+        use byard_core::atlas::layout::Spacing;
+        let (p, errs) = resolve_padding("View C() { Column #[p: (10, 5)] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        // (vertical, horizontal): top=bottom=10, left=right=5.
+        assert_eq!(
+            p,
+            Spacing {
+                top: 10.0,
+                right: 5.0,
+                bottom: 10.0,
+                left: 5.0
+            }
+        );
+    }
+
+    #[test]
+    fn impl30_quad_is_css_order() {
+        use byard_core::atlas::layout::Spacing;
+        let (p, errs) = resolve_padding("View C() { Column #[p: (4, 6, 8, 7)] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            p,
+            Spacing {
+                top: 4.0,
+                right: 6.0,
+                bottom: 8.0,
+                left: 7.0
+            }
+        );
+    }
+
+    #[test]
+    fn impl30_named_single_side_defaults_rest_to_zero() {
+        use byard_core::atlas::layout::Spacing;
+        let (p, errs) = resolve_padding("View C() { Column #[p: (bottom: 7)] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            p,
+            Spacing {
+                top: 0.0,
+                right: 0.0,
+                bottom: 7.0,
+                left: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn impl30_named_axis_shorthands() {
+        use byard_core::atlas::layout::Spacing;
+        let (p, errs) =
+            resolve_padding("View C() { Column #[p: (horizontal: 10, vertical: 5)] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            p,
+            Spacing {
+                top: 5.0,
+                right: 10.0,
+                bottom: 5.0,
+                left: 10.0
+            }
+        );
+    }
+
+    #[test]
+    fn impl30_unknown_side_is_unknown_attribute_with_hint() {
+        let (_p, errs) = resolve_padding("View C() { Column #[p: (tpo: 4)] {} }");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                CompileError::UnknownAttribute { name, hint: Some(h), .. }
+                    if name == "tpo" && h == "top"
+            )),
+            "expected UnknownAttribute(tpo)->top, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn impl30_axis_plus_component_conflicts() {
+        let (_p, errs) = resolve_padding("View C() { Column #[p: (horizontal: 10, left: 3)] {} }");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::ConflictingSpacingField { .. })),
+            "expected ConflictingSpacingField, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn impl30_non_int_side_is_type_mismatch() {
+        let (_p, errs) = resolve_padding("View C() { Column #[p: (top: 4, left: \"x\")] {} }");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::AttributeTypeMismatch { .. })),
+            "expected AttributeTypeMismatch, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn impl30_wrong_positional_arity_is_arity_mismatch() {
+        let (_p, errs) = resolve_padding("View C() { Column #[p: (1, 2, 3)] {} }");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { .. })),
+            "expected ArityMismatch for a 3-tuple, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn impl30_mixing_named_and_positional_errors() {
+        let (_p, errs) = resolve_padding("View C() { Column #[p: (10, top: 4)] {} }");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::ConflictingSpacingField { .. })),
+            "expected a conflict for mixed named/positional, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn impl30_px_py_are_now_unknown_attributes() {
+        let parsed = parse("View C() { Column #[px: 5] {} }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let _ = interp.lower_view(view, &[]);
+        assert!(
+            interp.errors().iter().any(|e| matches!(
+                e,
+                CompileError::UnknownAttribute { name, .. } if name == "px"
+            )),
+            "px must now be UnknownAttribute, got {:?}",
+            interp.errors()
         );
     }
 
