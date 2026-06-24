@@ -29,10 +29,10 @@ View Main() {
         }
 
         // ── Counter card: events (=>), ternary, fn + interpolation ───────────
-        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 12, border: 0x2C2C3C, shadow: "md"] {
+        Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
             Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
             Row #[gap: 12, align: center] {
-                Button("-") #[bg: 0x3A3A4D, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
+                Button("-") #[bg: 0x4A4A66, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
                 Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
                 Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
                 Spacer
@@ -41,7 +41,7 @@ View Main() {
         }
 
         // ── Interactive widgets bound two-way to the vars above ──────────────
-        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 16, border: 0x2C2C3C] {
+        Column #[bg: 0x262636, radius: 16, p: 20, gap: 16, border: 0x3C3C52] {
             Row #[align: center, justify: between] {
                 Text("Favourite") #[color: 0x9AA0AC, size: 15]
                 Toggle #[bind: liked, width: 52, height: 30]
@@ -51,13 +51,13 @@ View Main() {
                 Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
             }
             // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
-            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x2A2A38, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            TextField #[bind: note, placeholder: "a quick note…", bg: 0x2A2A38, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
             Text("Hi {name}") #[color: 0x10B981, size: 14]
         }
 
         // ── Structural: when … else, and a for-loop over a list ──────────────
-        Column #[bg: 0x1E1E2A, radius: 16, p: 20, gap: 8, border: 0x2C2C3C] {
+        Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
             when liked {
                 Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
             } else {
@@ -65,7 +65,7 @@ View Main() {
             }
             Row #[gap: 8] {
                 for tag in ["reactive", "typed", "native"] {
-                    Box #[bg: 0x2C2C3C, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                    Box #[bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10)] {
                         Text("{tag}") #[color: 0xC9C9D4, size: 13]
                     }
                 }

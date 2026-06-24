@@ -94,7 +94,21 @@ fn decode_and_upload(
     sampler: &wgpu::Sampler,
     src: &str,
 ) -> Option<TextureEntry> {
-    let img = image::open(src).ok()?.to_rgba8();
+    let img = match image::open(src) {
+        Ok(img) => img.to_rgba8(),
+        Err(err) => {
+            // Alert the dev that their asset isn't where the engine looked. The
+            // cache stores this `None` so the warning fires once per path, not
+            // every frame (IMPL-32: a missing image simply does not draw).
+            let cwd = std::env::current_dir()
+                .map_or_else(|_| "?".to_string(), |p| p.display().to_string());
+            eprintln!(
+                "byard: warning: image not found or could not be decoded: \
+                 '{src}' (searched relative to {cwd}): {err}"
+            );
+            return None;
+        }
+    };
     let (width, height) = img.dimensions();
     let size = wgpu::Extent3d {
         width,

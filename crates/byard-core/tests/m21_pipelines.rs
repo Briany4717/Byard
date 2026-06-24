@@ -3,11 +3,12 @@
 //! GPU-dependent tests request a real adapter and **skip gracefully** when none
 //! is available (headless CI), so they assert on machines with a GPU without
 //! breaking those without. The `uv_transform` tests are pure CPU and always run.
+#![allow(clippy::cast_precision_loss)]
 
 use byard_core::ByardError;
 use byard_core::encoder::EncoderSubsystem;
 use byard_core::encoder::texture_sampler::uv_transform;
-use byard_core::frame::ImageFit;
+use byard_core::frame::{BoxInstance, DecoratedBox, ImageFit, RenderFrame, Viewport};
 use std::sync::Arc;
 
 /// Elementwise approximate equality for a UV transform `[f32; 4]`.
@@ -98,6 +99,133 @@ fn bad_shader_surfaces_pipeline_compilation_not_panic() {
         reason: err.unwrap().to_string(),
     };
     assert!(matches!(mapped, ByardError::PipelineCompilation { .. }));
+}
+
+/// Renders `frame` to an offscreen `size×size` target on the real GPU and reads
+/// the RGBA8 pixel at logical `(px, py)`.
+fn render_and_read(
+    enc: &mut EncoderSubsystem,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    frame: &RenderFrame,
+    size: u32,
+    px: u32,
+    py: u32,
+) -> [u8; 4] {
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("readback target"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let cmd = enc.encode_frame_from_relay(&target, frame).unwrap();
+    queue.submit(std::iter::once(cmd));
+
+    let bpr = 256u32 * size.div_ceil(64); // round 4*size up to 256.
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback buffer"),
+        size: u64::from(bpr) * u64::from(size),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut ce = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    ce.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(size),
+            },
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(ce.finish()));
+
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range();
+    let row = (py * bpr) as usize;
+    let idx = row + (px * 4) as usize;
+    [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]
+}
+
+#[test]
+fn solid_and_decorated_boxes_actually_paint_pixels() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping readback test");
+        return;
+    };
+    let size = 128u32;
+    let mut enc = pollster::block_on(EncoderSubsystem::init(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        1.0,
+        size,
+        size,
+    ))
+    .unwrap();
+    enc.update_viewport(
+        Viewport {
+            width: size as f32,
+            height: size as f32,
+        },
+        size,
+        size,
+        1.0,
+    );
+
+    // A red solid box and a blue decorated (bordered) box, both well inside.
+    let mut frame = RenderFrame::new();
+    frame.push_instance(BoxInstance {
+        rect: [10.0, 10.0, 40.0, 40.0],
+        color: [1.0, 0.0, 0.0, 1.0],
+        radii: [0.0; 4],
+    });
+    frame.push_decorated(DecoratedBox {
+        base: BoxInstance {
+            rect: [70.0, 70.0, 40.0, 40.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+            radii: [0.0; 4],
+        },
+        border_width: 3.0,
+        border_color: [1.0, 1.0, 1.0, 1.0],
+        ..DecoratedBox::default()
+    });
+
+    let solid = render_and_read(&mut enc, &device, &queue, &frame, size, 30, 30);
+    let decorated = render_and_read(&mut enc, &device, &queue, &frame, size, 90, 90);
+
+    assert!(
+        solid[0] > 120 && solid[1] < 80 && solid[2] < 80,
+        "SolidBox should paint red pixels, got {solid:?}"
+    );
+    assert!(
+        decorated[2] > 120,
+        "DecoratedBox should paint blue pixels, got {decorated:?}"
+    );
 }
 
 #[test]

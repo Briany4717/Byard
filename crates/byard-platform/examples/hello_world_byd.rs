@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn main() {
-    let host = WinitHost::new("Byard — hello_world.byd", 800, 600);
+    // Sized to fit the demo's 540-wide × ~700-tall content with margin, so no
+    // card (notably the bottom decoration row) clips off the window.
+    let host = WinitHost::new("Byard — hello_world.byd", 600, 940);
     host.run(App::default()).expect("event loop error");
 }
 
