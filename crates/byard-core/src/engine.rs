@@ -350,6 +350,18 @@ impl Engine {
         self.relay.push_input(event);
     }
 
+    /// Installs a callback the logic thread fires after it publishes a frame
+    /// that changed in response to input.
+    ///
+    /// An event-driven (`Wait`-mode) host should point this at its event loop's
+    /// wake primitive (e.g. a winit `EventLoopProxy`) and request a redraw when
+    /// it fires, so input results appear immediately instead of waiting for the
+    /// next unrelated OS event. A continuously-redrawing (`Poll`) host does not
+    /// need it. See [`Relay::set_frame_waker`](crate::relay::Relay::set_frame_waker).
+    pub fn set_frame_waker(&self, waker: crate::relay::FrameWaker) {
+        self.relay.set_frame_waker(waker);
+    }
+
     /// Notifies the engine that the window surface has been resized.
     ///
     /// `width` and `height` are the new dimensions in **physical pixels**

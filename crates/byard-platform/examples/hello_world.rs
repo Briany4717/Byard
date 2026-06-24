@@ -51,6 +51,7 @@ impl PlatformHost for App {
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         size: WindowSize,
+        _waker: byard_core::relay::FrameWaker,
     ) -> Result<(), ByardError> {
         let mut engine = pollster::block_on(Engine::init(
             instance,

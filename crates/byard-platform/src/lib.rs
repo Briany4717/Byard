@@ -12,13 +12,21 @@
 
 use std::sync::Arc;
 
+use byard_core::relay::FrameWaker;
 use byard_core::{ByardError, PlatformHost, PointerButton, PointerState, WindowSize};
+use std::sync::Mutex;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// User event posted to the winit loop by the logic thread's [`FrameWaker`]
+/// when it publishes a frame that changed in response to input. It carries no
+/// data — its only job is to wake a `Wait`-mode loop so it redraws the update.
+#[derive(Debug, Clone, Copy)]
+struct FramePublished;
 
 /// A `winit`-backed [`PlatformHost`] driver.
 ///
@@ -76,7 +84,11 @@ impl WinitHost {
     /// `ApplicationHandler` callbacks are themselves infallible, so such
     /// errors are captured internally and surfaced here once the loop exits.
     pub fn run<H: PlatformHost>(self, host: H) -> Result<(), ByardError> {
-        let event_loop = EventLoop::new().map_err(|e| ByardError::Platform(e.to_string()))?;
+        // A user-event loop so the logic thread can wake it via a proxy when it
+        // publishes a changed frame (see `FramePublished` / the frame waker).
+        let event_loop = EventLoop::<FramePublished>::with_user_event()
+            .build()
+            .map_err(|e| ByardError::Platform(e.to_string()))?;
         // Poll mode for live-reload dev tools; Wait mode for shipped applications
         // (waits for OS events, no busy-loop — saves battery on static scenes).
         if self.poll {
@@ -84,6 +96,18 @@ impl WinitHost {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+
+        // The waker handed to the host's `Engine`: each call posts a
+        // `FramePublished` to this loop, which redraws on receipt. The proxy is
+        // wrapped in a `Mutex` so the closure is `Sync` regardless of whether
+        // `EventLoopProxy` is, satisfying the `FrameWaker` bound; the lock is
+        // only ever taken by the single logic thread, so it never contends.
+        let proxy = Mutex::new(event_loop.create_proxy());
+        let waker: FrameWaker = std::sync::Arc::new(move || {
+            if let Ok(proxy) = proxy.lock() {
+                let _ = proxy.send_event(FramePublished);
+            }
+        });
 
         let mut app = WinitApp {
             host,
@@ -94,6 +118,7 @@ impl WinitHost {
             fatal: None,
             cursor_pos: (0.0, 0.0),
             poll: self.poll,
+            waker,
         };
 
         event_loop
@@ -128,6 +153,9 @@ struct WinitApp<H: PlatformHost> {
     /// a redraw on every event-loop iteration so hot-reload frames appear
     /// immediately without waiting for the next user input event.
     poll: bool,
+    /// Frame waker installed on the host's `Engine` in `resumed`; fired by the
+    /// logic thread to wake this loop when a changed frame is ready.
+    waker: FrameWaker,
 }
 
 impl<H: PlatformHost> WinitApp<H> {
@@ -139,7 +167,7 @@ impl<H: PlatformHost> WinitApp<H> {
     }
 }
 
-impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
+impl<H: PlatformHost> ApplicationHandler<FramePublished> for WinitApp<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Already initialised — e.g. resumed again after a mobile suspend.
         if self.window.is_some() {
@@ -175,7 +203,10 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
 
         let size = to_window_size(window.inner_size(), window.scale_factor());
 
-        if let Err(e) = self.host.on_resume(&instance, surface, size) {
+        if let Err(e) = self
+            .host
+            .on_resume(&instance, surface, size, self.waker.clone())
+        {
             self.fail(event_loop, e);
             return;
         }
@@ -262,6 +293,15 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
             }
 
             _ => {}
+        }
+    }
+
+    /// The logic thread published a frame that changed in response to input.
+    /// Request a redraw so a `Wait`-mode loop presents it immediately instead
+    /// of showing the pre-input frame until the next unrelated OS event.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 

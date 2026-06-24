@@ -144,7 +144,21 @@ pub struct Relay {
     io_result_rx: Mutex<UnboundedReceiver<IoResult>>,
     input_tx: crossbeam_channel::Sender<InputEvent>,
     input_rx: crossbeam_channel::Receiver<InputEvent>,
+    // Invoked by the logic thread after it publishes a frame that changed in
+    // response to input, so a `Wait`-mode (event-driven) render loop knows to
+    // wake and present it. `None` until a host installs one via
+    // [`Relay::set_frame_waker`]; a continuously-redrawing (`Poll`) host can
+    // leave it unset. Set rarely (once at startup), read once per published
+    // frame — the mutex is never contended.
+    frame_waker: Mutex<Option<FrameWaker>>,
 }
+
+/// A host-installed callback the logic thread fires after publishing a changed
+/// frame (see [`Relay::set_frame_waker`]). The platform layer points it at its
+/// event loop's wake primitive (e.g. a winit `EventLoopProxy`) so an
+/// event-driven render thread redraws exactly when there is something new to
+/// show — no busy polling, no stale frame after an input.
+pub type FrameWaker = Arc<dyn Fn() + Send + Sync>;
 
 impl Relay {
     /// Creates a new `Relay` with an empty frame slot, a seeded recycle
@@ -187,12 +201,36 @@ impl Relay {
             io_result_rx: Mutex::new(io_result_rx),
             input_tx,
             input_rx,
+            frame_waker: Mutex::new(None),
         })
     }
 
     /// Pushes an input event into the logic queue.
     pub fn push_input(&self, event: InputEvent) {
         let _ = self.input_tx.send(event);
+    }
+
+    /// Installs the callback fired after the logic thread publishes a frame
+    /// that changed in response to input. See [`FrameWaker`].
+    pub fn set_frame_waker(&self, waker: FrameWaker) {
+        *self
+            .frame_waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(waker);
+    }
+
+    /// Fires the installed [`FrameWaker`], if any. The `Arc` is cloned out of
+    /// the lock first so the (host-supplied) callback never runs while the
+    /// mutex is held.
+    fn wake_renderer(&self) {
+        let waker = self
+            .frame_waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     /// Returns a frame ready to be populated, preferring a recycled buffer
@@ -388,6 +426,7 @@ impl Relay {
                     // The reactive interpreter computes its own dirty set; the
                     // engine-level dirty-target plumbing is wired in a later
                     // phase, so pass an empty slice for now.
+                    let had_input = !inputs.is_empty();
                     runtime.evaluate_tick(&mut frame, &inputs, &[]);
                     relay.publish(frame);
 
@@ -398,10 +437,15 @@ impl Relay {
                     // speed so bursts drain immediately; only an idle tick parks
                     // briefly, capping idle CPU while keeping first-input latency
                     // under one short park. (RFC-0001 leaves pacing to the caller.)
-                    if inputs.is_empty() {
-                        thread::park_timeout(IDLE_PARK);
-                    } else {
+                    if had_input {
+                        // The frame just published reflects this input — wake an
+                        // event-driven (`Wait`-mode) render thread so it presents
+                        // the update now, rather than showing the pre-input frame
+                        // until the next unrelated OS event.
+                        relay.wake_renderer();
                         thread::yield_now();
+                    } else {
+                        thread::park_timeout(IDLE_PARK);
                     }
                 }
             })
@@ -945,6 +989,50 @@ mod tests {
         assert!(
             relay.current().is_some(),
             "ticking must have published at least one frame"
+        );
+    }
+
+    #[test]
+    fn frame_waker_fires_after_an_input_bearing_tick() {
+        // The wake-on-publish contract (Wait-mode redraw): after the logic
+        // thread processes input and publishes, it must fire the installed
+        // waker so an event-driven render loop knows to present the update.
+        let relay = Arc::new(Relay::new().unwrap());
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = Arc::clone(&woke);
+        relay.set_frame_waker(Arc::new(move || {
+            woke_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_factory = Arc::clone(&hits);
+        let handle = Relay::spawn_logic_from_view(&relay, move |arena| {
+            Box::new(CounterRuntime {
+                signal: crate::evaluator::Signal::new_in(arena, 0_i64),
+                hits: hits_factory,
+            })
+        })
+        .expect("thread spawn should succeed in tests");
+
+        // Feed an input event; the next (input-bearing) tick must wake.
+        relay.push_input(InputEvent {
+            kind: crate::platform::EventKind::PointerDown,
+            pos: (1.0, 1.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        });
+
+        let start = Instant::now();
+        while woke.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        relay.request_shutdown();
+        handle.join().expect("logic thread must not panic");
+
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "an input-bearing tick must fire the frame waker"
         );
     }
 }

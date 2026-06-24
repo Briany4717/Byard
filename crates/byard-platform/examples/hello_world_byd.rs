@@ -96,6 +96,7 @@ impl PlatformHost for App {
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         size: WindowSize,
+        waker: byard_core::relay::FrameWaker,
     ) -> Result<(), ByardError> {
         let parsed = parse(SRC);
         assert!(
@@ -112,6 +113,9 @@ impl PlatformHost for App {
             size.height,
             size.scale_factor,
         ))?;
+        // Wake the (Wait-mode) event loop when the logic thread publishes a
+        // frame produced by input, so clicks/keys show up immediately.
+        engine.set_frame_waker(waker);
 
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         let w = size.width as f32 / size.scale_factor as f32;

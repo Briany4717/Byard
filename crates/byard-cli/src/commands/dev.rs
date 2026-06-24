@@ -278,6 +278,7 @@ impl PlatformHost for App {
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         size: WindowSize,
+        waker: byard_core::relay::FrameWaker,
     ) -> Result<(), ByardError> {
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         let w = size.width as f32 / size.scale_factor as f32;
@@ -317,6 +318,10 @@ impl PlatformHost for App {
             size.height,
             size.scale_factor,
         ))?;
+        // `byard dev` runs in Poll mode (redraws every iteration for hot-reload),
+        // so the waker is not strictly required — installing it is still correct
+        // and makes input-driven redraws prompt if the mode ever changes.
+        engine.set_frame_waker(waker);
 
         engine.start_logic_from_view(move |_arena| {
             let (interp, tree, current_views) = if initial_views.is_empty() {

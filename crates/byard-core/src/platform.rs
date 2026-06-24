@@ -177,6 +177,13 @@ pub trait PlatformHost {
     /// and device creation must happen before it returns; `surface` is
     /// moved in because the resulting `Engine` owns it for its lifetime.
     ///
+    /// `waker` is a frame-waker tied to the host's event loop (see
+    /// [`Engine::set_frame_waker`](crate::engine::Engine::set_frame_waker)).
+    /// An event-driven (`Wait`-mode) host should install it on the `Engine` it
+    /// creates here — `engine.set_frame_waker(waker)` — so input results are
+    /// presented as soon as the logic thread publishes them. A
+    /// continuously-redrawing (`Poll`) host may ignore it.
+    ///
     /// # Errors
     ///
     /// Returns whatever [`ByardError`] engine initialisation produces (see
@@ -187,6 +194,7 @@ pub trait PlatformHost {
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         size: WindowSize,
+        waker: crate::relay::FrameWaker,
     ) -> Result<(), ByardError>;
 
     /// Called whenever the window is resized or the OS DPI scale changes.
@@ -260,6 +268,7 @@ mod tests {
             _instance: &wgpu::Instance,
             _surface: wgpu::Surface<'static>,
             _size: WindowSize,
+            _waker: crate::relay::FrameWaker,
         ) -> Result<(), ByardError> {
             Ok(())
         }
