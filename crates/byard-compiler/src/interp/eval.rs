@@ -693,20 +693,46 @@ impl Interpreter {
                             color: super::intrinsics::color_to_rgba(color, false),
                             radii: [radius; 4],
                         };
-                        if is_decorated || border_color.is_some() {
+                        let border_rgba = border_color
+                            .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
+                        let shadow_rgba = shadow_color
+                            .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, true));
+                        let translucent = (opacity - 1.0).abs() > f32::EPSILON;
+                        if translucent {
+                            // A translucent box blends its fill as one unit on the
+                            // decorated pipeline (leaf showcase boxes); keep it whole.
                             frame.push_decorated(byard_core::frame::DecoratedBox {
                                 base,
                                 border_width,
-                                border_color: border_color.map_or([0.0; 4], |c| {
-                                    super::intrinsics::color_to_rgba(c, false)
-                                }),
+                                border_color: border_rgba,
                                 shadow_dx,
                                 shadow_dy,
                                 shadow_blur,
-                                shadow_color: shadow_color.map_or([0.0; 4], |c| {
-                                    super::intrinsics::color_to_rgba(c, true)
-                                }),
+                                shadow_color: shadow_rgba,
                                 opacity,
+                            });
+                        } else if is_decorated || border_color.is_some() {
+                            // Paint the opaque fill on the SolidBox pass so it stays
+                            // *behind* this container's children (they also paint as
+                            // solids, pushed after it — and the decorated pass runs
+                            // after every solid). Then add the border/shadow as a
+                            // decorated overlay whose interior is transparent: it only
+                            // strokes the edge and casts the shadow, so it can never
+                            // occlude the children drawn beneath it. (IMPL-39: fixes
+                            // the parent-card-over-child-widget z-order bug.)
+                            frame.push_instance(base);
+                            frame.push_decorated(byard_core::frame::DecoratedBox {
+                                base: byard_core::BoxInstance {
+                                    color: [0.0; 4],
+                                    ..base
+                                },
+                                border_width,
+                                border_color: border_rgba,
+                                shadow_dx,
+                                shadow_dy,
+                                shadow_blur,
+                                shadow_color: shadow_rgba,
+                                opacity: 1.0,
                             });
                         } else {
                             frame.push_instance(base);
@@ -2879,9 +2905,67 @@ mod tests {
         let mut frame = byard_core::frame::RenderFrame::new();
         interp.render(&tree, &mut frame, 400.0, 300.0);
 
-        assert_eq!(frame.decorated().len(), 1, "border box → DecoratedBox");
-        assert_eq!(frame.instances().len(), 0, "not a plain BoxInstance");
+        // IMPL-39: a bordered container splits into an opaque SolidBox fill
+        // (so it stays behind its children, which also paint as solids) plus a
+        // decorated *overlay* whose interior is transparent and only strokes the
+        // 2px border — it can't occlude the children drawn beneath it.
+        assert_eq!(
+            frame.instances().len(),
+            1,
+            "opaque fill on the SolidBox pass"
+        );
+        assert_eq!(
+            frame.instances()[0].color,
+            [1.0, 1.0, 1.0, 1.0],
+            "the fill carries the bg colour"
+        );
+        assert_eq!(frame.decorated().len(), 1, "border overlay → DecoratedBox");
         assert!((frame.decorated()[0].border_width - 2.0).abs() < f32::EPSILON);
+        assert_eq!(
+            frame.decorated()[0].base.color,
+            [0.0; 4],
+            "the overlay interior is transparent so children stay visible"
+        );
+    }
+
+    #[test]
+    fn bordered_container_paints_fill_before_its_child_widget() {
+        // The regression behind the "widgets invisible" report: an opaque,
+        // bordered card must NOT paint over the solid boxes of the widgets it
+        // contains. After IMPL-39 the card's fill is a SolidBox pushed *before*
+        // the child's, and the only decorated primitive is a transparent-interior
+        // border overlay — so the child's fill is never occluded.
+        let parsed = parse(
+            "View C() {\n Column #[bg: 0x222233, border: 0x445566] {\n Box #[bg: 0xFF0000, width: 20, height: 20]\n }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Two solid fills: the card, then the child — in that paint order, so
+        // the child (drawn second) lands on top of the card, not under it.
+        assert_eq!(frame.instances().len(), 2, "card fill + child fill");
+        assert_ne!(
+            frame.instances()[0].color,
+            [1.0, 0.0, 0.0, 1.0],
+            "the first solid fill is the card, not the child"
+        );
+        assert_eq!(
+            frame.instances()[1].color,
+            [1.0, 0.0, 0.0, 1.0],
+            "the child's red fill paints last (on top)"
+        );
+        // Every decorated primitive in this frame is a transparent-interior
+        // overlay, so nothing opaque is layered above the child.
+        assert!(
+            frame.decorated().iter().all(|d| d.base.color[3] == 0.0),
+            "all decorated overlays have transparent interiors"
+        );
     }
 
     #[test]
