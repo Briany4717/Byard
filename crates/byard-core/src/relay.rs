@@ -114,6 +114,12 @@ const RECYCLE_POOL_SIZE: usize = 2;
 // the build immediately if anyone ever sets this to 0.
 const _: () = assert!(RECYCLE_POOL_SIZE > 0);
 
+/// How long an *idle* logic tick parks before re-checking for input. ~6 ms caps
+/// idle CPU to a fraction of one core (vs a 100% `yield_now` spin) while keeping
+/// the latency of the first input after an idle period imperceptible (well under
+/// one 60 Hz frame). A waiting input is never delayed beyond this bound.
+const IDLE_PARK: std::time::Duration = std::time::Duration::from_millis(6);
+
 /// Owns the atomic frame swap, the frame recycle pool, and the async I/O
 /// runtime described in RFC-0001 §5.
 ///
@@ -384,7 +390,19 @@ impl Relay {
                     // phase, so pass an empty slice for now.
                     runtime.evaluate_tick(&mut frame, &inputs, &[]);
                     relay.publish(frame);
-                    thread::yield_now();
+
+                    // Idle throttle: a UI with no pending input re-publishes an
+                    // identical frame every iteration, so a tight `yield_now`
+                    // spin would peg a core at 100% (heat → thermal throttling →
+                    // sluggish input). When input *is* waiting we loop at full
+                    // speed so bursts drain immediately; only an idle tick parks
+                    // briefly, capping idle CPU while keeping first-input latency
+                    // under one short park. (RFC-0001 leaves pacing to the caller.)
+                    if inputs.is_empty() {
+                        thread::park_timeout(IDLE_PARK);
+                    } else {
+                        thread::yield_now();
+                    }
                 }
             })
             .map_err(|e| ByardError::ThreadSpawn(e.to_string()))

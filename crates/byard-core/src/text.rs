@@ -8,10 +8,20 @@
 //! once (it loads the system fonts) and reused for every measurement.
 
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use std::collections::HashMap;
 
 /// Measures shaped text sizes, reusing one [`FontSystem`].
+///
+/// Shaping a string through `cosmic-text` (`Shaping::Advanced`) is expensive —
+/// several hundred microseconds for a short label. Because layout re-measures
+/// every `Text`/`Button` on **every** render tick (and most strings are
+/// unchanged frame to frame), results are memoised in a `(text, font_size)`
+/// cache so a steady-state tick re-shapes nothing. This is the single biggest
+/// factor in per-tick cost on a continuously-redrawing logic thread.
 pub struct TextMeasurer {
     font_system: FontSystem,
+    /// `(text, font_size.to_bits())` → shaped `(width, height)`.
+    cache: HashMap<(String, u32), (f32, f32)>,
 }
 
 impl Default for TextMeasurer {
@@ -26,6 +36,7 @@ impl TextMeasurer {
     pub fn new() -> Self {
         Self {
             font_system: FontSystem::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -35,6 +46,17 @@ impl TextMeasurer {
     /// height so an empty label keeps its baseline.
     #[must_use]
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        let key = (text.to_string(), font_size.to_bits());
+        if let Some(&hit) = self.cache.get(&key) {
+            return hit;
+        }
+        let measured = self.shape(text, font_size);
+        self.cache.insert(key, measured);
+        measured
+    }
+
+    /// Shapes `text` through `cosmic-text` and returns its `(width, height)`.
+    fn shape(&mut self, text: &str, font_size: f32) -> (f32, f32) {
         let line_height = font_size * 1.2;
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
         // Unbounded so the natural (single-line) width is measured.
@@ -79,6 +101,22 @@ mod tests {
         let (_, h_small) = m.measure("Ag", 12.0);
         let (_, h_big) = m.measure("Ag", 48.0);
         assert!(h_big > h_small);
+    }
+
+    #[test]
+    fn repeated_measures_are_cached() {
+        // Re-measuring an unchanged (text, size) — which layout does on every
+        // render tick — must hit the cache and return an identical result, so a
+        // steady-state tick re-shapes nothing (the per-tick perf fix).
+        let mut m = TextMeasurer::new();
+        let first = m.measure("the counter is 0", 16.0);
+        assert_eq!(m.cache.len(), 1, "the result was memoised");
+        let second = m.measure("the counter is 0", 16.0);
+        assert_eq!(first, second, "cache returns the same measurement");
+        assert_eq!(m.cache.len(), 1, "no second shaping was performed");
+        // A distinct size is a distinct key.
+        let _ = m.measure("the counter is 0", 20.0);
+        assert_eq!(m.cache.len(), 2);
     }
 
     #[test]
