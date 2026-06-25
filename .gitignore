@@ -1,6 +1,7 @@
 /target
 /dist
 Cargo.lock
+/support/
 **/*.rs.bk
 *.pdb
 .env

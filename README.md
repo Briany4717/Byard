@@ -161,8 +161,6 @@ Byard is open to contributions. The best entry points are:
 
 - Read the relevant RFC before touching a subsystem — the design decisions are the
   contract; the code is the implementation.
-- Each milestone in `ROADMAP.md` has an Objective / Spec / Files / Steps / Tests /
-  Gate structure — new milestones follow the same format.
 - `cargo test --workspace` and `cargo clippy --workspace` must stay green.
 
 ## License
