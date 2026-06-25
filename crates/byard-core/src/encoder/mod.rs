@@ -120,7 +120,7 @@ pub struct EncoderSubsystem {
     /// letterforms are sparse), the destination is left **unchanged**.
     /// Combined with `LoadOp::Load` on an incremental frame, that means old
     /// ink can never be erased by simply redrawing new content with
-    /// standard "over" blending (issue #31's visual-verification finding).
+    /// standard "over" blending.
     /// `clear_pipeline` uses `blend: None`, so the fragment shader's output
     /// unconditionally **replaces** the destination regardless of its
     /// alpha, making it possible to genuinely wipe a rect.
@@ -139,7 +139,7 @@ pub struct EncoderSubsystem {
     texture_bind_group_layout: wgpu::BindGroupLayout,
     /// Shared linear sampler for all sampled images.
     image_sampler: wgpu::Sampler,
-    /// Path-keyed cache of decoded image textures (M21, IMPL-32).
+    /// Path-keyed cache of decoded image textures (M21).
     texture_cache: texture_sampler::TextureCache,
     /// Async-decode plumbing (M29): the relay's I/O runtime handle and the
     /// type-erased result sender, installed by the engine via
@@ -171,9 +171,7 @@ pub struct EncoderSubsystem {
     /// real, always-retained surface that `LoadOp::Load` + `set_scissor_rect`
     /// draw into; the swapchain image only ever receives a full, unscissored
     /// copy of this texture's current contents once per frame (see
-    /// `encode_frame`'s final `copy_texture_to_texture` call). See the
-    /// "Scope decision" note in the scissor-clipping PR for the full
-    /// rationale.
+    /// `encode_frame`'s final `copy_texture_to_texture` call).
     persistent_color: wgpu::Texture,
     /// View of [`persistent_color`](Self::persistent_color), cached to avoid
     /// recreating it every frame.
@@ -202,8 +200,8 @@ pub struct EncoderSubsystem {
     /// Number of `BoxInstance`s passed to the previous `encode_frame` call.
     ///
     /// `BoxInstance`s carry no per-instance dirty bit (nothing in the current
-    /// codebase mutates a `BoxInstance` after construction — see the "Scope
-    /// decision" PR note), so a *count* change is the only structural signal
+    /// codebase mutates a `BoxInstance` after construction), so a *count*
+    /// change is the only structural signal
     /// available that the instance list changed shape. A mismatch forces a
     /// full redraw so a future caller that does start mutating the instance
     /// list cannot silently lose a newly added box to the scissor rect.
@@ -543,9 +541,9 @@ impl EncoderSubsystem {
         // text and solid boxes (RFC-0001 §3.3).
 
         // Every `BoxInstance` in the frame is treated as dirty: the lowering
-        // re-emits the whole instance list each tick (IMPL-29) and `BoxInstance`
-        // is a pure GPU `Pod` type with no room for a per-instance dirty bit
-        // (IMPL-41), so the honest, layout-safe representation of "a box may
+        // re-emits the whole instance list each tick and `BoxInstance`
+        // is a pure GPU `Pod` type with no room for a per-instance dirty bit,
+        // so the honest, layout-safe representation of "a box may
         // have changed" is "all of them might have." This is what fixes the M26
         // bug: a box-only mutation (no dirty text) now always produces a
         // non-empty scissor and reaches the screen.
@@ -764,7 +762,7 @@ impl EncoderSubsystem {
     /// the engine for each [`DecodedImage`] drained from the relay's I/O
     /// channel, before encoding the next frame. The GPU upload is fast; the
     /// expensive decode already happened off-thread. Because every primitive is
-    /// re-emitted dirty each tick (IMPL-29), the newly-`Ready` texture repaints
+    /// re-emitted dirty each tick, the newly-`Ready` texture repaints
     /// on the next frame without any extra dirty signal.
     pub fn apply_decoded(&mut self, decoded: DecodedImage) {
         self.texture_cache.apply_decoded(
@@ -997,9 +995,8 @@ fn create_persistent_target(
 /// advance and line-height multiplier. Over-estimating only wastes a little
 /// scissor-rect area (a little extra fragment-write bandwidth);
 /// under-estimating would visibly clip glyphs, which is a real correctness
-/// bug. See the "Scope decision" PR note. A measured-extent version is a
-/// natural Phase 2 follow-up once `TextLine` (or the Atlas) carries real
-/// shaped-glyph bounds.
+/// bug. A measured-extent version is a natural follow-up once `TextLine` (or
+/// the Atlas) carries real shaped-glyph bounds.
 // A `TextLine` will never hold remotely enough characters (2^24 = 16M+) to
 // make this cast lossy in practice; the line's logical-pixel width would
 // exceed any real display by many orders of magnitude well before that.
@@ -1025,16 +1022,14 @@ fn text_line_bounds(line: &TextLine) -> Rect {
 /// move between frames (e.g. a reactive label whose text gets shorter):
 /// without it, the new (smaller) bounds would leave the line's old
 /// footprint entirely outside the computed scissor rect, and that old
-/// content would never be cleared — issue #31's visual-verification
-/// finding.
+/// content would never be cleared.
 ///
 /// Returns `None` when no entry is dirty, the caller's signal to skip the
 /// incremental render pass entirely for this frame. Multiple simultaneously
 /// dirty lines are merged into a single bounding box via repeated
 /// [`Rect::union`] rather than issued as separate scissored sub-passes —
 /// one scissor + draw call instead of N, at the cost of a marginally larger
-/// over-draw region when the dirty lines are far apart on screen. See the
-/// "Scope decision: multi-rect merge policy" PR note for the full rationale.
+/// over-draw region when the dirty lines are far apart on screen.
 fn dirty_text_bounds(texts: &[TextLine], previous: &[Rect]) -> Option<Rect> {
     texts
         .iter()
@@ -1245,8 +1240,7 @@ fn logical_rect_to_physical_scissor(
 /// A full redraw is forced by `sticky` (set on construction and after a
 /// resize — see [`EncoderSubsystem::needs_full_redraw`]) OR by a structural
 /// change in the instance/text counts since the previous frame, since
-/// neither `BoxInstance` nor `TextLine` carries an "added this frame" bit —
-/// see the "Scope decision" PR note.
+/// neither `BoxInstance` nor `TextLine` carries an "added this frame" bit.
 fn needs_full_redraw_this_frame(
     sticky: bool,
     prev_instance_count: usize,
@@ -1435,8 +1429,7 @@ fn draw_clear_quad(
 /// active GPU scissor rect (not this function) is what actually bounds the
 /// pixels touched here, so calling this unconditionally on every
 /// `should_draw` frame is still proportional to the dirty region's
-/// bandwidth, not the full instance list's. See the "Scope decision" PR
-/// note's update.
+/// bandwidth, not the full instance list's.
 fn draw_solid_box_instances(
     render_pass: &mut wgpu::RenderPass<'_>,
     device: &wgpu::Device,
@@ -1966,7 +1959,7 @@ mod tests {
     fn dirty_text_bounds_unions_with_previous_frame_bounds() {
         // A line that shrinks between frames: its NEW bounds alone would
         // leave the old (wider) footprint outside the scissor rect,
-        // exactly the bug behind issue #31's visual-verification finding.
+        // exactly the bug behind the shrinking-line visual-verification finding.
         let shrunk = line(0.0, 0.0, "a", 16.0, true);
         let previous_bounds =
             text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));

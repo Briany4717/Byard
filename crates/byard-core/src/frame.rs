@@ -140,10 +140,9 @@ impl Rect {
     ///
     /// Used by the Encoder (RFC-0001 §3.3) to merge several dirty-region
     /// bounding boxes into the single bounding box passed to
-    /// `wgpu::RenderPass::set_scissor_rect` — see the "Scope decision" note
-    /// on multi-rect merging in the scissor-clipping PR. Degenerate
-    /// (zero-area) rects are handled the same as any other rect: the union
-    /// still expands to cover their `(x, y)` corner.
+    /// `wgpu::RenderPass::set_scissor_rect`. Degenerate (zero-area) rects are
+    /// handled the same as any other rect: the union still expands to cover
+    /// their `(x, y)` corner.
     #[must_use]
     pub fn union(&self, other: &Rect) -> Rect {
         let min_x = self.x.min(other.x);
@@ -224,7 +223,7 @@ pub struct DecoratedBox {
     /// lowering, trusted by the Encoder when computing the incremental scissor
     /// union. A decoration's `base` is a [`BoxInstance`], which is a pure GPU
     /// `Pod` vertex type and therefore cannot itself carry a dirty bit — so the
-    /// flag lives here on the (non-`Pod`) wrapper instead (see IMPL-41).
+    /// flag lives here on the (non-`Pod`) wrapper instead.
     pub dirty: bool,
 }
 

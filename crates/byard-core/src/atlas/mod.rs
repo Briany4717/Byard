@@ -45,7 +45,7 @@
 //!
 //! # Builder API
 //!
-//! [`LayoutAtlasBuilder`] (issue #15) sits on top of `add_leaf` /
+//! [`LayoutAtlasBuilder`] sits on top of `add_leaf` /
 //! `add_container` / `set_root` to let a multi-level tree be expressed as
 //! a single chained expression, instead of one imperative call per node:
 //!

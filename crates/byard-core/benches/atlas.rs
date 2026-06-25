@@ -212,7 +212,7 @@ fn build_flex_tree_computed(mid: u32, per_mid: u32) -> (LayoutAtlas, Vec<TargetI
 
 /// M28: compares `recompute_dirty` on a 200-leaf tree when **1** node is dirty
 /// versus when **all** nodes are dirty. The gap (or lack of one) is what the
-/// IMPL-42 decision gate turns on: `rebuild_grid` does a full tree walk either
+/// decision gate turns on: `rebuild_grid` does a full tree walk either
 /// way, so if the 1-dirty case is already cheap the full walk is not worth
 /// replacing with a riskier partial update.
 fn bench_grid_dirty_scaling(mid: u32, per_mid: u32, iters: u64) {

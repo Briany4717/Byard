@@ -172,7 +172,7 @@ pub struct ParsedFile {
 }
 
 /// Spawns a background OS thread that watches `path` with `notify` and publishes
-/// fresh [`ParsedFile`]s to `channel` on every change (IMPL-23, M25).
+/// fresh [`ParsedFile`]s to `channel` on every change (M25).
 ///
 /// A parse error keeps `views` empty so the caller retains the last-good view.
 /// Returns the watcher handle — drop it to stop watching.

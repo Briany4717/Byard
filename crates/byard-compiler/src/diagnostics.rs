@@ -172,7 +172,7 @@ pub enum CompileError {
     },
     /// A `p`/`m` spacing tuple named a side more than once, combined an axis
     /// shorthand (`horizontal`/`vertical`) with one of its component sides, or
-    /// mixed named and positional fields (RFC-0005 §1 `Len` erratum; IMPL-30).
+    /// mixed named and positional fields (RFC-0005 §1 `Len` erratum).
     ConflictingSpacingField {
         /// Source range of the offending tuple or element.
         span: Span,

@@ -188,7 +188,7 @@ impl EventRouter {
 
     /// Whether `elem` is the currently focused element (for focus-indicator
     /// visuals, M19). Reflects the focus state carried across the per-tick
-    /// handler rebuild (IMPL-27).
+    /// handler rebuild.
     #[must_use]
     pub fn is_focused(&self, elem: u32) -> bool {
         self.focused == Some(elem)

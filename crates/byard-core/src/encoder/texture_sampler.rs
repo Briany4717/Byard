@@ -1,7 +1,7 @@
 //! `TextureSampler` render pipeline (M21, RFC-0001 §3.1).
 //!
 //! Draws a decoded image into a (optionally rounded) quad with a `fit` policy.
-//! Host-side decode uses the `image` crate (IMPL-32): the runner owns decode, the
+//! Host-side decode uses the `image` crate: the runner owns decode, the
 //! interpreter only carries the `Str` path. Decoded textures are cached by path
 //! so a static image is uploaded once.
 
@@ -108,7 +108,7 @@ enum TextureState {
 
 /// Path-keyed cache of decoded textures so a static image uploads once.
 ///
-/// Decode is **asynchronous** (RFC-0001 §5.1, IMPL-43): [`ensure`](Self::ensure)
+/// Decode is **asynchronous** (RFC-0001 §5.1): [`ensure`](Self::ensure)
 /// never touches the filesystem on the calling (render) thread — it inserts a
 /// [`TextureState::Pending`] marker and spawns the blocking `image::open` decode
 /// on the relay's I/O runtime. The decoded pixels return through the type-erased
@@ -165,7 +165,7 @@ impl TextureCache {
         let state = match decoded.result {
             Ok(rgba) => TextureState::Ready(upload_rgba(device, queue, layout, sampler, &rgba)),
             Err(err) => {
-                // IMPL-32: a missing/corrupt image simply does not draw. The
+                // A missing/corrupt image simply does not draw. The
                 // warning fires once per path (the entry is now `Failed`, so
                 // `ensure` never re-spawns it).
                 eprintln!(
@@ -180,7 +180,7 @@ impl TextureCache {
 
     /// Looks up a `Ready` entry. Returns `None` for both `Pending` and
     /// `Failed` — a not-yet-loaded image draws nothing, exactly like a missing
-    /// one (IMPL-32/IMPL-43), so callers need no new pending-state handling.
+    /// one, so callers need no new pending-state handling.
     #[must_use]
     pub fn get(&self, src: &str) -> Option<&TextureEntry> {
         match self.entries.get(src) {
@@ -586,7 +586,7 @@ mod tests {
     /// A texture is `Pending` (drawing nothing) until its decode result is
     /// drained and applied, after which it is `Ready`. Since every primitive is
     /// re-emitted dirty each tick, that `Ready` texture then paints on the next
-    /// frame with no extra dirty signal needed (IMPL-43).
+    /// frame with no extra dirty signal needed.
     #[test]
     fn texture_becomes_ready_after_io_result_drain() {
         let Some((device, queue)) = try_device() else {
@@ -618,7 +618,7 @@ mod tests {
     }
 
     /// A bad path decodes to `Failed` (drawing nothing), never a panic, and
-    /// `get` keeps returning `None` (IMPL-32/IMPL-43).
+    /// `get` keeps returning `None`.
     #[test]
     fn missing_image_resolves_to_failed_not_panic() {
         let Some((device, queue)) = try_device() else {

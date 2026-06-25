@@ -41,7 +41,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
 ///
 /// Parse/lex errors short-circuit; otherwise every `View` is lowered and rendered
 /// into a throwaway [`RenderFrame`] so attribute-contract and `Len`-form
-/// (IMPL-30) checks — which run during lowering and render — are exercised.
+/// validation checks — which run during lowering and render — are exercised.
 #[must_use]
 pub fn check_source(src: &str) -> Vec<CompileError> {
     let parsed = byard_compiler::parser::parse(src);
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn removed_px_attr_is_reported() {
-        // IMPL-30: px/py are no longer accepted attributes.
+        // px/py are no longer accepted attributes.
         let errs = check_source("View Main() { Column #[px: 4] {} }");
         assert!(
             errs.iter().any(|e| matches!(

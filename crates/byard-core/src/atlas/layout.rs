@@ -289,7 +289,7 @@ impl ContainerStyle {
 /// [`LayoutAtlasBuilder::container`] and committed to a real atlas in one
 /// recursive pass via [`LayoutAtlas::build`] or [`LayoutAtlas::build_root`].
 ///
-/// This is the fluent construction API from issue #15 — it sits on top
+/// This is the fluent construction API — it sits on top
 /// of [`LayoutAtlas::add_leaf`] / [`LayoutAtlas::add_container`] /
 /// [`LayoutAtlas::set_root`] and calls them in the exact same depth-first,
 /// children-before-parent order a hand-written imperative sequence would,
@@ -840,7 +840,7 @@ impl LayoutAtlas {
     ///
     /// This is a full `clear()` + root-to-leaf walk on every
     /// `compute`/`recompute_dirty`, regardless of how many nodes were marked
-    /// dirty. That was measured (M28, IMPL-42) on a 200-leaf tree (the high end
+    /// dirty. That was measured (M28) on a 200-leaf tree (the high end
     /// of `EvaluatorTick`'s expected per-tick target count): the whole
     /// `recompute_dirty` — layout + this grid rebuild — costs ~24 µs with one
     /// dirty leaf and ~111 µs with every node dirty, i.e. ≲0.7% of a 60 Hz
@@ -1506,7 +1506,7 @@ mod tests {
         assert_f32_eq(rect.height, 50.0);
     }
 
-    /// Acceptance criterion (issue #23): a `Signal` mutation results in
+    /// Acceptance criterion: a `Signal` mutation results in
     /// only the affected entries being marked dirty in `RenderFrame`.
     ///
     /// Builds a two-leaf tree, subscribes a signal to only one leaf, and
@@ -1657,9 +1657,9 @@ mod tests {
         let _ = atlas.hit_test(50.0, 50.0);
     }
 
-    // --- Cross-atlas AtlasNodeId scoping (issue #18) ---------------------
+    // --- Cross-atlas AtlasNodeId scoping ---------------------
     //
-    // These tests exercise the actual hazard issue #18 closes off: an
+    // These tests exercise the actual hazard this closes off: an
     // `AtlasNodeId` produced by one `LayoutAtlas` must never be silently
     // accepted by a different instance. Every entry point that takes an
     // `AtlasNodeId` from a caller must return `Err(AtlasError::ForeignNode)`
@@ -1752,9 +1752,9 @@ mod tests {
         assert!(byard_err.to_string().contains("AtlasNodeId belongs to"));
     }
 
-    // --- Builder API (issue #15) -----------------------------------------
+    // --- Builder API -----------------------------------------
     //
-    // These tests exercise the acceptance criteria from issue #15: a
+    // These tests exercise the acceptance criteria: a
     // multi-level tree expressed as a single chained expression, identical
     // `AtlasNodeId`s to the equivalent imperative sequence, and that the
     // low-level API (PR #14) is untouched by the addition.

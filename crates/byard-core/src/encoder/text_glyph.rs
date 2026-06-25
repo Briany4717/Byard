@@ -390,7 +390,7 @@ impl TextGlyphPipeline {
 //
 // `needs_reshape` and `assert_dirty_flag_consistency` are extracted as pure,
 // glyphon/wgpu-free functions specifically so the dirty-flag decision logic
-// from issue #23's acceptance criteria ("encoder pipelines never recompute
+// from the acceptance criteria ("encoder pipelines never recompute
 // did-this-change") can be exercised deterministically here, without a real
 // `wgpu::Device` — the same CPU-mirror-of-decision-logic style already used
 // by `encoder::mod`'s `cpu_sd_rounded_box` tests.

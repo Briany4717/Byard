@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn starter_view_compiles_clean() {
-        // RFC-0006 §4 / IMPL-30: the scaffolded view must validate with no errors
+        // RFC-0006 §4: the scaffolded view must validate with no errors
         // and use the new `Len` forms (no `px`/`py`).
         let src = starter_view("demo");
         assert!(

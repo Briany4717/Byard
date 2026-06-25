@@ -165,7 +165,7 @@ fn demo_boxes_are_actually_painted_on_screen() {
     );
 }
 
-/// IMPL-39 regression: a widget that sits *inside* an opaque, bordered card
+/// Regression: a widget that sits *inside* an opaque, bordered card
 /// (here the `Toggle`, whose ON track is painted in the theme accent) must
 /// remain visible on screen. Before the fix the card became an opaque
 /// `DecoratedBox` drawn in the decorated pass — *after* the widget's `SolidBox`

@@ -735,8 +735,8 @@ impl Interpreter {
                                 shadow_blur,
                                 shadow_color: shadow_rgba,
                                 opacity,
-                                // Re-walked and re-emitted every tick (IMPL-29);
-                                // mirror Text's always-dirty lowering (IMPL-41).
+                                // Re-walked and re-emitted every tick;
+                                // mirror Text's always-dirty lowering.
                                 dirty: true,
                             });
                         } else if is_decorated || border_color.is_some() {
@@ -746,8 +746,8 @@ impl Interpreter {
                             // after every solid). Then add the border/shadow as a
                             // decorated overlay whose interior is transparent: it only
                             // strokes the edge and casts the shadow, so it can never
-                            // occlude the children drawn beneath it. (IMPL-39: fixes
-                            // the parent-card-over-child-widget z-order bug.)
+                            // occlude the children drawn beneath it (fixes the
+                            // parent-card-over-child-widget z-order bug).
                             frame.push_instance(base);
                             frame.push_decorated(byard_core::frame::DecoratedBox {
                                 base: byard_core::BoxInstance {
@@ -870,8 +870,8 @@ impl Interpreter {
                         fit,
                         radii,
                         opacity,
-                        // Re-emitted every tick (IMPL-29); mirror Text's
-                        // always-dirty lowering (IMPL-41).
+                        // Re-emitted every tick; mirror Text's
+                        // always-dirty lowering.
                         dirty: true,
                     });
                 }
@@ -1112,7 +1112,7 @@ impl Interpreter {
             });
         }
 
-        // Caret at the end of the entered text while focused (M17/M19, IMPL-33).
+        // Caret at the end of the entered text while focused (M17/M19).
         if is_focused {
             let measured = if is_placeholder {
                 0.0
@@ -1444,7 +1444,7 @@ impl Interpreter {
     }
 
     /// Resolves a `Len`-typed `p`/`m` attribute value into a `Spacing` quad
-    /// (RFC-0005 §1 erratum; IMPL-30), emitting span-anchored `CompileError`s
+    /// (RFC-0005 §1 erratum), emitting span-anchored `CompileError`s
     /// for the four error classes:
     ///
     /// - an unknown side name → [`CompileError::UnknownAttribute`] with a hint;
@@ -1590,7 +1590,7 @@ impl Interpreter {
     /// `BoxInstance::radii`/`TextureSampler::radii` expect (`frame.rs`).
     ///
     /// RFC-0005 §"Decoration" documents `radius: Len` as "scalar = all, quad =
-    /// per-corner" (IMPL-44). Accepted forms: a scalar (`radius: 16`, all four
+    /// per-corner". Accepted forms: a scalar (`radius: 16`, all four
     /// corners) and the positional CSS-order quad (`radius: (4, 8, 12, 16)`).
     /// Unlike `p`/`m`'s generic `Len` contract, there is no pair shorthand and
     /// no named-field form for `radius` — the RFC documents only scalar/quad,
@@ -2006,7 +2006,7 @@ impl Interpreter {
 
 /// Renders a value for string interpolation (`"Count: {count}"`).
 /// Coerces a spacing side/scalar value to `f32`; only numeric values are valid
-/// `Len`s (IMPL-30 — a non-numeric side is a `TypeMismatch`).
+/// `Len`s (a non-numeric side is a `TypeMismatch`).
 fn spacing_value(v: &Value) -> Option<f32> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     match v {
@@ -2018,7 +2018,7 @@ fn spacing_value(v: &Value) -> Option<f32> {
 
 /// Assigns one resolved side of a named spacing tuple, recording a
 /// [`CompileError::ConflictingSpacingField`] if the side was already set (either
-/// directly or via an axis shorthand) — IMPL-30.
+/// directly or via an axis shorthand).
 fn assign_side(
     slot: &mut Option<f32>,
     v: f32,
@@ -2223,7 +2223,7 @@ mod tests {
                 "View C() { Column #[p: (2, 3)] {} }",
                 Spacing::symmetric(2.0, 3.0),
             ),
-            // 4-value positional: CSS order top, right, bottom, left (IMPL-30)
+            // 4-value positional: CSS order top, right, bottom, left
             (
                 "View C() { Column #[p: (1, 2, 3, 4)] {} }",
                 Spacing {
@@ -2233,7 +2233,7 @@ mod tests {
                     left: 4.0,
                 },
             ),
-            // Named top only — unspecified sides default to 0 (IMPL-30)
+            // Named top only — unspecified sides default to 0
             (
                 "View C() { Column #[p: (top: 10)] {} }",
                 Spacing {
@@ -2263,7 +2263,7 @@ mod tests {
                     left: 5.0,
                 },
             ),
-            // Verbose axis shorthands (the only accepted shorthands; IMPL-30)
+            // Verbose axis shorthands (the only accepted shorthands)
             (
                 "View C() { Column #[p: (horizontal: 10, vertical: 5)] {} }",
                 Spacing {
@@ -2348,7 +2348,7 @@ mod tests {
         );
     }
 
-    // ── M25 / IMPL-30: `Len` padding/margin forms ────────────────────────
+    // ── M25: `Len` padding/margin forms ──────────────────────────────────
 
     /// Lowers a single-`Box` view and returns the resolved padding plus any
     /// errors raised during style resolution.
@@ -2513,7 +2513,7 @@ mod tests {
         );
     }
 
-    // ── IMPL-44: per-corner `radius` ─────────────────────────────────────
+    // ── Per-corner `radius` ──────────────────────────────────────────────
 
     /// Lowers a single-element view and returns `resolve_radii`'s result for
     /// its `radius` attribute alongside any errors raised.
@@ -3197,7 +3197,7 @@ mod tests {
 
     #[test]
     fn box_with_border_becomes_decorated_box() {
-        // `border` is the catalog Color attr; it yields a 2px ring (IMPL-32).
+        // `border` is the catalog Color attr; it yields a 2px ring.
         let parsed = parse("View C() {\n Box #[bg: 0xffffff, border: 0x000000]\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let view = &parsed.views[0];
@@ -3208,7 +3208,7 @@ mod tests {
         let mut frame = byard_core::frame::RenderFrame::new();
         interp.render(&tree, &mut frame, 400.0, 300.0);
 
-        // IMPL-39: a bordered container splits into an opaque SolidBox fill
+        // A bordered container splits into an opaque SolidBox fill
         // (so it stays behind its children, which also paint as solids) plus a
         // decorated *overlay* whose interior is transparent and only strokes the
         // 2px border — it can't occlude the children drawn beneath it.
@@ -3235,7 +3235,7 @@ mod tests {
     fn bordered_container_paints_fill_before_its_child_widget() {
         // The regression behind the "widgets invisible" report: an opaque,
         // bordered card must NOT paint over the solid boxes of the widgets it
-        // contains. After IMPL-39 the card's fill is a SolidBox pushed *before*
+        // contains. The card's fill is a SolidBox pushed *before*
         // the child's, and the only decorated primitive is a transparent-interior
         // border overlay — so the child's fill is never occluded.
         let parsed = parse(
