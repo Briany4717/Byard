@@ -7,11 +7,11 @@
 
 View Main() {
     // ── Reactive state (Int / Bool / Float / Str) ───────────────────────────
-    var count = 0
-    var liked = true
-    var volume = 0.5
-    var name = ""
-    var note = ""
+    var count: Int = 0
+    var liked: Bool = true
+    var volume: Float = 0.5
+    var name: String = ""
+    var note: String = ""
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
@@ -32,7 +32,7 @@ View Main() {
         Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
             Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
             Row #[gap: 12, align: center] {
-                Button("-") #[bg: 0x4A4A66, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
+                Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
                 Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
                 Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
                 Spacer
