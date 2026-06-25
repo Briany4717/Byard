@@ -837,6 +837,18 @@ impl LayoutAtlas {
     }
 
     /// Rebuilds the hit-testing spatial grid from the current layout.
+    ///
+    /// This is a full `clear()` + root-to-leaf walk on every
+    /// `compute`/`recompute_dirty`, regardless of how many nodes were marked
+    /// dirty. That was measured (M28, IMPL-42) on a 200-leaf tree (the high end
+    /// of `EvaluatorTick`'s expected per-tick target count): the whole
+    /// `recompute_dirty` — layout + this grid rebuild — costs ~24 µs with one
+    /// dirty leaf and ~111 µs with every node dirty, i.e. ≲0.7% of a 60 Hz
+    /// frame even in the worst case. A partial grid update would have to track
+    /// nodes whose rect shifted only as a *side effect* of a sibling's flex
+    /// reflow, risking dangling (stale-but-queryable) hit rects — a correctness
+    /// hazard strictly worse than a redundant walk this cheap. The full walk is
+    /// therefore kept deliberately; see the `atlas` bench for the numbers.
     fn rebuild_grid(&mut self) {
         self.grid.clear();
         let Some(root) = self.root else {
