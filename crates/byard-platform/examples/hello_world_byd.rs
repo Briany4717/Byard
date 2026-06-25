@@ -1,0 +1,231 @@
+//! Renders `hello_world.byd` in a real winit/wgpu window.
+//!
+//! The byld `Interpreter` runs on the logic thread (via `start_logic_from_view`)
+//! and publishes a `RenderFrame` each tick. It forwards cursor coordinates and
+//! mouse input events directly to the interpreter, which dispatches them to
+//! layout-aware elements in the layout tree.
+//!
+//! Run with:
+//! ```sh
+//! cargo run --example hello_world_byd -p byard-platform
+//! ```
+
+use byard_compiler::interp::eval::{Interpreter, RenderNode};
+use byard_compiler::parser::parse;
+use byard_core::frame::{RenderFrame, TargetId};
+use byard_core::{
+    ByardError, Engine, LogicRuntime, PlatformHost, PointerButton, PointerState, WindowSize,
+};
+use byard_platform::WinitHost;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SRC: &str = include_str!("../../byard-compiler/examples/hello_world.byd");
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() * 1000 + u64::from(d.subsec_millis()))
+}
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+fn main() {
+    // Sized to fit the demo's 540-wide × ~700-tall content with margin, so no
+    // card (notably the bottom decoration row) clips off the window.
+    let host = WinitHost::new("Byard — hello_world.byd", 600, 940);
+    host.run(App::default()).expect("event loop error");
+}
+
+struct ByldRuntime {
+    interp: Interpreter,
+    tree: Vec<RenderNode>,
+    width_bits: Arc<AtomicU32>,
+    height_bits: Arc<AtomicU32>,
+    /// The `count` signal, so the e2e debug trace can show it react.
+    count_sig: Option<byard_compiler::interp::env::SignalId>,
+    debug: bool,
+}
+
+impl LogicRuntime for ByldRuntime {
+    fn evaluate_tick(
+        &mut self,
+        frame: &mut RenderFrame,
+        input_events: &[byard_core::platform::InputEvent],
+        _dirty: &[TargetId],
+    ) {
+        // ── e2e debug trace (run with BYARD_DEBUG=1) ──────────────────────
+        // Confirms link by link that winit events reach the interpreter and
+        // that hit-testing fires the button: every input event is logged with
+        // its logical position, and `count` is printed whenever it changes.
+        if self.debug {
+            for ev in input_events {
+                eprintln!("[input] {:?} @ ({:.1}, {:.1})", ev.kind, ev.pos.0, ev.pos.1);
+            }
+        }
+        let before = self.count_sig.map(|s| self.interp.peek(s));
+
+        self.interp.dispatch_events(input_events);
+        self.interp.tick();
+
+        if self.debug {
+            if let (Some(sig), Some(b)) = (self.count_sig, before) {
+                let now = self.interp.peek(sig);
+                if now != b {
+                    eprintln!("[react] count: {b:?} -> {now:?}");
+                }
+            }
+        }
+
+        let w = f32::from_bits(self.width_bits.load(Ordering::Relaxed));
+        let h = f32::from_bits(self.height_bits.load(Ordering::Relaxed));
+        self.interp.render(&self.tree, frame, w, h);
+    }
+}
+
+#[derive(Default)]
+struct App {
+    engine: Option<Engine>,
+    width_bits: Option<Arc<AtomicU32>>,
+    height_bits: Option<Arc<AtomicU32>>,
+}
+
+impl PlatformHost for App {
+    fn on_resume(
+        &mut self,
+        instance: &wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        size: WindowSize,
+        waker: byard_core::relay::FrameWaker,
+    ) -> Result<(), ByardError> {
+        let parsed = parse(SRC);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let view = parsed.views[0].clone();
+
+        let mut engine = pollster::block_on(Engine::init(
+            instance,
+            surface,
+            size.width,
+            size.height,
+            size.scale_factor,
+        ))?;
+        // Wake the (Wait-mode) event loop when the logic thread publishes a
+        // frame produced by input, so clicks/keys show up immediately.
+        engine.set_frame_waker(waker);
+
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let w = size.width as f32 / size.scale_factor as f32;
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let h = size.height as f32 / size.scale_factor as f32;
+        let width_bits = Arc::new(AtomicU32::new(w.to_bits()));
+        let height_bits = Arc::new(AtomicU32::new(h.to_bits()));
+
+        let w_clone = Arc::clone(&width_bits);
+        let h_clone = Arc::clone(&height_bits);
+
+        let debug = std::env::var_os("BYARD_DEBUG").is_some();
+        engine.start_logic_from_view(move |_arena| {
+            let mut interp = Interpreter::new();
+            let tree = interp.lower_view(&view, &[]);
+            interp.tick();
+            let count_sig = interp.var_signal(&byard_compiler::symbol::Symbol::intern("count"));
+            Box::new(ByldRuntime {
+                interp,
+                tree,
+                width_bits: w_clone,
+                height_bits: h_clone,
+                count_sig,
+                debug,
+            })
+        })?;
+
+        self.engine = Some(engine);
+        self.width_bits = Some(width_bits);
+        self.height_bits = Some(height_bits);
+        Ok(())
+    }
+
+    fn on_resize(&mut self, size: WindowSize) {
+        if let Some(e) = self.engine.as_mut() {
+            e.on_resize(size.width, size.height, size.scale_factor);
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let w = size.width as f32 / size.scale_factor as f32;
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let h = size.height as f32 / size.scale_factor as f32;
+            if let Some(w_bits) = &self.width_bits {
+                w_bits.store(w.to_bits(), Ordering::Relaxed);
+            }
+            if let Some(h_bits) = &self.height_bits {
+                h_bits.store(h.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn on_redraw(&mut self) -> Result<(), ByardError> {
+        if let Some(e) = self.engine.as_mut() {
+            e.render_latest()?;
+        }
+        Ok(())
+    }
+
+    fn on_pointer_input(&mut self, _button: PointerButton, state: PointerState, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            let kind = match state {
+                PointerState::Pressed => byard_core::platform::EventKind::PointerDown,
+                PointerState::Released => byard_core::platform::EventKind::PointerUp,
+            };
+            engine.push_input(byard_core::platform::InputEvent {
+                kind,
+                pos: (x, y),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_cursor_moved(&mut self, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerMove,
+                pos: (x, y),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_key(&mut self, key: &str, pressed: bool) {
+        if let Some(engine) = &self.engine {
+            let kind = if pressed {
+                byard_core::platform::EventKind::KeyDown
+            } else {
+                byard_core::platform::EventKind::KeyUp
+            };
+            engine.push_input(byard_core::platform::InputEvent {
+                kind,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(key.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_text(&mut self, text: &str) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::TextInput,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(text.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
+}

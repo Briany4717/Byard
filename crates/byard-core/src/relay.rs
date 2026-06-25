@@ -88,6 +88,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::ByardError;
+use crate::InputEvent;
+use crate::LogicRuntime;
+use crate::evaluator::ViewArena;
 use crate::frame::RenderFrame;
 
 /// A type-erased result delivered from the async I/O pool back to the
@@ -111,6 +114,12 @@ const RECYCLE_POOL_SIZE: usize = 2;
 // the build immediately if anyone ever sets this to 0.
 const _: () = assert!(RECYCLE_POOL_SIZE > 0);
 
+/// How long an *idle* logic tick parks before re-checking for input. ~6 ms caps
+/// idle CPU to a fraction of one core (vs a 100% `yield_now` spin) while keeping
+/// the latency of the first input after an idle period imperceptible (well under
+/// one 60 Hz frame). A waiting input is never delayed beyond this bound.
+const IDLE_PARK: std::time::Duration = std::time::Duration::from_millis(6);
+
 /// Owns the atomic frame swap, the frame recycle pool, and the async I/O
 /// runtime described in RFC-0001 §5.
 ///
@@ -133,7 +142,23 @@ pub struct Relay {
     // it once per tick), so it does not reintroduce blocking in any
     // meaningful sense.
     io_result_rx: Mutex<UnboundedReceiver<IoResult>>,
+    input_tx: crossbeam_channel::Sender<InputEvent>,
+    input_rx: crossbeam_channel::Receiver<InputEvent>,
+    // Invoked by the logic thread after it publishes a frame that changed in
+    // response to input, so a `Wait`-mode (event-driven) render loop knows to
+    // wake and present it. `None` until a host installs one via
+    // [`Relay::set_frame_waker`]; a continuously-redrawing (`Poll`) host can
+    // leave it unset. Set rarely (once at startup), read once per published
+    // frame — the mutex is never contended.
+    frame_waker: Mutex<Option<FrameWaker>>,
 }
+
+/// A host-installed callback the logic thread fires after publishing a changed
+/// frame (see [`Relay::set_frame_waker`]). The platform layer points it at its
+/// event loop's wake primitive (e.g. a winit `EventLoopProxy`) so an
+/// event-driven render thread redraws exactly when there is something new to
+/// show — no busy polling, no stale frame after an input.
+pub type FrameWaker = Arc<dyn Fn() + Send + Sync>;
 
 impl Relay {
     /// Creates a new `Relay` with an empty frame slot, a seeded recycle
@@ -164,6 +189,7 @@ impl Relay {
             .map_err(|e| ByardError::RuntimeCreation(e.to_string()))?;
 
         let (io_result_tx, io_result_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
 
         Ok(Self {
             latest: ArcSwapOption::from(None),
@@ -173,7 +199,38 @@ impl Relay {
             io_runtime,
             io_result_tx,
             io_result_rx: Mutex::new(io_result_rx),
+            input_tx,
+            input_rx,
+            frame_waker: Mutex::new(None),
         })
+    }
+
+    /// Pushes an input event into the logic queue.
+    pub fn push_input(&self, event: InputEvent) {
+        let _ = self.input_tx.send(event);
+    }
+
+    /// Installs the callback fired after the logic thread publishes a frame
+    /// that changed in response to input. See [`FrameWaker`].
+    pub fn set_frame_waker(&self, waker: FrameWaker) {
+        *self
+            .frame_waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(waker);
+    }
+
+    /// Fires the installed [`FrameWaker`], if any. The `Arc` is cloned out of
+    /// the lock first so the (host-supplied) callback never runs while the
+    /// mutex is held.
+    fn wake_renderer(&self) {
+        let waker = self
+            .frame_waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     /// Returns a frame ready to be populated, preferring a recycled buffer
@@ -322,6 +379,74 @@ impl Relay {
                     tick(&mut frame);
                     relay.publish(frame);
                     thread::yield_now();
+                }
+            })
+            .map_err(|e| ByardError::ThreadSpawn(e.to_string()))
+    }
+
+    /// Spawns the logic thread from a `build` factory that constructs a
+    /// [`LogicRuntime`] **inside** the thread, then drives it
+    /// `acquire_recycled → evaluate_tick → publish` until shutdown
+    /// (RFC-0002 §"Integration with Engine", RFC-0003 §8).
+    ///
+    /// This is the generalization of [`Relay::spawn_logic_thread`] for a
+    /// stateful interpreter: the running runtime holds `!Send` data
+    /// (`Signal`s, a `ViewArena`, a logic-thread-local reactive scope), so it
+    /// can never cross a thread boundary. Only the **factory** is bounded
+    /// `Send + 'static` (INV-6) — it closes over plain owned data (a
+    /// `CompiledView`) and is moved into the thread, where it builds the arena
+    /// and the borrowing runtime in place. The `for<'a>` HRTB ties the
+    /// runtime's borrow to the thread-local arena's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByardError::ThreadSpawn`] if the OS refuses to create the
+    /// thread.
+    pub fn spawn_logic_from_view<F>(
+        relay: &Arc<Relay>,
+        build: F,
+    ) -> Result<JoinHandle<()>, ByardError>
+    where
+        F: for<'a> FnOnce(&'a ViewArena) -> Box<dyn LogicRuntime + 'a> + Send + 'static,
+    {
+        let relay = Arc::clone(relay);
+        thread::Builder::new()
+            .name("byard-logic-thread".to_string())
+            .spawn(move || {
+                // The arena and the runtime that borrows it both live for the
+                // thread body only; neither is ever observed off this thread.
+                let arena = ViewArena::new();
+                let mut runtime = build(&arena);
+                while !relay.is_shutdown() {
+                    let mut frame = relay.acquire_recycled();
+                    let mut inputs = Vec::new();
+                    while let Ok(ev) = relay.input_rx.try_recv() {
+                        inputs.push(ev);
+                    }
+                    // The reactive interpreter computes its own dirty set; the
+                    // engine-level dirty-target plumbing is wired in a later
+                    // phase, so pass an empty slice for now.
+                    let had_input = !inputs.is_empty();
+                    runtime.evaluate_tick(&mut frame, &inputs, &[]);
+                    relay.publish(frame);
+
+                    // Idle throttle: a UI with no pending input re-publishes an
+                    // identical frame every iteration, so a tight `yield_now`
+                    // spin would peg a core at 100% (heat → thermal throttling →
+                    // sluggish input). When input *is* waiting we loop at full
+                    // speed so bursts drain immediately; only an idle tick parks
+                    // briefly, capping idle CPU while keeping first-input latency
+                    // under one short park. (RFC-0001 leaves pacing to the caller.)
+                    if had_input {
+                        // The frame just published reflects this input — wake an
+                        // event-driven (`Wait`-mode) render thread so it presents
+                        // the update now, rather than showing the pre-input frame
+                        // until the next unrelated OS event.
+                        relay.wake_renderer();
+                        thread::yield_now();
+                    } else {
+                        thread::park_timeout(IDLE_PARK);
+                    }
                 }
             })
             .map_err(|e| ByardError::ThreadSpawn(e.to_string()))
@@ -614,6 +739,37 @@ mod tests {
     }
 
     #[test]
+    fn real_image_decode_on_the_io_pool_is_received_after_it_completes() {
+        // The M29 shape end-to-end at the relay level: a deliberately slow
+        // (sleep + real decode) task on the I/O pool reports its result back
+        // through the type-erased channel, exactly as `TextureCache::ensure`
+        // does — proving a blocking `image` decode never touches the caller.
+        use std::io::Cursor;
+
+        let relay = Relay::new().unwrap();
+        let tx = relay.io_result_sender();
+
+        // A tiny PNG, encoded in-memory so the test needs no fixture file.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let task = relay.io_handle().spawn(async move {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+            let dims = (decoded.width(), decoded.height());
+            tx.send(Box::new(dims)).unwrap();
+        });
+        relay.io_handle().block_on(task).unwrap();
+
+        let result = relay
+            .try_recv_io_result()
+            .expect("decode task should have sent its result");
+        assert_eq!(*result.downcast::<(u32, u32)>().unwrap(), (4, 4));
+    }
+
+    #[test]
     fn dropping_relay_with_unconsumed_io_results_does_not_panic() {
         let relay = Relay::new().unwrap();
         let tx = relay.io_result_sender();
@@ -807,5 +963,107 @@ mod tests {
 
         assert!(a.current().is_some());
         assert!(b.current().is_none());
+    }
+
+    // ── spawn_logic_from_view: the !Send-runtime / Send-factory contract ──
+
+    /// A minimal `!Send` `LogicRuntime`: it holds a [`Signal`] (which is `!Send`
+    /// by construction, RFC-0001 §5.1), proving a stateful interpreter can run
+    /// on the logic thread without ever crossing a thread boundary.
+    struct CounterRuntime<'a> {
+        signal: crate::evaluator::Signal<'a, i64>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl LogicRuntime for CounterRuntime<'_> {
+        fn evaluate_tick(
+            &mut self,
+            frame: &mut RenderFrame,
+            _input_events: &[InputEvent],
+            _dirty: &[crate::frame::TargetId],
+        ) {
+            self.signal.write(|v| *v += 1);
+            #[allow(clippy::cast_sign_loss)]
+            frame.set_version(self.signal.read(|v| *v as u64));
+            self.hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn spawn_logic_from_view_builds_a_non_send_runtime_and_ticks() {
+        let relay = Arc::new(Relay::new().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_factory = Arc::clone(&hits);
+
+        // The factory is `Send` (it captures only an `Arc<AtomicUsize>`); the
+        // runtime it builds borrows the thread-local arena and is `!Send`.
+        let handle = Relay::spawn_logic_from_view(&relay, move |arena| {
+            Box::new(CounterRuntime {
+                signal: crate::evaluator::Signal::new_in(arena, 0_i64),
+                hits: hits_factory,
+            })
+        })
+        .expect("thread spawn should succeed in tests");
+
+        // Wait until at least one tick has run.
+        let start = Instant::now();
+        while hits.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        relay.request_shutdown();
+        handle.join().expect("logic thread must not panic");
+
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "the !Send runtime must have ticked at least once"
+        );
+        assert!(
+            relay.current().is_some(),
+            "ticking must have published at least one frame"
+        );
+    }
+
+    #[test]
+    fn frame_waker_fires_after_an_input_bearing_tick() {
+        // The wake-on-publish contract (Wait-mode redraw): after the logic
+        // thread processes input and publishes, it must fire the installed
+        // waker so an event-driven render loop knows to present the update.
+        let relay = Arc::new(Relay::new().unwrap());
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = Arc::clone(&woke);
+        relay.set_frame_waker(Arc::new(move || {
+            woke_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_factory = Arc::clone(&hits);
+        let handle = Relay::spawn_logic_from_view(&relay, move |arena| {
+            Box::new(CounterRuntime {
+                signal: crate::evaluator::Signal::new_in(arena, 0_i64),
+                hits: hits_factory,
+            })
+        })
+        .expect("thread spawn should succeed in tests");
+
+        // Feed an input event; the next (input-bearing) tick must wake.
+        relay.push_input(InputEvent {
+            kind: crate::platform::EventKind::PointerDown,
+            pos: (1.0, 1.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        });
+
+        let start = Instant::now();
+        while woke.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        relay.request_shutdown();
+        handle.join().expect("logic thread must not panic");
+
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "an input-bearing tick must fire the frame waker"
+        );
     }
 }

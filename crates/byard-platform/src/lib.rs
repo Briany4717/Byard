@@ -12,12 +12,21 @@
 
 use std::sync::Arc;
 
+use byard_core::relay::FrameWaker;
 use byard_core::{ByardError, PlatformHost, PointerButton, PointerState, WindowSize};
+use std::sync::Mutex;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// User event posted to the winit loop by the logic thread's [`FrameWaker`]
+/// when it publishes a frame that changed in response to input. It carries no
+/// data — its only job is to wake a `Wait`-mode loop so it redraws the update.
+#[derive(Debug, Clone, Copy)]
+struct FramePublished;
 
 /// A `winit`-backed [`PlatformHost`] driver.
 ///
@@ -28,6 +37,11 @@ pub struct WinitHost {
     title: String,
     width: u32,
     height: u32,
+    /// When `true`, uses `ControlFlow::Poll` so the event loop spins
+    /// continuously and new `RenderFrame`s are presented without waiting
+    /// for a user input event. Intended for `byard dev` where hot-reload
+    /// must appear immediately after a file save.
+    poll: bool,
 }
 
 impl WinitHost {
@@ -38,7 +52,19 @@ impl WinitHost {
             title: title.into(),
             width,
             height,
+            poll: false,
         }
+    }
+
+    /// Switches the event loop to `ControlFlow::Poll` — redraws are requested
+    /// on every iteration instead of waiting for the next OS event.
+    ///
+    /// Use this for dev tools (e.g. `byard dev`) where file-change frames must
+    /// appear without requiring a mouse event to unblock the event loop.
+    #[must_use]
+    pub fn with_poll(mut self) -> Self {
+        self.poll = true;
+        self
     }
 
     /// Runs the `winit` event loop until the window closes, dispatching
@@ -58,9 +84,30 @@ impl WinitHost {
     /// `ApplicationHandler` callbacks are themselves infallible, so such
     /// errors are captured internally and surfaced here once the loop exits.
     pub fn run<H: PlatformHost>(self, host: H) -> Result<(), ByardError> {
-        let event_loop = EventLoop::new().map_err(|e| ByardError::Platform(e.to_string()))?;
-        // Wait: sleep until the OS sends an event; no busy-loop for a static scene.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // A user-event loop so the logic thread can wake it via a proxy when it
+        // publishes a changed frame (see `FramePublished` / the frame waker).
+        let event_loop = EventLoop::<FramePublished>::with_user_event()
+            .build()
+            .map_err(|e| ByardError::Platform(e.to_string()))?;
+        // Poll mode for live-reload dev tools; Wait mode for shipped applications
+        // (waits for OS events, no busy-loop — saves battery on static scenes).
+        if self.poll {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+
+        // The waker handed to the host's `Engine`: each call posts a
+        // `FramePublished` to this loop, which redraws on receipt. The proxy is
+        // wrapped in a `Mutex` so the closure is `Sync` regardless of whether
+        // `EventLoopProxy` is, satisfying the `FrameWaker` bound; the lock is
+        // only ever taken by the single logic thread, so it never contends.
+        let proxy = Mutex::new(event_loop.create_proxy());
+        let waker: FrameWaker = std::sync::Arc::new(move || {
+            if let Ok(proxy) = proxy.lock() {
+                let _ = proxy.send_event(FramePublished);
+            }
+        });
 
         let mut app = WinitApp {
             host,
@@ -69,6 +116,9 @@ impl WinitHost {
             width: self.width,
             height: self.height,
             fatal: None,
+            cursor_pos: (0.0, 0.0),
+            poll: self.poll,
+            waker,
         };
 
         event_loop
@@ -98,6 +148,14 @@ struct WinitApp<H: PlatformHost> {
     /// `WinitHost::run` checks this after the event loop exits and surfaces
     /// it to its own caller.
     fatal: Option<ByardError>,
+    cursor_pos: (f32, f32),
+    /// Mirror of [`WinitHost::poll`]: when `true`, `about_to_wait` requests
+    /// a redraw on every event-loop iteration so hot-reload frames appear
+    /// immediately without waiting for the next user input event.
+    poll: bool,
+    /// Frame waker installed on the host's `Engine` in `resumed`; fired by the
+    /// logic thread to wake this loop when a changed frame is ready.
+    waker: FrameWaker,
 }
 
 impl<H: PlatformHost> WinitApp<H> {
@@ -109,7 +167,7 @@ impl<H: PlatformHost> WinitApp<H> {
     }
 }
 
-impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
+impl<H: PlatformHost> ApplicationHandler<FramePublished> for WinitApp<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Already initialised — e.g. resumed again after a mobile suspend.
         if self.window.is_some() {
@@ -145,7 +203,10 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
 
         let size = to_window_size(window.inner_size(), window.scale_factor());
 
-        if let Err(e) = self.host.on_resume(&instance, surface, size) {
+        if let Err(e) = self
+            .host
+            .on_resume(&instance, surface, size, self.waker.clone())
+        {
             self.fail(event_loop, e);
             return;
         }
@@ -193,13 +254,65 @@ impl<H: PlatformHost> ApplicationHandler for WinitApp<H> {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale_factor = window.scale_factor();
+                let logical = position.to_logical::<f64>(scale_factor);
+                #[allow(clippy::cast_possible_truncation)]
+                let x = logical.x as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let y = logical.y as f32;
+                self.cursor_pos = (x, y);
+                self.host.on_cursor_moved(x, y);
+                window.request_redraw();
+            }
+
             WindowEvent::MouseInput { state, button, .. } => {
-                self.host
-                    .on_pointer_input(to_pointer_button(button), to_pointer_state(state));
+                let (x, y) = self.cursor_pos;
+                self.host.on_pointer_input(
+                    to_pointer_button(button),
+                    to_pointer_state(state),
+                    x,
+                    y,
+                );
+                window.request_redraw();
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                let key_str = key_to_str(&event.logical_key);
+                if !key_str.is_empty() {
+                    self.host.on_key(&key_str, pressed);
+                }
+                // Fire text input only for printable characters on press
+                if pressed {
+                    if let Key::Character(s) = &event.logical_key {
+                        self.host.on_text(s.as_str());
+                    }
+                }
                 window.request_redraw();
             }
 
             _ => {}
+        }
+    }
+
+    /// The logic thread published a frame that changed in response to input.
+    /// Request a redraw so a `Wait`-mode loop presents it immediately instead
+    /// of showing the pre-input frame until the next unrelated OS event.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// In poll mode, request a redraw after every event-loop iteration so
+    /// the logic thread's latest `RenderFrame` is presented without waiting
+    /// for the next user input event (needed for hot-reload in `byard dev`).
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.poll {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 }
@@ -239,6 +352,30 @@ fn to_pointer_state(state: ElementState) -> PointerState {
     match state {
         ElementState::Pressed => PointerState::Pressed,
         ElementState::Released => PointerState::Released,
+    }
+}
+
+/// Converts a `winit` logical key to a string key name.
+///
+/// Returns an empty string for keys we don't model (so the caller can skip).
+fn key_to_str(key: &Key) -> String {
+    match key {
+        Key::Character(s) => s.to_string(),
+        Key::Named(named) => match named {
+            NamedKey::Backspace => "Backspace".to_string(),
+            NamedKey::Delete => "Delete".to_string(),
+            NamedKey::Enter => "Enter".to_string(),
+            NamedKey::Tab => "Tab".to_string(),
+            NamedKey::Escape => "Escape".to_string(),
+            NamedKey::ArrowLeft => "ArrowLeft".to_string(),
+            NamedKey::ArrowRight => "ArrowRight".to_string(),
+            NamedKey::ArrowUp => "ArrowUp".to_string(),
+            NamedKey::ArrowDown => "ArrowDown".to_string(),
+            NamedKey::Home => "Home".to_string(),
+            NamedKey::End => "End".to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
     }
 }
 

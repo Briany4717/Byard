@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
-use taffy::{AvailableSpace, Dimension, NodeId, Size, Style, TaffyError, TaffyTree};
+use taffy::{
+    AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
+    LengthPercentageAuto, NodeId, Rect as TaffyRect, Size, Style, TaffyError, TaffyTree,
+};
 
 use super::spatial::SpatialGrid;
 
@@ -61,26 +64,89 @@ impl LeafSize {
     }
 }
 
-/// Style for a container node.
+/// Granular spacing for padding or margin (top, right, bottom, left).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Spacing {
+    /// Top spacing.
+    pub top: f32,
+    /// Right spacing.
+    pub right: f32,
+    /// Bottom spacing.
+    pub bottom: f32,
+    /// Left spacing.
+    pub left: f32,
+}
+
+impl Spacing {
+    /// Creates a Spacing with all sides set to the same value.
+    #[must_use]
+    pub const fn all(val: f32) -> Self {
+        Self {
+            top: val,
+            right: val,
+            bottom: val,
+            left: val,
+        }
+    }
+
+    /// Creates a Spacing with specific vertical and horizontal values.
+    #[must_use]
+    pub const fn symmetric(vertical: f32, horizontal: f32) -> Self {
+        Self {
+            top: vertical,
+            right: horizontal,
+            bottom: vertical,
+            left: horizontal,
+        }
+    }
+}
+
+/// Main-axis direction of a flex container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlexDir {
+    /// Children flow left-to-right.
+    #[default]
+    Row,
+    /// Children flow top-to-bottom.
+    Column,
+}
+
+/// Cross-axis alignment of a flex container's children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    /// Pack against the cross-axis start.
+    Start,
+    /// Center on the cross axis.
+    Center,
+    /// Pack against the cross-axis end.
+    End,
+    /// Stretch to fill the cross axis (the default).
+    #[default]
+    Stretch,
+}
+
+/// Main-axis distribution of a flex container's children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Justify {
+    /// Pack against the main-axis start (the default).
+    #[default]
+    Start,
+    /// Center on the main axis.
+    Center,
+    /// Pack against the main-axis end.
+    End,
+    /// Even space between children.
+    Between,
+    /// Even space around children.
+    Around,
+    /// Even space including the ends.
+    Evenly,
+}
+
+/// Style for a container node, mapped onto a Taffy flex `Style`.
 ///
-/// # Layout defaults (Taffy 0.10)
-///
-/// When constructed via `Default::default()` or with only `width`/`height`
-/// set, Taffy applies these defaults:
-///
-/// - `display: Flex`
-/// - `flex_direction: Row` — children flow left-to-right
-/// - `align_items: Stretch` — children stretch on the cross axis if their
-///   size is not explicitly set, otherwise they keep their declared size
-/// - `justify_content: FlexStart` — children packed against the start of
-///   the main axis with no gap
-///
-/// These match CSS flexbox defaults. Phase 1 does not yet expose
-/// `flex_direction`, `align_items`, etc. through `ContainerStyle` —
-/// callers needing those must wait for the builder API sub-issue.
-///
-/// Marked `#[non_exhaustive]` so additional style fields can be added
-/// without breaking downstream code.
+/// Marked `#[non_exhaustive]`; construct with [`ContainerStyle::new`] /
+/// [`ContainerStyle::default`] and the `with_*` builders.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct ContainerStyle {
@@ -88,15 +154,130 @@ pub struct ContainerStyle {
     pub width: Option<f32>,
     /// Explicit height in logical pixels. `None` means "grow to fit children".
     pub height: Option<f32>,
+    /// Main-axis direction.
+    pub direction: FlexDir,
+    /// Space between children, in logical pixels.
+    pub gap: f32,
+    /// Granular padding, in logical pixels.
+    pub padding: Spacing,
+    /// Granular margin, in logical pixels.
+    pub margin: Spacing,
+    /// Cross-axis alignment of children.
+    pub align: Align,
+    /// Main-axis distribution of children.
+    pub justify: Justify,
+    /// Flex-grow factor (how much this node expands to fill its parent's main
+    /// axis).
+    pub grow: f32,
 }
 
 impl ContainerStyle {
-    /// Constructs a `ContainerStyle` with the given explicit dimensions.
-    ///
-    /// Either dimension may be `None` to mean "grow to fit children".
+    /// Constructs a `ContainerStyle` with the given explicit dimensions and
+    /// flex defaults (row, stretch, start, no gap/padding/grow).
     #[must_use]
-    pub const fn new(width: Option<f32>, height: Option<f32>) -> Self {
-        Self { width, height }
+    pub fn new(width: Option<f32>, height: Option<f32>) -> Self {
+        Self {
+            width,
+            height,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the main-axis direction.
+    #[must_use]
+    pub fn with_direction(mut self, direction: FlexDir) -> Self {
+        self.direction = direction;
+        self
+    }
+
+    /// Sets the inter-child gap (logical px).
+    #[must_use]
+    pub fn with_gap(mut self, gap: f32) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Sets the padding (logical px).
+    #[must_use]
+    pub fn with_padding(mut self, padding: Spacing) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Sets the margin (logical px).
+    #[must_use]
+    pub fn with_margin(mut self, margin: Spacing) -> Self {
+        self.margin = margin;
+        self
+    }
+
+    /// Sets the cross-axis alignment.
+    #[must_use]
+    pub fn with_align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Sets the main-axis distribution.
+    #[must_use]
+    pub fn with_justify(mut self, justify: Justify) -> Self {
+        self.justify = justify;
+        self
+    }
+
+    /// Sets the flex-grow factor.
+    #[must_use]
+    pub fn with_grow(mut self, grow: f32) -> Self {
+        self.grow = grow;
+        self
+    }
+
+    /// Builds the Taffy `Style` this container maps to.
+    fn to_taffy(self) -> Style {
+        Style {
+            size: Size {
+                width: self.width.map_or(Dimension::auto(), Dimension::from_length),
+                height: self
+                    .height
+                    .map_or(Dimension::auto(), Dimension::from_length),
+            },
+            flex_direction: match self.direction {
+                FlexDir::Row => FlexDirection::Row,
+                FlexDir::Column => FlexDirection::Column,
+            },
+            gap: Size {
+                width: LengthPercentage::from_length(self.gap),
+                height: LengthPercentage::from_length(self.gap),
+            },
+            padding: TaffyRect {
+                left: LengthPercentage::from_length(self.padding.left),
+                right: LengthPercentage::from_length(self.padding.right),
+                top: LengthPercentage::from_length(self.padding.top),
+                bottom: LengthPercentage::from_length(self.padding.bottom),
+            },
+            margin: TaffyRect {
+                left: LengthPercentageAuto::length(self.margin.left),
+                right: LengthPercentageAuto::length(self.margin.right),
+                top: LengthPercentageAuto::length(self.margin.top),
+                bottom: LengthPercentageAuto::length(self.margin.bottom),
+            },
+            align_items: Some(match self.align {
+                Align::Start => AlignItems::FlexStart,
+                Align::Center => AlignItems::Center,
+                Align::End => AlignItems::FlexEnd,
+                Align::Stretch => AlignItems::Stretch,
+            }),
+            justify_content: Some(match self.justify {
+                Justify::Start => JustifyContent::FlexStart,
+                Justify::Center => JustifyContent::Center,
+                Justify::End => JustifyContent::FlexEnd,
+                Justify::Between => JustifyContent::SpaceBetween,
+                Justify::Around => JustifyContent::SpaceAround,
+                Justify::Evenly => JustifyContent::SpaceEvenly,
+            }),
+            flex_grow: self.grow,
+            ..Default::default()
+        }
     }
 }
 
@@ -108,7 +289,7 @@ impl ContainerStyle {
 /// [`LayoutAtlasBuilder::container`] and committed to a real atlas in one
 /// recursive pass via [`LayoutAtlas::build`] or [`LayoutAtlas::build_root`].
 ///
-/// This is the fluent construction API from issue #15 — it sits on top
+/// This is the fluent construction API — it sits on top
 /// of [`LayoutAtlas::add_leaf`] / [`LayoutAtlas::add_container`] /
 /// [`LayoutAtlas::set_root`] and calls them in the exact same depth-first,
 /// children-before-parent order a hand-written imperative sequence would,
@@ -246,6 +427,7 @@ pub struct LayoutAtlas {
     /// [`Self::next_instance_id`]. Stamped onto every [`AtlasNodeId`] this
     /// atlas produces so a foreign id can be rejected in `O(1)`.
     instance_id: u32,
+    parents: rustc_hash::FxHashMap<NodeId, NodeId>,
 }
 
 impl LayoutAtlas {
@@ -261,6 +443,7 @@ impl LayoutAtlas {
             nodes_by_index: Vec::new(),
             current_generation: 0,
             instance_id: Self::next_instance_id(),
+            parents: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -314,6 +497,7 @@ impl LayoutAtlas {
         self.children_scratch.clear();
         self.grid.clear();
         self.nodes_by_index.clear();
+        self.parents.clear();
         self.current_generation = self.current_generation.wrapping_add(1);
     }
 
@@ -376,17 +560,7 @@ impl LayoutAtlas {
             self.validate_node(child)?;
         }
 
-        let taffy_style = Style {
-            size: Size {
-                width: style
-                    .width
-                    .map_or(Dimension::auto(), Dimension::from_length),
-                height: style
-                    .height
-                    .map_or(Dimension::auto(), Dimension::from_length),
-            },
-            ..Default::default()
-        };
+        let taffy_style = style.to_taffy();
         self.children_scratch.clear();
         self.children_scratch
             .extend(children.iter().map(|c| c.node_id));
@@ -395,6 +569,9 @@ impl LayoutAtlas {
             .tree
             .new_with_children(taffy_style, &self.children_scratch)
             .map_err(|e| AtlasError::from_taffy(&e))?;
+        for &child in children {
+            self.parents.insert(child.node_id, node);
+        }
         self.tree
             .set_node_context(node, Some(next_index))
             .map_err(|e| AtlasError::from_taffy(&e))?;
@@ -604,6 +781,30 @@ impl LayoutAtlas {
         None
     }
 
+    /// Returns the context index of the given node, if it belongs to this atlas.
+    #[must_use]
+    pub fn node_index(&self, node: AtlasNodeId) -> Option<u32> {
+        if node.atlas_id == self.instance_id {
+            self.tree.get_node_context(node.node_id).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Returns the parent node of the given node, if it belongs to this atlas and has a parent.
+    #[must_use]
+    pub fn parent_node(&self, node: AtlasNodeId) -> Option<AtlasNodeId> {
+        if node.atlas_id == self.instance_id {
+            let parent_id = self.parents.get(&node.node_id)?;
+            Some(AtlasNodeId {
+                node_id: *parent_id,
+                atlas_id: self.instance_id,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Recursively walks the tree from `node` in pre-order, pushing each
     /// resolved rectangle — and its dirty state — into `frame`.
     ///
@@ -636,6 +837,18 @@ impl LayoutAtlas {
     }
 
     /// Rebuilds the hit-testing spatial grid from the current layout.
+    ///
+    /// This is a full `clear()` + root-to-leaf walk on every
+    /// `compute`/`recompute_dirty`, regardless of how many nodes were marked
+    /// dirty. That was measured (M28) on a 200-leaf tree (the high end
+    /// of `EvaluatorTick`'s expected per-tick target count): the whole
+    /// `recompute_dirty` — layout + this grid rebuild — costs ~24 µs with one
+    /// dirty leaf and ~111 µs with every node dirty, i.e. ≲0.7% of a 60 Hz
+    /// frame even in the worst case. A partial grid update would have to track
+    /// nodes whose rect shifted only as a *side effect* of a sibling's flex
+    /// reflow, risking dangling (stale-but-queryable) hit rects — a correctness
+    /// hazard strictly worse than a redundant walk this cheap. The full walk is
+    /// therefore kept deliberately; see the `atlas` bench for the numbers.
     fn rebuild_grid(&mut self) {
         self.grid.clear();
         let Some(root) = self.root else {
@@ -670,9 +883,23 @@ impl LayoutAtlas {
     /// caller).
     fn resolved_rect_internal(&self, node: AtlasNodeId) -> Option<Rect> {
         let layout = self.tree.layout(node.node_id).ok()?;
+        let mut x = layout.location.x;
+        let mut y = layout.location.y;
+
+        let mut current = node.node_id;
+        while let Some(&parent) = self.parents.get(&current) {
+            if let Ok(p_layout) = self.tree.layout(parent) {
+                x += p_layout.location.x;
+                y += p_layout.location.y;
+                current = parent;
+            } else {
+                break;
+            }
+        }
+
         Some(Rect {
-            x: layout.location.x,
-            y: layout.location.y,
+            x,
+            y,
             width: layout.size.width,
             height: layout.size.height,
         })
@@ -843,6 +1070,7 @@ mod tests {
                 ContainerStyle {
                     width: Some(200.0),
                     height: Some(100.0),
+                    ..Default::default()
                 },
                 &[child],
             )
@@ -976,6 +1204,7 @@ mod tests {
                 ContainerStyle {
                     width: Some(200.0),
                     height: Some(100.0),
+                    ..Default::default()
                 },
                 &[child],
             )
@@ -1077,6 +1306,7 @@ mod tests {
                 ContainerStyle {
                     width: Some(200.0),
                     height: Some(200.0),
+                    ..Default::default()
                 },
                 &[a, b],
             )
@@ -1276,7 +1506,7 @@ mod tests {
         assert_f32_eq(rect.height, 50.0);
     }
 
-    /// Acceptance criterion (issue #23): a `Signal` mutation results in
+    /// Acceptance criterion: a `Signal` mutation results in
     /// only the affected entries being marked dirty in `RenderFrame`.
     ///
     /// Builds a two-leaf tree, subscribes a signal to only one leaf, and
@@ -1296,6 +1526,7 @@ mod tests {
                 ContainerStyle {
                     width: Some(200.0),
                     height: Some(200.0),
+                    ..Default::default()
                 },
                 &[a, b],
             )
@@ -1363,6 +1594,7 @@ mod tests {
                 ContainerStyle {
                     width: Some(200.0),
                     height: Some(200.0),
+                    ..Default::default()
                 },
                 &[child],
             )
@@ -1425,9 +1657,9 @@ mod tests {
         let _ = atlas.hit_test(50.0, 50.0);
     }
 
-    // --- Cross-atlas AtlasNodeId scoping (issue #18) ---------------------
+    // --- Cross-atlas AtlasNodeId scoping ---------------------
     //
-    // These tests exercise the actual hazard issue #18 closes off: an
+    // These tests exercise the actual hazard this closes off: an
     // `AtlasNodeId` produced by one `LayoutAtlas` must never be silently
     // accepted by a different instance. Every entry point that takes an
     // `AtlasNodeId` from a caller must return `Err(AtlasError::ForeignNode)`
@@ -1520,9 +1752,9 @@ mod tests {
         assert!(byard_err.to_string().contains("AtlasNodeId belongs to"));
     }
 
-    // --- Builder API (issue #15) -----------------------------------------
+    // --- Builder API -----------------------------------------
     //
-    // These tests exercise the acceptance criteria from issue #15: a
+    // These tests exercise the acceptance criteria: a
     // multi-level tree expressed as a single chained expression, identical
     // `AtlasNodeId`s to the equivalent imperative sequence, and that the
     // low-level API (PR #14) is untouched by the addition.
@@ -1700,5 +1932,53 @@ mod tests {
         let root_rect = atlas.resolved_rect(root).unwrap().unwrap();
         assert_f32_eq(root_rect.width, 15.0);
         assert_f32_eq(root_rect.height, 15.0);
+    }
+
+    #[test]
+    fn column_direction_gap_and_padding_lay_children_vertically() {
+        let mut atlas = LayoutAtlas::new();
+        let a = atlas.add_leaf(LeafSize::new(40.0, 20.0)).unwrap();
+        let b = atlas.add_leaf(LeafSize::new(40.0, 20.0)).unwrap();
+        let col = atlas
+            .add_container(
+                ContainerStyle::new(Some(200.0), Some(200.0))
+                    .with_direction(FlexDir::Column)
+                    .with_gap(10.0)
+                    .with_padding(Spacing::all(8.0)),
+                &[a, b],
+            )
+            .unwrap();
+        atlas.set_root(col).unwrap();
+        atlas.compute(Viewport::new(200.0, 200.0)).unwrap();
+
+        let ra = atlas.resolved_rect(a).unwrap().unwrap();
+        let rb = atlas.resolved_rect(b).unwrap().unwrap();
+        // Padding offsets the first child; the gap separates the two.
+        assert_f32_eq(ra.x, 8.0);
+        assert_f32_eq(ra.y, 8.0);
+        assert_f32_eq(rb.y, 8.0 + 20.0 + 10.0); // padding + first height + gap
+    }
+
+    #[test]
+    fn grow_distributes_main_axis_space() {
+        let mut atlas = LayoutAtlas::new();
+        let spacer = atlas
+            .add_container(ContainerStyle::default().with_grow(1.0), &[])
+            .unwrap();
+        let fixed = atlas.add_leaf(LeafSize::new(40.0, 20.0)).unwrap();
+        let row = atlas
+            .add_container(
+                ContainerStyle::new(Some(200.0), Some(50.0)).with_direction(FlexDir::Row),
+                &[spacer, fixed],
+            )
+            .unwrap();
+        atlas.set_root(row).unwrap();
+        atlas.compute(Viewport::new(200.0, 50.0)).unwrap();
+
+        let rs = atlas.resolved_rect(spacer).unwrap().unwrap();
+        let rf = atlas.resolved_rect(fixed).unwrap().unwrap();
+        // The grow:1 spacer eats the slack, pushing the fixed leaf to the end.
+        assert_f32_eq(rs.width, 160.0); // 200 - 40 fixed
+        assert_f32_eq(rf.x, 160.0);
     }
 }

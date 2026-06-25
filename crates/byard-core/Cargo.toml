@@ -21,6 +21,13 @@ glyphon = "0.11"
 arc-swap = "1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+# Image decode for the `TextureSampler` pipeline (M21, IMPL-32). PNG/JPEG only
+# keeps the dependency tree small; the runner/host owns decode, not the interp.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# Blocks on the async wgpu device request inside headless pipeline tests (M21).
+pollster = "0.4"
 
 [lints]
 workspace = true

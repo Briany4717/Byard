@@ -22,6 +22,8 @@ winit = "0.30"
 # Visual verification example (examples/hello_world.rs).
 # Minimal async executor for blocking on `Engine::init` inside `on_resume`.
 pollster = "0.3"
+# hello_world_byd example: drives the byld interpreter in a real winit window.
+byard-compiler = { path = "../byard-compiler" }
 
 [lints]
 workspace = true

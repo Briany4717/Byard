@@ -51,6 +51,7 @@ impl PlatformHost for App {
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         size: WindowSize,
+        _waker: byard_core::relay::FrameWaker,
     ) -> Result<(), ByardError> {
         let mut engine = pollster::block_on(Engine::init(
             instance,
@@ -115,7 +116,7 @@ impl PlatformHost for App {
         Ok(())
     }
 
-    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState) {
+    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState, _x: f32, _y: f32) {
         if button != PointerButton::Left || state != PointerState::Pressed {
             return;
         }

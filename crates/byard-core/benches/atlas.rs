@@ -158,6 +158,87 @@ fn bench_incremental_recompute(name: &str, leaf_count: usize, iters: u64) {
     );
 }
 
+/// Builds a ~200-leaf tree under two levels of flex containers
+/// (`root → mid containers → per_mid leaves each`), runs the initial compute,
+/// and returns the atlas plus the `TargetId` of **every** node and of the
+/// **first leaf**.
+///
+/// This is the M28 shape: the high end of `EvaluatorTick`'s "tens to low
+/// hundreds of targets" (`evaluator/tick.rs`), used to measure whether
+/// `recompute_dirty`'s full `rebuild_grid` walk is a problem when only one
+/// node is dirty versus when all of them are.
+fn build_flex_tree_computed(mid: u32, per_mid: u32) -> (LayoutAtlas, Vec<TargetId>, TargetId) {
+    let mut atlas = LayoutAtlas::new();
+    let mut all_nodes: Vec<AtlasNodeId> = Vec::new();
+    let mut first_leaf: Option<AtlasNodeId> = None;
+    let mut mids: Vec<AtlasNodeId> = Vec::new();
+
+    for _ in 0..mid {
+        let mut leaves = Vec::with_capacity(per_mid as usize);
+        for _ in 0..per_mid {
+            let leaf = atlas.add_leaf(LeafSize::new(10.0, 10.0)).unwrap();
+            if first_leaf.is_none() {
+                first_leaf = Some(leaf);
+            }
+            all_nodes.push(leaf);
+            leaves.push(leaf);
+        }
+        let container = atlas
+            .add_container(ContainerStyle::new(None, None), &leaves)
+            .unwrap();
+        all_nodes.push(container);
+        mids.push(container);
+    }
+    let root = atlas
+        .add_container(ContainerStyle::new(Some(1024.0), Some(768.0)), &mids)
+        .unwrap();
+    all_nodes.push(root);
+    atlas.set_root(root).unwrap();
+    atlas.compute(Viewport::new(1024.0, 768.0)).unwrap();
+
+    let generation = atlas.current_generation();
+    let to_target = |node: &AtlasNodeId| {
+        TargetId::new(
+            atlas.node_index(*node).unwrap(),
+            generation,
+            TargetKind::AtlasNode as u16,
+        )
+    };
+    let all_targets: Vec<TargetId> = all_nodes.iter().map(to_target).collect();
+    let first_target = to_target(&first_leaf.unwrap());
+
+    (atlas, all_targets, first_target)
+}
+
+/// M28: compares `recompute_dirty` on a 200-leaf tree when **1** node is dirty
+/// versus when **all** nodes are dirty. The gap (or lack of one) is what the
+/// decision gate turns on: `rebuild_grid` does a full tree walk either
+/// way, so if the 1-dirty case is already cheap the full walk is not worth
+/// replacing with a riskier partial update.
+fn bench_grid_dirty_scaling(mid: u32, per_mid: u32, iters: u64) {
+    let leaves = mid * per_mid;
+    bench_with_setup(
+        &format!("atlas: grid {leaves}-leaf recompute (1 dirty leaf)"),
+        iters,
+        || build_flex_tree_computed(mid, per_mid),
+        |(mut atlas, _all, first)| {
+            atlas.mark_dirty_all(&[first]);
+            atlas.recompute_dirty(Viewport::new(1024.0, 768.0)).unwrap();
+            black_box(&atlas);
+        },
+    );
+    bench_with_setup(
+        &format!("atlas: grid {leaves}-leaf recompute (all dirty)"),
+        iters,
+        || build_flex_tree_computed(mid, per_mid),
+        |(mut atlas, all, _first)| {
+            atlas.mark_dirty_all(&all);
+            atlas.recompute_dirty(Viewport::new(1024.0, 768.0)).unwrap();
+            black_box(&atlas);
+        },
+    );
+}
+
 fn bench_with_setup<S, F, T>(name: &str, iters: u64, mut setup: S, mut measure: F)
 where
     S: FnMut() -> T,
@@ -232,6 +313,10 @@ fn main() {
         10_000,
     );
     bench_deep_incremental("atlas: 125-leaf incremental 1 dirty leaf", 3, 5, 10_000);
+
+    println!("\n── M28: spatial-grid rebuild cost, 1-dirty vs all-dirty (200 leaves) ──");
+    // root → 10 flex containers → 20 leaves each = 200 leaves, 211 nodes.
+    bench_grid_dirty_scaling(10, 20, 10_000);
 
     println!();
 }

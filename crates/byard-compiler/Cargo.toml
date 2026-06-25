@@ -1,0 +1,23 @@
+[package]
+name = "byard-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+logos = "0.14"
+smallvec = "1"
+crossbeam-channel = "0.5"
+notify = "6"
+byard-core = { path = "../byard-core" }
+
+[dev-dependencies]
+proptest = "1"
+byard-core = { path = "../byard-core" }
+
+[lints]
+workspace = true

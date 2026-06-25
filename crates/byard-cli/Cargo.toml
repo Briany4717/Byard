@@ -1,0 +1,25 @@
+[package]
+name = "byard-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "byard"
+path = "src/main.rs"
+
+[dependencies]
+byard-compiler = { path = "../byard-compiler" }
+byard-platform = { path = "../byard-platform" }
+byard-core     = { path = "../byard-core" }
+clap           = { version = "4", features = ["derive"] }
+toml           = "0.8"
+pollster       = "0.3"
+wgpu           = "29.0"
+
+[lints]
+workspace = true

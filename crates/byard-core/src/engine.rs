@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::ByardError;
+use crate::InputEvent;
 use crate::atlas::{LayoutAtlas, LeafSize};
 use crate::encoder::EncoderSubsystem;
 use crate::evaluator::{EvaluatorTick, Signal, ViewArena};
@@ -316,6 +317,10 @@ impl Engine {
         );
 
         let relay = Arc::new(Relay::new()?);
+        // Wire async image decode (M29): the encoder spawns decodes on the
+        // relay's I/O pool and reports results back through its type-erased
+        // channel, which `render_latest` drains.
+        encoder.set_io_context(relay.io_handle(), relay.io_result_sender());
         let (label_tx, label_rx) = crossbeam_channel::unbounded::<String>();
 
         Ok(Self {
@@ -342,6 +347,23 @@ impl Engine {
         // it only fires when the logic thread has already exited, at which
         // point delivering the text is moot.
         let _ = self.label_tx.send(text.into());
+    }
+
+    /// Pushes an input event into the engine's logic queue.
+    pub fn push_input(&self, event: InputEvent) {
+        self.relay.push_input(event);
+    }
+
+    /// Installs a callback the logic thread fires after it publishes a frame
+    /// that changed in response to input.
+    ///
+    /// An event-driven (`Wait`-mode) host should point this at its event loop's
+    /// wake primitive (e.g. a winit `EventLoopProxy`) and request a redraw when
+    /// it fires, so input results appear immediately instead of waiting for the
+    /// next unrelated OS event. A continuously-redrawing (`Poll`) host does not
+    /// need it. See [`Relay::set_frame_waker`](crate::relay::Relay::set_frame_waker).
+    pub fn set_frame_waker(&self, waker: crate::relay::FrameWaker) {
+        self.relay.set_frame_waker(waker);
     }
 
     /// Notifies the engine that the window surface has been resized.
@@ -461,6 +483,33 @@ impl Engine {
         Ok(())
     }
 
+    /// Spawns the logic thread from a `build` factory that constructs a
+    /// [`LogicRuntime`] (e.g. the `byld` Dev interpreter) **inside** the thread
+    /// (RFC-0002 §"Integration with Engine", RFC-0003 §8).
+    ///
+    /// This is the entry point the `byard-compiler` crate targets: it hands in
+    /// a `Send + 'static` factory closing over a plain-data compiled view, and
+    /// the factory builds the `!Send` running interpreter (holding `Signal`s
+    /// and a logic-thread-local reactive scope) on the logic thread, where it
+    /// is then driven once per tick. The `Send + 'static` bound is on the
+    /// factory only — never on the [`LogicRuntime`] it produces (INV-6).
+    ///
+    /// Use this **instead of** [`start_logic`](Engine::start_logic); call it at
+    /// most once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByardError::ThreadSpawn`] if the OS refuses to create the
+    /// logic thread.
+    pub fn start_logic_from_view<F>(&mut self, build: F) -> Result<(), ByardError>
+    where
+        F: for<'a> FnOnce(&'a ViewArena) -> Box<dyn crate::LogicRuntime + 'a> + Send + 'static,
+    {
+        let handle = Relay::spawn_logic_from_view(&self.relay, build)?;
+        self.logic_handle = Some(handle);
+        Ok(())
+    }
+
     /// Renders the latest [`RenderFrame`](crate::frame::RenderFrame) published
     /// by the logic thread to the window surface.
     ///
@@ -497,6 +546,20 @@ impl Engine {
                 ));
             }
         };
+
+        // Drain any completed async image decodes (M29) and upload them on this
+        // (render) thread before encoding, so a freshly-decoded texture is
+        // `Ready` for this frame. The decode itself already ran on the relay's
+        // I/O pool — only the cheap GPU upload happens here (INV-12).
+        while let Some(result) = self.relay.try_recv_io_result() {
+            match result.downcast::<crate::encoder::DecodedImage>() {
+                Ok(decoded) => self.encoder.apply_decoded(*decoded),
+                // A result of some other type (not an image) is not ours to
+                // handle here; drop it. Today only image decode uses this
+                // channel on the render thread.
+                Err(_other) => {}
+            }
+        }
 
         let Some(relay_frame) = self.relay.current() else {
             return Ok(());

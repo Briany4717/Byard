@@ -1,0 +1,87 @@
+{
+  "name": "byld-vscode",
+  "displayName": "Byld Language Support",
+  "description": "Syntax highlighting and LSP integration for the Byld (.byd) UI layout language",
+  "version": "0.1.0",
+  "publisher": "byld",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:byld"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "byld",
+        "aliases": [
+          "Byld",
+          "byld"
+        ],
+        "extensions": [
+          ".byd"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "byld",
+        "scopeName": "source.byld",
+        "path": "./syntaxes/byld.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[byld]": {
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "title": "Byld configuration",
+      "properties": {
+        "byld.lsp.serverPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Path to the `byld-lsp` server executable. If not specified, the extension will search for `byld-lsp` in `PATH` or the workspace build directory."
+        },
+        "byld.lsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the Byld language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "vscode-test",
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -b",
+    "watch": "tsc -b -w",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.15.11",
+    "@types/vscode": "^1.75.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^3.0.0",
+    "esbuild": "^0.17.15",
+    "typescript": "^5.0.4"
+  }
+}

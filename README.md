@@ -8,11 +8,11 @@
 
 ---
 
-> **Project status: pre-alpha — design phase.**
-> Byard is currently a set of design documents and an architectural plan. There is
-> no usable build yet. The public interface, the `byld` DSL syntax, and the
-> crate layout are all expected to change. This README describes the **intended**
-> system; see [the RFCs](docs/rfcs/) for the authoritative design.
+> **Project status: pre-alpha — interactive widgets phase.**
+> The engine, compiler, and dev toolchain are functional. You can write a `.byd`
+> file, run `byard dev`, and see it live-reload on every save. The next phase
+> (M16–M20) wires up interactivity for `Toggle`, `Slider`, and `TextField`.
+> Public APIs and the `byld` syntax will change before the first stable release.
 
 ## What is Byard?
 
@@ -30,8 +30,8 @@ IPC, no serialization boundary, and no runtime glue.
 Byard renders directly to the GPU through [`wgpu`](https://github.com/gfx-rs/wgpu),
 lays out with [`taffy`](https://github.com/DioxusLabs/taffy), and rasterizes text
 with [`glyphon`](https://github.com/grovesNL/glyphon). It has **no garbage
-collector**: memory is owned by component-scoped arenas that are released in a
-single `O(1)` operation when a view is unmounted.
+collector**: memory is owned by component-scoped arenas released in a single `O(1)`
+operation when a view unmounts.
 
 ## Why does Byard exist?
 
@@ -53,74 +53,115 @@ performance**: stable frame times, no GC pauses, no VRAM spikes.
    never mixed in one file.
 2. **Zero garbage collector.** Memory is managed through Rust ownership and
    component-scoped memory arenas.
-3. **Deterministic, raw performance.** If it does not hold a stable frame rate, or it
-   spikes VRAM, the architecture has failed. Asynchronous hardware acceleration is
-   preferred over CPU-side logic.
+3. **Deterministic, raw performance.** Stable frame rate and bounded VRAM are
+   first-class correctness criteria, not aspirations.
 4. **No raw math in the view.** The declarative layer exposes organic concepts —
    views, signals, environments — never graphs, pointers, or Z-indices.
-
-## Architecture at a glance
-
-The engine is four concurrent subsystems:
-
-- **Logic subsystem** — interprets state (`Signal`s) and owns the per-view memory
-  arenas.
-- **Spatial subsystem** — topological layout via Taffy plus a parallel spatial hash
-  grid for `O(1)` hit-testing, fully decoupled from the UI tree.
-- **Render subsystem** — a multi-pipeline `wgpu` command dispatcher (no über-shader).
-- **Concurrency subsystem** — thread management, double-buffered visual state, and a
-  Tokio pool for async I/O.
-
-The full design — memory model, the multi-pipeline renderer, the spatial hit-testing
-grid, the threading model, and the `byld` compiler pipeline — is specified in
-[**RFC-0001: Core Architecture**](docs/rfcs/0001-core-architecture.md).
+5. **Live reload by default.** `byard dev` reflects every save in the running window,
+   with state preserved on reactive-compatible changes and gesture safety on
+   structural ones.
 
 ## A taste of `byld`
 
 ```
-// Conceptual byld — syntax is not final.
-View UserCard() {
-    signal clicks = 0
-    inject AppEnvironment as env
+View Counter() {
+    var count = 0
 
-    Column(gap: 12, bg: env.theme.surface, radius: 16, p: 20) {
-        Text("Clicks: {clicks}", typo: m3.titleLarge)
-        Button("Action", onClick: () => clicks++)
+    Column #[gap: 20, p: 32, align: center, justify: center] {
+        Text("{count} taps") #[size: 24, color: 0xFFFFFF]
+
+        Button("+") #[bg: 0x3B82F6, radius: 8, p: 10,
+                      color: 0xFFFFFF, weight: bold] => count++
     }
 }
 ```
 
 Wrapper components (`Padding`, `Align`, …) are intentionally absent — spatial and
-decorative properties are passed as arguments to the base component.
+decorative properties are inline arguments on the element they affect.
+
+## Getting started
+
+```sh
+# Scaffold a new project
+byard new my_app
+cd my_app
+
+# Start the live-reload dev window
+byard dev
+
+# Validate without opening a window (CI-friendly)
+byard check
+```
+
+Edit `main.byd` and save — the window updates within one frame. No recompile,
+no `cargo run`, no hot key.
+
+## Architecture at a glance
+
+The engine is four concurrent subsystems:
+
+- **Logic subsystem** — interprets state (`var`/`let` signals) and owns the
+  per-view memory arenas. Runs on a dedicated thread.
+- **Spatial subsystem** — Taffy-based layout plus a spatial hash grid for `O(1)`
+  hit-testing, decoupled from the UI tree.
+- **Render subsystem** — a multi-pipeline `wgpu` command dispatcher (`SolidBox`,
+  `TextGlyph`, and planned `DecoratedBox`/`TextureSampler`).
+- **Concurrency subsystem** — double-buffered visual state, the Relay signal bus,
+  and a Tokio pool for async I/O.
+
+The `byard-cli` dev runner wires these together with a `notify` OS file watcher.
+On every save, the view's shape is diffed: reactive-compatible patches apply
+instantly (signal state preserved); structure-incompatible patches are held past
+any in-flight pointer gesture, then applied cleanly.
+
+The full design is specified across six RFCs in [`docs/rfcs/`](docs/rfcs/):
+
+| RFC | Topic |
+|-----|-------|
+| [0001](docs/rfcs/0001-core-architecture.md) | Core architecture, crate layering, memory model, `PlatformHost` |
+| [0002](docs/rfcs/0002-byld-language-and-compiler-pipeline.md) | `byld` language, compiler pipeline, hot-reload boundary |
+| [0003](docs/rfcs/0003-interactive-events-and-view-mutation.md) | Event system, gesture recognition, write-back |
+| [0004](docs/rfcs/0004-reactive-interpreter.md) | Reactive core: Mark-and-Pull, memos, structural scopes |
+| [0005](docs/rfcs/0005-intrinsic-view-catalog.md) | Built-in view catalog (`Column`, `Button`, `TextField`, …) |
+| [0006](docs/rfcs/0006-cli-and-dev-runner.md) | `byard` CLI, dev runner, live-reload wiring |
+
+## Crate layout
+
+```
+crates/
+  byard-core/       — engine subsystems (renderer, atlas/layout, relay, frame)
+  byard-compiler/   — byld lexer, parser, reactive interpreter, hot-reload logic
+  byard-platform/   — PlatformHost implementations (winit + wgpu)
+  byard-cli/        — the `byard` binary (new / dev / check / build)
+  byard-macro/      — #[byard_controller] proc-macro (Phase 4)
+  byld-lsp/         — language server (in progress)
+```
 
 ## Roadmap
 
-Byard is being built in phases.
+| Phase | Status | Scope |
+|-------|--------|-------|
+| **0 — Design** | ✅ complete | RFCs 0001–0006, architecture, crate layout |
+| **1 — Engine core** | ✅ complete | `wgpu` renderer, Taffy layout, Relay threading, `PlatformHost` |
+| **2 — `byld` compiler & dev toolchain** | ✅ complete | Lexer, parser, reactive interpreter (Mark-and-Pull), event router, hot-reload, `byard-cli`, 370+ tests |
+| **3 — Interactive widgets** | 🔲 next | `Toggle`/`Slider`/`TextField` interactivity, keyboard input, focus, `for`/`when` in render |
+| **4 — Production pipelines** | 🔲 planned | `DecoratedBox`/`TextureSampler`, theming, `#[byard_controller]` bridge |
+| **5 — Production transpiler** | 🔲 planned | `byld` → native Rust AOT, accessibility `AccessBridge` |
 
-- **Phase 0 — Design** *(complete)* — RFCs, architecture, crate layout.
-- **Phase 1 — Engine core** *(current)* — `wgpu` multi-pipeline renderer, Taffy
-  integration, the spatial hash grid, and the double-buffered threading model.
-  Scope and progress tracked in the
-  [Phase 1 milestone](https://github.com/Briany4717/byard/milestones).
-- **Phase 2 — `byld` compiler** — `logos` lexer, hand-written recursive descent
-  parser, and the dev-mode AST interpreter.
-- **Phase 3 — Rust ↔ `byld` bridge** — the `#[byard_controller]` macro and LSP
-  metadata generation.
-- **Phase 4 — Production transpiler** — `byld` → native Rust for AOT builds.
-
-Roadmap items will be tracked as
-[GitHub milestones](https://github.com/Briany4717/byard/milestones) as the project moves
-out of the design phase.
+**Phase 3 milestones (M16–M20):**
+- **M16** `bind:`/`value:` write-back → widgets mutate their bound `var` on interaction
+- **M17** Keyboard & text delivery → `TextField` receives characters
+- **M18** Focus system → Tab, click-to-focus, key routing to the focused element
+- **M19** Visual lowering → `Toggle`/`Slider`/`TextField` render their actual visual structure
+- **M20** `for`/`when` in render → reactive lists and conditionals in the view tree
 
 ## Contributing
 
-Byard is open to contributions from day one. The
-[Phase 1 milestone](https://github.com/Briany4717/byard/milestones) tracks the
-current implementation work — look for issues labelled `phase-1` and
-`good first issue` to get started.
+Byard is open to contributions. The best entry points are:
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md) before opening an issue or pull request.
+- Read the relevant RFC before touching a subsystem — the design decisions are the
+  contract; the code is the implementation.
+- `cargo test --workspace` and `cargo clippy --workspace` must stay green.
 
 ## License
 

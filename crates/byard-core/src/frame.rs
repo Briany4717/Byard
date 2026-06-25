@@ -140,10 +140,9 @@ impl Rect {
     ///
     /// Used by the Encoder (RFC-0001 §3.3) to merge several dirty-region
     /// bounding boxes into the single bounding box passed to
-    /// `wgpu::RenderPass::set_scissor_rect` — see the "Scope decision" note
-    /// on multi-rect merging in the scissor-clipping PR. Degenerate
-    /// (zero-area) rects are handled the same as any other rect: the union
-    /// still expands to cover their `(x, y)` corner.
+    /// `wgpu::RenderPass::set_scissor_rect`. Degenerate (zero-area) rects are
+    /// handled the same as any other rect: the union still expands to cover
+    /// their `(x, y)` corner.
     #[must_use]
     pub fn union(&self, other: &Rect) -> Rect {
         let min_x = self.x.min(other.x);
@@ -178,6 +177,99 @@ pub struct BoxInstance {
     pub color: [f32; 4],
     /// Per-corner border radii: `[top_left, top_right, bottom_right, bottom_left]`.
     pub radii: [f32; 4],
+}
+
+/// How an image is scaled/positioned inside its bounding rect.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ImageFit {
+    /// Stretch to fill, ignoring aspect ratio.
+    #[default]
+    Fill,
+    /// Scale uniformly to contain inside the rect (letterbox).
+    Contain,
+    /// Scale uniformly to cover the rect (crop).
+    Cover,
+    /// No scaling — image at natural size, top-left aligned.
+    None,
+}
+
+/// A `DecoratedBox` extends a [`BoxInstance`] with an optional border and
+/// drop shadow (M21 pipeline). Fields that don't apply are zeroed.
+///
+/// The Encoder promotes a plain `BoxInstance` to `DecoratedBox` when any of
+/// border or shadow fields are non-trivial.
+#[derive(Copy, Clone, Debug)]
+pub struct DecoratedBox {
+    /// The underlying fill/radii data.
+    pub base: BoxInstance,
+    /// Border width in logical pixels (0.0 = no border).
+    pub border_width: f32,
+    /// Border colour `[r, g, b, a]`.
+    pub border_color: [f32; 4],
+    /// Drop-shadow offset X in logical pixels.
+    pub shadow_dx: f32,
+    /// Drop-shadow offset Y in logical pixels.
+    pub shadow_dy: f32,
+    /// Drop-shadow blur radius in logical pixels.
+    pub shadow_blur: f32,
+    /// Drop-shadow colour `[r, g, b, a]`.
+    pub shadow_color: [f32; 4],
+    /// Element opacity `0.0–1.0`.
+    pub opacity: f32,
+    /// Whether this decoration changed since the last tick.
+    ///
+    /// The encoder's analogue of [`TextLine::dirty`] for the `DecoratedBox`
+    /// pipeline (RFC-0001 §3.3): set upstream by the Evaluator → `RenderFrame`
+    /// lowering, trusted by the Encoder when computing the incremental scissor
+    /// union. A decoration's `base` is a [`BoxInstance`], which is a pure GPU
+    /// `Pod` vertex type and therefore cannot itself carry a dirty bit — so the
+    /// flag lives here on the (non-`Pod`) wrapper instead.
+    pub dirty: bool,
+}
+
+impl Default for DecoratedBox {
+    fn default() -> Self {
+        Self {
+            base: BoxInstance {
+                rect: [0.0; 4],
+                color: [0.0; 4],
+                radii: [0.0; 4],
+            },
+            border_width: 0.0,
+            border_color: [0.0; 4],
+            shadow_dx: 0.0,
+            shadow_dy: 0.0,
+            shadow_blur: 0.0,
+            shadow_color: [0.0; 4],
+            opacity: 1.0,
+            dirty: false,
+        }
+    }
+}
+
+/// A texture-sampled rectangle: `Image` intrinsic lowered to a GPU primitive
+/// (M21 pipeline). Texture data is identified by a host-opaque `texture_id`
+/// (registered outside the engine boundary via the controller boundary, M23).
+#[derive(Clone, Debug)]
+pub struct TextureSampler {
+    /// Rectangle in logical pixels `[x, y, width, height]`.
+    pub rect: [f32; 4],
+    /// Texture source path or ID (resolved by the controller boundary at M23).
+    pub src: String,
+    /// How the image is scaled within the rect.
+    pub fit: ImageFit,
+    /// Per-corner border radii.
+    pub radii: [f32; 4],
+    /// Opacity `0.0–1.0`.
+    pub opacity: f32,
+    /// Whether this image primitive changed since the last tick.
+    ///
+    /// The `TextureSampler` analogue of [`TextLine::dirty`] (RFC-0001 §3.3) —
+    /// set upstream by the lowering, trusted by the Encoder's incremental
+    /// scissor union. Also set by the Encoder itself the frame after an async
+    /// decode completes (M29), so a freshly-loaded image paints without a full
+    /// redraw.
+    pub dirty: bool,
 }
 
 /// A single line of text to be rendered in a frame.
@@ -260,6 +352,12 @@ pub struct RenderFrame {
     /// Solid-rectangle instances populated by the Logic thread each tick.
     instances: Vec<BoxInstance>,
 
+    /// Decorated-box instances (M21) — boxes with border/shadow/opacity.
+    decorated: Vec<DecoratedBox>,
+
+    /// Texture-sampled image instances (M21).
+    textures: Vec<TextureSampler>,
+
     /// Text lines populated by the Logic thread each tick.
     texts: Vec<TextLine>,
 
@@ -289,28 +387,40 @@ impl RenderFrame {
         self.rects.clear();
         self.dirty.clear();
         self.instances.clear();
+        self.decorated.clear();
+        self.textures.clear();
         self.texts.clear();
         self.version = 0;
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
-    pub(crate) fn push_rect(&mut self, rect: Rect, dirty: bool) {
+    pub fn push_rect(&mut self, rect: Rect, dirty: bool) {
         self.rects.push(rect);
         self.dirty.push(dirty);
     }
 
     /// Appends a [`BoxInstance`] to the frame.
-    pub(crate) fn push_instance(&mut self, instance: BoxInstance) {
+    pub fn push_instance(&mut self, instance: BoxInstance) {
         self.instances.push(instance);
     }
 
+    /// Appends a [`DecoratedBox`] (border/shadow/opacity) to the frame (M21).
+    pub fn push_decorated(&mut self, d: DecoratedBox) {
+        self.decorated.push(d);
+    }
+
+    /// Appends a [`TextureSampler`] (image) to the frame (M21).
+    pub fn push_texture(&mut self, t: TextureSampler) {
+        self.textures.push(t);
+    }
+
     /// Appends a [`TextLine`] to the frame.
-    pub(crate) fn push_text(&mut self, text: TextLine) {
+    pub fn push_text(&mut self, text: TextLine) {
         self.texts.push(text);
     }
 
     /// Sets the frame's version counter.
-    pub(crate) fn set_version(&mut self, version: u64) {
+    pub fn set_version(&mut self, version: u64) {
         self.version = version;
     }
 
@@ -330,6 +440,18 @@ impl RenderFrame {
     #[must_use]
     pub fn instances(&self) -> &[BoxInstance] {
         &self.instances
+    }
+
+    /// Returns the decorated-box instances in this frame (M21).
+    #[must_use]
+    pub fn decorated(&self) -> &[DecoratedBox] {
+        &self.decorated
+    }
+
+    /// Returns the texture-sampled image instances in this frame (M21).
+    #[must_use]
+    pub fn textures(&self) -> &[TextureSampler] {
+        &self.textures
     }
 
     /// Returns the text lines in this frame.

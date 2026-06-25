@@ -1,0 +1,367 @@
+//! Golden parses and targeted parser unit tests (RFC-0002 §"Grammar").
+
+use super::ast::*;
+use super::parse;
+use crate::symbol::Symbol;
+
+fn sym(s: &str) -> Symbol {
+    Symbol::intern(s)
+}
+
+/// Parses `src`, asserting it produced exactly one view and no diagnostics.
+fn one_view(src: &str) -> ViewDecl {
+    let parsed = parse(src);
+    assert!(
+        parsed.errors.is_empty(),
+        "unexpected diagnostics: {:#?}",
+        parsed.errors
+    );
+    assert_eq!(parsed.views.len(), 1, "expected exactly one view");
+    parsed.views.into_iter().next().unwrap()
+}
+
+fn as_element(member: &Member) -> &ElementNode {
+    match member {
+        Member::Element(e) => e,
+        other => panic!("expected element, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Golden parses (the four canonical examples).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_counter() {
+    // RFC-0003 §"Mutating the view".
+    let src = r#"
+View Counter() {
+    var count = 0
+    Column #[gap: 8, p: 16] {
+        Text("Count: {count}")
+        Button("+") => count++
+        Button("−") #[tap => count--]
+        Button("Reset") #[tap => count = 0]
+    }
+}
+"#;
+    let view = one_view(src);
+    assert_eq!(view.name, sym("Counter"));
+    assert_eq!(view.body.len(), 2);
+    assert!(matches!(&view.body[0], Member::Var { name, .. } if *name == sym("count")));
+
+    let column = as_element(&view.body[1]);
+    assert_eq!(column.name, sym("Column"));
+    assert_eq!(column.attrs.len(), 2);
+    assert_eq!(column.children.len(), 4);
+
+    // Text("Count: {count}") → [Text("Count: "), Interp(count)]
+    let text = as_element(&column.children[0]);
+    let Expr::StrLit(parts, _) = &text.content[0].value else {
+        panic!("expected string literal content");
+    };
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(&parts[0], StrPart::Text(t) if t == "Count: "));
+    assert!(
+        matches!(&parts[1], StrPart::Interp(e) if matches!(**e, Expr::Ident(ref s, _) if *s == sym("count")))
+    );
+
+    // Button("+") => count++   (action shorthand)
+    let plus = as_element(&column.children[1]);
+    assert!(matches!(
+        &plus.action,
+        Some(Expr::Postfix {
+            op: PostfixOp::Inc,
+            ..
+        })
+    ));
+
+    // Button("−") #[tap => count--]   (explicit event)
+    let minus = as_element(&column.children[2]);
+    assert_eq!(minus.attrs.len(), 1);
+    assert_eq!(minus.attrs[0].name, sym("tap"));
+    assert!(matches!(
+        &minus.attrs[0].kind,
+        AttrKind::Event {
+            payload: None,
+            action: Expr::Postfix {
+                op: PostfixOp::Dec,
+                ..
+            }
+        }
+    ));
+
+    // Button("Reset") #[tap => count = 0]   (assignment action)
+    let reset = as_element(&column.children[3]);
+    assert!(matches!(
+        &reset.attrs[0].kind,
+        AttrKind::Event {
+            action: Expr::Assign {
+                op: AssignOp::Assign,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn golden_user_card() {
+    // Erratum canonical / RFC-0002 §"at a glance".
+    let src = r#"
+View UserCard() {
+    var clicks = 0
+    inject AppEnvironment as env
+
+    Column #[gap: 12, bg: env.theme.surface, radius: 16, p: 20] {
+        Text("Clicks: {clicks}") #[typo: m3.titleLarge]
+        Button("Action") => clicks++
+    }
+}
+"#;
+    let view = one_view(src);
+    assert_eq!(view.name, sym("UserCard"));
+    assert_eq!(view.body.len(), 3);
+    assert!(matches!(&view.body[0], Member::Var { name, .. } if *name == sym("clicks")));
+    assert!(matches!(
+        &view.body[1],
+        Member::Inject { ty: Type::Named { name, .. }, name: bind, .. }
+            if *name == sym("AppEnvironment") && *bind == sym("env")
+    ));
+
+    let column = as_element(&view.body[2]);
+    assert_eq!(column.attrs.len(), 4);
+    // bg: env.theme.surface  → nested member access
+    let bg = &column.attrs[1];
+    assert_eq!(bg.name, sym("bg"));
+    assert!(matches!(
+        &bg.kind,
+        AttrKind::Prop {
+            value: Expr::Member { .. }
+        }
+    ));
+
+    let button = as_element(&column.children[1]);
+    assert!(matches!(
+        &button.action,
+        Some(Expr::Postfix {
+            op: PostfixOp::Inc,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn golden_search() {
+    // RFC-0002 §"State, derived values" — exercises typed var, let/fn memos,
+    // lambdas, for/when, and a scoped style block.
+    let src = r#"
+View Search() {
+    var query = ""
+    var items: List<Str> = ["apple", "pear", "plum"]
+
+    let filtered = items.filter(|x| x.starts_with(query))
+    fn greeting() -> Str => filtered.is_empty() ? "No matches" : "Results"
+
+    Column #[gap: 8, p: 16] {
+        Text(greeting()) #[style: .title]
+        TextField #[bind: query, placeholder: "Filter…"]
+
+        for item in filtered {
+            Text(item) #[style: .row]
+        }
+        when filtered.is_empty() {
+            Text("Nothing here") #[style: .muted]
+        }
+    }
+
+    style {
+        .title #[size: 20, weight: bold]
+        .row   #[p: (4, 8)]
+        .muted #[color: 0x888888]
+    }
+}
+"#;
+    let view = one_view(src);
+    assert_eq!(view.name, sym("Search"));
+
+    // var items: List<Str> = [...]
+    let Member::Var {
+        ty: Some(Type::Named { name, args, .. }),
+        init: Expr::Array(elems, _),
+        ..
+    } = &view.body[1]
+    else {
+        panic!("expected typed array var, got {:?}", view.body[1]);
+    };
+    assert_eq!(*name, sym("List"));
+    assert_eq!(args.len(), 1);
+    assert_eq!(elems.len(), 3);
+
+    // let filtered = items.filter(|x| ...)
+    assert!(matches!(
+        &view.body[2],
+        Member::Let { init: Expr::Call { .. }, name, .. } if *name == sym("filtered")
+    ));
+
+    // fn greeting() -> Str => ... ? ... : ...
+    let Member::Fn {
+        ret: Some(Type::Named { name: ret, .. }),
+        body,
+        ..
+    } = &view.body[3]
+    else {
+        panic!("expected fn with return type");
+    };
+    assert_eq!(*ret, sym("Str"));
+    assert!(matches!(body, Expr::Ternary { .. }));
+
+    // The Column has Text, TextField, a `for`, and a `when`.
+    let column = as_element(&view.body[4]);
+    assert_eq!(column.children.len(), 4);
+    assert!(matches!(&column.children[2], Member::For { var, .. } if *var == sym("item")));
+    assert!(matches!(
+        &column.children[3],
+        Member::When { els: None, .. }
+    ));
+
+    // #[style: .title] resolves to a class reference value.
+    let text = as_element(&column.children[0]);
+    assert!(matches!(
+        &text.attrs[0].kind,
+        AttrKind::Prop { value: Expr::ClassRef(c, _) } if *c == sym("title")
+    ));
+
+    // The scoped style block has three rules.
+    let Member::Style { rules, .. } = &view.body[5] else {
+        panic!("expected style block");
+    };
+    assert_eq!(rules.len(), 3);
+    assert_eq!(rules[0].class, sym("title"));
+}
+
+#[test]
+fn golden_profile_card() {
+    // RFC-0005 §"Guide-level" — params with a type, hex colors, a Len pair,
+    // a nested interpolated string, and a `=> follow()` action.
+    let src = r#"
+View ProfileCard(name: Str) {
+    var liked = false
+
+    Column #[gap: 12, p: 16, bg: 0x1E1E1E, radius: 16, width: 280] {
+        Row #[gap: 8, align: center] {
+            Image("avatar.png") #[width: 40, height: 40, radius: 20, fit: cover]
+            Text(name) #[typo: titleMedium]
+            Spacer #[grow: 1]
+            Toggle #[bind: liked]
+        }
+        Text("{name} {liked ? \"♥ liked\" : \"\"}") #[color: 0xAAAAAA, lines: 1]
+        Button("Follow") #[bg: 0x3B82F6, radius: 8, p: (8, 16)] => follow()
+    }
+}
+"#;
+    let view = one_view(src);
+    assert_eq!(view.name, sym("ProfileCard"));
+    assert_eq!(view.params.len(), 1);
+    assert!(matches!(
+        &view.params[0],
+        Param { name, ty: Some(Type::Named { name: ty, .. }), .. }
+            if *name == sym("name") && *ty == sym("Str")
+    ));
+
+    let column = as_element(&view.body[1]);
+    // bg: 0x1E1E1E lexed as a hex int.
+    assert!(matches!(
+        &column.attrs[2].kind,
+        AttrKind::Prop { value: Expr::IntLit(v, _) } if *v == 0x001E_1E1E
+    ));
+
+    let row = as_element(&column.children[0]);
+    assert_eq!(row.children.len(), 4);
+    // fit: cover → enum token as an identifier.
+    let image = as_element(&row.children[0]);
+    assert!(matches!(
+        &image.attrs[3].kind,
+        AttrKind::Prop { value: Expr::Ident(c, _) } if *c == sym("cover")
+    ));
+
+    // The interpolated string with nested escaped strings inside the ternary.
+    let text = as_element(&column.children[1]);
+    let Expr::StrLit(parts, _) = &text.content[0].value else {
+        panic!("expected interpolated string");
+    };
+    // [Interp(name), Text(" "), Interp(ternary)]
+    assert!(matches!(&parts[0], StrPart::Interp(_)));
+    assert!(
+        parts
+            .iter()
+            .any(|p| matches!(p, StrPart::Interp(e) if matches!(**e, Expr::Ternary { .. })))
+    );
+
+    // Button("Follow") #[... p: (8, 16)] => follow()
+    let button = as_element(&column.children[2]);
+    assert!(matches!(
+        &button.attrs[2].kind,
+        AttrKind::Prop { value: Expr::Tuple(items, _) } if items.len() == 2
+    ));
+    assert!(matches!(&button.action, Some(Expr::Call { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Targeted unit tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prop_vs_event_attributes() {
+    let view = one_view("View V() { Box #[gap: 12, tap => x++, move(e) => y = e.pos] }");
+    let el = as_element(&view.body[0]);
+    assert_eq!(el.attrs.len(), 3);
+    assert!(matches!(&el.attrs[0].kind, AttrKind::Prop { .. }));
+    assert!(matches!(
+        &el.attrs[1].kind,
+        AttrKind::Event { payload: None, .. }
+    ));
+    assert!(matches!(
+        &el.attrs[2].kind,
+        AttrKind::Event { payload: Some(p), .. } if *p == sym("e")
+    ));
+}
+
+#[test]
+fn function_types_parse() {
+    let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
+    let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {
+        panic!("expected Fn type for onPick");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(ret.is_none());
+
+    let Type::Function { params, ret, .. } = view.params[1].ty.as_ref().unwrap() else {
+        panic!("expected Fn type for test");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(matches!(ret.as_deref(), Some(Type::Named { name, .. }) if *name == sym("Bool")));
+}
+
+#[test]
+fn multiple_views_per_file() {
+    let parsed = parse("View A() {}\nView B() {}");
+    assert!(parsed.errors.is_empty());
+    assert_eq!(parsed.views.len(), 2);
+    assert_eq!(parsed.views[0].name, sym("A"));
+    assert_eq!(parsed.views[1].name, sym("B"));
+}
+
+#[test]
+fn error_recovery_collects_multiple_diagnostics() {
+    // Two independent malformed bindings must each be reported, and the view is
+    // still returned (single-pass multi-diagnostic recovery).
+    let parsed = parse("View Bad() {\n    var = 1\n    let = 2\n}");
+    assert!(
+        parsed.errors.len() >= 2,
+        "expected ≥2 diagnostics, got {:#?}",
+        parsed.errors
+    );
+    assert_eq!(parsed.views.len(), 1);
+    assert_eq!(parsed.views[0].body.len(), 2);
+}
