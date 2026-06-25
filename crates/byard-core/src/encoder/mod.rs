@@ -42,6 +42,21 @@ use text_glyph::{TextGlyphPipeline, TextLine};
 /// importing from the Encoder subsystem (RFC-0001 §9).
 pub use crate::frame::BoxInstance;
 
+/// Re-exported so the engine's render-thread drain (M29) can downcast the
+/// type-erased I/O result back to a decoded image and hand it to
+/// [`EncoderSubsystem::apply_decoded`].
+pub use texture_sampler::DecodedImage;
+
+/// The async-decode plumbing the engine hands the encoder (M29), cloned out of
+/// `Relay`: a Tokio handle to spawn the blocking `image::open` decode on, and
+/// the type-erased result sender those tasks report back through. Held as a
+/// plain struct (not a `relay` import) so the encoder never depends on the
+/// relay subsystem (RFC-0001 §9 / INV-11).
+struct IoContext {
+    handle: tokio::runtime::Handle,
+    tx: texture_sampler::IoResultSender,
+}
+
 impl BoxInstance {
     /// Returns the `wgpu` vertex buffer layout for the instance buffer.
     ///
@@ -126,6 +141,13 @@ pub struct EncoderSubsystem {
     image_sampler: wgpu::Sampler,
     /// Path-keyed cache of decoded image textures (M21, IMPL-32).
     texture_cache: texture_sampler::TextureCache,
+    /// Async-decode plumbing (M29): the relay's I/O runtime handle and the
+    /// type-erased result sender, installed by the engine via
+    /// [`set_io_context`](Self::set_io_context). `None` for a bare encoder
+    /// constructed without a relay (e.g. GPU-readback tests that never load
+    /// images) — in that case [`encode_frame_with_decorations`] decodes
+    /// synchronously, since there is no I/O pool to offload to.
+    io: Option<IoContext>,
     /// DPI scale factor, derived once per resize from the OS-reported value.
     ///
     /// Stored here so `encode_frame` can pass it to `TextGlyphPipeline::prepare`
@@ -200,6 +222,17 @@ pub struct EncoderSubsystem {
     /// leaving stale ink permanently outside the scissor rect (and
     /// therefore never cleared). See [`dirty_text_bounds`].
     last_text_bounds: Vec<Rect>,
+    /// Per-`BoxInstance` bounding boxes from the previous `encode_frame` call,
+    /// positionally aligned with that call's `instances` slice. Mirrors
+    /// [`last_text_bounds`](Self::last_text_bounds) for the solid-box pipeline
+    /// (M26) so a moved/shrunk box still clears its old footprint.
+    last_box_bounds: Vec<Rect>,
+    /// Per-`DecoratedBox` bounding boxes from the previous call (M27), aligned
+    /// with that call's `decorated` slice. Same shrink/move-safety contract.
+    last_decorated_bounds: Vec<Rect>,
+    /// Per-`TextureSampler` bounding boxes from the previous call (M27),
+    /// aligned with that call's `textures` slice.
+    last_texture_bounds: Vec<Rect>,
     /// The [`RenderFrame::version`] value from the last frame rendered via
     /// [`encode_frame_from_relay`](Self::encode_frame_from_relay).
     ///
@@ -352,6 +385,7 @@ impl EncoderSubsystem {
             texture_bind_group_layout,
             image_sampler,
             texture_cache: texture_sampler::TextureCache::default(),
+            io: None,
             scale_factor,
             viewport_dirty: false,
             persistent_color,
@@ -365,6 +399,9 @@ impl EncoderSubsystem {
             last_instance_count: 0,
             last_text_count: 0,
             last_text_bounds: Vec::new(),
+            last_box_bounds: Vec::new(),
+            last_decorated_bounds: Vec::new(),
+            last_texture_bounds: Vec::new(),
             last_relay_version: 0,
         })
     }
@@ -491,31 +528,28 @@ impl EncoderSubsystem {
         decorated: &[crate::frame::DecoratedBox],
         textures: &[crate::frame::TextureSampler],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
-        // Decode/upload any new image sources before the render pass (queue
-        // texture writes are illegal inside an active pass).
-        for t in textures {
-            self.texture_cache.ensure(
-                &self.device,
-                &self.queue,
-                &self.texture_bind_group_layout,
-                &self.image_sampler,
-                &t.src,
-            );
-        }
+        self.request_textures(textures);
 
-        let mut full_redraw = needs_full_redraw_this_frame(
+        let full_redraw = needs_full_redraw_this_frame(
             self.needs_full_redraw,
             self.last_instance_count,
             instances.len(),
             self.last_text_count,
             texts.len(),
         );
-        // Decorated boxes and textures carry no per-primitive dirty tracking, so
-        // any frame that contains them is drawn in full (correctness over the
-        // incremental-scissor optimization; the common empty case is unaffected).
-        if !decorated.is_empty() || !textures.is_empty() {
-            full_redraw = true;
-        }
+        // M27: `DecoratedBox`/`TextureSampler` no longer force a full,
+        // unscissored redraw just by being present — they now carry their own
+        // `dirty` bit and contribute to the same incremental scissor union as
+        // text and solid boxes (RFC-0001 §3.3).
+
+        // Every `BoxInstance` in the frame is treated as dirty: the lowering
+        // re-emits the whole instance list each tick (IMPL-29) and `BoxInstance`
+        // is a pure GPU `Pod` type with no room for a per-instance dirty bit
+        // (IMPL-41), so the honest, layout-safe representation of "a box may
+        // have changed" is "all of them might have." This is what fixes the M26
+        // bug: a box-only mutation (no dirty text) now always produces a
+        // non-empty scissor and reaches the screen.
+        let instances_dirty = vec![true; instances.len()];
 
         // Only meaningful on a non-full-redraw frame — every primitive is
         // drawn regardless of its dirty bit when `full_redraw` is true.
@@ -523,8 +557,17 @@ impl EncoderSubsystem {
             None
         } else {
             compute_scissor(
-                texts,
-                &self.last_text_bounds,
+                &ScissorInputs {
+                    texts,
+                    prev_texts: &self.last_text_bounds,
+                    instances,
+                    instances_dirty: &instances_dirty,
+                    prev_boxes: &self.last_box_bounds,
+                    decorated,
+                    prev_decorated: &self.last_decorated_bounds,
+                    textures,
+                    prev_textures: &self.last_texture_bounds,
+                },
                 self.scale_factor,
                 self.phys_w,
                 self.phys_h,
@@ -608,7 +651,7 @@ impl EncoderSubsystem {
             },
         );
 
-        update_frame_bookkeeping(self, instances, texts);
+        update_frame_bookkeeping(self, instances, texts, decorated, textures);
 
         Ok(encoder.finish())
     }
@@ -672,6 +715,66 @@ impl EncoderSubsystem {
         self.last_relay_version = frame.version();
         Ok(cmd)
     }
+
+    /// Requests decode of every texture source in `textures` before the render
+    /// pass (M29). With an I/O context the decode runs on the relay's pool and
+    /// the upload happens later via [`apply_decoded`](Self::apply_decoded), so
+    /// the render thread never blocks here (INV-12). A bare encoder with no
+    /// relay falls back to a synchronous decode+upload — used only by
+    /// GPU-readback tests, which never carry images, so this branch is a safety
+    /// net rather than a hot path.
+    fn request_textures(&mut self, textures: &[crate::frame::TextureSampler]) {
+        if let Some(io) = &self.io {
+            let handle = io.handle.clone();
+            let tx = io.tx.clone();
+            for t in textures {
+                self.texture_cache.ensure(&handle, &tx, &t.src);
+            }
+        } else {
+            for t in textures {
+                let decoded = texture_sampler::DecodedImage {
+                    src: t.src.clone(),
+                    result: texture_sampler::decode_rgba(&t.src),
+                };
+                self.texture_cache.apply_decoded(
+                    &self.device,
+                    &self.queue,
+                    &self.texture_bind_group_layout,
+                    &self.image_sampler,
+                    decoded,
+                );
+            }
+        }
+    }
+
+    /// Installs the async-decode plumbing (M29): the relay's I/O runtime handle
+    /// (decode tasks are spawned here) and the type-erased result sender (they
+    /// report decoded pixels back through it). Called once by the engine after
+    /// it has both a `Relay` and this encoder. Until set, image decode falls
+    /// back to a synchronous path (see [`encode_frame_with_decorations`]).
+    pub fn set_io_context(
+        &mut self,
+        handle: tokio::runtime::Handle,
+        tx: texture_sampler::IoResultSender,
+    ) {
+        self.io = Some(IoContext { handle, tx });
+    }
+
+    /// Uploads one async decode result on the render thread (M29). Called by
+    /// the engine for each [`DecodedImage`] drained from the relay's I/O
+    /// channel, before encoding the next frame. The GPU upload is fast; the
+    /// expensive decode already happened off-thread. Because every primitive is
+    /// re-emitted dirty each tick (IMPL-29), the newly-`Ready` texture repaints
+    /// on the next frame without any extra dirty signal.
+    pub fn apply_decoded(&mut self, decoded: DecodedImage) {
+        self.texture_cache.apply_decoded(
+            &self.device,
+            &self.queue,
+            &self.texture_bind_group_layout,
+            &self.image_sampler,
+            decoded,
+        );
+    }
 }
 
 /// Updates the structural-change bookkeeping consulted by
@@ -684,15 +787,20 @@ fn update_frame_bookkeeping(
     state: &mut EncoderSubsystem,
     instances: &[BoxInstance],
     texts: &[TextLine],
+    decorated: &[crate::frame::DecoratedBox],
+    textures: &[crate::frame::TextureSampler],
 ) {
     state.needs_full_redraw = false;
     state.last_instance_count = instances.len();
     state.last_text_count = texts.len();
-    // Recomputed for every line (not just dirty ones) — a clean line's
-    // bounds are unchanged from last frame anyway, so this is a no-op for
-    // it, and it keeps `last_text_bounds` positionally aligned with `texts`
-    // without needing a separate "did this line move" check.
+    // Recomputed for every primitive (not just dirty ones) — a clean
+    // primitive's bounds are unchanged from last frame anyway, so this is a
+    // no-op for it, and it keeps each `last_*_bounds` positionally aligned with
+    // its slice without needing a separate "did this move" check.
     state.last_text_bounds = texts.iter().map(text_line_bounds).collect();
+    state.last_box_bounds = instances.iter().map(|b| rect_of(b.rect)).collect();
+    state.last_decorated_bounds = decorated.iter().map(|d| rect_of(d.base.rect)).collect();
+    state.last_texture_bounds = textures.iter().map(|t| rect_of(t.rect)).collect();
 }
 
 /// Draws the UI render pass: a scissored clear quad (incremental frames
@@ -942,12 +1050,124 @@ fn dirty_text_bounds(texts: &[TextLine], previous: &[Rect]) -> Option<Rect> {
         .reduce(|acc, r| acc.union(&r))
 }
 
-/// Combines [`dirty_text_bounds`] and [`logical_rect_to_physical_scissor`]
-/// into the single result [`EncoderSubsystem::encode_frame`] needs to
-/// decide whether (and where) to scissor an incremental frame: the logical
-/// bounds (needed to size the clear quad) alongside the physical
-/// `(x, y, width, height)` tuple `wgpu::RenderPass::set_scissor_rect`
-/// expects.
+/// Builds a [`Rect`] from a primitive's `[x, y, width, height]` paint rect.
+const fn rect_of(rect: [f32; 4]) -> Rect {
+    Rect::new(rect[0], rect[1], rect[2], rect[3])
+}
+
+/// The generalisation of [`dirty_text_bounds`] to any primitive type
+/// (RFC-0001 §3.3): unions the current bounds of every **dirty** item with
+/// that item's bounds from the previous frame (`previous`, positionally
+/// aligned), so a shrunk or moved primitive still clears its old footprint.
+///
+/// `items` yields `(current_bounds, is_dirty)` in slice order. Returns `None`
+/// when nothing is dirty.
+fn union_dirty_rects(items: impl Iterator<Item = (Rect, bool)>, previous: &[Rect]) -> Option<Rect> {
+    items
+        .enumerate()
+        .filter(|(_, (_, dirty))| *dirty)
+        .map(|(i, (current, _))| match previous.get(i) {
+            Some(prev) => current.union(prev),
+            None => current,
+        })
+        .reduce(|acc, r| acc.union(&r))
+}
+
+/// `dirty_text_bounds` for the `SolidBox` pipeline (M26).
+///
+/// `dirty` is positionally aligned with `instances`. Each box's bounds are its
+/// paint rect directly (a solid box's geometry *is* its bounds, unlike text
+/// whose extents are heuristically estimated). See [`union_dirty_rects`] for
+/// the previous-frame-union contract this shares with text.
+fn dirty_box_bounds(instances: &[BoxInstance], dirty: &[bool], previous: &[Rect]) -> Option<Rect> {
+    union_dirty_rects(
+        instances
+            .iter()
+            .zip(dirty.iter())
+            .map(|(b, d)| (rect_of(b.rect), *d)),
+        previous,
+    )
+}
+
+/// `dirty_text_bounds` for the `DecoratedBox` pipeline (M27); dirtiness comes
+/// from each decoration's own [`DecoratedBox::dirty`](crate::frame::DecoratedBox::dirty)
+/// bit and its bounds from its `base` rect.
+fn dirty_decorated_bounds(
+    decorated: &[crate::frame::DecoratedBox],
+    previous: &[Rect],
+) -> Option<Rect> {
+    union_dirty_rects(
+        decorated.iter().map(|d| (rect_of(d.base.rect), d.dirty)),
+        previous,
+    )
+}
+
+/// `dirty_text_bounds` for the `TextureSampler` pipeline (M27); dirtiness comes
+/// from each sampler's own [`TextureSampler::dirty`](crate::frame::TextureSampler::dirty)
+/// bit.
+fn dirty_texture_bounds(
+    textures: &[crate::frame::TextureSampler],
+    previous: &[Rect],
+) -> Option<Rect> {
+    union_dirty_rects(
+        textures.iter().map(|t| (rect_of(t.rect), t.dirty)),
+        previous,
+    )
+}
+
+/// Unions two optional rects: `Some ∪ Some` merges, `Some ∪ None` (either
+/// order) passes the `Some` through, `None ∪ None` is `None`.
+fn union_opt(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.union(&y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// Every per-primitive dirty input [`compute_scissor`] unions into one
+/// scissor rect, bundled so the call site stays under the argument-count lint
+/// and reads as one coherent "what changed this frame" snapshot. Each
+/// `prev_*` slice is positionally aligned with its primitive slice (the
+/// previous frame's bounds) for the shrink/move-safety contract in
+/// [`union_dirty_rects`].
+struct ScissorInputs<'a> {
+    texts: &'a [TextLine],
+    prev_texts: &'a [Rect],
+    instances: &'a [BoxInstance],
+    instances_dirty: &'a [bool],
+    prev_boxes: &'a [Rect],
+    decorated: &'a [crate::frame::DecoratedBox],
+    prev_decorated: &'a [Rect],
+    textures: &'a [crate::frame::TextureSampler],
+    prev_textures: &'a [Rect],
+}
+
+#[cfg(test)]
+impl<'a> ScissorInputs<'a> {
+    /// Builds inputs that carry only text (no boxes/decorations/textures) —
+    /// the original text-only `compute_scissor` shape, kept so the text-path
+    /// unit tests read unchanged.
+    fn text_only(texts: &'a [TextLine], prev_texts: &'a [Rect]) -> Self {
+        Self {
+            texts,
+            prev_texts,
+            instances: &[],
+            instances_dirty: &[],
+            prev_boxes: &[],
+            decorated: &[],
+            prev_decorated: &[],
+            textures: &[],
+            prev_textures: &[],
+        }
+    }
+}
+
+/// Unions every dirty primitive's bounds (text + solid boxes + decorations +
+/// textures, RFC-0001 §3.3) and converts the result into the single
+/// [`EncoderSubsystem::encode_frame`] needs to scissor an incremental frame:
+/// the logical bounds (needed to size the clear quad) alongside the physical
+/// `(x, y, width, height)` tuple `wgpu::RenderPass::set_scissor_rect` expects.
 ///
 /// Pure and unit-testable independent of any `wgpu` state, following the
 /// project's established pattern of extracting CPU-mirror decision logic
@@ -955,13 +1175,21 @@ fn dirty_text_bounds(texts: &[TextLine], previous: &[Rect]) -> Option<Rect> {
 /// both when nothing is dirty and when the dirty bounds degenerate to a
 /// zero-size physical rect (wgpu rejects a zero-size scissor rect).
 fn compute_scissor(
-    texts: &[TextLine],
-    previous: &[Rect],
+    inputs: &ScissorInputs<'_>,
     scale: f32,
     max_w: u32,
     max_h: u32,
 ) -> Option<(Rect, u32, u32, u32, u32)> {
-    let bounds = dirty_text_bounds(texts, previous)?;
+    let bounds = union_opt(
+        union_opt(
+            dirty_text_bounds(inputs.texts, inputs.prev_texts),
+            dirty_box_bounds(inputs.instances, inputs.instances_dirty, inputs.prev_boxes),
+        ),
+        union_opt(
+            dirty_decorated_bounds(inputs.decorated, inputs.prev_decorated),
+            dirty_texture_bounds(inputs.textures, inputs.prev_textures),
+        ),
+    )?;
     let (x, y, w, h) = logical_rect_to_physical_scissor(bounds, scale, max_w, max_h);
     if w > 0 && h > 0 {
         Some((bounds, x, y, w, h))
@@ -1870,18 +2098,19 @@ mod tests {
     #[test]
     fn compute_scissor_is_none_when_nothing_is_dirty() {
         let texts = [line(0.0, 0.0, "a", 16.0, false)];
-        assert!(compute_scissor(&texts, &[], 1.0, 1000, 1000).is_none());
+        assert!(compute_scissor(&ScissorInputs::text_only(&texts, &[]), 1.0, 1000, 1000).is_none());
     }
 
     #[test]
     fn compute_scissor_is_none_for_empty_texts() {
-        assert!(compute_scissor(&[], &[], 1.0, 1000, 1000).is_none());
+        assert!(compute_scissor(&ScissorInputs::text_only(&[], &[]), 1.0, 1000, 1000).is_none());
     }
 
     #[test]
     fn compute_scissor_returns_physical_rect_for_a_dirty_line() {
         let texts = [line(10.0, 20.0, "hello", 16.0, true)];
-        let (bounds, x, y, w, h) = compute_scissor(&texts, &[], 2.0, 1000, 1000).unwrap();
+        let (bounds, x, y, w, h) =
+            compute_scissor(&ScissorInputs::text_only(&texts, &[]), 2.0, 1000, 1000).unwrap();
         let expected_bounds = text_line_bounds(&texts[0]);
         assert_eq!(bounds, expected_bounds, "logical bounds must be unscaled");
         let (expected_x, expected_y, expected_w, expected_h) =
@@ -1907,8 +2136,13 @@ mod tests {
         let previous_bounds =
             text_line_bounds(&line(0.0, 0.0, "a much longer string", 16.0, false));
         let texts = [shrunk];
-        let (bounds, _, _, w, _) =
-            compute_scissor(&texts, &[previous_bounds], 1.0, 1000, 1000).unwrap();
+        let (bounds, _, _, w, _) = compute_scissor(
+            &ScissorInputs::text_only(&texts, &[previous_bounds]),
+            1.0,
+            1000,
+            1000,
+        )
+        .unwrap();
         assert!(
             bounds.width >= previous_bounds.width,
             "logical union must retain the previous (wider) footprint"
@@ -1927,6 +2161,159 @@ mod tests {
         // scissor, so `compute_scissor` must surface `None` rather than a
         // degenerate `Some((..., 0, 0))`.
         let texts = [line(2000.0, 2000.0, "offscreen", 16.0, true)];
-        assert!(compute_scissor(&texts, &[], 1.0, 100, 100).is_none());
+        assert!(compute_scissor(&ScissorInputs::text_only(&texts, &[]), 1.0, 100, 100).is_none());
+    }
+
+    // ── M26/M27: box / decorated / texture dirty bounds + combined scissor ────
+
+    /// Builds a `BoxInstance` at `(x, y, w, h)` (colour/radii irrelevant to
+    /// the bounds helpers under test).
+    fn box_at(x: f32, y: f32, w: f32, h: f32) -> BoxInstance {
+        BoxInstance {
+            rect: [x, y, w, h],
+            color: [0.0; 4],
+            radii: [0.0; 4],
+        }
+    }
+
+    fn decorated_at(x: f32, y: f32, w: f32, h: f32, dirty: bool) -> crate::frame::DecoratedBox {
+        crate::frame::DecoratedBox {
+            base: box_at(x, y, w, h),
+            dirty,
+            ..Default::default()
+        }
+    }
+
+    fn texture_at(x: f32, y: f32, w: f32, h: f32, dirty: bool) -> crate::frame::TextureSampler {
+        crate::frame::TextureSampler {
+            rect: [x, y, w, h],
+            src: String::new(),
+            fit: crate::frame::ImageFit::Fill,
+            radii: [0.0; 4],
+            opacity: 1.0,
+            dirty,
+        }
+    }
+
+    #[test]
+    fn dirty_box_bounds_is_none_when_nothing_is_dirty() {
+        let boxes = [box_at(0.0, 0.0, 10.0, 10.0), box_at(50.0, 50.0, 10.0, 10.0)];
+        assert!(dirty_box_bounds(&boxes, &[false, false], &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_box_bounds_ignores_non_dirty_boxes() {
+        let boxes = [
+            box_at(10.0, 10.0, 20.0, 20.0),
+            box_at(900.0, 900.0, 5.0, 5.0),
+        ];
+        let bounds = dirty_box_bounds(&boxes, &[true, false], &[]).unwrap();
+        assert_eq!(
+            bounds,
+            rect_of(boxes[0].rect),
+            "a clean box must not widen the union"
+        );
+    }
+
+    #[test]
+    fn dirty_box_bounds_unions_with_previous_frame_bounds() {
+        // A box that shrinks between frames: its old (wider) footprint must
+        // still be covered, mirroring `dirty_text_bounds_unions_with_previous_*`.
+        let shrunk = box_at(0.0, 0.0, 10.0, 10.0);
+        let previous = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let bounds = dirty_box_bounds(std::slice::from_ref(&shrunk), &[true], &[previous]).unwrap();
+        assert_eq!(bounds, rect_of(shrunk.rect).union(&previous));
+        assert!(bounds.width >= previous.width);
+    }
+
+    #[test]
+    fn compute_scissor_is_some_when_only_a_box_is_dirty_and_no_text_exists() {
+        // The M26 regression test: no text at all, one dirty box. The old
+        // text-only `compute_scissor` returned `None` here, so `should_draw`
+        // was false and the box mutation never reached the screen.
+        let boxes = [box_at(10.0, 20.0, 30.0, 40.0)];
+        let inputs = ScissorInputs {
+            instances: &boxes,
+            instances_dirty: &[true],
+            ..ScissorInputs::text_only(&[], &[])
+        };
+        let scissor = compute_scissor(&inputs, 1.0, 1000, 1000);
+        assert!(
+            scissor.is_some(),
+            "a box-only mutation must produce a non-empty scissor"
+        );
+        let (bounds, ..) = scissor.unwrap();
+        assert_eq!(bounds, rect_of(boxes[0].rect));
+    }
+
+    #[test]
+    fn compute_scissor_unions_box_and_text_dirty_regions() {
+        // One dirty box far from one dirty text line; the scissor must cover
+        // both regions, not just one.
+        let texts = [line(0.0, 0.0, "a", 16.0, true)];
+        let boxes = [box_at(500.0, 500.0, 40.0, 40.0)];
+        let inputs = ScissorInputs {
+            instances: &boxes,
+            instances_dirty: &[true],
+            ..ScissorInputs::text_only(&texts, &[])
+        };
+        let (bounds, ..) = compute_scissor(&inputs, 1.0, 1000, 1000).unwrap();
+        let expected = text_line_bounds(&texts[0]).union(&rect_of(boxes[0].rect));
+        assert_eq!(bounds, expected);
+    }
+
+    #[test]
+    fn dirty_texture_bounds_is_none_when_nothing_is_dirty() {
+        let textures = [texture_at(0.0, 0.0, 10.0, 10.0, false)];
+        assert!(dirty_texture_bounds(&textures, &[]).is_none());
+    }
+
+    #[test]
+    fn dirty_texture_bounds_ignores_non_dirty_textures() {
+        let textures = [
+            texture_at(10.0, 10.0, 20.0, 20.0, true),
+            texture_at(900.0, 900.0, 5.0, 5.0, false),
+        ];
+        let bounds = dirty_texture_bounds(&textures, &[]).unwrap();
+        assert_eq!(bounds, rect_of(textures[0].rect));
+    }
+
+    #[test]
+    fn dirty_texture_bounds_unions_with_previous_frame_bounds() {
+        let shrunk = texture_at(0.0, 0.0, 10.0, 10.0, true);
+        let previous = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let bounds = dirty_texture_bounds(std::slice::from_ref(&shrunk), &[previous]).unwrap();
+        assert_eq!(bounds, rect_of(shrunk.rect).union(&previous));
+    }
+
+    #[test]
+    fn compute_scissor_does_not_force_full_redraw_when_a_clean_decorated_box_is_present() {
+        // The actual point of M27: a scene with one *non-dirty* DecoratedBox
+        // and one dirty text line must scissor to the text's bounds only — not
+        // the whole viewport (which is what the old forced-`full_redraw` block,
+        // now deleted, effectively did).
+        let texts = [line(10.0, 20.0, "hi", 16.0, true)];
+        let decorated = [decorated_at(0.0, 0.0, 999.0, 999.0, false)];
+        let inputs = ScissorInputs {
+            decorated: &decorated,
+            ..ScissorInputs::text_only(&texts, &[])
+        };
+        let (bounds, ..) = compute_scissor(&inputs, 1.0, 1000, 1000).unwrap();
+        assert_eq!(
+            bounds,
+            text_line_bounds(&texts[0]),
+            "a clean decorated box must not expand the scissor"
+        );
+    }
+
+    #[test]
+    fn compute_scissor_includes_a_dirty_decorated_box() {
+        let decorated = [decorated_at(100.0, 100.0, 50.0, 50.0, true)];
+        let inputs = ScissorInputs {
+            decorated: &decorated,
+            ..ScissorInputs::text_only(&[], &[])
+        };
+        let (bounds, ..) = compute_scissor(&inputs, 1.0, 1000, 1000).unwrap();
+        assert_eq!(bounds, rect_of(decorated[0].base.rect));
     }
 }

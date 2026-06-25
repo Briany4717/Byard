@@ -28,6 +28,31 @@ use crate::parser::ast::{
 };
 use crate::symbol::Symbol;
 
+/// Decimal places a `Slider` without an explicit `step` quantises its value to.
+///
+/// A continuous slider otherwise emits the full `f64` precision of a
+/// pixel-derived ratio (e.g. `0.6035294…`); rounding keeps the bound value
+/// readable. Authors who need a specific granularity set `step:` instead.
+const SLIDER_DEFAULT_DECIMALS: i32 = 3;
+
+/// Decimal places implied by `step`, via its shortest round-trip form
+/// (`0.1 → 1`, `0.25 → 2`, `1.0 → 0`). Used so a stepped slider never emits a
+/// value with more decimal places than the step itself — e.g. `step: 0.1`
+/// landing on `6 × 0.1 = 0.6000000000000001` is rounded back to `0.6`. Capped
+/// at 10 places (any real step is far coarser).
+fn step_decimals(step: f64) -> i32 {
+    match format!("{}", step.abs()).split_once('.') {
+        Some((_, frac)) => i32::try_from(frac.len().min(10)).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Rounds `val` to `decimals` decimal places (half-away-from-zero).
+fn round_to_decimals(val: f64, decimals: i32) -> f64 {
+    let factor = 10f64.powi(decimals);
+    (val * factor).round() / factor
+}
+
 /// A lowered render-tree node: the interpreter's plan for one element. Reactive
 /// fields are reactive-scope ids the engine reads each tick (M14).
 #[derive(Debug, Clone, PartialEq)]
@@ -662,7 +687,7 @@ impl Interpreter {
                         rect.height,
                     );
                     let bg = self.eval_color_prop(attrs, "bg");
-                    let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
+                    let radii = self.resolve_radii(attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
                     // draws a 2px ring of that colour.
                     let border_color = self.eval_color_prop(attrs, "border");
@@ -691,7 +716,7 @@ impl Interpreter {
                         let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
-                            radii: [radius; 4],
+                            radii,
                         };
                         let border_rgba = border_color
                             .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
@@ -710,6 +735,9 @@ impl Interpreter {
                                 shadow_blur,
                                 shadow_color: shadow_rgba,
                                 opacity,
+                                // Re-walked and re-emitted every tick (IMPL-29);
+                                // mirror Text's always-dirty lowering (IMPL-41).
+                                dirty: true,
                             });
                         } else if is_decorated || border_color.is_some() {
                             // Paint the opaque fill on the SolidBox pass so it stays
@@ -733,6 +761,7 @@ impl Interpreter {
                                 shadow_blur,
                                 shadow_color: shadow_rgba,
                                 opacity: 1.0,
+                                dirty: true,
                             });
                         } else {
                             frame.push_instance(base);
@@ -831,7 +860,7 @@ impl Interpreter {
                         .and_then(|v| if let Value::Str(s) = v { Some(s) } else { None })
                         .unwrap_or_default();
                     let fit = self.eval_fit_prop(attrs);
-                    let radius = self.eval_int_prop(attrs, "radius").unwrap_or(0) as f32;
+                    let radii = self.resolve_radii(attrs, "radius");
                     let opacity = self
                         .eval_float_prop(attrs, "opacity")
                         .map_or(1.0, |v| v as f32);
@@ -839,8 +868,11 @@ impl Interpreter {
                         rect: [rect.x, rect.y, rect.width, rect.height],
                         src: src_val,
                         fit,
-                        radii: [radius; 4],
+                        radii,
                         opacity,
+                        // Re-emitted every tick (IMPL-29); mirror Text's
+                        // always-dirty lowering (IMPL-41).
+                        dirty: true,
                     });
                 }
             }
@@ -918,9 +950,16 @@ impl Interpreter {
         elem_idx: Option<u32>,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
-        let min = self.eval_float_prop(attrs, "min").unwrap_or(0.0) as f32;
-        let max = self.eval_float_prop(attrs, "max").unwrap_or(1.0) as f32;
-        let step = self.eval_float_prop(attrs, "step").map(|v| v as f32);
+        // Keep the authored `f64` values for the value-write path: computing the
+        // emitted value in `f64` avoids the `f32`→`f64` widening artifact (a drag
+        // landing on 0.6 was stored as `f64::from(0.6_f32)` =
+        // 0.6000000238418579). The `f32` casts below are only for pixel-space
+        // visual layout (track/fill/thumb), where the noise is invisible.
+        let min_f = self.eval_float_prop(attrs, "min").unwrap_or(0.0);
+        let max_f = self.eval_float_prop(attrs, "max").unwrap_or(1.0);
+        let step_f = self.eval_float_prop(attrs, "step");
+        let min = min_f as f32;
+        let max = max_f as f32;
         let cur_val = bound_sig.map_or(min, |s| match self.ctx.peek_signal(s) {
             Value::Float(f) => f as f32,
             Value::Int(n) => n as f32,
@@ -981,26 +1020,35 @@ impl Interpreter {
             let track_x = rect.x;
             let track_w = rect.w;
             let make_drag_action =
-                |min: f32, max: f32, step: Option<f32>| -> super::events::Action {
+                |min: f64, max: f64, step: Option<f64>| -> super::events::Action {
                     Box::new(move |ctx, _| {
                         let pos = super::events::CURRENT_EVENT_POS.with(std::cell::Cell::get);
-                        let t = ((pos.0 - track_x) / track_w).clamp(0.0, 1.0);
+                        // Pixel positions are `f32`; widen before the value math so
+                        // the stored value never carries `f32` rounding noise.
+                        let t = ((f64::from(pos.0) - f64::from(track_x)) / f64::from(track_w))
+                            .clamp(0.0, 1.0);
                         let raw = min + t * (max - min);
-                        let val = step.map_or(raw, |s| (raw / s).round() * s);
-                        ctx.write_signal(sig, Value::Float(f64::from(val)));
+                        // Quantise so the value never carries more decimals than
+                        // the step (or, with no step, a readable default) — see
+                        // `step_decimals`/`SLIDER_DEFAULT_DECIMALS`.
+                        let val = match step {
+                            Some(s) => round_to_decimals((raw / s).round() * s, step_decimals(s)),
+                            None => round_to_decimals(raw, SLIDER_DEFAULT_DECIMALS),
+                        };
+                        ctx.write_signal(sig, Value::Float(val));
                     })
                 };
             self.router.on(
                 idx,
                 hit_rect,
                 super::events::EventKind::PointerDown,
-                make_drag_action(min, max, step),
+                make_drag_action(min_f, max_f, step_f),
             );
             self.router.on(
                 idx,
                 hit_rect,
                 super::events::EventKind::PointerDrag,
-                make_drag_action(min, max, step),
+                make_drag_action(min_f, max_f, step_f),
             );
         }
     }
@@ -1533,6 +1581,77 @@ impl Interpreter {
                     found: n,
                 });
                 Spacing::default()
+            }
+        }
+    }
+
+    /// Resolves a `radius`-typed attribute into per-corner radii
+    /// `[top_left, top_right, bottom_right, bottom_left]` — the exact order
+    /// `BoxInstance::radii`/`TextureSampler::radii` expect (`frame.rs`).
+    ///
+    /// RFC-0005 §"Decoration" documents `radius: Len` as "scalar = all, quad =
+    /// per-corner" (IMPL-44). Accepted forms: a scalar (`radius: 16`, all four
+    /// corners) and the positional CSS-order quad (`radius: (4, 8, 12, 16)`).
+    /// Unlike `p`/`m`'s generic `Len` contract, there is no pair shorthand and
+    /// no named-field form for `radius` — the RFC documents only scalar/quad,
+    /// so this resolver doesn't invent additional surface. A non-4 tuple
+    /// arity is a `CompileError::ArityMismatch`; a non-numeric corner is an
+    /// `AttributeTypeMismatch`; a named field is a `ConflictingSpacingField`
+    /// (reusing the existing diagnostic — the message states the real cause).
+    fn resolve_radii(&mut self, attrs: &[Attr], name: &str) -> [f32; 4] {
+        let Some(attr) = attrs.iter().find(|a| a.name.as_str() == name) else {
+            return [0.0; 4];
+        };
+        let AttrKind::Prop { value } = &attr.kind else {
+            return [0.0; 4];
+        };
+        match value {
+            Expr::Tuple(args, span) => {
+                if args.iter().any(|a| a.name.is_some()) {
+                    self.errors.push(CompileError::ConflictingSpacingField {
+                        span: *span,
+                        message: format!(
+                            "`{name}` does not accept named corner fields; use a \
+                             positional quad (top_left, top_right, bottom_right, \
+                             bottom_left)"
+                        ),
+                    });
+                    return [0.0; 4];
+                }
+                if args.len() != 4 {
+                    self.errors.push(CompileError::ArityMismatch {
+                        span: *span,
+                        name: name.to_string(),
+                        expected: 4,
+                        found: args.len(),
+                    });
+                    return [0.0; 4];
+                }
+                let mut radii = [0.0_f32; 4];
+                for (slot, arg) in radii.iter_mut().zip(args) {
+                    let val = self.eval_pure(&arg.value);
+                    if let Some(v) = spacing_value(&val) {
+                        *slot = v;
+                    } else {
+                        self.errors.push(CompileError::AttributeTypeMismatch {
+                            span: arg.value.span(),
+                            expected: "a length (an integer)".to_string(),
+                        });
+                    }
+                }
+                radii
+            }
+            other => {
+                let val = self.eval_pure(other);
+                if let Some(v) = spacing_value(&val) {
+                    [v; 4]
+                } else {
+                    self.errors.push(CompileError::AttributeTypeMismatch {
+                        span: other.span(),
+                        expected: "a length (an integer)".to_string(),
+                    });
+                    [0.0; 4]
+                }
             }
         }
     }
@@ -2394,6 +2513,111 @@ mod tests {
         );
     }
 
+    // ── IMPL-44: per-corner `radius` ─────────────────────────────────────
+
+    /// Lowers a single-element view and returns `resolve_radii`'s result for
+    /// its `radius` attribute alongside any errors raised.
+    fn resolve_radius_test(src: &str) -> ([f32; 4], Vec<CompileError>) {
+        let parsed = parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let attrs = element(&view.body[0]).attrs.clone();
+        let radii = interp.resolve_radii(&attrs, "radius");
+        (radii, interp.errors().to_vec())
+    }
+
+    #[test]
+    fn impl44_radius_scalar_broadcasts_to_all_four_corners() {
+        let (radii, errs) = resolve_radius_test("View C() { Column #[radius: 16] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(radii, [16.0, 16.0, 16.0, 16.0]);
+    }
+
+    #[test]
+    fn impl44_radius_quad_sets_independent_corners_in_css_order() {
+        // top_left, top_right, bottom_right, bottom_left (frame.rs / WGSL convention).
+        let (radii, errs) = resolve_radius_test("View C() { Column #[radius: (4, 8, 12, 16)] {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(radii, [4.0, 8.0, 12.0, 16.0]);
+    }
+
+    #[test]
+    fn impl44_radius_missing_attribute_defaults_to_zero() {
+        let (radii, errs) = resolve_radius_test("View C() { Column {} }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(radii, [0.0; 4]);
+    }
+
+    #[test]
+    fn impl44_radius_wrong_arity_is_arity_mismatch() {
+        let (radii, errs) = resolve_radius_test("View C() { Column #[radius: (4, 8)] {} }");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                CompileError::ArityMismatch {
+                    expected: 4,
+                    found: 2,
+                    ..
+                }
+            )),
+            "expected ArityMismatch(4, found 2), got {errs:?}"
+        );
+        assert_eq!(radii, [0.0; 4]);
+    }
+
+    #[test]
+    fn impl44_radius_named_corner_field_is_rejected() {
+        let (radii, errs) = resolve_radius_test(
+            "View C() { Column #[radius: (top_left: 4, top_right: 8, bottom_right: 12, bottom_left: 16)] {} }",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::ConflictingSpacingField { .. })),
+            "expected ConflictingSpacingField for named corners, got {errs:?}"
+        );
+        assert_eq!(radii, [0.0; 4]);
+    }
+
+    #[test]
+    fn impl44_radius_non_numeric_corner_is_type_mismatch() {
+        let (radii, errs) =
+            resolve_radius_test("View C() { Column #[radius: (4, \"x\", 12, 16)] {} }");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::AttributeTypeMismatch { .. })),
+            "expected AttributeTypeMismatch, got {errs:?}"
+        );
+        // Valid corners still resolve; the bad one is left at the [0.0;4]
+        // default rather than aborting the whole tuple.
+        assert_eq!(radii, [4.0, 0.0, 12.0, 16.0]);
+    }
+
+    #[test]
+    fn impl44_decorated_box_carries_independent_corner_radii_into_box_instance() {
+        // End-to-end: a quad `radius` on a Box that also has `bg` (so it's a
+        // plain BoxInstance push, not a DecoratedBox) reaches the GPU instance
+        // with all four corners intact rather than being collapsed to a scalar.
+        let parsed = parse(
+            "View C() { Box #[bg: 0xFF0000, radius: (4, 8, 12, 16), width: 50, height: 50] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let instances = frame.instances();
+        assert_eq!(instances.len(), 1, "expected exactly one BoxInstance");
+        assert_eq!(instances[0].radii, [4.0, 8.0, 12.0, 16.0]);
+    }
+
     // ── M16: Toggle/Slider/TextField write-back ──────────────────────────
 
     #[test]
@@ -2542,6 +2766,85 @@ mod tests {
             (val - 0.5).abs() < 0.1,
             "slider at 50% should be ~0.5, got {val}"
         );
+    }
+
+    #[test]
+    fn slider_value_has_no_f32_widening_tail() {
+        // Regression: a drag landing on 0.6 used to be stored as
+        // `f64::from(0.6_f32)` = 0.6000000238418579 because the value math ran
+        // in f32 and was only widened at the end. The value path now stays in
+        // f64, so a pixel-aligned 60% drag round-trips to a clean "0.6".
+        let parsed = parse(
+            "View C() {\n var vol = 0.0\n Slider #[bind: vol, min: 0, max: 1, width: 100]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("vol"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // x = 60 on a 100px track starting at x = 0 → exactly 60%.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerDown,
+            pos: (60.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+
+        let val = match interp.peek(sig) {
+            Value::Float(f) => f,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        assert_eq!(
+            format!("{val}"),
+            "0.6",
+            "slider value must not carry an f32 widening tail"
+        );
+    }
+
+    #[test]
+    fn slider_with_step_does_not_emit_more_decimals_than_the_step() {
+        // step: 0.1 landing on 60% used to store 6 * 0.1 = 0.6000000000000001.
+        // The value is now rounded to the step's precision → a clean "0.6".
+        let parsed = parse(
+            "View C() {\n var vol = 0.0\n Slider #[bind: vol, min: 0, max: 1, step: 0.1, width: 100]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("vol"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerDown,
+            pos: (60.0, 5.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+
+        let val = match interp.peek(sig) {
+            Value::Float(f) => f,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        assert_eq!(format!("{val}"), "0.6");
     }
 
     #[test]

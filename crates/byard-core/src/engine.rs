@@ -317,6 +317,10 @@ impl Engine {
         );
 
         let relay = Arc::new(Relay::new()?);
+        // Wire async image decode (M29): the encoder spawns decodes on the
+        // relay's I/O pool and reports results back through its type-erased
+        // channel, which `render_latest` drains.
+        encoder.set_io_context(relay.io_handle(), relay.io_result_sender());
         let (label_tx, label_rx) = crossbeam_channel::unbounded::<String>();
 
         Ok(Self {
@@ -542,6 +546,20 @@ impl Engine {
                 ));
             }
         };
+
+        // Drain any completed async image decodes (M29) and upload them on this
+        // (render) thread before encoding, so a freshly-decoded texture is
+        // `Ready` for this frame. The decode itself already ran on the relay's
+        // I/O pool — only the cheap GPU upload happens here (INV-12).
+        while let Some(result) = self.relay.try_recv_io_result() {
+            match result.downcast::<crate::encoder::DecodedImage>() {
+                Ok(decoded) => self.encoder.apply_decoded(*decoded),
+                // A result of some other type (not an image) is not ours to
+                // handle here; drop it. Today only image decode uses this
+                // channel on the render thread.
+                Err(_other) => {}
+            }
+        }
 
         let Some(relay_frame) = self.relay.current() else {
             return Ok(());

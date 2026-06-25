@@ -217,6 +217,15 @@ pub struct DecoratedBox {
     pub shadow_color: [f32; 4],
     /// Element opacity `0.0–1.0`.
     pub opacity: f32,
+    /// Whether this decoration changed since the last tick.
+    ///
+    /// The encoder's analogue of [`TextLine::dirty`] for the `DecoratedBox`
+    /// pipeline (RFC-0001 §3.3): set upstream by the Evaluator → `RenderFrame`
+    /// lowering, trusted by the Encoder when computing the incremental scissor
+    /// union. A decoration's `base` is a [`BoxInstance`], which is a pure GPU
+    /// `Pod` vertex type and therefore cannot itself carry a dirty bit — so the
+    /// flag lives here on the (non-`Pod`) wrapper instead (see IMPL-41).
+    pub dirty: bool,
 }
 
 impl Default for DecoratedBox {
@@ -234,6 +243,7 @@ impl Default for DecoratedBox {
             shadow_blur: 0.0,
             shadow_color: [0.0; 4],
             opacity: 1.0,
+            dirty: false,
         }
     }
 }
@@ -253,6 +263,14 @@ pub struct TextureSampler {
     pub radii: [f32; 4],
     /// Opacity `0.0–1.0`.
     pub opacity: f32,
+    /// Whether this image primitive changed since the last tick.
+    ///
+    /// The `TextureSampler` analogue of [`TextLine::dirty`] (RFC-0001 §3.3) —
+    /// set upstream by the lowering, trusted by the Encoder's incremental
+    /// scissor union. Also set by the Encoder itself the frame after an async
+    /// decode completes (M29), so a freshly-loaded image paints without a full
+    /// redraw.
+    pub dirty: bool,
 }
 
 /// A single line of text to be rendered in a frame.

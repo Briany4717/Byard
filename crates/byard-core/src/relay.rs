@@ -739,6 +739,37 @@ mod tests {
     }
 
     #[test]
+    fn real_image_decode_on_the_io_pool_is_received_after_it_completes() {
+        // The M29 shape end-to-end at the relay level: a deliberately slow
+        // (sleep + real decode) task on the I/O pool reports its result back
+        // through the type-erased channel, exactly as `TextureCache::ensure`
+        // does — proving a blocking `image` decode never touches the caller.
+        use std::io::Cursor;
+
+        let relay = Relay::new().unwrap();
+        let tx = relay.io_result_sender();
+
+        // A tiny PNG, encoded in-memory so the test needs no fixture file.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let task = relay.io_handle().spawn(async move {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+            let dims = (decoded.width(), decoded.height());
+            tx.send(Box::new(dims)).unwrap();
+        });
+        relay.io_handle().block_on(task).unwrap();
+
+        let result = relay
+            .try_recv_io_result()
+            .expect("decode task should have sent its result");
+        assert_eq!(*result.downcast::<(u32, u32)>().unwrap(), (4, 4));
+    }
+
+    #[test]
     fn dropping_relay_with_unconsumed_io_results_does_not_panic() {
         let relay = Relay::new().unwrap();
         let tx = relay.io_result_sender();
