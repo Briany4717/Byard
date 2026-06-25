@@ -506,9 +506,10 @@ mod tests {
     fn ensure_does_not_block_when_decoding_a_slow_fixture() {
         let rt = io_runtime();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn Any + Send>>();
-        // A 512×512 PNG: its decode (inflate + unfilter) takes well over the
-        // sub-millisecond bound `ensure` itself must stay under.
-        let path = write_png_fixture("inv12", 512, 512);
+        // A 1024×1024 PNG: its decode (inflate + unfilter) takes many
+        // milliseconds — far longer than the microseconds `ensure` needs just
+        // to spawn the task and return.
+        let path = write_png_fixture("inv12", 1024, 1024);
         let src = path.to_str().unwrap();
 
         // Warm the pool so its worker threads are already running — we are
@@ -525,14 +526,27 @@ mod tests {
         cache.ensure(rt.handle(), &tx, src);
         let elapsed = start.elapsed();
 
+        // The load-bearing INV-12 check is *structural*, not a tight timing
+        // bound (CI runners are too jittery for sub-millisecond wall-clock
+        // assertions): immediately after `ensure` returns, the decode result
+        // has **not** arrived on the channel. A blocking `ensure` (one that ran
+        // `image::open` inline before returning) would have already sent its
+        // result, so this is empty only because the decode is still in flight
+        // on the I/O pool.
         assert!(
-            elapsed < Duration::from_millis(1),
-            "ensure must not block on decode; took {elapsed:?}"
+            rx.try_recv().is_err(),
+            "ensure must not have completed the decode synchronously"
         );
-        // The decode has been deferred: nothing is `Ready` yet.
+        // The decode is deferred, so nothing is `Ready` yet either.
         assert!(
             cache.get(src).is_none(),
             "image must be Pending (not Ready) immediately after ensure"
+        );
+        // Secondary sanity bound, deliberately generous: `ensure` only spawns,
+        // so it returns far below the multi-ms decode even on a loaded runner.
+        assert!(
+            elapsed < Duration::from_millis(25),
+            "ensure should return promptly (only spawns); took {elapsed:?}"
         );
 
         // It does complete off-thread, proving the decode actually ran there.
