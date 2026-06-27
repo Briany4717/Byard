@@ -532,14 +532,6 @@ impl Interpreter {
     /// `known_views` are user `ViewDecl` names in scope.
     pub fn lower_element(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
         self.errors.extend(validate_element(el, known_views));
-        // A name that resolves in the view table — and is not an intrinsic, which
-        // always wins (IMPL-50) — is a user-view call, expanded in its own
-        // instance scope rather than lowered as a generic container (RFC-0007 §2).
-        if super::intrinsics::lookup(el.name.as_str()).is_none()
-            && self.view_table.contains(&el.name)
-        {
-            return self.lower_user_view_call(el, known_views);
-        }
         match el.name.as_str() {
             "Text" | "Button" if !el.content.is_empty() => {
                 let content = self.bind_value(&el.content[0].value);
@@ -601,23 +593,54 @@ impl Interpreter {
         }
     }
 
-    /// Lowers a user-`View` call site into its instantiated subtree (RFC-0007
-    /// §2). M30 establishes the single hook; M31 binds arguments → parameters,
-    /// M32 expands the callee body in a fresh instance scope, M33 bounds
-    /// recursion.
-    fn lower_user_view_call(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
-        // M31: bind arguments → parameters here.
-        // M32: open instance scope, lower `callee.body`, splice, truncate.
-        // For M30 this reproduces the historical generic-container behavior so
-        // the gate stays green with no semantic change yet.
-        let children = self.lower_members(&el.children, known_views);
-        RenderNode::Box {
-            name: el.name.clone(),
-            attrs: el.attrs.clone(),
-            children,
-            action: el.action.clone(),
-            bound_sig: None,
+    /// Whether `el` is a user-`View` call: a name that resolves in the view
+    /// table and is not an RFC-0005 intrinsic, which always wins (IMPL-50).
+    fn is_user_view_call(&self, el: &ElementNode) -> bool {
+        super::intrinsics::lookup(el.name.as_str()).is_none() && self.view_table.contains(&el.name)
+    }
+
+    /// Expands a user-`View` call site into its instantiated subtree, spliced as
+    /// siblings at `out` (RFC-0007 §2). Opens a fresh instance scope holding the
+    /// argument bindings (M31) plus the callee's own local `var`/`let`/`fn`
+    /// (isolated per instance), lowers the callee body, then truncates the scope
+    /// so the parent environment is untouched.
+    fn lower_user_view_call(
+        &mut self,
+        el: &ElementNode,
+        known_views: &[&str],
+        out: &mut Vec<RenderNode>,
+    ) {
+        // A user view is not validated by the intrinsic contract; its argument
+        // diagnostics come from `bind_args` (RFC-0007 §3/§6).
+        let Some(id) = self.view_table.resolve(&el.name) else {
+            // Unreachable in practice (caller checked), but degrade gracefully.
+            out.push(self.lower_element(el, known_views));
+            return;
+        };
+        // Own the callee so the `&self.view_table` borrow does not conflict with
+        // the `&mut self` lowering below (the table is `Send`/owned, INV-3).
+        let callee = self.view_table.decl(id).clone();
+
+        // 1) Bind arguments → parameters in the *parent* scope (RFC-0007 §3).
+        let bindings = self.bind_args(&callee, el);
+
+        // 2) Open the per-instance lexical frame (D-D / IMPL-49): push the
+        //    parameter memos, then the callee's own declarations.
+        let snapshot = self.env.len();
+        for (name, scope) in &bindings.bindings {
+            self.env.push(name.clone(), Value::Memo(*scope));
         }
+        // Local `var`/`let`/`fn`/`inject` open in the instance frame, so two
+        // instances of the same view keep independent state.
+        self.eval_view_decls(&callee);
+
+        // 3) Lower the callee body and splice the roots as siblings (RFC-0007
+        //    §2 step 5; reuses the multi-node `when`/`for` splice shape).
+        let nodes = self.lower_members(&callee.body, known_views);
+        out.extend(nodes);
+
+        // 4) Close the instance scope (RFC-0007 §2 step 6).
+        self.env.truncate(snapshot);
     }
 
     /// Lowers a slice of `Member`s into child `RenderNode`s, handling
@@ -637,6 +660,11 @@ impl Interpreter {
         out: &mut Vec<RenderNode>,
     ) {
         match member {
+            Member::Element(e) if self.is_user_view_call(e) => {
+                // A user-view call expands into its instantiated subtree, spliced
+                // as siblings here (RFC-0007 §2).
+                self.lower_user_view_call(e, known_views, out);
+            }
             Member::Element(e) => {
                 out.push(self.lower_element(e, known_views));
             }
@@ -2267,29 +2295,35 @@ mod tests {
 
     // ── M30: user-view registry & call-site recognition ──────────────────
 
-    #[test]
-    fn user_view_call_is_recognized_without_behavior_change() {
-        // `App` calls `Card` (a user view). M30 recognizes the call as a
-        // user-view instantiation but reproduces the historical container
-        // behavior: a `Box` named `Card`. No `UnknownView` diagnostic fires.
-        let parsed = parse("View Card() { Text(\"hi\") }\nView App() { Card() }");
+    /// Loads a multi-view file and lowers the named view to a render tree.
+    fn lower_named(src: &str, name: &str) -> (Interpreter, Vec<RenderNode>) {
+        let parsed = parse(src);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let mut interp = Interpreter::new();
         interp.load_views(&parsed.views);
         let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
-        let app = parsed
+        let view = parsed
             .views
             .iter()
-            .find(|v| v.name.as_str() == "App")
+            .find(|v| v.name.as_str() == name)
             .unwrap();
-        let tree = interp.lower_view(app, &known);
+        let tree = interp.lower_view(view, &known);
+        (interp, tree)
+    }
+
+    #[test]
+    fn user_view_call_is_recognized_and_no_unknown_view_fires() {
+        // `App` calls `Card` (a user view); no `UnknownView` diagnostic fires.
+        let (interp, _tree) =
+            lower_named("View Card() { Text(\"hi\") }\nView App() { Card() }", "App");
         assert!(
-            interp.errors().is_empty(),
-            "no diagnostics expected: {:?}",
+            !interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownView { .. })),
+            "no UnknownView expected: {:?}",
             interp.errors()
         );
-        assert_eq!(tree.len(), 1);
-        assert!(matches!(&tree[0], RenderNode::Box { name, .. } if name.as_str() == "Card"));
     }
 
     #[test]
@@ -2442,6 +2476,122 @@ mod tests {
         let memo = b.bindings[0].1;
         interp.tick();
         assert_eq!(interp.read_memo(memo), Value::Int(5));
+    }
+
+    // ── M32: body expansion & per-instance scope ─────────────────────────
+
+    /// The string value of a `Text` node's content scope, after a tick.
+    fn text_value(interp: &mut Interpreter, node: &RenderNode) -> String {
+        let RenderNode::Text { content, .. } = node else {
+            panic!("expected Text node, got {node:?}");
+        };
+        interp.tick();
+        match interp.binding_value(*content) {
+            Some(Value::Str(s)) => s,
+            other => panic!("expected Str binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_view_expands_body_and_binds_a_parameter() {
+        // `App` calls `Greet("Ada")`; the call expands to the callee body with
+        // `name` bound, projecting "Hi Ada".
+        let (mut interp, tree) = lower_named(
+            "View Greet(name) { Text(\"Hi {name}\") }\nView App() { Greet(\"Ada\") }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1, "one spliced root");
+        assert_eq!(text_value(&mut interp, &tree[0]), "Hi Ada");
+    }
+
+    #[test]
+    fn user_view_passes_value_to_an_intrinsic() {
+        // `Avatar(url, size)` lowers `Image(url) #[width: size]`; the call's
+        // arguments flow through to the intrinsic node.
+        let (_interp, tree) = lower_named(
+            "View Avatar(url, size) { Image(url) #[width: size, height: size] }\n\
+             View App() { Avatar(\"ada.png\", 40) }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1);
+        assert!(
+            matches!(&tree[0], RenderNode::Image { .. }),
+            "expected an Image node, got {:?}",
+            tree[0]
+        );
+    }
+
+    #[test]
+    fn a_call_yielding_multiple_roots_splices_as_siblings() {
+        let (_interp, tree) = lower_named(
+            "View Pair() { Text(\"a\")\n Text(\"b\") }\nView App() { Pair() }",
+            "App",
+        );
+        assert_eq!(tree.len(), 2, "both callee roots spliced as siblings");
+    }
+
+    #[test]
+    fn nested_user_view_calls_expand() {
+        // App → Outer → Inner → Text("x").
+        let (mut interp, tree) = lower_named(
+            "View Inner() { Text(\"x\") }\n\
+             View Outer() { Inner() }\n\
+             View App() { Outer() }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1);
+        assert_eq!(text_value(&mut interp, &tree[0]), "x");
+    }
+
+    #[test]
+    fn two_instances_keep_independent_local_state() {
+        // Two `Counter()` instances each lower their own `var n`; their content
+        // scopes are distinct bindings (independent per-instance state).
+        let (_interp, tree) = lower_named(
+            "View Counter() { var n = 0\n Text(\"{n}\") }\n\
+             View App() { Column { Counter()\n Counter() } }",
+            "App",
+        );
+        // App → Column(Box) containing two expanded Counters.
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected a Column box, got {:?}", tree[0]);
+        };
+        let texts: Vec<&RenderNode> = children
+            .iter()
+            .filter(|c| matches!(c, RenderNode::Text { .. }))
+            .collect();
+        assert_eq!(texts.len(), 2, "two independent Counter texts");
+        let scopes: Vec<ScopeId> = texts
+            .iter()
+            .map(|t| match t {
+                RenderNode::Text { content, .. } => *content,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_ne!(scopes[0], scopes[1], "each instance has its own binding");
+    }
+
+    #[test]
+    fn two_level_composition_golden_shape() {
+        // UserRow composes Avatar + Text inside a Row; App stacks two UserRows.
+        let (_interp, tree) = lower_named(
+            "View Avatar(url) { Image(url) }\n\
+             View UserRow(name, avatar) { Row { Avatar(avatar)\n Text(name) } }\n\
+             View App() { Column { UserRow(\"Ada\", \"ada.png\")\n UserRow(\"Alan\", \"alan.png\") } }",
+            "App",
+        );
+        // App → Column(Box) → [Row(Box)[Image, Text], Row(Box)[Image, Text]].
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(children.len(), 2, "two UserRow instances");
+        for row in children {
+            let RenderNode::Box { children: rc, .. } = row else {
+                panic!("expected Row");
+            };
+            assert!(matches!(rc[0], RenderNode::Image { .. }));
+            assert!(matches!(rc[1], RenderNode::Text { .. }));
+        }
     }
 
     #[test]
