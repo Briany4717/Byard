@@ -13,3 +13,4 @@ pub mod reactive;
 pub mod reload;
 pub mod style;
 pub mod theme;
+pub mod views;

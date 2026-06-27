@@ -119,6 +119,11 @@ pub struct Interpreter {
     /// Parameterized fn definitions: `fn f(params) => body` stored as
     /// `(param names, body expr)`, indexed by `AstId` (M25).
     fn_table: Vec<(Vec<Symbol>, Expr)>,
+    /// The resolved user-`View` registry for this program (RFC-0007 §1, M30).
+    /// Built once from `ParsedFile::views` via [`Interpreter::load_views`]; a
+    /// call whose name resolves here is a user-view instantiation, not a
+    /// container.
+    view_table: super::views::ViewTable,
 }
 
 impl Interpreter {
@@ -138,6 +143,33 @@ impl Interpreter {
     #[must_use]
     pub fn errors(&self) -> &[CompileError] {
         &self.errors
+    }
+
+    /// Builds the user-`View` registry (RFC-0007 §1, M30) from a whole file's
+    /// views and stores it on the interpreter, so subsequent `lower_view`/
+    /// `lower_element` calls can recognize and (M32+) expand user-view calls.
+    /// Returns the load-time diagnostics — `IntrinsicShadowed` (IMPL-50) and any
+    /// unguarded-cycle `RecursiveView` (RFC-0007 §4, M33) — which are also
+    /// recorded in [`Interpreter::errors`].
+    pub fn load_views(&mut self, views: &[ViewDecl]) -> Vec<CompileError> {
+        let (table, mut diags) = super::views::ViewTable::build(views);
+        // Static cycle detection over the call graph (M33).
+        let graph = super::views::CallGraph::build(&table);
+        if let Some((view, path)) = graph.unguarded_cycle(&table) {
+            diags.push(CompileError::RecursiveView {
+                span: table.decl(view).span,
+                path,
+            });
+        }
+        self.view_table = table;
+        self.errors.extend(diags.iter().cloned());
+        diags
+    }
+
+    /// The resolved user-`View` registry (for the reload pass and tests).
+    #[must_use]
+    pub fn view_table(&self) -> &super::views::ViewTable {
+        &self.view_table
     }
 
     /// Runs one tick: begins an epoch and pulls all dirty scopes.
@@ -354,6 +386,14 @@ impl Interpreter {
     /// `known_views` are user `ViewDecl` names in scope.
     pub fn lower_element(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
         self.errors.extend(validate_element(el, known_views));
+        // A name that resolves in the view table — and is not an intrinsic, which
+        // always wins (IMPL-50) — is a user-view call, expanded in its own
+        // instance scope rather than lowered as a generic container (RFC-0007 §2).
+        if super::intrinsics::lookup(el.name.as_str()).is_none()
+            && self.view_table.contains(&el.name)
+        {
+            return self.lower_user_view_call(el, known_views);
+        }
         match el.name.as_str() {
             "Text" | "Button" if !el.content.is_empty() => {
                 let content = self.bind_value(&el.content[0].value);
@@ -412,6 +452,25 @@ impl Interpreter {
                     bound_sig: None,
                 }
             }
+        }
+    }
+
+    /// Lowers a user-`View` call site into its instantiated subtree (RFC-0007
+    /// §2). M30 establishes the single hook; M31 binds arguments → parameters,
+    /// M32 expands the callee body in a fresh instance scope, M33 bounds
+    /// recursion.
+    fn lower_user_view_call(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
+        // M31: bind arguments → parameters here.
+        // M32: open instance scope, lower `callee.body`, splice, truncate.
+        // For M30 this reproduces the historical generic-container behavior so
+        // the gate stays green with no semantic change yet.
+        let children = self.lower_members(&el.children, known_views);
+        RenderNode::Box {
+            name: el.name.clone(),
+            attrs: el.attrs.clone(),
+            children,
+            action: el.action.clone(),
+            bound_sig: None,
         }
     }
 
@@ -2058,6 +2117,46 @@ mod tests {
             Member::Element(e) => e,
             _ => panic!("expected element"),
         }
+    }
+
+    // ── M30: user-view registry & call-site recognition ──────────────────
+
+    #[test]
+    fn user_view_call_is_recognized_without_behavior_change() {
+        // `App` calls `Card` (a user view). M30 recognizes the call as a
+        // user-view instantiation but reproduces the historical container
+        // behavior: a `Box` named `Card`. No `UnknownView` diagnostic fires.
+        let parsed = parse("View Card() { Text(\"hi\") }\nView App() { Card() }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        interp.load_views(&parsed.views);
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let app = parsed
+            .views
+            .iter()
+            .find(|v| v.name.as_str() == "App")
+            .unwrap();
+        let tree = interp.lower_view(app, &known);
+        assert!(
+            interp.errors().is_empty(),
+            "no diagnostics expected: {:?}",
+            interp.errors()
+        );
+        assert_eq!(tree.len(), 1);
+        assert!(matches!(&tree[0], RenderNode::Box { name, .. } if name.as_str() == "Card"));
+    }
+
+    #[test]
+    fn intrinsic_named_view_reports_shadowed_at_load() {
+        let parsed = parse("View Row() { Text(\"x\") }");
+        let mut interp = Interpreter::new();
+        let diags = interp.load_views(&parsed.views);
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, CompileError::IntrinsicShadowed { .. })),
+            "expected IntrinsicShadowed, got {diags:?}"
+        );
     }
 
     #[test]

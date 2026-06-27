@@ -94,7 +94,11 @@ impl ByldRuntime {
         if let (Some(old), Some(new)) = (self.current_views.first(), new_views.first()) {
             let diff_kind = byard_compiler::interp::reload::diff_view(old, new);
             self.interp.reload(new, diff_kind);
-            self.tree = self.interp.lower_view(new, &[]);
+            // Rebuild the user-`View` registry so reloaded sibling views resolve
+            // and expand (RFC-0007 §1/§5, M30/M34).
+            self.interp.load_views(new_views);
+            let known: Vec<&str> = new_views.iter().map(|v| v.name.as_str()).collect();
+            self.tree = self.interp.lower_view(new, &known);
         }
         self.current_views = new_views.to_vec();
         self.error_state = None;
@@ -328,7 +332,9 @@ impl PlatformHost for App {
                 (Interpreter::new(), vec![], vec![])
             } else {
                 let mut interp = Interpreter::new();
-                let tree = interp.lower_view(&initial_views[0], &[]);
+                interp.load_views(&initial_views);
+                let known: Vec<&str> = initial_views.iter().map(|v| v.name.as_str()).collect();
+                let tree = interp.lower_view(&initial_views[0], &known);
                 interp.tick();
                 (interp, tree, initial_views)
             };
