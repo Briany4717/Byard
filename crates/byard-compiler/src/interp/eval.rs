@@ -113,11 +113,17 @@ pub struct InstanceBindings {
 }
 
 /// The default-value expression of a parameter, if it declares one (RFC-0007
-/// D-B / IMPL-47). Defaults are surfaced in M35; until then this is always
-/// `None`, so every unbound parameter is required.
-fn param_default(_param: &Param) -> Option<&Expr> {
-    None
+/// D-B / IMPL-47). A parameter with a default is not required at the call site;
+/// the default is evaluated in the callee scope when the argument is omitted.
+fn param_default(param: &Param) -> Option<&Expr> {
+    param.default.as_ref()
 }
+
+/// The reserved parameter/element name for a user view's child-block slot
+/// (RFC-0007 D-A / IMPL-46). A `View` declaring a `content` parameter accepts a
+/// `{ ... }` block at its call sites; referencing `content` as an element inside
+/// the body splices the caller-supplied block.
+const RESERVED_CONTENT: &str = "content";
 
 thread_local! {
     /// Thread-local storage holding the active payload of the event currently being processed.
@@ -155,6 +161,11 @@ pub struct Interpreter {
     /// Current user-view instantiation depth, bounded by [`MAX_INSTANCE_DEPTH`]
     /// to guard against runaway guarded recursion (RFC-0007 §4, IMPL-48, M33).
     instance_depth: u32,
+    /// Stack of caller-supplied child-block slots, one frame per active
+    /// user-view instance (RFC-0007 D-A / IMPL-46, M35). The block is
+    /// pre-lowered in the *caller* scope so a `content` element reference inside
+    /// the callee body splices nodes that capture the caller's environment.
+    slot_stack: Vec<Vec<RenderNode>>,
 }
 
 impl Interpreter {
@@ -417,6 +428,11 @@ impl Interpreter {
         value: &Expr,
         slots: &mut [Option<ScopeId>],
     ) {
+        // The reserved `content` slot is filled by the child block, never a
+        // named value (IMPL-46).
+        if name.as_str() == RESERVED_CONTENT {
+            return;
+        }
         match params.iter().position(|p| &p.name == name) {
             Some(i) if slots[i].is_none() => {
                 slots[i] = Some(self.project_arg(value));
@@ -450,6 +466,14 @@ impl Interpreter {
         let params = &callee.params;
         let callee_name = callee.name.as_str().to_string();
         let mut slots: Vec<Option<ScopeId>> = vec![None; params.len()];
+        // Positional arguments map only to *value* parameters; the reserved
+        // `content` slot (IMPL-46) is filled by the child block, not a value.
+        let value_param_idx: Vec<usize> = params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.name.as_str() != RESERVED_CONTENT)
+            .map(|(i, _)| i)
+            .collect();
         let mut positional_count = 0usize;
         let mut next_positional = 0usize;
 
@@ -459,8 +483,7 @@ impl Interpreter {
                 self.bind_named_arg(params, &callee_name, name, &arg.value, &mut slots);
             } else {
                 positional_count += 1;
-                if next_positional < params.len() {
-                    let i = next_positional;
+                if let Some(&i) = value_param_idx.get(next_positional) {
                     next_positional += 1;
                     let scope = self.project_arg(&arg.value);
                     if slots[i].is_some() {
@@ -485,20 +508,25 @@ impl Interpreter {
             }
         }
 
-        // 3) Arity: more positional args than the callee declares (RFC-0007 §6).
-        if positional_count > params.len() {
+        // 3) Arity: more positional args than the callee declares value
+        //    parameters (RFC-0007 §6).
+        if positional_count > value_param_idx.len() {
             self.errors.push(CompileError::ViewArityMismatch {
                 span: call.span,
                 name: callee_name.clone(),
-                expected: params.len(),
+                expected: value_param_idx.len(),
                 found: positional_count,
             });
         }
 
-        // 4) Missing required parameters. Defaults (IMPL-47) land in M35; until
-        //    then every unbound parameter is required.
+        // 4) Missing required parameters: an unbound parameter with no default
+        //    (IMPL-47). The reserved `content` slot is never required — it
+        //    defaults to an empty block.
         for (i, slot) in slots.iter().enumerate() {
-            if slot.is_none() && param_default(&params[i]).is_none() {
+            if slot.is_none()
+                && param_default(&params[i]).is_none()
+                && params[i].name.as_str() != RESERVED_CONTENT
+            {
                 self.errors.push(CompileError::MissingParam {
                     span: call.span,
                     name: params[i].name.as_str().to_string(),
@@ -647,22 +675,57 @@ impl Interpreter {
         }
         self.instance_depth += 1;
 
+        // Slot (RFC-0007 D-A / IMPL-46): a `{ ... }` block is allowed only when
+        // the callee declares a `content` parameter; the block is pre-lowered in
+        // the *caller* scope (capturing caller `var`s) and pushed as this
+        // instance's slot. A block passed to a slot-less callee is
+        // `UnexpectedChildren`.
+        let has_content_param = callee
+            .params
+            .iter()
+            .any(|p| p.name.as_str() == RESERVED_CONTENT);
+        let slot_nodes = if el.children.is_empty() {
+            Vec::new()
+        } else if has_content_param {
+            self.lower_members(&el.children, known_views)
+        } else {
+            self.errors.push(CompileError::UnexpectedChildren {
+                span: el.span,
+                name: el.name.as_str().to_string(),
+            });
+            Vec::new()
+        };
+
         // 1) Bind arguments → parameters in the *parent* scope (RFC-0007 §3).
         let bindings = self.bind_args(&callee, el);
 
-        // 2) Open the per-instance lexical frame (D-D / IMPL-49): push the
-        //    parameter memos, then the callee's own declarations.
+        // 2) Open the per-instance lexical frame (D-D / IMPL-49): push each
+        //    parameter in declaration order — a bound argument's memo, else a
+        //    default evaluated in the callee scope (IMPL-47) — then the callee's
+        //    own declarations.
         let snapshot = self.env.len();
-        for (name, scope) in &bindings.bindings {
-            self.env.push(name.clone(), Value::Memo(*scope));
+        for param in &callee.params {
+            if let Some((_, scope)) = bindings.bindings.iter().find(|(n, _)| n == &param.name) {
+                self.env.push(param.name.clone(), Value::Memo(*scope));
+            } else if let Some(default) = param_default(param) {
+                // Lowered in the current (callee) frame, so a default may
+                // reference earlier parameters.
+                let scope = self.project_arg(default);
+                self.env.push(param.name.clone(), Value::Memo(scope));
+            }
+            // An unbound, defaultless parameter already produced a `MissingParam`
+            // diagnostic in `bind_args`; leave it unbound.
         }
         // Local `var`/`let`/`fn`/`inject` open in the instance frame, so two
         // instances of the same view keep independent state.
         self.eval_view_decls(&callee);
 
         // 3) Lower the callee body and splice the roots as siblings (RFC-0007
-        //    §2 step 5; reuses the multi-node `when`/`for` splice shape).
+        //    §2 step 5; reuses the multi-node `when`/`for` splice shape). The
+        //    slot is live for `content` references within the body.
+        self.slot_stack.push(slot_nodes);
         let nodes = self.lower_members(&callee.body, known_views);
+        self.slot_stack.pop();
         out.extend(nodes);
 
         // 4) Close the instance scope (RFC-0007 §2 step 6).
@@ -687,6 +750,16 @@ impl Interpreter {
         out: &mut Vec<RenderNode>,
     ) {
         match member {
+            // A `content` reference inside a user-view body splices the slot the
+            // current instance was called with (RFC-0007 D-A / IMPL-46). The slot
+            // nodes were pre-lowered in the caller scope.
+            Member::Element(e)
+                if e.name.as_str() == RESERVED_CONTENT && !self.slot_stack.is_empty() =>
+            {
+                if let Some(slot) = self.slot_stack.last() {
+                    out.extend(slot.clone());
+                }
+            }
             Member::Element(e) if self.is_user_view_call(e) => {
                 // A user-view call expands into its instantiated subtree, spliced
                 // as siblings here (RFC-0007 §2).
@@ -2719,6 +2792,96 @@ mod tests {
         };
         assert_eq!(text_value(&mut interp, &children[0]), "new");
         assert_eq!(text_value(&mut interp, &children[1]), "new");
+    }
+
+    // ── M35: slots & parameter defaults ──────────────────────────────────
+
+    #[test]
+    fn omitted_defaulted_param_uses_its_default() {
+        // `label` is omitted; the default "?" is evaluated in the callee scope.
+        let (mut interp, tree) = lower_named(
+            "View Tag(label = \"?\") { Text(label) }\nView App() { Tag() }",
+            "App",
+        );
+        assert!(
+            interp.errors().is_empty(),
+            "a defaulted param is not required: {:?}",
+            interp.errors()
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "?");
+    }
+
+    #[test]
+    fn supplied_argument_overrides_the_default() {
+        let (mut interp, tree) = lower_named(
+            "View Tag(label = \"?\") { Text(label) }\nView App() { Tag(\"hi\") }",
+            "App",
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "hi");
+    }
+
+    #[test]
+    fn missing_param_only_fires_for_required_params() {
+        // `a` is required, `b` is defaulted; omitting both reports only `a`.
+        let (callee, _) =
+            callee_and_call("View V(a, b = 1) { Text(a) }", "View H() { Text(\"_\") }");
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View V(a, b = 1) { Text(a) }", "View H() { V() }");
+        interp.bind_args(&callee, &call);
+        let missing: Vec<&str> = interp
+            .errors()
+            .iter()
+            .filter_map(|e| match e {
+                CompileError::MissingParam { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(missing, vec!["a"], "only the required param is missing");
+    }
+
+    #[test]
+    fn content_slot_renders_the_passed_block() {
+        // `Card` declares a `content` slot; `App` passes a `Text` block, which is
+        // spliced where `content` appears inside the card body.
+        let (mut interp, tree) = lower_named(
+            "View Card(content) { Column { content } }\n\
+             View App() { Card { Text(\"inside\") } }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected the card's Column, got {:?}", tree[0]);
+        };
+        assert_eq!(children.len(), 1, "the passed block is spliced");
+        assert_eq!(text_value(&mut interp, &children[0]), "inside");
+    }
+
+    #[test]
+    fn block_passed_to_a_slotless_view_is_unexpected_children() {
+        let (interp, _tree) = lower_named(
+            "View Plain() { Text(\"x\") }\nView App() { Plain { Text(\"no\") } }",
+            "App",
+        );
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnexpectedChildren { .. })),
+            "expected UnexpectedChildren, got {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn slot_block_captures_the_caller_scope() {
+        // The block passed to `Card` reads the *caller's* `name` var, proving the
+        // slot is lowered in the caller scope (not the callee's).
+        let (mut interp, tree) = lower_named(
+            "View Card(content) { content }\n\
+             View App() { var name = \"Ada\"\n Card { Text(\"Hi {name}\") } }",
+            "App",
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "Hi Ada");
     }
 
     #[test]

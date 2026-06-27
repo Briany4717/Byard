@@ -211,9 +211,16 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // Optional default value (`= expr`), RFC-0007 D-B / IMPL-47.
+            let default = if self.eat(&Token::Eq) {
+                Some(self.parse_expr(0))
+            } else {
+                None
+            };
             params.push(Param {
                 name,
                 ty,
+                default,
                 span: self.span_from(start),
             });
             if !self.eat(&Token::Comma) {
