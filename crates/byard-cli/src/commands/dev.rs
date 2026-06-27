@@ -88,17 +88,23 @@ struct ByldRuntime {
 
 impl ByldRuntime {
     fn apply_reload(&mut self, new_views: &[ViewDecl], _kind: ReloadKind) {
-        // For a single-view project, reload the first matching view by name.
-        // Multi-view support (D11 per-ViewDecl) is wired but only the first
-        // View is tracked by the renderer at this stage.
-        if let (Some(old), Some(new)) = (self.current_views.first(), new_views.first()) {
-            let diff_kind = byard_compiler::interp::reload::diff_view(old, new);
-            self.interp.reload(new, diff_kind);
+        // The rendered root is the first tracked view. Editing any view it
+        // transitively instantiates must re-derive its tree, so compute the
+        // affected set (changed views ∪ transitive callers, RFC-0007 §5) and
+        // re-lower only when the root is in it — siblings unrelated to the root
+        // keep their state.
+        if let (Some(old_root), Some(new_root)) = (self.current_views.first(), new_views.first()) {
+            let affected =
+                byard_compiler::interp::reload::affected_views(&self.current_views, new_views);
+            let diff_kind = byard_compiler::interp::reload::diff_view(old_root, new_root);
+            self.interp.reload(new_root, diff_kind);
             // Rebuild the user-`View` registry so reloaded sibling views resolve
             // and expand (RFC-0007 §1/§5, M30/M34).
             self.interp.load_views(new_views);
-            let known: Vec<&str> = new_views.iter().map(|v| v.name.as_str()).collect();
-            self.tree = self.interp.lower_view(new, &known);
+            if affected.contains(&new_root.name) {
+                let known: Vec<&str> = new_views.iter().map(|v| v.name.as_str()).collect();
+                self.tree = self.interp.lower_view(new_root, &known);
+            }
         }
         self.current_views = new_views.to_vec();
         self.error_state = None;

@@ -2685,6 +2685,42 @@ mod tests {
         );
     }
 
+    // ── M34: hot-reload across instances ─────────────────────────────────
+
+    #[test]
+    fn reloading_a_leaf_view_updates_all_its_instances() {
+        use crate::interp::reload::{affected_views, diff_view};
+
+        let old = parse("View Leaf() { Text(\"old\") }\nView App() { Column { Leaf()\n Leaf() } }");
+        let new = parse("View Leaf() { Text(\"new\") }\nView App() { Column { Leaf()\n Leaf() } }");
+
+        let mut interp = Interpreter::new();
+        interp.load_views(&old.views);
+        let known_old: Vec<&str> = old.views.iter().map(|v| v.name.as_str()).collect();
+        let app_old = old.views.iter().find(|v| v.name.as_str() == "App").unwrap();
+        let tree = interp.lower_view(app_old, &known_old);
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(text_value(&mut interp, &children[0]), "old");
+
+        // The edit to the leaf transitively affects App (RFC-0007 §5).
+        let affected = affected_views(&old.views, &new.views);
+        assert!(affected.contains(&Symbol::intern("App")));
+
+        // Rebuild the registry and re-derive App; both Leaf instances update.
+        interp.load_views(&new.views);
+        let app_new = new.views.iter().find(|v| v.name.as_str() == "App").unwrap();
+        interp.reload(app_new, diff_view(app_old, app_new));
+        let known_new: Vec<&str> = new.views.iter().map(|v| v.name.as_str()).collect();
+        let tree = interp.lower_view(app_new, &known_new);
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(text_value(&mut interp, &children[0]), "new");
+        assert_eq!(text_value(&mut interp, &children[1]), "new");
+    }
+
     #[test]
     fn var_text_binding_updates_after_mutation_and_tick() {
         let parsed =
