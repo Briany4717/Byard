@@ -36,6 +36,14 @@ use crate::util::closest_match;
 /// readable. Authors who need a specific granularity set `step:` instead.
 const SLIDER_DEFAULT_DECIMALS: i32 = 3;
 
+/// Maximum user-`View` instantiation depth before lowering truncates with a
+/// diagnostic rather than risking a native stack overflow (RFC-0007 §4, D-C /
+/// IMPL-48). Far beyond any hand-written nesting, shallow enough to never
+/// approach the stack limit. The static cycle check (`load_views`) catches
+/// *unguarded* cycles at load; this bound is the backstop for a guarded
+/// recursion whose runtime guard never terminates at lower time.
+const MAX_INSTANCE_DEPTH: u32 = 64;
+
 /// Decimal places implied by `step`, via its shortest round-trip form
 /// (`0.1 → 1`, `0.25 → 2`, `1.0 → 0`). Used so a stepped slider never emits a
 /// value with more decimal places than the step itself — e.g. `step: 0.1`
@@ -144,6 +152,9 @@ pub struct Interpreter {
     /// call whose name resolves here is a user-view instantiation, not a
     /// container.
     view_table: super::views::ViewTable,
+    /// Current user-view instantiation depth, bounded by [`MAX_INSTANCE_DEPTH`]
+    /// to guard against runaway guarded recursion (RFC-0007 §4, IMPL-48, M33).
+    instance_depth: u32,
 }
 
 impl Interpreter {
@@ -621,6 +632,21 @@ impl Interpreter {
         // the `&mut self` lowering below (the table is `Send`/owned, INV-3).
         let callee = self.view_table.decl(id).clone();
 
+        // Runtime depth bound (RFC-0007 §4, IMPL-48): a guarded recursion whose
+        // guard never terminates at lower time is truncated with a diagnostic
+        // rather than overflowing the native stack.
+        if self.instance_depth >= MAX_INSTANCE_DEPTH {
+            self.errors.push(CompileError::RecursiveView {
+                span: el.span,
+                path: format!(
+                    "{} (instantiation depth bound {MAX_INSTANCE_DEPTH} exceeded)",
+                    el.name.as_str()
+                ),
+            });
+            return; // truncate the subtree; never recurse past the bound
+        }
+        self.instance_depth += 1;
+
         // 1) Bind arguments → parameters in the *parent* scope (RFC-0007 §3).
         let bindings = self.bind_args(&callee, el);
 
@@ -641,6 +667,7 @@ impl Interpreter {
 
         // 4) Close the instance scope (RFC-0007 §2 step 6).
         self.env.truncate(snapshot);
+        self.instance_depth -= 1;
     }
 
     /// Lowers a slice of `Member`s into child `RenderNode`s, handling
@@ -2592,6 +2619,70 @@ mod tests {
             assert!(matches!(rc[0], RenderNode::Image { .. }));
             assert!(matches!(rc[1], RenderNode::Text { .. }));
         }
+    }
+
+    // ── M33: recursion & cycle protection ────────────────────────────────
+
+    #[test]
+    fn unguarded_self_call_is_recursive_view_at_load() {
+        let parsed = parse("View A() { A() }");
+        let mut interp = Interpreter::new();
+        let diags = interp.load_views(&parsed.views);
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, CompileError::RecursiveView { .. })),
+            "expected RecursiveView at load, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn guarded_recursion_that_terminates_is_legal() {
+        // `Tree` recurses only in the `else` of a guard that is true at lower
+        // time, so it renders to a finite depth with no diagnostic.
+        let (mut interp, tree) = lower_named(
+            "View Tree() { var leaf = true\n when leaf { Text(\"x\") } else { Tree() } }\n\
+             View App() { Tree() }",
+            "App",
+        );
+        assert!(
+            interp.errors().is_empty(),
+            "guarded terminating recursion is legal: {:?}",
+            interp.errors()
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "x");
+    }
+
+    #[test]
+    fn runaway_guarded_recursion_hits_depth_bound_without_panicking() {
+        // `go` is always true, so the guard never terminates at lower time. The
+        // static check does not flag it (the cycle is guarded), so the runtime
+        // depth bound must stop it with a diagnostic — not a stack overflow.
+        let parsed =
+            parse("View Loop() { var go = true\n when go { Loop() } }\nView App() { Loop() }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let load_diags = interp.load_views(&parsed.views);
+        assert!(
+            !load_diags
+                .iter()
+                .any(|d| matches!(d, CompileError::RecursiveView { .. })),
+            "a guarded cycle is not a static error"
+        );
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let app = parsed
+            .views
+            .iter()
+            .find(|v| v.name.as_str() == "App")
+            .unwrap();
+        let _tree = interp.lower_view(app, &known); // must return, not overflow
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::RecursiveView { .. })),
+            "expected a depth-bound RecursiveView diagnostic"
+        );
     }
 
     #[test]
