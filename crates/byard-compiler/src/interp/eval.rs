@@ -95,6 +95,14 @@ pub enum RenderNode {
         /// The reactive scope that evaluates to the image source path/URL.
         src: ScopeId,
     },
+    /// An MSDF vector glyph — the `VectorIcon` intrinsic (RFC-0009 §1, M50)
+    /// routed to the `VectorMSDF` pipeline.
+    Vector {
+        /// Styling attributes (`size`, `color`, `m`, `opacity`, `style`).
+        attrs: Vec<Attr>,
+        /// The reactive scope evaluating to the asset handle (a `Str` path).
+        src: ScopeId,
+    },
 }
 
 /// A lowered reactive computation (see the module docs).
@@ -607,6 +615,19 @@ impl Interpreter {
                     src,
                 }
             }
+            // VectorIcon intrinsic → VectorMSDF pipeline (M50). Content is an
+            // asset handle (a `Str` path), like Image's source.
+            "VectorIcon" => {
+                let src_expr = el.content.first().map_or_else(
+                    || Expr::StrLit(vec![], crate::diagnostics::Span::new(0, 0)),
+                    |c| c.value.clone(),
+                );
+                let src = self.bind_value(&src_expr);
+                RenderNode::Vector {
+                    attrs: el.attrs.clone(),
+                    src,
+                }
+            }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
                 let bound_sig = self.resolve_bind_sig(&el.attrs);
@@ -876,6 +897,14 @@ impl Interpreter {
                 let w = self.eval_int_prop(attrs, "width").unwrap_or(100) as f32;
                 let h = self.eval_int_prop(attrs, "height").unwrap_or(100) as f32;
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                flat_ids.push(id);
+                Ok(id)
+            }
+            // A VectorIcon is a square leaf sized by its `size` prop (default 24),
+            // RFC-0009 §1.
+            RenderNode::Vector { attrs, .. } => {
+                let s = self.eval_int_prop(attrs, "size").unwrap_or(24) as f32;
+                let id = self.atlas.add_leaf(LeafSize::new(s, s))?;
                 flat_ids.push(id);
                 Ok(id)
             }
@@ -1207,6 +1236,28 @@ impl Interpreter {
                         // always-dirty lowering.
                         dirty: true,
                     });
+                }
+            }
+            RenderNode::Vector { attrs, src: _ } => {
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // Until the dev JIT atlas resolves the asset handle to a UV
+                    // slot (M46), emit a zero-opacity placeholder so the frame
+                    // ships without stalling (INV-9). The `color` rgb is resolved
+                    // now so a resident glyph tints correctly once M46 lands.
+                    let rgb =
+                        self.eval_color_prop(attrs, "color")
+                            .map_or([1.0, 1.0, 1.0, 0.0], |c| {
+                                let mut c = super::intrinsics::color_to_rgba(c, false);
+                                c[3] = 0.0; // placeholder: not yet resident
+                                c
+                            });
+                    frame.push_vector(byard_core::frame::VectorInstance::new(
+                        byard_core::frame::Rect::new(rect.x, rect.y, rect.width, rect.height),
+                        byard_core::frame::Rect::new(0.0, 0.0, 0.0, 0.0),
+                        rgb,
+                        super::intrinsics::VECTOR_DEFAULT_PX_RANGE,
+                        0,
+                    ));
                 }
             }
         }
@@ -2409,6 +2460,19 @@ mod tests {
             .unwrap();
         let tree = interp.lower_view(view, &known);
         (interp, tree)
+    }
+
+    #[test]
+    fn vector_icon_lowers_to_a_vector_node() {
+        let (_interp, tree) = lower_named(
+            "View App() { VectorIcon(\"icons/gear.svg\") #[size: 24, color: 0xFFFFFF] }",
+            "App",
+        );
+        assert!(
+            matches!(&tree[0], RenderNode::Vector { .. }),
+            "VectorIcon lowers to RenderNode::Vector, got {:?}",
+            tree[0]
+        );
     }
 
     #[test]
