@@ -24,9 +24,10 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StrPart, ViewDecl,
+    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StrPart, ViewDecl,
 };
 use crate::symbol::Symbol;
+use crate::util::closest_match;
 
 /// Decimal places a `Slider` without an explicit `step` quantises its value to.
 ///
@@ -90,6 +91,25 @@ pub enum RenderNode {
 
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
+
+/// The per-instance parameter bindings produced by binding a user-view call's
+/// arguments to the callee's declared parameters (RFC-0007 §3, M31). Each entry
+/// is a reactive memo projecting the argument expression over the *parent*
+/// scope, so a parameter fed a parent `var` stays live (RFC-0004); a literal
+/// argument lowers to a constant memo with no dirty edges.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct InstanceBindings {
+    /// Successfully bound `(param name, projecting memo)` pairs, in parameter
+    /// declaration order.
+    pub bindings: Vec<(Symbol, ScopeId)>,
+}
+
+/// The default-value expression of a parameter, if it declares one (RFC-0007
+/// D-B / IMPL-47). Defaults are surfaced in M35; until then this is always
+/// `None`, so every unbound parameter is required.
+fn param_default(_param: &Param) -> Option<&Expr> {
+    None
+}
 
 thread_local! {
     /// Thread-local storage holding the active payload of the event currently being processed.
@@ -357,6 +377,132 @@ impl Interpreter {
         let target = self.next_target();
         let compute = self.lower_expr(expr, None);
         self.ctx.open_value_binding(target, compute)
+    }
+
+    /// Reads a memo's current value (for the engine bridge and tests). Pulls it
+    /// on demand if dirty.
+    pub fn read_memo(&mut self, scope: ScopeId) -> Value {
+        self.ctx.read_memo(scope)
+    }
+
+    // ── M31: argument → parameter binding (RFC-0007 §3) ──────────────────
+
+    /// Projects one call argument into a reactive memo over the **parent** scope
+    /// (the env active at the call site), so a parameter fed a parent `var` stays
+    /// live (RFC-0004); a literal lowers to a constant memo with no dirty edges.
+    fn project_arg(&mut self, expr: &Expr) -> ScopeId {
+        let compute = self.lower_expr(expr, None);
+        self.ctx.open_memo(compute)
+    }
+
+    /// Binds a single named argument (`name: value`, from `(...)` or `#[...]`) to
+    /// the callee parameter of the same `Symbol`, filling `slots[i]` and emitting
+    /// `UnknownParam`/`DuplicateParam` as needed (RFC-0007 §3/§6).
+    fn bind_named_arg(
+        &mut self,
+        params: &[Param],
+        callee: &str,
+        name: &Symbol,
+        value: &Expr,
+        slots: &mut [Option<ScopeId>],
+    ) {
+        match params.iter().position(|p| &p.name == name) {
+            Some(i) if slots[i].is_none() => {
+                slots[i] = Some(self.project_arg(value));
+            }
+            Some(_) => self.errors.push(CompileError::DuplicateParam {
+                span: value.span(),
+                name: name.as_str().to_string(),
+                callee: callee.to_string(),
+            }),
+            None => {
+                let hint = closest_match(name.as_str(), params.iter().map(|p| p.name.as_str()))
+                    .map(str::to_string);
+                self.errors.push(CompileError::UnknownParam {
+                    span: value.span(),
+                    name: name.as_str().to_string(),
+                    callee: callee.to_string(),
+                    hint,
+                });
+            }
+        }
+    }
+
+    /// Binds a user-view call's positional `content` and named `content`/`attrs`
+    /// arguments to the callee's declared parameters, producing one reactive memo
+    /// per bound parameter (RFC-0007 §3) and the §6 diagnostics
+    /// (`ViewArityMismatch`/`UnknownParam`/`MissingParam`/`DuplicateParam`).
+    ///
+    /// Positional arguments (unnamed `(...)` entries) match by declaration order;
+    /// named arguments (`name:` in `(...)` or `#[name: value]`) match by symbol.
+    pub fn bind_args(&mut self, callee: &ViewDecl, call: &ElementNode) -> InstanceBindings {
+        let params = &callee.params;
+        let callee_name = callee.name.as_str().to_string();
+        let mut slots: Vec<Option<ScopeId>> = vec![None; params.len()];
+        let mut positional_count = 0usize;
+        let mut next_positional = 0usize;
+
+        // 1) `(...)` content: unnamed → positional by order; named → by symbol.
+        for arg in &call.content {
+            if let Some(name) = &arg.name {
+                self.bind_named_arg(params, &callee_name, name, &arg.value, &mut slots);
+            } else {
+                positional_count += 1;
+                if next_positional < params.len() {
+                    let i = next_positional;
+                    next_positional += 1;
+                    let scope = self.project_arg(&arg.value);
+                    if slots[i].is_some() {
+                        self.errors.push(CompileError::DuplicateParam {
+                            span: arg.value.span(),
+                            name: params[i].name.as_str().to_string(),
+                            callee: callee_name.clone(),
+                        });
+                    } else {
+                        slots[i] = Some(scope);
+                    }
+                }
+                // Excess positional args are reported once via the arity check
+                // below.
+            }
+        }
+
+        // 2) `#[name: value]` attrs: named arguments (events are not parameters).
+        for attr in &call.attrs {
+            if let AttrKind::Prop { value } = &attr.kind {
+                self.bind_named_arg(params, &callee_name, &attr.name, value, &mut slots);
+            }
+        }
+
+        // 3) Arity: more positional args than the callee declares (RFC-0007 §6).
+        if positional_count > params.len() {
+            self.errors.push(CompileError::ViewArityMismatch {
+                span: call.span,
+                name: callee_name.clone(),
+                expected: params.len(),
+                found: positional_count,
+            });
+        }
+
+        // 4) Missing required parameters. Defaults (IMPL-47) land in M35; until
+        //    then every unbound parameter is required.
+        for (i, slot) in slots.iter().enumerate() {
+            if slot.is_none() && param_default(&params[i]).is_none() {
+                self.errors.push(CompileError::MissingParam {
+                    span: call.span,
+                    name: params[i].name.as_str().to_string(),
+                    callee: callee_name.clone(),
+                });
+            }
+        }
+
+        InstanceBindings {
+            bindings: slots
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.map(|sc| (params[i].name.clone(), sc)))
+                .collect(),
+        }
     }
 
     // ── element lowering (RFC-0005) ─────────────────────────────────────
@@ -2157,6 +2303,145 @@ mod tests {
                 .any(|d| matches!(d, CompileError::IntrinsicShadowed { .. })),
             "expected IntrinsicShadowed, got {diags:?}"
         );
+    }
+
+    // ── M31: argument → parameter binding ────────────────────────────────
+
+    /// Parses `callee_src` (a single view) and a call element from `call_src`'s
+    /// first view body, returning `(callee, call_element)`.
+    fn callee_and_call(callee_src: &str, call_src: &str) -> (ViewDecl, ElementNode) {
+        let callee = parse(callee_src).views.into_iter().next().unwrap();
+        let host = parse(call_src).views.into_iter().next().unwrap();
+        let Member::Element(call) = host.body.into_iter().next().unwrap() else {
+            panic!("expected element")
+        };
+        (callee, call)
+    }
+
+    #[test]
+    fn named_positional_and_mixed_binding() {
+        let (callee, _) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Text(\"x\") }",
+        );
+        // Named.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(url: \"a.png\", size: 40) }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+        assert_eq!(b.bindings[0].0.as_str(), "url");
+        assert_eq!(b.bindings[1].0.as_str(), "size");
+
+        // Positional.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(\"a.png\", 40) }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+
+        // Mixed: positional then named.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(\"a.png\") #[size: 40] }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+    }
+
+    #[test]
+    fn arity_unknown_duplicate_and_missing_diagnostics() {
+        let (callee, _) = callee_and_call("View A(x, y) { Text(x) }", "View H() { Text(\"_\") }");
+
+        // Over-arity: 3 positional for 2 params.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1, 2, 3) }");
+        interp.bind_args(&callee, &call);
+        assert!(interp.errors().iter().any(|e| matches!(
+            e,
+            CompileError::ViewArityMismatch {
+                expected: 2,
+                found: 3,
+                ..
+            }
+        )));
+
+        // Unknown named param.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(z: 1) }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownParam { .. }))
+        );
+
+        // Duplicate: positional + named bind the same param.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1) #[x: 2] }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::DuplicateParam { .. }))
+        );
+
+        // Missing required.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1) }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::MissingParam { name, .. } if name == "y"))
+        );
+    }
+
+    #[test]
+    fn parent_var_arg_is_a_live_memo_literal_is_constant() {
+        // The parent declares `var n = 1`; the call passes `n` to a parameter.
+        // The projecting memo tracks the parent signal: writing `n` and ticking
+        // changes the memo's value (dirty edge preserved).
+        let callee = parse("View Foo(v) { Text(\"{v}\") }")
+            .views
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut interp = Interpreter::new();
+        let init = Expr::IntLit(1, crate::diagnostics::Span::new(0, 1));
+        let n = interp.define_var(Symbol::intern("n"), &init);
+
+        let (_, call) = callee_and_call("View Foo(v) { Text(\"{v}\") }", "View H() { Foo(n) }");
+        let b = interp.bind_args(&callee, &call);
+        let memo = b.bindings[0].1;
+        interp.tick();
+        assert_eq!(interp.read_memo(memo), Value::Int(1));
+        interp.write_var(n, Value::Int(7));
+        interp.tick();
+        assert_eq!(
+            interp.read_memo(memo),
+            Value::Int(7),
+            "memo tracks the parent var"
+        );
+
+        // A literal argument is a constant memo: it never changes.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View Foo(v) { Text(\"{v}\") }", "View H() { Foo(5) }");
+        let b = interp.bind_args(&callee, &call);
+        let memo = b.bindings[0].1;
+        interp.tick();
+        assert_eq!(interp.read_memo(memo), Value::Int(5));
     }
 
     #[test]
