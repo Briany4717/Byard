@@ -28,6 +28,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 [dev-dependencies]
 # Blocks on the async wgpu device request inside headless pipeline tests (M21).
 pollster = "0.4"
+# Headless WGSL validation of every shader module (RFC-0009 M44): naga 29 matches
+# wgpu 29's bundled shader compiler, so a green naga validation predicts a clean
+# `create_shader_module` on the GPU without needing a device.
+naga = { version = "29.0", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

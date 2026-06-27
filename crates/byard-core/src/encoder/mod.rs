@@ -27,6 +27,7 @@
 pub mod decorated_box;
 pub mod text_glyph;
 pub mod texture_sampler;
+pub mod vector_msdf;
 
 use std::sync::Arc;
 
