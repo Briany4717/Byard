@@ -247,10 +247,17 @@ impl Engine {
         // wgpu 29: request_device takes only &DeviceDescriptor (trace path moved
         // into DeviceDescriptor::trace); use ..Default::default() to zero-fill
         // the new `experimental_features` and `trace` fields.
+        //
+        // `TIMESTAMP_QUERY` is requested opportunistically (intersected with
+        // what the adapter actually supports, never a hard requirement) so
+        // `EncoderSubsystem`'s `GpuTimer` (RFC-0013 "GPU timing") can activate
+        // when the backend allows it; `GpuTimer::new` checks the resulting
+        // `device.features()` and degrades to unavailable otherwise (P5).
+        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ByardCore - Engine Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: optional_features,
                 // Use the adapter's own limits — no artificial WebGL2 cap.
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -571,6 +578,28 @@ impl Engine {
         self.encoder.submit(cmd);
         frame.present();
         Ok(())
+    }
+
+    /// Returns the CPU-side telemetry ([`crate::telemetry::SampleBlock`])
+    /// captured on the **logic** thread for the most recently published
+    /// frame, or `None` if nothing has been published yet.
+    ///
+    /// Call after [`render_latest`](Self::render_latest) to build a combined
+    /// CPU+GPU overlay (RFC-0013 "Overlay format"): GPU-tagged samples for
+    /// the frame just encoded land on the **calling** thread's own telemetry
+    /// ring instead (see [`crate::encoder::EncoderSubsystem`]'s module
+    /// docs), so a caller on the render thread drains
+    /// [`crate::telemetry::drain_samples`] itself for those.
+    #[must_use]
+    pub fn latest_cpu_telemetry(&self) -> Option<crate::telemetry::SampleBlock> {
+        self.relay.current().map(|frame| frame.telemetry().clone())
+    }
+
+    /// Whether GPU pass timing is active for this engine (RFC-0013 **P5**) —
+    /// see [`crate::encoder::EncoderSubsystem::gpu_timing_available`].
+    #[must_use]
+    pub fn gpu_timing_available(&self) -> bool {
+        self.encoder.gpu_timing_available()
     }
 }
 

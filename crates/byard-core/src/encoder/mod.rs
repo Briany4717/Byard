@@ -25,8 +25,19 @@
 //! — the engine never panics on a GPU error.
 
 pub mod decorated_box;
+pub mod gpu_timer;
 pub mod text_glyph;
 pub mod texture_sampler;
+
+pub use gpu_timer::GpuTimer;
+
+/// Name of the single GPU pass this codebase currently times (RFC-0013 §"GPU
+/// timing"): `SolidBox`, `DecoratedBox`, `TextureSampler`, and `TextGlyph` all
+/// draw within one `wgpu::RenderPass` (see [`draw_ui_pass`]), so — unlike the
+/// RFC's four-pipeline illustration — there is exactly one pass boundary to
+/// time today. Per-pipeline GPU timing needs the encoder to split that pass
+/// first; tracked as a follow-up, not attempted here.
+pub const GPU_UI_PASS_SCOPE: &str = "gpu.ui_pass";
 
 use std::sync::Arc;
 
@@ -241,6 +252,21 @@ pub struct EncoderSubsystem {
     /// `TextLine::dirty` bits are all `false` because they were cleared
     /// before the render thread read the frame.
     last_relay_version: u64,
+    /// Async GPU pass timing (RFC-0013 §"GPU timing"), or `None` if the
+    /// device lacks `wgpu::Features::TIMESTAMP_QUERY` (P5) — checked once at
+    /// construction, never re-probed per frame.
+    gpu_timer: Option<GpuTimer>,
+    /// This frame's `Gpu`-tagged samples, drained from `gpu_timer` at the
+    /// start of the next [`encode_frame_with_decorations`](Self::encode_frame_with_decorations)
+    /// call and pushed onto the calling (render) thread's telemetry ring —
+    /// reused across calls so draining never allocates once warmed up.
+    gpu_samples_scratch: Vec<crate::telemetry::Sample>,
+    /// Set when [`GpuTimer::resolve_and_copy`] ran during the last
+    /// [`encode_frame_with_decorations`](Self::encode_frame_with_decorations)
+    /// call (i.e. a pass was actually timed this frame); consumed by
+    /// [`submit`](Self::submit), which must only call
+    /// [`GpuTimer::request_map`] when there is a fresh copy to map.
+    gpu_timing_pending: bool,
 }
 
 impl EncoderSubsystem {
@@ -369,6 +395,8 @@ impl EncoderSubsystem {
         let (persistent_color, persistent_view) =
             create_persistent_target(&device, surface_format, width, height);
 
+        let gpu_timer = GpuTimer::new(&device, &queue, &[GPU_UI_PASS_SCOPE]);
+
         Ok(Self {
             device,
             queue,
@@ -401,6 +429,9 @@ impl EncoderSubsystem {
             last_decorated_bounds: Vec::new(),
             last_texture_bounds: Vec::new(),
             last_relay_version: 0,
+            gpu_timer,
+            gpu_samples_scratch: Vec::new(),
+            gpu_timing_pending: false,
         })
     }
 
@@ -412,12 +443,49 @@ impl EncoderSubsystem {
         &self.device
     }
 
+    /// Whether this encoder's GPU pass timing is active (RFC-0013 **P5**) —
+    /// `false` when the device lacks `wgpu::Features::TIMESTAMP_QUERY`. Used
+    /// by the overlay/CLI to show a clear "GPU timing unavailable" notice
+    /// instead of a silently empty GPU section.
+    #[must_use]
+    pub fn gpu_timing_available(&self) -> bool {
+        self.gpu_timer.is_some()
+    }
+
     /// Submits a command buffer to the GPU queue.
     ///
     /// Thin wrapper around `queue.submit` so that callers outside this module
-    /// do not need to hold a separate reference to the queue.
-    pub(crate) fn submit(&self, buffer: wgpu::CommandBuffer) {
+    /// do not need to hold a separate reference to the queue. Also requests
+    /// this frame's GPU-timing readback map, if a pass was timed — `wgpu`
+    /// requires the `map_async` request to happen only after the command
+    /// buffer that writes the mapped buffer has actually been submitted
+    /// (see [`GpuTimer::resolve_and_copy`]'s doc comment).
+    pub(crate) fn submit(&mut self, buffer: wgpu::CommandBuffer) {
         self.queue.submit(std::iter::once(buffer));
+        if self.gpu_timing_pending {
+            self.gpu_timing_pending = false;
+            if let Some(timer) = &mut self.gpu_timer {
+                timer.request_map();
+            }
+        }
+    }
+
+    /// Drains any GPU pass timings that finished resolving since the last
+    /// call (RFC-0013 "GPU timing": never blocks, so a slot may still be
+    /// pending — it is simply checked again next time) and pushes them onto
+    /// this (render) thread's own telemetry ring, alongside whatever this
+    /// thread profiles directly — the overlay drains both. Extracted out of
+    /// [`encode_frame_with_decorations`](Self::encode_frame_with_decorations)
+    /// purely to keep that function under clippy's line-count threshold.
+    fn drain_gpu_samples_into_telemetry(&mut self) {
+        let Some(timer) = &mut self.gpu_timer else {
+            return;
+        };
+        self.gpu_samples_scratch.clear();
+        timer.drain_ready(&self.device, &mut self.gpu_samples_scratch);
+        for sample in self.gpu_samples_scratch.drain(..) {
+            crate::telemetry::push_sample(sample);
+        }
     }
 
     /// Uploads updated viewport dimensions to the GPU uniform buffer and
@@ -528,6 +596,8 @@ impl EncoderSubsystem {
     ) -> Result<wgpu::CommandBuffer, ByardError> {
         self.request_textures(textures);
 
+        self.drain_gpu_samples_into_telemetry();
+
         let full_redraw = needs_full_redraw_this_frame(
             self.needs_full_redraw,
             self.last_instance_count,
@@ -621,7 +691,16 @@ impl EncoderSubsystem {
                     textures,
                     texture_cache: &self.texture_cache,
                 },
+                self.gpu_timer.as_ref(),
             )?;
+            // Only when a pass actually ran this frame — resolving an
+            // untouched query set would read stale or never-written slots.
+            // The matching `request_map` happens in `submit`, once this
+            // encoder's command buffer has actually reached the queue.
+            if let Some(timer) = &mut self.gpu_timer {
+                timer.resolve_and_copy(&mut encoder);
+                self.gpu_timing_pending = true;
+            }
         }
 
         // ── Composite onto the swapchain image ────────────────────────────────
@@ -844,6 +923,7 @@ fn draw_ui_pass(
     full_redraw: bool,
     scissor: Option<(Rect, u32, u32, u32, u32)>,
     primitives: &DrawPrimitives<'_>,
+    gpu_timer: Option<&GpuTimer>,
 ) -> Result<(), ByardError> {
     let DrawPipelines {
         solid: render_pipeline,
@@ -875,7 +955,7 @@ fn draw_ui_pass(
             depth_slice: None,
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: gpu_timer.and_then(|t| t.timestamp_writes(GPU_UI_PASS_SCOPE)),
         occlusion_query_set: None,
         // wgpu 28: new required field; None disables multiview rendering.
         multiview_mask: None,
