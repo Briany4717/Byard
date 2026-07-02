@@ -1581,11 +1581,15 @@ mod tests {
         // without at least this test noticing.
         //
         // Built at runtime (not a literal in this file) so this very
-        // assertion doesn't trip on itself via `include_str!`.
+        // assertion doesn't trip on itself via `include_str!`. The file list
+        // is every `.rs` file in this directory (`ls src/encoder/*.rs`) —
+        // keep it in sync when adding a new one, since `include_str!` can't
+        // glob a directory.
         let forbidden_call = ["LayoutAtlas", "::", "compute"].concat();
         for (name, src) in [
             ("mod.rs", include_str!("mod.rs")),
             ("decorated_box.rs", include_str!("decorated_box.rs")),
+            ("gpu_timer.rs", include_str!("gpu_timer.rs")),
             ("text_glyph.rs", include_str!("text_glyph.rs")),
             ("texture_sampler.rs", include_str!("texture_sampler.rs")),
         ] {
