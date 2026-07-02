@@ -45,7 +45,7 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::ByardError;
-use crate::frame::{Rect, RenderFrame, Viewport};
+use crate::frame::{Rect, RenderFrame, Transform, Viewport};
 use text_glyph::{TextGlyphPipeline, TextLine};
 
 /// Re-exported from [`crate::frame`] — the canonical definition now lives
@@ -96,6 +96,36 @@ impl BoxInstance {
                     offset: 32,
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32x4,
+                },
+                // transform.translate
+                wgpu::VertexAttribute {
+                    offset: 48,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                // transform.scale
+                wgpu::VertexAttribute {
+                    offset: 56,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                // transform.rotate
+                wgpu::VertexAttribute {
+                    offset: 64,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                // transform.origin
+                wgpu::VertexAttribute {
+                    offset: 68,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                // transform.opacity
+                wgpu::VertexAttribute {
+                    offset: 76,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32,
                 },
             ],
         }
@@ -1487,6 +1517,7 @@ fn draw_clear_quad(
         rect: [bounds.x, bounds.y, bounds.width, bounds.height],
         color: [0.0, 0.0, 0.0, 0.0],
         radii: [0.0; 4],
+        transform: Transform::IDENTITY,
     };
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ByardCore - Clear Quad Instance Buffer"),
@@ -1529,8 +1560,8 @@ fn draw_solid_box_instances(
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
     // Safety: no UI frame will ever hold 2^32 instances. The cast is
-    // bounded by system memory (each BoxInstance is 48 bytes, so 2^32
-    // would require 192 GiB of RAM before reaching this code).
+    // bounded by system memory (each BoxInstance is 80 bytes, so 2^32
+    // would require 320 GiB of RAM before reaching this code).
     #[allow(clippy::cast_possible_truncation)]
     render_pass.draw(0..4, 0..instances.len() as u32);
 }
@@ -1538,6 +1569,36 @@ fn draw_solid_box_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── INV-8: paint-time transforms never trigger a relayout ─────────────────
+
+    #[test]
+    fn encoder_module_never_calls_layout_atlas_compute() {
+        // RFC-0011 (INV-8): a paint-time `Transform` must never cause a Taffy
+        // relayout. Structurally enforced by module boundaries (`encoder`
+        // never imports `crate::atlas`) — this test scans the encoder's own
+        // sources for the literal call so a future edit can't reintroduce it
+        // without at least this test noticing.
+        //
+        // Built at runtime (not a literal in this file) so this very
+        // assertion doesn't trip on itself via `include_str!`. The file list
+        // is every `.rs` file in this directory (`ls src/encoder/*.rs`) —
+        // keep it in sync when adding a new one, since `include_str!` can't
+        // glob a directory.
+        let forbidden_call = ["LayoutAtlas", "::", "compute"].concat();
+        for (name, src) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("decorated_box.rs", include_str!("decorated_box.rs")),
+            ("gpu_timer.rs", include_str!("gpu_timer.rs")),
+            ("text_glyph.rs", include_str!("text_glyph.rs")),
+            ("texture_sampler.rs", include_str!("texture_sampler.rs")),
+        ] {
+            assert!(
+                !src.contains(&forbidden_call),
+                "{name} must never call into layout recomputation (INV-8)"
+            );
+        }
+    }
 
     // ── BoxInstance layout ────────────────────────────────────────────────────
     //
@@ -1547,12 +1608,13 @@ mod tests {
 
     #[test]
     fn box_instance_size_and_alignment() {
-        // 3 fields × [f32; 4] × 4 bytes = 48 bytes total.
-        // The GPU stride declaration in `layout()` hardcodes this value.
+        // 3 fields × [f32; 4] × 4 bytes = 48, + Transform's 8 × f32 × 4 bytes
+        // = 32, for 80 bytes total (RFC-0011). The GPU stride declaration in
+        // `layout()` hardcodes this value.
         assert_eq!(
             std::mem::size_of::<BoxInstance>(),
-            48,
-            "BoxInstance must be exactly 48 bytes"
+            80,
+            "BoxInstance must be exactly 80 bytes"
         );
         // f32 requires 4-byte alignment; wgpu vertex attributes assume this.
         assert_eq!(std::mem::align_of::<BoxInstance>(), 4);
@@ -1560,11 +1622,18 @@ mod tests {
 
     #[test]
     fn box_instance_field_offsets_match_shader_locations() {
-        // `BoxInstance::layout()` declares offsets 0, 16, 32 for rect/color/radii.
-        // If any field is reordered or padded, the shader sees garbage.
+        // `BoxInstance::layout()` declares offsets 0, 16, 32, 48 for
+        // rect/color/radii/transform. If any field is reordered or padded,
+        // the shader sees garbage.
         assert_eq!(std::mem::offset_of!(BoxInstance, rect), 0);
         assert_eq!(std::mem::offset_of!(BoxInstance, color), 16);
         assert_eq!(std::mem::offset_of!(BoxInstance, radii), 32);
+        assert_eq!(std::mem::offset_of!(BoxInstance, transform), 48);
+        assert_eq!(std::mem::offset_of!(Transform, translate), 0);
+        assert_eq!(std::mem::offset_of!(Transform, scale), 8);
+        assert_eq!(std::mem::offset_of!(Transform, rotate), 16);
+        assert_eq!(std::mem::offset_of!(Transform, origin), 20);
+        assert_eq!(std::mem::offset_of!(Transform, opacity), 28);
     }
 
     #[test]
@@ -1572,7 +1641,7 @@ mod tests {
         let layout = BoxInstance::layout();
 
         assert_eq!(
-            layout.array_stride, 48,
+            layout.array_stride, 80,
             "stride must equal size_of::<BoxInstance>()"
         );
         assert_eq!(
@@ -1583,7 +1652,7 @@ mod tests {
 
         // Verify each attribute's (shader_location, offset) pair.
         let attrs = layout.attributes;
-        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs.len(), 8);
 
         assert_eq!(attrs[0].shader_location, 1); // rect
         assert_eq!(attrs[0].offset, 0);
@@ -1596,6 +1665,26 @@ mod tests {
         assert_eq!(attrs[2].shader_location, 3); // radii
         assert_eq!(attrs[2].offset, 32);
         assert_eq!(attrs[2].format, wgpu::VertexFormat::Float32x4);
+
+        assert_eq!(attrs[3].shader_location, 4); // transform.translate
+        assert_eq!(attrs[3].offset, 48);
+        assert_eq!(attrs[3].format, wgpu::VertexFormat::Float32x2);
+
+        assert_eq!(attrs[4].shader_location, 5); // transform.scale
+        assert_eq!(attrs[4].offset, 56);
+        assert_eq!(attrs[4].format, wgpu::VertexFormat::Float32x2);
+
+        assert_eq!(attrs[5].shader_location, 6); // transform.rotate
+        assert_eq!(attrs[5].offset, 64);
+        assert_eq!(attrs[5].format, wgpu::VertexFormat::Float32);
+
+        assert_eq!(attrs[6].shader_location, 7); // transform.origin
+        assert_eq!(attrs[6].offset, 68);
+        assert_eq!(attrs[6].format, wgpu::VertexFormat::Float32x2);
+
+        assert_eq!(attrs[7].shader_location, 8); // transform.opacity
+        assert_eq!(attrs[7].offset, 76);
+        assert_eq!(attrs[7].format, wgpu::VertexFormat::Float32);
     }
 
     #[test]
@@ -1607,15 +1696,17 @@ mod tests {
                 rect: [0.0, 0.0, 100.0, 50.0],
                 color: [1.0, 0.0, 0.5, 1.0],
                 radii: [8.0, 8.0, 8.0, 8.0],
+                transform: Transform::IDENTITY,
             },
             BoxInstance {
                 rect: [10.0, 20.0, 200.0, 80.0],
                 color: [0.0, 1.0, 0.0, 0.8],
                 radii: [0.0; 4],
+                transform: Transform::IDENTITY,
             },
         ];
         let bytes: &[u8] = bytemuck::cast_slice(&instances);
-        assert_eq!(bytes.len(), 2 * 48, "2 instances × 48 bytes each");
+        assert_eq!(bytes.len(), 2 * 80, "2 instances × 80 bytes each");
     }
 
     #[test]
@@ -1769,6 +1860,7 @@ mod tests {
             rect: [1.0, 2.0, 300.0, 400.0],
             color: [0.25, 0.5, 0.75, 1.0],
             radii: [8.0, 16.0, 24.0, 32.0],
+            transform: Transform::IDENTITY,
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);
@@ -1905,9 +1997,10 @@ mod tests {
             rect: [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0],
             color: [f32::NAN; 4],
             radii: [f32::INFINITY; 4],
+            transform: Transform::IDENTITY,
         };
         let bytes = bytemuck::bytes_of(&inst);
-        assert_eq!(bytes.len(), 48, "NaN/inf must not change struct size");
+        assert_eq!(bytes.len(), 80, "NaN/inf must not change struct size");
     }
 
     // ── QUAD_VERTICES: TriangleStrip geometry ────────────────────────────────
@@ -2246,6 +2339,7 @@ mod tests {
             rect: [x, y, w, h],
             color: [0.0; 4],
             radii: [0.0; 4],
+            transform: Transform::IDENTITY,
         }
     }
 

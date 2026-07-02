@@ -30,6 +30,18 @@ pub struct DecoratedInstance {
     pub params: [f32; 4],
     /// `[opacity, 0, 0, 0]`.
     pub misc: [f32; 4],
+    /// Paint-time transform translate (RFC-0011), from `d.base.transform`.
+    /// Only the geometric fields (`translate`/`scale`/`rotate`/`origin`) are
+    /// read here — `d.base.transform.opacity` is **not** consulted; `misc.x`
+    /// (above) is the authoritative opacity for decorated boxes, unchanged
+    /// since M21.
+    pub t_translate: [f32; 2],
+    /// Paint-time transform per-axis scale (RFC-0011).
+    pub t_scale: [f32; 2],
+    /// Paint-time transform rotation in radians (RFC-0011).
+    pub t_rotate: f32,
+    /// Paint-time transform pivot (RFC-0011).
+    pub t_origin: [f32; 2],
 }
 
 impl From<&DecoratedBox> for DecoratedInstance {
@@ -42,12 +54,16 @@ impl From<&DecoratedBox> for DecoratedInstance {
             shadow_color: d.shadow_color,
             params: [d.border_width, d.shadow_dx, d.shadow_dy, d.shadow_blur],
             misc: [d.opacity, 0.0, 0.0, 0.0],
+            t_translate: d.base.transform.translate,
+            t_scale: d.base.transform.scale,
+            t_rotate: d.base.transform.rotate,
+            t_origin: d.base.transform.origin,
         }
     }
 }
 
 impl DecoratedInstance {
-    /// Vertex buffer layout for the per-instance step (locations 1..=7; the
+    /// Vertex buffer layout for the per-instance step (locations 1..=11; the
     /// static quad occupies location 0).
     #[must_use]
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -59,6 +75,10 @@ impl DecoratedInstance {
             5 => Float32x4, // shadow_color
             6 => Float32x4, // params
             7 => Float32x4, // misc
+            8 => Float32x2, // transform.translate
+            9 => Float32x2, // transform.scale
+            10 => Float32, // transform.rotate
+            11 => Float32x2, // transform.origin
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DecoratedInstance>() as wgpu::BufferAddress,
