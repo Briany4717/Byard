@@ -396,7 +396,11 @@ impl RenderFrame {
         self.textures.clear();
         self.texts.clear();
         self.version = 0;
-        self.telemetry = crate::telemetry::SampleBlock::default();
+        // `Vec::clear` only, not `SampleBlock::default()` — the latter would
+        // drop the block's existing allocation and defeat the capacity
+        // retention this method promises once telemetry is attached.
+        self.telemetry.samples.clear();
+        self.telemetry.dropped = 0;
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
@@ -472,10 +476,18 @@ impl RenderFrame {
         self.version
     }
 
-    /// Attaches this tick's CPU scope samples (RFC-0013 "Hand-off"),
-    /// piggybacked on this frame instead of a dedicated channel.
-    pub fn set_telemetry(&mut self, block: crate::telemetry::SampleBlock) {
-        self.telemetry = block;
+    /// Pulls the calling thread's CPU scope samples into this frame
+    /// (RFC-0013 "Hand-off"), piggybacked on this frame's atomic swap instead
+    /// of a dedicated channel.
+    ///
+    /// Called from the logic thread, once per tick, by
+    /// [`crate::relay::Relay::publish`] right before the frame is swapped
+    /// in — so every publish path picks up telemetry automatically, with no
+    /// per-call-site wiring needed. Reuses this frame's existing
+    /// `SampleBlock` allocation (see [`RenderFrame::clear`]) rather than
+    /// allocating a fresh one each tick.
+    pub fn drain_telemetry(&mut self) {
+        crate::telemetry::drain_samples_into(&mut self.telemetry);
     }
 
     /// Returns this tick's CPU scope samples, if any were captured.

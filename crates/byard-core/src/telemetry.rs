@@ -3,10 +3,10 @@
 //! Each engine thread owns a fixed-capacity, thread-local ring of
 //! [`Sample`]s. [`profile_scope!`] wraps a block in an RAII [`Guard`] that
 //! writes one sample on drop; the ring never grows and never allocates on
-//! the hot path (P1). At end-of-tick the logic thread calls
-//! [`drain_samples`] and attaches the resulting [`SampleBlock`] to the
-//! [`crate::frame::RenderFrame`] it is about to publish, piggybacking on
-//! the existing atomic frame swap instead of opening a new channel.
+//! the hot path (P1). At end-of-tick, [`crate::relay::Relay::publish`] calls
+//! [`crate::frame::RenderFrame::drain_telemetry`], which pulls the calling
+//! thread's ring into the frame's own [`SampleBlock`], piggybacking on the
+//! existing atomic frame swap instead of opening a new channel.
 //!
 //! With the `telemetry` Cargo feature off, [`profile_scope!`] expands to a
 //! no-op statement — zero cost in a build that disables it (e.g. release).
@@ -30,7 +30,13 @@ pub struct ScopeId(pub u16);
 ///
 /// Backed by a small `Mutex<Vec<&'static str>>` registry — touched once per
 /// unique call site, never on the per-sample hot path.
-#[allow(clippy::cast_possible_truncation)] // registry realistically never exceeds u16::MAX scopes
+///
+/// # Panics
+///
+/// Panics if more than `u16::MAX` distinct scope names are ever registered
+/// (a build-time authoring error, not something user input can trigger) —
+/// silently wrapping the index would alias two unrelated scopes under the
+/// same `ScopeId` and corrupt profiling data.
 pub fn scope_id(name: &'static str) -> ScopeId {
     static REGISTRY: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
@@ -38,10 +44,14 @@ pub fn scope_id(name: &'static str) -> ScopeId {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(pos) = names.iter().position(|&n| n == name) {
-        return ScopeId(pos as u16);
+        return ScopeId(index_to_u16(pos));
     }
     names.push(name);
-    ScopeId((names.len() - 1) as u16)
+    ScopeId(index_to_u16(names.len() - 1))
+}
+
+fn index_to_u16(index: usize) -> u16 {
+    u16::try_from(index).expect("telemetry scope registry exceeded u16::MAX distinct scope names")
 }
 
 /// Returns the engine's telemetry epoch, established on first use.
@@ -136,16 +146,20 @@ impl Ring {
         self.dropped
     }
 
-    /// Copies out the current contents as a [`SampleBlock`] and resets the
-    /// ring for the next tick.
-    fn drain_into_block(&mut self) -> SampleBlock {
-        let block = SampleBlock {
-            samples: self.buf[..self.len].to_vec(),
-            dropped: self.dropped,
-        };
+    /// Copies out the current contents into `out` and resets the ring for
+    /// the next tick.
+    ///
+    /// Reuses `out.samples`' existing heap allocation (`Vec::clear` +
+    /// `extend_from_slice`) instead of allocating a fresh `Vec` every tick,
+    /// so a caller that keeps its `SampleBlock` around (e.g. a recycled
+    /// [`crate::frame::RenderFrame`]) drains at steady-state zero
+    /// allocation once its capacity has grown to fit a typical tick.
+    fn drain_into(&mut self, out: &mut SampleBlock) {
+        out.samples.clear();
+        out.samples.extend_from_slice(&self.buf[..self.len]);
+        out.dropped = self.dropped;
         self.len = 0;
         self.dropped = 0;
-        block
     }
 }
 
@@ -171,11 +185,26 @@ pub fn ring_dropped() -> u64 {
     RING.with(|r| r.borrow().dropped())
 }
 
-/// Drains the calling thread's ring into a [`SampleBlock`], resetting it for
-/// the next tick. Call once per tick, right before publishing the frame.
+/// Drains the calling thread's ring into `out`, resetting the ring for the
+/// next tick and reusing `out`'s existing `Vec` allocation.
+///
+/// This is the hot path — [`crate::frame::RenderFrame::drain_telemetry`]
+/// calls this on the logic thread right before [`crate::relay::Relay::publish`]
+/// swaps the frame in, so a recycled frame's `SampleBlock` never reallocates
+/// once it has grown to fit a typical tick.
+pub fn drain_samples_into(out: &mut SampleBlock) {
+    RING.with(|r| r.borrow_mut().drain_into(out));
+}
+
+/// Drains the calling thread's ring into a freshly allocated [`SampleBlock`].
+///
+/// Convenience for tests and one-off call sites; steady-state hot paths
+/// should prefer [`drain_samples_into`] with a reused buffer.
 #[must_use]
 pub fn drain_samples() -> SampleBlock {
-    RING.with(|r| r.borrow_mut().drain_into_block())
+    let mut block = SampleBlock::default();
+    drain_samples_into(&mut block);
+    block
 }
 
 /// RAII guard produced by [`profile_scope!`]; writes one [`Sample`] to the
@@ -296,6 +325,32 @@ mod tests {
         // Draining resets the ring for the next tick.
         assert_eq!(ring_len(), 0);
         assert_eq!(ring_dropped(), 0);
+    }
+
+    #[test]
+    fn drain_samples_into_reuses_the_callers_vec_allocation() {
+        let _ = drain_samples();
+        let mut block = SampleBlock::default();
+        block.samples.reserve(RING_CAPACITY);
+        let reused_capacity = block.samples.capacity();
+        assert!(reused_capacity >= RING_CAPACITY);
+
+        for _ in 0..RING_CAPACITY {
+            push_sample(Sample::default());
+        }
+        drain_samples_into(&mut block);
+        assert_eq!(block.samples.len(), RING_CAPACITY);
+        assert_eq!(
+            block.samples.capacity(),
+            reused_capacity,
+            "draining into an already-sized buffer must not reallocate"
+        );
+
+        // A second tick with fewer samples reuses the same allocation again.
+        push_sample(Sample::default());
+        drain_samples_into(&mut block);
+        assert_eq!(block.samples.len(), 1);
+        assert_eq!(block.samples.capacity(), reused_capacity);
     }
 
     #[test]
