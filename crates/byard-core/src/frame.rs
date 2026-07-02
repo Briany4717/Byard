@@ -368,6 +368,11 @@ pub struct RenderFrame {
     /// advance means the render thread skipped at least one dirty frame and must
     /// force a full redraw + text reshape to avoid displaying stale glyphs.
     version: u64,
+
+    /// This tick's CPU scope samples (RFC-0013 "Hand-off"), piggybacked on
+    /// the existing atomic frame swap instead of a dedicated channel. Empty
+    /// when the `telemetry` feature is off or nothing was profiled this tick.
+    telemetry: crate::telemetry::SampleBlock,
 }
 
 impl RenderFrame {
@@ -391,6 +396,7 @@ impl RenderFrame {
         self.textures.clear();
         self.texts.clear();
         self.version = 0;
+        self.telemetry = crate::telemetry::SampleBlock::default();
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
@@ -464,6 +470,18 @@ impl RenderFrame {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Attaches this tick's CPU scope samples (RFC-0013 "Hand-off"),
+    /// piggybacked on this frame instead of a dedicated channel.
+    pub fn set_telemetry(&mut self, block: crate::telemetry::SampleBlock) {
+        self.telemetry = block;
+    }
+
+    /// Returns this tick's CPU scope samples, if any were captured.
+    #[must_use]
+    pub fn telemetry(&self) -> &crate::telemetry::SampleBlock {
+        &self.telemetry
     }
 }
 

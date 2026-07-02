@@ -29,6 +29,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Blocks on the async wgpu device request inside headless pipeline tests (M21).
 pollster = "0.4"
 
+[features]
+default = ["telemetry"]
+# Zero-allocation profiler (RFC-0013): `profile_scope!` compiles to nothing
+# when this is off, so a release build pays exactly zero cost for it.
+telemetry = []
+
 [lints]
 workspace = true
 
