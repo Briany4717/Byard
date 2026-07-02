@@ -12,6 +12,11 @@ View Main() {
     var volume: Float = 0.5
     var name: String = ""
     var note: String = ""
+    var hovered: Bool = false
+    var eventFocused: Bool = false
+    var pokes: Int = 0
+    var wheelTicks: Int = 0
+    var scrollTicks: Int = 0
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
@@ -51,8 +56,8 @@ View Main() {
                 Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
             }
             // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
-            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+            TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
             Text("Hi {name}") #[color: 0x10B981, size: 14]
         }
 
@@ -78,6 +83,41 @@ View Main() {
             Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
             Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
             Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
+        }
+
+        // ── Full event exposure (RFC-0012 §A): hover/enter/exit, long_press,
+        // double_tap, secondary (right-click), the `click` alias, and the
+        // `focus =>`/`blur =>` sugar — hover the box, left/right/double-click
+        // it, hold it, then Tab to move focus in and out.
+        Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
+            Text("Event exposure") #[color: 0x9AA0AC, size: 15]
+            Box #[
+                bg: hovered ? 0x6495ED : 0x34344A,
+                radius: 10,
+                p: (vertical: 14, horizontal: 18),
+                width: 320,
+                hover => hovered = true,
+                pointer_exit => hovered = false,
+                click => pokes++,
+                double_tap => pokes += 10,
+                long_press => pokes += 100,
+                secondary => pokes = 0,
+                focused: eventFocused,
+                focus => eventFocused = true,
+                blur => eventFocused = false,
+            ] {
+                Text(eventFocused ? "focused — click, right-click, hold, or double-click" : "click to focus me") #[color: 0xFFFFFF, size: 14]
+            }
+            Text("pokes: {pokes} (click +1, double-tap +10, long-press +100, right-click resets)") #[color: 0x9AA0AC, size: 13]
+
+            // Hardware wheel/scroll origin (RFC-0012 §A loose end): hover
+            // this area and use a physical mouse wheel (`wheelTicks`) or a
+            // trackpad scroll gesture (`scrollTicks`) over it. `scroll` is
+            // only in `ScrollView`'s accepted vocabulary today; `wheel` is
+            // universal.
+            ScrollView #[bg: 0x1E1E2A, radius: 10, p: (vertical: 14, horizontal: 18), width: 320, wheel => wheelTicks++, scroll => scrollTicks++] {
+                Text("wheel: {wheelTicks}   scroll: {scrollTicks}") #[color: 0xFFFFFF, size: 14]
+            }
         }
     }
 }

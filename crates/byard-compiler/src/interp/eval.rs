@@ -1213,7 +1213,7 @@ impl Interpreter {
         for attr in attrs {
             if let AttrKind::Event { payload, action } = &attr.kind {
                 let event_kind = match attr.name.as_str() {
-                    "tap" => super::events::EventKind::Tap,
+                    "tap" | "click" => super::events::EventKind::Tap, // "click" is an alias (RFC-0012 §A)
                     "pointer_down" => super::events::EventKind::PointerDown,
                     "pointer_up" => super::events::EventKind::PointerUp,
                     "pointer_move" => super::events::EventKind::PointerMove,
@@ -1223,6 +1223,18 @@ impl Interpreter {
                     "key_down" => super::events::EventKind::KeyDown,
                     "key_up" => super::events::EventKind::KeyUp,
                     "text_input" => super::events::EventKind::TextInput,
+                    // RFC-0012 §A: the six modeled-but-previously-unexposed events.
+                    "hover" => super::events::EventKind::Hover,
+                    "pointer_enter" => super::events::EventKind::PointerEnter,
+                    "pointer_exit" => super::events::EventKind::PointerExit,
+                    "long_press" => super::events::EventKind::LongPress,
+                    "double_tap" => super::events::EventKind::DoubleTap,
+                    "secondary" => super::events::EventKind::Secondary,
+                    // RFC-0012 S2: `focus =>`/`blur =>` sugar over `focused_sig`'s
+                    // edges — registered as ordinary handlers here; `steal_focus`
+                    // fires them directly (see `interp::events::EventKind::Focus`).
+                    "focus" => super::events::EventKind::Focus,
+                    "blur" => super::events::EventKind::Blur,
                     _ => continue,
                 };
                 if let Ok(closure) = self.lower_action(action, payload.clone()) {
@@ -1234,17 +1246,33 @@ impl Interpreter {
         }
     }
 
-    /// Registers an element as focusable if it has a `focused:` prop attr (M16/M18).
+    /// Registers an element as focusable if it has a `focused:` prop attr
+    /// (M16/M18), **or** a `focus =>`/`blur =>` handler (RFC-0012 S2) — the
+    /// sugar rides `focused_sig`'s edges, so an element that only wants the
+    /// one-shot event (no bound `var`) still needs a signal for
+    /// `steal_focus` to flip. That signal is a fresh internal one when
+    /// `focused:` wasn't given, mirroring `render_text_field`'s same
+    /// bind-or-create pattern for its own `focused_sig`.
     fn register_focusable(
         &mut self,
         attrs: &[Attr],
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
     ) {
-        if let Some(sig) = self.resolve_focused_sig(attrs) {
-            if let Some(idx) = elem_idx {
-                self.router.focusable(idx, hit_rect, sig);
-            }
+        // Without an index there is nowhere to register the focusable, so a
+        // freshly created internal signal below would just be dropped —
+        // bail out first rather than allocate one for nothing.
+        let Some(idx) = elem_idx else {
+            return;
+        };
+        let has_focus_sugar = attrs.iter().any(|a| {
+            matches!(a.kind, AttrKind::Event { .. }) && matches!(a.name.as_str(), "focus" | "blur")
+        });
+        let sig = self
+            .resolve_focused_sig(attrs)
+            .or_else(|| has_focus_sugar.then(|| self.ctx.create_signal(Value::Bool(false))));
+        if let Some(sig) = sig {
+            self.router.focusable(idx, hit_rect, sig);
         }
     }
 

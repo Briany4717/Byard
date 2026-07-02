@@ -424,17 +424,23 @@ impl PlatformHost for App {
         Ok(())
     }
 
-    fn on_pointer_input(&mut self, _button: PointerButton, state: PointerState, x: f32, y: f32) {
+    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState, x: f32, y: f32) {
         if let Some(engine) = &self.engine {
             let kind = match state {
                 PointerState::Pressed => byard_core::platform::EventKind::PointerDown,
                 PointerState::Released => byard_core::platform::EventKind::PointerUp,
             };
+            // The router only consults this on `PointerDown` (RFC-0012
+            // `secondary`): a right-button press flags the whole down→up
+            // gesture as `secondary` instead of `tap`. Without it every
+            // button reports as a plain left-click.
+            let payload = (button == PointerButton::Right)
+                .then_some(byard_core::platform::InputPayload::Bool(true));
             engine.push_input(byard_core::platform::InputEvent {
                 kind,
                 pos: (x, y),
                 delta: (0.0, 0.0),
-                payload: None,
+                payload,
                 time_ms: now_ms(),
             });
         }
@@ -452,18 +458,21 @@ impl PlatformHost for App {
         }
     }
 
-    fn on_key(&mut self, _key: &str, pressed: bool) {
+    fn on_key(&mut self, key: &str, pressed: bool) {
         if let Some(engine) = &self.engine {
             let kind = if pressed {
                 byard_core::platform::EventKind::KeyDown
             } else {
                 byard_core::platform::EventKind::KeyUp
             };
+            // The router keys `Tab` traversal (M18) and `Backspace`/edit
+            // handling (M17) off this payload — dropping it here silently
+            // breaks both, since every key would otherwise look identical.
             engine.push_input(byard_core::platform::InputEvent {
                 kind,
                 pos: (0.0, 0.0),
                 delta: (0.0, 0.0),
-                payload: None,
+                payload: Some(byard_core::platform::InputPayload::Key(key.to_string())),
                 time_ms: now_ms(),
             });
         }
@@ -476,6 +485,30 @@ impl PlatformHost for App {
                 pos: (0.0, 0.0),
                 delta: (0.0, 0.0),
                 payload: Some(byard_core::platform::InputPayload::Key(text.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_scroll(&mut self, dx: f32, dy: f32, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Scroll,
+                pos: (x, y),
+                delta: (dx, dy),
+                payload: None,
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_wheel(&mut self, dx: f32, dy: f32, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (x, y),
+                delta: (dx, dy),
+                payload: None,
                 time_ms: now_ms(),
             });
         }

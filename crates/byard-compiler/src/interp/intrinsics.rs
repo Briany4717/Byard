@@ -102,6 +102,7 @@ const TEXT_PROPS: &[(&str, PropType)] = &[
 
 const POINTER_EVENTS: &[&str] = &[
     "tap",
+    "click", // alias of "tap" (RFC-0012 §A)
     "pointer_down",
     "pointer_up",
     "pointer_move",
@@ -112,8 +113,15 @@ const POINTER_EVENTS: &[&str] = &[
     "double_tap",
     "secondary",
     "wheel",
+    // `focus =>`/`blur =>` sugar (RFC-0012 S2) makes *any* interactive
+    // element focusable on demand (`register_focusable` creates a fresh
+    // internal `focused_sig` when `focused:` wasn't given) — so, unlike
+    // `key_down`/`key_up` below, these aren't gated behind an intrinsic's
+    // *default* focusability.
+    "focus",
+    "blur",
 ];
-const KEY_EVENTS: &[&str] = &["key_down", "key_up", "focus", "blur"];
+const KEY_EVENTS: &[&str] = &["key_down", "key_up"];
 
 /// The accepted vocabulary of one intrinsic.
 pub struct Intrinsic {

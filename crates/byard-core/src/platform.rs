@@ -251,6 +251,20 @@ pub trait PlatformHost {
     /// `text` is the committed string (usually one character but may be more
     /// for IME). Defaults to a no-op.
     fn on_text(&mut self, _text: &str) {}
+
+    /// Called on a trackpad-style scroll gesture at cursor position `(x, y)`,
+    /// with `(dx, dy)` the scroll delta in logical pixels (RFC-0012 §A loose
+    /// end: `scroll`'s hardware origin).
+    ///
+    /// Defaults to a no-op.
+    fn on_scroll(&mut self, _dx: f32, _dy: f32, _x: f32, _y: f32) {}
+
+    /// Called on a physical mouse-wheel tick at cursor position `(x, y)`,
+    /// with `(dx, dy)` the wheel delta (RFC-0012 §A loose end: `wheel`'s
+    /// hardware origin).
+    ///
+    /// Defaults to a no-op.
+    fn on_wheel(&mut self, _dx: f32, _dy: f32, _x: f32, _y: f32) {}
 }
 
 #[cfg(test)]
@@ -293,6 +307,14 @@ mod tests {
         host.on_pointer_input(PointerButton::Left, PointerState::Pressed, 0.0, 0.0);
         host.on_pointer_input(PointerButton::Other(7), PointerState::Released, 10.0, 20.0);
         host.on_cursor_moved(15.0, 25.0);
+    }
+
+    #[test]
+    fn on_scroll_and_on_wheel_defaults_are_no_ops() {
+        let mut host = DefaultsOnlyHost;
+        // Must not panic for any delta/position combination.
+        host.on_scroll(1.0, -2.0, 10.0, 20.0);
+        host.on_wheel(0.0, 3.0, 30.0, 40.0);
     }
 
     #[test]

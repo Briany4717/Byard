@@ -56,6 +56,15 @@ pub enum EventKind {
     DoubleTap,
     /// A secondary (right) button tap.
     Secondary,
+    // ── RFC-0012 §A: `focus =>`/`blur =>` sugar ──────────────────────────
+    /// An element's focus state rose (RFC-0012 S2). **Internal-only**: never
+    /// produced by a raw [`InputEvent`] — fired directly by
+    /// [`EventRouter::steal_focus`] on the rising edge of `focused_sig`.
+    Focus,
+    /// An element's focus state fell (RFC-0012 S2). **Internal-only**: never
+    /// produced by a raw [`InputEvent`] — fired directly by
+    /// [`EventRouter::steal_focus`] on the falling edge of `focused_sig`.
+    Blur,
 }
 
 impl EventKind {
@@ -374,6 +383,10 @@ impl EventRouter {
             EventKind::TextInput => {
                 self.fire_focused(ctx, EventKind::TextInput, ev.value.as_ref());
             }
+            // Never produced as a raw `InputEvent` — `steal_focus` fires
+            // these directly via `fire_on_elem`. Present only so this match
+            // stays exhaustive as the enum grows.
+            EventKind::Focus | EventKind::Blur => {}
         }
     }
 
@@ -428,11 +441,16 @@ impl EventRouter {
             if let Some(f) = self.focusables.iter().find(|f| f.elem == old) {
                 ctx.write_signal(f.focused_sig, Value::Bool(false));
             }
+            // RFC-0012 S2: `blur =>` sugar fires on the falling edge, riding
+            // the same `focused_sig` transition as the reflected prop above.
+            self.fire_on_elem(ctx, Some(old), EventKind::Blur, (0.0, 0.0), None);
         }
         if let Some(n) = new {
             if let Some(f) = self.focusables.iter().find(|f| f.elem == n) {
                 ctx.write_signal(f.focused_sig, Value::Bool(true));
             }
+            // RFC-0012 S2: `focus =>` sugar fires on the rising edge.
+            self.fire_on_elem(ctx, Some(n), EventKind::Focus, (0.0, 0.0), None);
         }
         self.focused = new;
     }

@@ -318,7 +318,7 @@ mod tests {
 
     /// Creates a 4x4 render target and records + submits one timed trivial
     /// render pass on `timer`, calling `request_map` right after submission
-    /// (mirrors `EncoderSubsystem::submit`'s ordering, see IMPL-74).
+    /// (mirrors `EncoderSubsystem::submit`'s resolve-then-map ordering).
     fn record_and_submit_one_timed_pass(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
