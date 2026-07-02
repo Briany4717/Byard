@@ -158,6 +158,58 @@ impl Rect {
     }
 }
 
+/// A paint-time affine transform (RFC-0011): translate/scale/rotate about a
+/// pivot, plus an opacity multiplier. Applied in the vertex/fragment shader
+/// *after* Taffy has placed the element — layout geometry and hit-testing
+/// rects are never affected, and Taffy is never re-run because a transform
+/// changed (INV-8). The identity value is a free no-op in the shader.
+///
+/// Deliberately a decomposed TRS (not a baked matrix): smaller to upload,
+/// trivial to interpolate per-component (RFC-0010's GPU springs animate one
+/// field at a time), and legible in a debugger.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Transform {
+    /// Logical-pixel offset applied after layout placement; siblings never move.
+    pub translate: [f32; 2],
+    /// Per-axis scale about `origin`; `[1.0, 1.0]` is unscaled.
+    pub scale: [f32; 2],
+    /// Rotation about `origin`, in radians.
+    pub rotate: f32,
+    /// The pivot for `scale`/`rotate`, resolved at lower time into the same
+    /// absolute logical-pixel space as the element's laid-out rectangle
+    /// (e.g. `center` resolves to the rect's own midpoint).
+    pub origin: [f32; 2],
+    /// Element alpha multiplier, `0.0..=1.0`.
+    pub opacity: f32,
+}
+
+impl Transform {
+    /// The no-op transform: no offset, unit scale, no rotation, full opacity.
+    pub const IDENTITY: Transform = Transform {
+        translate: [0.0, 0.0],
+        scale: [1.0, 1.0],
+        rotate: 0.0,
+        origin: [0.0, 0.0],
+        opacity: 1.0,
+    };
+
+    /// Whether this transform is a no-op (bit-exact match against `IDENTITY`
+    /// — every field is set from either a literal default or an exact
+    /// user-authored value, never accumulated arithmetic, so exact float
+    /// comparison is safe here).
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
 /// GPU-ready instance data for a single solid rectangle.
 ///
 /// Shared between the logic thread (which populates [`RenderFrame::instances`])
@@ -177,6 +229,9 @@ pub struct BoxInstance {
     pub color: [f32; 4],
     /// Per-corner border radii: `[top_left, top_right, bottom_right, bottom_left]`.
     pub radii: [f32; 4],
+    /// Paint-time transform (RFC-0011); `Transform::IDENTITY` for an
+    /// untransformed box.
+    pub transform: Transform,
 }
 
 /// How an image is scaled/positioned inside its bounding rect.
@@ -200,7 +255,11 @@ pub enum ImageFit {
 /// border or shadow fields are non-trivial.
 #[derive(Copy, Clone, Debug)]
 pub struct DecoratedBox {
-    /// The underlying fill/radii data.
+    /// The underlying fill/radii data. `base.transform`'s `translate`/`scale`/
+    /// `rotate`/`origin` apply as usual; `base.transform.opacity` is **not**
+    /// consulted for decorated boxes — [`DecoratedBox::opacity`] (below) is
+    /// the one that reaches the shader, since it predates RFC-0011 and
+    /// already has an established call-site contract.
     pub base: BoxInstance,
     /// Border width in logical pixels (0.0 = no border).
     pub border_width: f32,
@@ -234,6 +293,7 @@ impl Default for DecoratedBox {
                 rect: [0.0; 4],
                 color: [0.0; 4],
                 radii: [0.0; 4],
+                transform: Transform::IDENTITY,
             },
             border_width: 0.0,
             border_color: [0.0; 4],

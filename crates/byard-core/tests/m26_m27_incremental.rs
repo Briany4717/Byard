@@ -7,7 +7,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use byard_core::encoder::EncoderSubsystem;
-use byard_core::frame::{BoxInstance, DecoratedBox, RenderFrame, TextLine, Viewport};
+use byard_core::frame::{BoxInstance, DecoratedBox, RenderFrame, TextLine, Transform, Viewport};
 use std::sync::Arc;
 
 /// Returns `(device, queue)` for a real adapter, or `None` if no GPU is present.
@@ -104,6 +104,7 @@ fn solid_box(rect: [f32; 4], color: [f32; 4]) -> BoxInstance {
         rect,
         color,
         radii: [0.0; 4],
+        transform: Transform::IDENTITY,
     }
 }
 

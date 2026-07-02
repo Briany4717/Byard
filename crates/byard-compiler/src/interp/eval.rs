@@ -717,6 +717,7 @@ impl Interpreter {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
                             radii,
+                            transform: byard_core::frame::Transform::IDENTITY,
                         };
                         let border_rgba = border_color
                             .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
@@ -910,6 +911,7 @@ impl Interpreter {
             rect: [rect.x, rect.y, rect.w, rect.h],
             color: track_color,
             radii: [radius; 4],
+            transform: byard_core::frame::Transform::IDENTITY,
         });
 
         // Thumb: a white circle inset from the track edges, sliding L↔R.
@@ -925,6 +927,7 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [thumb_size / 2.0; 4],
+            transform: byard_core::frame::Transform::IDENTITY,
         });
 
         // Tap handler to flip the bool (M16).
@@ -986,6 +989,7 @@ impl Interpreter {
             rect: [rect.x, track_y, rect.w, track_h],
             color: [0.40, 0.42, 0.48, 1.0],
             radii: [track_r; 4],
+            transform: byard_core::frame::Transform::IDENTITY,
         });
 
         // Fill up to the thumb.
@@ -995,6 +999,7 @@ impl Interpreter {
                 rect: [rect.x, track_y, fill_w, track_h],
                 color: accent_rgba,
                 radii: [track_r; 4],
+                transform: byard_core::frame::Transform::IDENTITY,
             });
         }
 
@@ -1007,12 +1012,14 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: accent_rgba,
             radii: [thumb_size / 2.0; 4],
+            transform: byard_core::frame::Transform::IDENTITY,
         });
         let inner = thumb_size - 5.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [inner / 2.0; 4],
+            transform: byard_core::frame::Transform::IDENTITY,
         });
 
         // Handlers: PointerDown + PointerDrag (M16).
@@ -1095,6 +1102,7 @@ impl Interpreter {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
                 color: super::intrinsics::color_to_rgba(self.theme.primary, false),
                 radii: [0.0; 4],
+                transform: byard_core::frame::Transform::IDENTITY,
             });
         }
 
@@ -1123,6 +1131,7 @@ impl Interpreter {
                 rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
                 color: [1.0, 1.0, 1.0, 1.0],
                 radii: [0.0; 4],
+                transform: byard_core::frame::Transform::IDENTITY,
             });
         }
 
