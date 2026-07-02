@@ -26,28 +26,87 @@ pub const RING_CAPACITY: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ScopeId(pub u16);
 
-/// Looks up (or registers, on first touch) the [`ScopeId`] for a scope name.
+/// Which cost bucket a scope belongs to (RFC-0013 §"The interpreter tax
+/// segmentation"): `Interpreter` scopes evaporate in an AOT release build,
+/// `Native` scopes don't, and `Gpu` scopes are async pass timings rather than
+/// CPU wall-clock at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeKind {
+    /// Tree-walking eval, dynamic dispatch, env lookups — the cost an AOT
+    /// (transpiled) build does not pay.
+    Interpreter,
+    /// Ordinary CPU work that costs the same in dev and in an AOT release.
+    #[default]
+    Native,
+    /// A `wgpu` render-pass timing, resolved asynchronously (RFC-0013
+    /// "GPU timing").
+    Gpu,
+}
+
+struct ScopeEntry {
+    name: &'static str,
+    kind: ScopeKind,
+}
+
+fn registry() -> &'static Mutex<Vec<ScopeEntry>> {
+    static REGISTRY: OnceLock<Mutex<Vec<ScopeEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Looks up (or registers, on first touch) the [`ScopeId`] for a scope name,
+/// tagged `Native` (see [`scope_id_tagged`] for `Interpreter`/`Gpu` scopes).
 ///
-/// Backed by a small `Mutex<Vec<&'static str>>` registry — touched once per
-/// unique call site, never on the per-sample hot path.
+/// Backed by a small `Mutex<Vec<_>>` registry — touched once per unique call
+/// site, never on the per-sample hot path.
+#[must_use]
+pub fn scope_id(name: &'static str) -> ScopeId {
+    scope_id_tagged(name, ScopeKind::Native)
+}
+
+/// Looks up (or registers, on first touch) the [`ScopeId`] for a scope name
+/// tagged with `kind`. Re-registering an existing name with a different
+/// `kind` is a programming error and panics — a scope's cost bucket is
+/// determined once, at its call site, and must not drift.
 ///
 /// # Panics
 ///
 /// Panics if more than `u16::MAX` distinct scope names are ever registered
 /// (a build-time authoring error, not something user input can trigger) —
 /// silently wrapping the index would alias two unrelated scopes under the
-/// same `ScopeId` and corrupt profiling data.
-pub fn scope_id(name: &'static str) -> ScopeId {
-    static REGISTRY: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
-    let registry = REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
-    let mut names = registry
+/// same `ScopeId` and corrupt profiling data. Also panics if `name` was
+/// already registered under a different `kind`.
+pub fn scope_id_tagged(name: &'static str, kind: ScopeKind) -> ScopeId {
+    let mut names = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(pos) = names.iter().position(|&n| n == name) {
+    if let Some(pos) = names.iter().position(|e| e.name == name) {
+        assert!(
+            names[pos].kind == kind,
+            "telemetry scope {name:?} re-registered with a different ScopeKind"
+        );
         return ScopeId(index_to_u16(pos));
     }
-    names.push(name);
+    names.push(ScopeEntry { name, kind });
     ScopeId(index_to_u16(names.len() - 1))
+}
+
+/// Returns the [`ScopeKind`] a [`ScopeId`] was registered with.
+#[must_use]
+pub fn scope_kind(id: ScopeId) -> Option<ScopeKind> {
+    let names = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    names.get(usize::from(id.0)).map(|e| e.kind)
+}
+
+/// Returns the name a [`ScopeId`] was registered with — the overlay/CLI's
+/// only way to turn a `Sample` back into a human-readable scope label.
+#[must_use]
+pub fn scope_name(id: ScopeId) -> Option<&'static str> {
+    let names = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    names.get(usize::from(id.0)).map(|e| e.name)
 }
 
 fn index_to_u16(index: usize) -> u16 {
@@ -92,6 +151,32 @@ pub struct Sample {
     pub end: u64,
 }
 
+impl Sample {
+    /// Builds a `Gpu`-tagged sample from an already-resolved pass duration
+    /// (RFC-0013 "GPU timing") rather than two wall-clock timestamps: GPU
+    /// passes are timed by the device's own timestamp queries, resolved
+    /// asynchronously, so there is no meaningful CPU-epoch `start` for them.
+    /// By convention `start` is `0` and `end` is the duration itself, so
+    /// `end - start` (the quantity every consumer actually wants) is still
+    /// the pass duration in nanoseconds.
+    #[must_use]
+    pub fn gpu_duration(scope: ScopeId, duration_ns: u64) -> Self {
+        Self {
+            scope,
+            _reserved_a: 0,
+            _reserved_b: 0,
+            start: 0,
+            end: duration_ns,
+        }
+    }
+
+    /// This sample's duration (`end - start`) in nanoseconds.
+    #[must_use]
+    pub fn duration_ns(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
 /// A flat, `Send` snapshot of one thread's ring for a single tick.
 ///
 /// Attached to the [`crate::frame::RenderFrame`] on the existing atomic
@@ -104,6 +189,27 @@ pub struct SampleBlock {
     pub samples: Vec<Sample>,
     /// How many samples were dropped this tick because the ring was full.
     pub dropped: u64,
+}
+
+impl SampleBlock {
+    /// Sums the duration of every sample whose scope is tagged `kind`
+    /// (RFC-0013 "the interpreter tax segmentation").
+    #[must_use]
+    pub fn sum_by_kind(&self, kind: ScopeKind) -> u64 {
+        self.samples
+            .iter()
+            .filter(|s| scope_kind(s.scope) == Some(kind))
+            .map(Sample::duration_ns)
+            .sum()
+    }
+
+    /// The total `Interpreter`-tagged time this tick — the tax an AOT release
+    /// build does not pay. Overlay/CLI consumers sum this bucket separately
+    /// from the rest of `frame.total` (RFC-0013 "the honest number").
+    #[must_use]
+    pub fn interpreter_tax_ns(&self) -> u64 {
+        self.sum_by_kind(ScopeKind::Interpreter)
+    }
 }
 
 /// A fixed-capacity, non-circular sample buffer: once full, new samples are
@@ -207,6 +313,53 @@ pub fn drain_samples() -> SampleBlock {
     block
 }
 
+/// A calibrated interpreter-vs-native cost ratio (RFC-0013 **P4**): a fixed
+/// set of microbenchmarks (e.g. `byard-core/benches/telemetry_calibration.rs`,
+/// signal read / element construct / memo eval), refreshed per release —
+/// never measured live, which would re-add observer overhead.
+#[derive(Debug, Clone, Copy)]
+pub struct Calibration {
+    /// Where this ratio came from — always shown alongside a projection so
+    /// the number is legible as an estimate, never a hard promise (P3).
+    pub basis: &'static str,
+    /// `native_ns ≈ interpreter_ns * ratio` for representative interpreter
+    /// operations, as measured by the calibration benchmarks.
+    pub interpreter_to_native_ratio: f64,
+}
+
+/// A projected "what would this cost in an AOT release build" estimate
+/// (RFC-0013 **P3**): opt-in, and always carries its [`Calibration::basis`]
+/// so the overlay/CLI can show the number is an estimate, not a measurement.
+#[derive(Debug, Clone, Copy)]
+pub struct Projection {
+    /// The projected total frame cost in nanoseconds.
+    pub projected_ns: u64,
+    /// The calibration basis this projection was computed from.
+    pub basis: &'static str,
+}
+
+/// Projects an AOT estimate from a tick's measured total and its
+/// [`SampleBlock::interpreter_tax_ns`] (RFC-0013 "The interpreter tax
+/// segmentation"): `native ≈ total − interp_measured + interp_native_equiv`,
+/// where `interp_native_equiv` comes from `calibration`.
+///
+/// Never called implicitly — a caller opts in by calling this and choosing to
+/// display the result (P3: "opt-in, always shown with its basis").
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)] // frame times never approach f64's precision or u64's range
+pub fn project_aot(total_ns: u64, interpreter_ns: u64, calibration: &Calibration) -> Projection {
+    let interp_native_equiv =
+        (interpreter_ns as f64 * calibration.interpreter_to_native_ratio) as u64;
+    Projection {
+        projected_ns: total_ns.saturating_sub(interpreter_ns) + interp_native_equiv,
+        basis: calibration.basis,
+    }
+}
+
 /// RAII guard produced by [`profile_scope!`]; writes one [`Sample`] to the
 /// calling thread's ring when dropped.
 pub struct Guard {
@@ -252,11 +405,14 @@ impl Drop for Guard {
 #[macro_export]
 macro_rules! profile_scope {
     ($name:expr) => {
+        $crate::profile_scope!($name, $crate::telemetry::ScopeKind::Native);
+    };
+    ($name:expr, $kind:expr) => {
         #[cfg(feature = "telemetry")]
         let _guard = {
             static SCOPE: ::std::sync::OnceLock<$crate::telemetry::ScopeId> =
                 ::std::sync::OnceLock::new();
-            let id = *SCOPE.get_or_init(|| $crate::telemetry::scope_id($name));
+            let id = *SCOPE.get_or_init(|| $crate::telemetry::scope_id_tagged($name, $kind));
             $crate::telemetry::Guard::new(id)
         };
         #[cfg(not(feature = "telemetry"))]
@@ -360,6 +516,84 @@ mod tests {
         let b = scope_id("telemetry.test.scope_b");
         assert_eq!(a1, a2, "the same name always resolves to the same id");
         assert_ne!(a1, b, "distinct names get distinct ids");
+    }
+
+    #[test]
+    fn scope_id_tagged_records_its_kind() {
+        let interp = scope_id_tagged("telemetry.test.kind.interp", ScopeKind::Interpreter);
+        let native = scope_id_tagged("telemetry.test.kind.native", ScopeKind::Native);
+        let gpu = scope_id_tagged("telemetry.test.kind.gpu", ScopeKind::Gpu);
+        assert_eq!(scope_kind(interp), Some(ScopeKind::Interpreter));
+        assert_eq!(scope_kind(native), Some(ScopeKind::Native));
+        assert_eq!(scope_kind(gpu), Some(ScopeKind::Gpu));
+        assert_eq!(
+            scope_kind(scope_id("telemetry.test.kind.default_native")),
+            Some(ScopeKind::Native),
+            "plain scope_id defaults to Native"
+        );
+    }
+
+    #[test]
+    fn scope_name_round_trips_through_scope_id() {
+        let id = scope_id("telemetry.test.name.round_trip");
+        assert_eq!(scope_name(id), Some("telemetry.test.name.round_trip"));
+    }
+
+    #[test]
+    #[should_panic(expected = "re-registered with a different ScopeKind")]
+    fn scope_id_tagged_rejects_a_kind_change_for_an_existing_name() {
+        let _ = scope_id_tagged("telemetry.test.kind.stable", ScopeKind::Native);
+        let _ = scope_id_tagged("telemetry.test.kind.stable", ScopeKind::Interpreter);
+    }
+
+    #[test]
+    fn interpreter_tax_sums_only_interpreter_tagged_samples() {
+        let interp = scope_id_tagged("telemetry.test.tax.interp", ScopeKind::Interpreter);
+        let native = scope_id_tagged("telemetry.test.tax.native", ScopeKind::Native);
+        let gpu = scope_id_tagged("telemetry.test.tax.gpu", ScopeKind::Gpu);
+        let block = SampleBlock {
+            samples: vec![
+                Sample {
+                    scope: interp,
+                    _reserved_a: 0,
+                    _reserved_b: 0,
+                    start: 0,
+                    end: 100,
+                },
+                Sample {
+                    scope: native,
+                    _reserved_a: 0,
+                    _reserved_b: 0,
+                    start: 0,
+                    end: 50,
+                },
+                Sample::gpu_duration(gpu, 30),
+                Sample {
+                    scope: interp,
+                    _reserved_a: 0,
+                    _reserved_b: 0,
+                    start: 100,
+                    end: 175,
+                },
+            ],
+            dropped: 0,
+        };
+        assert_eq!(block.interpreter_tax_ns(), 100 + 75);
+        assert_eq!(block.sum_by_kind(ScopeKind::Native), 50);
+        assert_eq!(block.sum_by_kind(ScopeKind::Gpu), 30);
+    }
+
+    #[test]
+    fn project_aot_replaces_measured_interpreter_cost_with_its_native_equivalent() {
+        let calibration = Calibration {
+            basis: "test calibration",
+            interpreter_to_native_ratio: 0.5,
+        };
+        // total = 10ms, of which 6ms was interpreter; native equivalent is
+        // half that (3ms), so the projection is 10 - 6 + 3 = 7ms.
+        let projection = project_aot(10_000_000, 6_000_000, &calibration);
+        assert_eq!(projection.projected_ns, 7_000_000);
+        assert_eq!(projection.basis, "test calibration");
     }
 
     #[test]
