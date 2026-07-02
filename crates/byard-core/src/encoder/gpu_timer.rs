@@ -143,11 +143,20 @@ impl GpuTimer {
         // ring is reclaimed here rather than overwritten silently — its
         // (stale) result is simply dropped, since a caller that never called
         // `drain_ready` in `READBACK_LAG` frames wasn't going to read it.
+        //
+        // The state cell itself is *replaced*, not just reset to IDLE: the
+        // previous lap's `map_async` callback (in `request_map`) closed over
+        // a clone of the old `Arc<AtomicU8>` and may still fire after this
+        // point (its completion is entirely GPU-driven, outside our control).
+        // If we reused the same `Arc`, that stale callback could later flip
+        // this *new* lap's state to READY/FAILED behind `drain_ready`'s back
+        // — e.g. right after `request_map` below sets it to PENDING — making
+        // `drain_ready` read an unmapped buffer or clobber an in-flight map.
+        // A fresh `Arc` makes the old callback write into an orphaned cell
+        // nobody reads anymore.
         if self.slots[slot_idx].state.load(Ordering::Acquire) != SLOT_IDLE {
             self.slots[slot_idx].buffer.unmap();
-            self.slots[slot_idx]
-                .state
-                .store(SLOT_IDLE, Ordering::Release);
+            self.slots[slot_idx].state = Arc::new(AtomicU8::new(SLOT_IDLE));
         }
 
         let count = u32::try_from(self.scopes.len() * 2).unwrap_or(0);
@@ -166,7 +175,18 @@ impl GpuTimer {
     /// Requests the async map for the slot [`GpuTimer::resolve_and_copy`]
     /// just filled. Call once per frame, immediately after the command
     /// buffer containing that copy has been submitted to the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before [`GpuTimer::resolve_and_copy`] has ever run —
+    /// `frame_index` would underflow and silently map the wrong slot in a
+    /// release build otherwise (a caller-ordering bug, not a runtime
+    /// condition; fail fast rather than map garbage deterministically).
     pub fn request_map(&mut self) {
+        assert!(
+            self.frame_index > 0,
+            "GpuTimer::request_map called before resolve_and_copy"
+        );
         let slot_idx = (self.frame_index - 1) % SLOTS;
         let state = Arc::clone(&self.slots[slot_idx].state);
         state.store(SLOT_PENDING, Ordering::Release);
@@ -296,18 +316,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_timed_pass_eventually_yields_a_gpu_tagged_sample() {
-        // End-to-end: record a real (trivial) render pass with timestamp
-        // writes, resolve + request its readback, then poll non-blockingly
-        // (RFC-0013: never `PollType::Wait`) until the async map completes.
-        let Some((device, queue)) = try_timestamp_device() else {
-            eprintln!("no TIMESTAMP_QUERY-capable adapter — skipping GpuTimer round-trip test");
-            return;
-        };
-        let mut timer = GpuTimer::new(&device, &queue, &["gpu.test_pass"])
-            .expect("TIMESTAMP_QUERY is enabled on this device");
-
+    /// Creates a 4x4 render target and records + submits one timed trivial
+    /// render pass on `timer`, calling `request_map` right after submission
+    /// (mirrors `EncoderSubsystem::submit`'s ordering, see IMPL-74).
+    fn record_and_submit_one_timed_pass(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        timer: &mut GpuTimer,
+    ) {
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ByardCore - GpuTimer Test Target"),
             size: wgpu::Extent3d {
@@ -348,6 +364,21 @@ mod tests {
         timer.resolve_and_copy(&mut encoder);
         queue.submit(std::iter::once(encoder.finish()));
         timer.request_map();
+    }
+
+    #[test]
+    fn a_timed_pass_eventually_yields_a_gpu_tagged_sample() {
+        // End-to-end: record a real (trivial) render pass with timestamp
+        // writes, resolve + request its readback, then poll non-blockingly
+        // (RFC-0013: never `PollType::Wait`) until the async map completes.
+        let Some((device, queue)) = try_timestamp_device() else {
+            eprintln!("no TIMESTAMP_QUERY-capable adapter — skipping GpuTimer round-trip test");
+            return;
+        };
+        let mut timer = GpuTimer::new(&device, &queue, &["gpu.test_pass"])
+            .expect("TIMESTAMP_QUERY is enabled on this device");
+
+        record_and_submit_one_timed_pass(&device, &queue, &mut timer);
 
         let mut samples = Vec::new();
         for _ in 0..200 {
@@ -359,5 +390,51 @@ mod tests {
         }
         assert_eq!(samples.len(), 1, "the single timed pass yields one sample");
         assert_eq!(scope_kind(samples[0].scope), Some(ScopeKind::Gpu));
+    }
+
+    /// Several full laps around `SLOTS` (3), used by the ring-reuse stress test.
+    const STRESS_TEST_LAPS: usize = 20;
+
+    #[test]
+    fn rapid_slot_reuse_never_corrupts_a_later_laps_state() {
+        // Regression for the High-severity review finding: reclaiming a
+        // non-idle slot in `resolve_and_copy` must not let a still-in-flight
+        // `map_async` callback from an earlier lap of the ring later flip a
+        // *reused* slot's state out from under `drain_ready`. Recording many
+        // more passes than `SLOTS` back-to-back, faster than the GPU can
+        // resolve them, forces every slot to be reclaimed at least once
+        // while a previous mapping may still be in flight.
+        let Some((device, queue)) = try_timestamp_device() else {
+            eprintln!("no TIMESTAMP_QUERY-capable adapter — skipping GpuTimer stress test");
+            return;
+        };
+        let mut timer = GpuTimer::new(&device, &queue, &["gpu.test_pass"])
+            .expect("TIMESTAMP_QUERY is enabled on this device");
+
+        for _ in 0..STRESS_TEST_LAPS {
+            record_and_submit_one_timed_pass(&device, &queue, &mut timer);
+            // No sleep, no draining: back-to-back submissions race ahead of
+            // the async readback on purpose.
+        }
+
+        // Drain until every lap's result has either arrived or been
+        // superseded by a later reclaim — bounded, never `PollType::Wait`.
+        let mut samples = Vec::new();
+        for _ in 0..500 {
+            timer.drain_ready(&device, &mut samples);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(
+            !samples.is_empty(),
+            "at least some laps must yield a sample"
+        );
+        assert!(
+            samples.len() <= STRESS_TEST_LAPS,
+            "never more samples than passes recorded — no state corruption fabricating extras"
+        );
+        for sample in &samples {
+            assert_eq!(scope_kind(sample.scope), Some(ScopeKind::Gpu));
+        }
     }
 }

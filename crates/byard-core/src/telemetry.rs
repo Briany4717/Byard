@@ -196,9 +196,19 @@ impl SampleBlock {
     /// (RFC-0013 "the interpreter tax segmentation").
     #[must_use]
     pub fn sum_by_kind(&self, kind: ScopeKind) -> u64 {
+        // Locks the registry once for the whole sum rather than once per
+        // sample (`scope_kind` per element would re-lock on every call —
+        // needless contention for a consumer aggregating many samples).
+        let names = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.samples
             .iter()
-            .filter(|s| scope_kind(s.scope) == Some(kind))
+            .filter(|s| {
+                names
+                    .get(usize::from(s.scope.0))
+                    .is_some_and(|e| e.kind == kind)
+            })
             .map(Sample::duration_ns)
             .sum()
     }
@@ -355,7 +365,9 @@ pub fn project_aot(total_ns: u64, interpreter_ns: u64, calibration: &Calibration
     let interp_native_equiv =
         (interpreter_ns as f64 * calibration.interpreter_to_native_ratio) as u64;
     Projection {
-        projected_ns: total_ns.saturating_sub(interpreter_ns) + interp_native_equiv,
+        projected_ns: total_ns
+            .saturating_sub(interpreter_ns)
+            .saturating_add(interp_native_equiv),
         basis: calibration.basis,
     }
 }
@@ -594,6 +606,18 @@ mod tests {
         let projection = project_aot(10_000_000, 6_000_000, &calibration);
         assert_eq!(projection.projected_ns, 7_000_000);
         assert_eq!(projection.basis, "test calibration");
+    }
+
+    #[test]
+    fn project_aot_saturates_instead_of_overflowing() {
+        // A pathological ratio/measurement combination must clamp to
+        // u64::MAX rather than silently wrapping around to a tiny number.
+        let calibration = Calibration {
+            basis: "test calibration",
+            interpreter_to_native_ratio: 1e9,
+        };
+        let projection = project_aot(u64::MAX, u64::MAX, &calibration);
+        assert_eq!(projection.projected_ns, u64::MAX);
     }
 
     #[test]
