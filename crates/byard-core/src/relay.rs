@@ -259,7 +259,14 @@ impl Relay {
     /// allocation is returned to the recycle pool for reuse. If the pool is
     /// momentarily full, the frame is dropped normally — a missed recycle
     /// opportunity, not a correctness issue. This call never blocks.
-    pub fn publish(&self, frame: RenderFrame) {
+    ///
+    /// Also drains the calling thread's telemetry ring into `frame`
+    /// (RFC-0013 "Hand-off") before the swap, so every publish path — the
+    /// Phase-1 demo loop, [`Relay::spawn_logic_thread`], and
+    /// [`Relay::spawn_logic_from_view`] alike — piggybacks CPU samples on
+    /// this same atomic exchange with no per-call-site wiring.
+    pub fn publish(&self, mut frame: RenderFrame) {
+        frame.drain_telemetry();
         let previous = self.latest.swap(Some(Arc::new(frame)));
         if let Some(arc) = previous {
             if let Ok(reclaimed) = Arc::try_unwrap(arc) {
@@ -510,6 +517,31 @@ mod tests {
         let observed = relay.current().expect("frame was published");
         assert_eq!(observed.rects().len(), 1);
         assert_eq!(observed.rects()[0], Rect::new(1.0, 2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn publish_drains_the_calling_threads_telemetry_ring_into_the_frame() {
+        // RFC-0013 "Hand-off": Relay::publish is the single choke point every
+        // logic-thread loop passes through, so profiling a scope right before
+        // publishing must show up on the published frame with no extra
+        // wiring at the call site.
+        let _ = crate::telemetry::drain_samples(); // isolate from other tests
+        let relay = Relay::new().unwrap();
+        let frame = relay.acquire_recycled();
+        {
+            crate::profile_scope!("relay.test.publish_drains_telemetry");
+        }
+        relay.publish(frame);
+
+        let observed = relay.current().expect("frame was published");
+        #[cfg(feature = "telemetry")]
+        assert_eq!(
+            observed.telemetry().samples.len(),
+            1,
+            "the scope profiled before publish must ride the same frame"
+        );
+        #[cfg(not(feature = "telemetry"))]
+        assert!(observed.telemetry().samples.is_empty());
     }
 
     #[test]

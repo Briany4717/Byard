@@ -368,6 +368,11 @@ pub struct RenderFrame {
     /// advance means the render thread skipped at least one dirty frame and must
     /// force a full redraw + text reshape to avoid displaying stale glyphs.
     version: u64,
+
+    /// This tick's CPU scope samples (RFC-0013 "Hand-off"), piggybacked on
+    /// the existing atomic frame swap instead of a dedicated channel. Empty
+    /// when the `telemetry` feature is off or nothing was profiled this tick.
+    telemetry: crate::telemetry::SampleBlock,
 }
 
 impl RenderFrame {
@@ -391,6 +396,11 @@ impl RenderFrame {
         self.textures.clear();
         self.texts.clear();
         self.version = 0;
+        // `Vec::clear` only, not `SampleBlock::default()` — the latter would
+        // drop the block's existing allocation and defeat the capacity
+        // retention this method promises once telemetry is attached.
+        self.telemetry.samples.clear();
+        self.telemetry.dropped = 0;
     }
 
     /// Appends a resolved rectangle and its dirty state to the frame.
@@ -464,6 +474,26 @@ impl RenderFrame {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Pulls the calling thread's CPU scope samples into this frame
+    /// (RFC-0013 "Hand-off"), piggybacked on this frame's atomic swap instead
+    /// of a dedicated channel.
+    ///
+    /// Called from the logic thread, once per tick, by
+    /// [`crate::relay::Relay::publish`] right before the frame is swapped
+    /// in — so every publish path picks up telemetry automatically, with no
+    /// per-call-site wiring needed. Reuses this frame's existing
+    /// `SampleBlock` allocation (see [`RenderFrame::clear`]) rather than
+    /// allocating a fresh one each tick.
+    pub fn drain_telemetry(&mut self) {
+        crate::telemetry::drain_samples_into(&mut self.telemetry);
+    }
+
+    /// Returns this tick's CPU scope samples, if any were captured.
+    #[must_use]
+    pub fn telemetry(&self) -> &crate::telemetry::SampleBlock {
+        &self.telemetry
     }
 }
 
