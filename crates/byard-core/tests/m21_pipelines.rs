@@ -8,7 +8,7 @@
 use byard_core::ByardError;
 use byard_core::encoder::EncoderSubsystem;
 use byard_core::encoder::texture_sampler::uv_transform;
-use byard_core::frame::{BoxInstance, DecoratedBox, ImageFit, RenderFrame, Viewport};
+use byard_core::frame::{BoxInstance, DecoratedBox, ImageFit, RenderFrame, Transform, Viewport};
 use std::sync::Arc;
 
 /// Elementwise approximate equality for a UV transform `[f32; 4]`.
@@ -203,12 +203,14 @@ fn solid_and_decorated_boxes_actually_paint_pixels() {
         rect: [10.0, 10.0, 40.0, 40.0],
         color: [1.0, 0.0, 0.0, 1.0],
         radii: [0.0; 4],
+        transform: Transform::IDENTITY,
     });
     frame.push_decorated(DecoratedBox {
         base: BoxInstance {
             rect: [70.0, 70.0, 40.0, 40.0],
             color: [0.0, 0.0, 1.0, 1.0],
             radii: [0.0; 4],
+            transform: Transform::IDENTITY,
         },
         border_width: 3.0,
         border_color: [1.0, 1.0, 1.0, 1.0],

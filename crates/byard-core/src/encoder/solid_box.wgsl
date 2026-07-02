@@ -6,6 +6,12 @@ struct InstanceInput {
     @location(1) rect: vec4<f32>,
     @location(2) color: vec4<f32>,
     @location(3) radii: vec4<f32>,
+    // Paint-time transform (RFC-0011); identity is a free no-op below.
+    @location(4) t_translate: vec2<f32>,
+    @location(5) t_scale: vec2<f32>,
+    @location(6) t_rotate: f32,
+    @location(7) t_origin: vec2<f32>,
+    @location(8) t_opacity: f32,
 };
 
 struct VertexOutput {
@@ -13,7 +19,10 @@ struct VertexOutput {
     /// Fragment position relative to the rectangle centre, in logical pixels.
     ///
     /// Covers the padded quad (see vertex shader), so values outside
-    /// ±half_size are valid and represent the anti-alias margin.
+    /// ±half_size are valid and represent the anti-alias margin. This is
+    /// deliberately computed *before* the transform (RFC-0011: transforms
+    /// reposition the painted quad as a rigid unit; the SDF still measures
+    /// distance to the shape's own, untransformed boundary).
     @location(0) local_pos: vec2<f32>,
     /// Half-size of the *original* (un-padded) rectangle, in logical pixels.
     ///
@@ -22,6 +31,7 @@ struct VertexOutput {
     @location(1) half_size: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) radii: vec4<f32>,
+    @location(4) opacity: f32,
 };
 
 @group(0) @binding(0) var<uniform> viewport_size: vec2<f32>;
@@ -33,6 +43,25 @@ struct VertexOutput {
 /// the anti-alias fringe is clipped at the cardinal points, making circles
 /// look flat-edged. Two pixels is enough for one-pixel smoothstep at 2× DPI.
 const QUAD_PADDING: f32 = 2.0;
+
+/// Applies a paint-time transform (RFC-0011) to a world-space (logical-pixel)
+/// position: rotate + scale about `origin`, then translate. Identity inputs
+/// (`scale = (1,1)`, `rotate = 0`, `translate = (0,0)`) collapse to `world`
+/// unchanged — a few cheap ALU ops, never a relayout (INV-8).
+fn apply_transform(
+    world: vec2<f32>,
+    translate: vec2<f32>,
+    scale: vec2<f32>,
+    rotate: f32,
+    origin: vec2<f32>,
+) -> vec2<f32> {
+    let p = world - origin;
+    let scaled = vec2<f32>(p.x * scale.x, p.y * scale.y);
+    let c = cos(rotate);
+    let s = sin(rotate);
+    let rotated = vec2<f32>(scaled.x * c - scaled.y * s, scaled.x * s + scaled.y * c);
+    return rotated + origin + translate;
+}
 
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
@@ -59,18 +88,29 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // is symmetric — QUAD_PADDING px of extra space on every side of the rect.
     let world_pos = instance.rect.xy - vec2<f32>(QUAD_PADDING) + vertex.quad_pos * padded;
 
+    // Paint-time transform (RFC-0011), applied after layout placement and
+    // before projection — layout itself never re-runs for this.
+    let transformed = apply_transform(
+        world_pos,
+        instance.t_translate,
+        instance.t_scale,
+        instance.t_rotate,
+        instance.t_origin,
+    );
+
     // Convert logical-pixel world position to NDC.
     // viewport_size is in logical pixels (set from window.scale_factor() in the engine),
     // so this division is unit-consistent regardless of display density.
     out.position = vec4<f32>(
-        (world_pos.x / viewport_size.x) * 2.0 - 1.0,
-        1.0 - (world_pos.y / viewport_size.y) * 2.0,
+        (transformed.x / viewport_size.x) * 2.0 - 1.0,
+        1.0 - (transformed.y / viewport_size.y) * 2.0,
         0.0,
         1.0
     );
 
     out.color = instance.color;
     out.radii = instance.radii;
+    out.opacity = instance.t_opacity;
     return out;
 }
 
@@ -111,5 +151,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    return vec4<f32>(in.color.rgb, in.color.a * alpha);
+    return vec4<f32>(in.color.rgb, in.color.a * alpha * in.opacity);
 }

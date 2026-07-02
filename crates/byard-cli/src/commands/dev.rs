@@ -182,6 +182,7 @@ fn render_error_overlay(frame: &mut RenderFrame, errors: &[CompileError], w: f32
         rect: [0.0, 0.0, w, h],
         color: [0.0, 0.0, 0.0, 0.8],
         radii: [0.0; 4],
+        transform: byard_core::frame::Transform::IDENTITY,
     });
 
     let padding = 32.0;
