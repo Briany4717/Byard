@@ -46,6 +46,10 @@ impl Parser<'_> {
                 self.advance();
                 Expr::FloatLit(f, span)
             }
+            Some(Token::AngleLit(rad)) => {
+                self.advance();
+                Expr::AngleLit(rad, span)
+            }
             Some(Token::StrLit) => {
                 self.advance();
                 let parts = self.parse_string_literal(span);

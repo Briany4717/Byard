@@ -17,6 +17,7 @@ View Main() {
     var pokes: Int = 0
     var wheelTicks: Int = 0
     var scrollTicks: Int = 0
+    var cardHovered: Bool = false
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
@@ -83,6 +84,35 @@ View Main() {
             Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
             Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
             Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
+        }
+
+        // ── Paint-time transforms (RFC-0011): translate/scale/rotate/origin
+        // never re-run layout — the boxes below sit in a plain Row, and
+        // moving/rotating/scaling them doesn't reflow their siblings.
+        Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52] {
+            Text("Paint-time transforms") #[color: 0x9AA0AC, size: 15]
+            Row #[gap: 24, align: center] {
+                // Hover to lift: scale up around the box's own center (the
+                // default origin), a common card/button micro-interaction.
+                Box #[
+                    bg: 0x6495ED,
+                    radius: 12,
+                    width: 90,
+                    height: 56,
+                    scale: cardHovered ? 1.12 : 1.0,
+                    hover => cardHovered = true,
+                    pointer_exit => cardHovered = false,
+                ]
+                // Nudged 14px right and 10px down from its laid-out position.
+                Box #[bg: 0x9C27B0, radius: 12, width: 90, height: 56, translate: (14, 10)]
+                // Sub-property axis form: only the y-axis translate is set.
+                Box #[bg: 0xEF4444, radius: 12, width: 90, height: 56, translate.y: 20]
+                // Rotated 12deg around its own center (the default origin).
+                Box #[bg: 0x10B981, radius: 12, width: 90, height: 56, rotate: 12deg]
+                // Rotated around its top-left corner instead of its center —
+                // visibly swings the whole box, not just its fill.
+                Box #[bg: 0xFBC02D, radius: 12, width: 90, height: 56, rotate: 20deg, origin: top_left]
+            }
         }
 
         // ── Full event exposure (RFC-0012 §A): hover/enter/exit, long_press,

@@ -328,6 +328,38 @@ fn prop_vs_event_attributes() {
 }
 
 #[test]
+fn sub_property_axis_parses_and_carries_the_base_name_plus_axis() {
+    // RFC-0011 `translate.y: 2` — one axis of a two-axis prop, set inline
+    // without a tuple.
+    let view = one_view("View V() { Box #[translate.y: 2, gap: 12] }");
+    let el = as_element(&view.body[0]);
+    assert_eq!(el.attrs.len(), 2);
+    assert_eq!(el.attrs[0].name, sym("translate"));
+    assert_eq!(el.attrs[0].axis, Some(sym("y")));
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop {
+            value: Expr::IntLit(2, _)
+        }
+    ));
+
+    // An ordinary attribute (no dot) always has `axis: None`.
+    assert_eq!(el.attrs[1].name, sym("gap"));
+    assert_eq!(el.attrs[1].axis, None);
+}
+
+#[test]
+fn angle_literal_parses_as_an_angle_lit_expr() {
+    let view = one_view("View V() { Box #[rotate: 90deg] }");
+    let el = as_element(&view.body[0]);
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop { value: Expr::AngleLit(rad, _) }
+            if (*rad - std::f64::consts::FRAC_PI_2).abs() < 1e-9
+    ));
+}
+
+#[test]
 fn function_types_parse() {
     let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
     let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {

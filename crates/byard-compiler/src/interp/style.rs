@@ -186,6 +186,7 @@ mod tests {
         let (_rules, attrs) = rules_and_element(&v);
         let defaults = vec![Attr {
             name: sym("p"),
+            axis: None,
             kind: AttrKind::Prop {
                 value: Expr::IntLit(16, crate::diagnostics::Span::new(0, 0)),
             },
