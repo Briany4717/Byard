@@ -47,6 +47,17 @@ fn step_decimals(step: f64) -> i32 {
     }
 }
 
+/// Settling thresholds for the CPU-sampled animation path (RFC-0010).
+///
+/// `eval_pure` animates opacity, scale, rotate, and translate through one
+/// generic path that doesn't carry the property's unit, so the epsilons must be
+/// tight enough to be correct for the *tightest* unit (ratios, ~0..1) — which is
+/// simply conservative (settles a hair later) for pixels and radians. Position
+/// is the final-value accuracy gate; a tight velocity gate keeps a spring's
+/// overshoot alive rather than freezing it at the first crossing of the target.
+const ANIM_SETTLE_EPS_POS: f32 = 0.002;
+const ANIM_SETTLE_EPS_VEL: f32 = 0.02;
+
 /// Rounds `val` to `decimals` decimal places (half-away-from-zero).
 fn round_to_decimals(val: f64, decimals: i32) -> f64 {
     let factor = 10f64.powi(decimals);
@@ -119,6 +130,28 @@ pub struct Interpreter {
     /// Parameterized fn definitions: `fn f(params) => body` stored as
     /// `(param names, body expr)`, indexed by `AstId` (M25).
     fn_table: Vec<(Vec<Symbol>, Expr)>,
+    /// Current engine time (ms since the runner's epoch), set once per frame by
+    /// the runner via [`set_now_ms`](Self::set_now_ms). Drives `with`
+    /// animations (RFC-0010).
+    now_ms: u32,
+    /// Whether a host has ever advanced the clock. Distinguishes a real
+    /// `set_now_ms(0)` start from "the clock was never set" — without it, a host
+    /// that never ticks the clock would pin an animation at `t = 0` (never
+    /// settling, `has_active_animations` latched true, an infinite redraw loop
+    /// on a wait-based runner). Unset ⇒ animations resolve to their target
+    /// instantly.
+    clock_set: bool,
+    /// Persisted per-property animation state (RFC-0010), keyed by the `with`
+    /// node's source span so it survives the whole-tree re-render each frame.
+    /// A mid-flight target change reseeds `from` to the current sampled value
+    /// (interruptible springs).
+    animations: std::collections::HashMap<Span, byard_core::frame::Motion>,
+    /// Set true during a render whenever an animation sampled this frame has not
+    /// yet settled — the runner reads it (via [`has_active_animations`]) to keep
+    /// requesting frames until motion stops (idle → 0 frames).
+    ///
+    /// [`has_active_animations`]: Self::has_active_animations
+    any_active: bool,
 }
 
 impl Interpreter {
@@ -144,6 +177,22 @@ impl Interpreter {
     pub fn tick(&mut self) {
         let epoch = self.ctx.begin_tick();
         self.ctx.pull(epoch);
+    }
+
+    /// Sets the current engine time (ms since the runner's epoch) that `with`
+    /// animations sample against (RFC-0010). The runner calls this once per
+    /// frame, before [`render`](Self::render).
+    pub fn set_now_ms(&mut self, ms: u32) {
+        self.now_ms = ms;
+        self.clock_set = true;
+    }
+
+    /// Whether any `with` animation was still in flight as of the last
+    /// [`render`](Self::render). The runner keeps requesting frames while this
+    /// is true and lets the app idle (0 frames) once every animation settles.
+    #[must_use]
+    pub fn has_active_animations(&self) -> bool {
+        self.any_active
     }
 
     /// The most recently projected value of a value binding (for tests).
@@ -484,6 +533,9 @@ impl Interpreter {
     ) {
         use byard_core::frame::Viewport;
 
+        // Recomputed every frame: an animation re-marks itself active below if it
+        // sampled without having settled this tick (RFC-0010).
+        self.any_active = false;
         self.atlas.clear();
         // Rebuild the handler set from the fresh layout, but keep the in-flight
         // gesture state (a pending `down`, the focused element) so a tap that
@@ -2248,8 +2300,73 @@ impl Interpreter {
     /// Evaluates `expr` once, immediately, with no scope active (so nothing
     /// subscribes). Used to seed `var`s and to evaluate action operands.
     fn eval_pure(&mut self, expr: &Expr) -> Value {
+        // A `with` animation (RFC-0010) is driven here, at the single evaluation
+        // chokepoint, so every animatable scalar prop (opacity/scale/translate/
+        // rotate — all of which resolve through `eval_pure`) animates without
+        // per-prop plumbing. A non-animated value takes the ordinary path.
+        if let Expr::Animated { value, anim, span } = expr {
+            return self.eval_animated(value, anim, *span);
+        }
         let mut compute = self.lower_expr(expr, None);
         compute(&mut self.ctx)
+    }
+
+    /// Drives one `with` animation (RFC-0010): resolves the target and curve,
+    /// advances (or seeds) the persisted [`Motion`](byard_core::frame::Motion)
+    /// keyed by `key`, and returns the value sampled at the current engine time.
+    /// A target change reseeds `from` to the current on-screen value so a
+    /// mid-flight reversal is continuous.
+    fn eval_animated(&mut self, target: &Expr, anim: &Expr, key: Span) -> Value {
+        let target_val = match self.eval_pure(target) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            // A non-numeric target can't be interpolated — pass it through
+            // untouched (the checker already restricts `with` to numeric props).
+            other => return other,
+        };
+        // No advancing clock (a host that never calls `set_now_ms`, e.g. a
+        // non-animating test path): resolve straight to the target so an
+        // animation can never latch `has_active_animations` on `t = 0` forever.
+        if !self.clock_set {
+            return Value::Float(f64::from(target_val));
+        }
+        let Ok(curve) = crate::interp::anim::resolve_curve(anim) else {
+            // The checker already reported this; render the target inertly.
+            return Value::Float(f64::from(target_val));
+        };
+        let packed = pack_curve(curve);
+        let now = self.now_ms;
+        let motion = self
+            .animations
+            .entry(key)
+            .or_insert_with(|| byard_core::frame::Motion {
+                from: target_val,
+                to: target_val,
+                start_ms: now,
+                curve: packed,
+            });
+        // Retarget on a goal change: reseed `from` to where the property
+        // actually is right now (interruptible spring), restart the clock.
+        if (motion.to - target_val).abs() > f32::EPSILON {
+            let current = motion.sample(now);
+            motion.from = current;
+            motion.to = target_val;
+            motion.start_ms = now;
+        }
+        // Keep the curve in sync (a hot-reload may have edited it).
+        motion.curve = packed;
+        let sampled = motion.sample(now);
+        // `Motion::DEFAULT_EPS_*` are pixel-scaled (0.5), far too loose for the
+        // ratio/opacity/radian props that also animate through this one generic
+        // path — with them an ease-out could read "settled" while still visibly
+        // short of the target. Use tight, unit-agnostic epsilons: position is
+        // the final-value accuracy gate; the velocity gate keeps a spring's
+        // overshoot alive instead of freezing it at the first target crossing.
+        let settled = motion.is_settled_with_eps(now, ANIM_SETTLE_EPS_POS, ANIM_SETTLE_EPS_VEL);
+        if !settled {
+            self.any_active = true;
+        }
+        Value::Float(f64::from(sampled))
     }
 
     fn resolve_var(&self, target: &Expr, span: Span) -> Result<SignalId, CompileError> {
@@ -2340,6 +2457,37 @@ fn spacing_value(v: &Value) -> Option<f32> {
         Value::Int(n) => Some(*n as f32),
         Value::Float(f) => Some(*f as f32),
         _ => None,
+    }
+}
+
+/// Packs the compiler's typed [`Curve`](crate::interp::anim::Curve) into the
+/// engine's POD [`MotionCurve`](byard_core::frame::MotionCurve) (RFC-0010), so
+/// a resolved curve crosses the frame boundary as plain data.
+fn pack_curve(curve: crate::interp::anim::Curve) -> byard_core::frame::MotionCurve {
+    use crate::interp::anim::{Curve, EaseKind};
+    use byard_core::frame::MotionCurve;
+    #[allow(clippy::cast_precision_loss)]
+    match curve {
+        Curve::Linear { ms } => MotionCurve {
+            kind: MotionCurve::LINEAR,
+            params: [ms as f32, 0.0, 0.0],
+        },
+        Curve::Ease { ms, kind } => MotionCurve {
+            kind: match kind {
+                EaseKind::In => MotionCurve::EASE_IN,
+                EaseKind::Out => MotionCurve::EASE_OUT,
+                EaseKind::InOut => MotionCurve::EASE_IN_OUT,
+            },
+            params: [ms as f32, 0.0, 0.0],
+        },
+        Curve::Spring {
+            stiffness,
+            damping,
+            v0,
+        } => MotionCurve {
+            kind: MotionCurve::SPRING,
+            params: [stiffness, damping, v0],
+        },
     }
 }
 
@@ -2969,6 +3117,82 @@ mod tests {
         assert!((t.rotate - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         // Unset `origin` defaults to the element's own center, not (0,0).
         assert_eq!(t.origin, [25.0, 25.0]);
+    }
+
+    #[test]
+    fn with_animation_interpolates_toward_the_target_and_settles() {
+        // A linear ramp gives deterministic sample points to assert on.
+        let parsed = parse(
+            "View V() { var on: Bool = false \
+             Box #[bg: 0x808080, width: 10, height: 10, \
+             scale: on ? 2.0 : 1.0 with anim.linear(1000)] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+
+        let render_scale = |interp: &mut Interpreter, now: u32| -> f32 {
+            interp.set_now_ms(now);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame.instances()[0].transform.scale[0]
+        };
+
+        // At rest: target is 1.0, nothing is animating.
+        assert!((render_scale(&mut interp, 0) - 1.0).abs() < 1e-3);
+        assert!(!interp.has_active_animations());
+
+        // Flip the target to 2.0 at t=0 — the motion retargets from the current
+        // value (~1.0) and is now active.
+        let sig = interp.var_signal(&Symbol::intern("on")).unwrap();
+        interp.write_var(sig, Value::Bool(true));
+        interp.tick();
+        assert!(
+            (render_scale(&mut interp, 0) - 1.0).abs() < 1e-2,
+            "starts where it was"
+        );
+        assert!(
+            interp.has_active_animations(),
+            "a just-retargeted motion is active"
+        );
+
+        // Halfway through the 1000 ms ramp → ~1.5.
+        assert!((render_scale(&mut interp, 500) - 1.5).abs() < 5e-2);
+
+        // Past the end → arrived at 2.0 and settled (idle again).
+        assert!((render_scale(&mut interp, 1000) - 2.0).abs() < 1e-3);
+        assert!(
+            !interp.has_active_animations(),
+            "settles once the ramp completes"
+        );
+    }
+
+    #[test]
+    fn animation_is_inert_until_the_clock_is_advanced() {
+        // A host that never advances the clock must resolve the value to its
+        // target and never mark it active — otherwise a wait-based runner would
+        // spin forever redrawing a motion pinned at t=0.
+        let parsed = parse(
+            "View V() { var on: Bool = true \
+             Box #[bg: 0x808080, width: 10, height: 10, \
+             scale: on ? 2.0 : 1.0 with anim.spring()] }",
+        );
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (frame.instances()[0].transform.scale[0] - 2.0).abs() < 1e-6,
+            "with no clock the value jumps straight to its target"
+        );
+        assert!(
+            !interp.has_active_animations(),
+            "an un-advanced clock must never leave an animation active"
+        );
     }
 
     #[test]

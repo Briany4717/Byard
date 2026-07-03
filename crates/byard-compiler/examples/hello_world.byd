@@ -105,13 +105,15 @@ View Main() {
                 Text("Paint-time transforms") #[color: 0x9AA0AC, size: 15]
                 Row #[gap: 24, align: center] {
                     // Hover to lift: scale up around the box's own center (the
-                    // default origin), a common card/button micro-interaction.
+                    // default origin) — and now the scale *springs* there
+                    // (RFC-0010) instead of snapping. Hover on and off to see it
+                    // interruptible: reversing mid-flight starts from where it is.
                     Box #[
                         bg: 0x6495ED,
                         radius: 12,
                         width: 90,
                         height: 56,
-                        scale: cardHovered ? 1.12 : 1.0,
+                        scale: cardHovered ? 1.12 : 1.0 with anim.spring(),
                         hover => cardHovered = true,
                         pointer_exit => cardHovered = false,
                     ]
