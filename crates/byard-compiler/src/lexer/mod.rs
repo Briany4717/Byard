@@ -79,6 +79,12 @@ pub enum Token {
     /// interpreter).
     #[token("untrack")]
     Untrack,
+    /// `with` (RFC-0010 A1): the infix animation operator inside `#[...]`
+    /// values (`radius: pressed ? 3 : 10 with anim.spring()`). Reserved as its
+    /// own token so it parses cleanly and can never be read as an identifier in
+    /// value position.
+    #[token("with")]
+    With,
 
     // ---- identifiers & literals ----
     /// An identifier (interned).
@@ -102,6 +108,13 @@ pub enum Token {
         s[..s.len() - 3].parse::<f64>().ok()
     })]
     AngleLit(f64),
+    /// A duration literal with a `ms` suffix (RFC-0010: `anim.linear(200ms)`),
+    /// value in **milliseconds**. Listed before the plain number rules so
+    /// `logos`'s longest-match prefers `200ms` over `200` + `ms`. The parser
+    /// lowers it to an `Expr::IntLit` node (see `parser/expr.rs`): a duration is
+    /// only meaningful inside an `anim.*` curve call, read there as milliseconds.
+    #[regex(r"[0-9]+ms", |lex| lex.slice()[..lex.slice().len() - 2].parse::<u32>().ok())]
+    DurationLit(u32),
     /// A floating-point literal. Listed before [`Token::IntLit`] because
     /// `logos` longest-match makes `3.14` a float, `3` an int.
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
@@ -328,7 +341,7 @@ mod tests {
     #[test]
     fn keywords_lex_to_their_tokens() {
         assert_eq!(
-            kinds("View var let fn inject as for in when else style untrack"),
+            kinds("View var let fn inject as for in when else style untrack with"),
             vec![
                 Token::View,
                 Token::Var,
@@ -342,6 +355,7 @@ mod tests {
                 Token::Else,
                 Token::Style,
                 Token::Untrack,
+                Token::With,
             ]
         );
     }

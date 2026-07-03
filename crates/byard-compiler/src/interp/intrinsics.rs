@@ -440,13 +440,46 @@ pub fn validate_element(el: &ElementNode, known_views: &[&str]) -> Vec<CompileEr
 
         // Rule 6 — attribute value type.
         if let (AttrKind::Prop { value }, Some(ty)) = (&attr.kind, prop_ty) {
-            if let Some(err) = check_value_type(ty, value) {
+            // RFC-0010: `value with anim.*(…)` — reject an animation on a layout
+            // property (it can't animate on the GPU), otherwise validate every
+            // curve in the (possibly nested) chain and type-check the innermost
+            // target value. The chain walk matters: `(x with a) with b` must not
+            // let its inner curve or value slip past unchecked.
+            if let Expr::Animated { span, .. } = value {
+                if is_layout_prop(an) {
+                    errs.push(CompileError::LayoutPropNotAnimatable {
+                        span: *span,
+                        prop: an.to_string(),
+                    });
+                } else {
+                    let mut target = value;
+                    while let Expr::Animated {
+                        value: inner, anim, ..
+                    } = target
+                    {
+                        if let Err(err) = crate::interp::anim::resolve_curve(anim) {
+                            errs.push(err);
+                        }
+                        target = inner;
+                    }
+                    if let Some(err) = check_value_type(ty, target) {
+                        errs.push(err);
+                    }
+                }
+            } else if let Some(err) = check_value_type(ty, value) {
                 errs.push(err);
             }
         }
     }
 
     errs
+}
+
+/// Whether `name` is a layout-affecting attribute — one whose value feeds Taffy
+/// and so cannot be GPU-animated (RFC-0010 §"Layout properties"). Covers the
+/// [`LAYOUT`] group plus the container `direction`.
+fn is_layout_prop(name: &str) -> bool {
+    name == "direction" || LAYOUT.iter().any(|(k, _)| *k == name)
 }
 
 /// Light, false-positive-averse type check: only clear scalar-literal
@@ -632,6 +665,54 @@ mod tests {
         // A verbose tuple with the wrong field name is a mismatch too.
         let e = errs("View V() { Box #[rotate: (deg: 90deg)] {} }");
         assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn with_animation_on_a_paint_prop_is_accepted() {
+        // RFC-0010: paint-time animatable props accept a `with` curve.
+        assert!(errs("View V() { Box #[scale: 1 with anim.spring()] {} }").is_empty());
+        assert!(errs("View V() { Box #[opacity: 0.5 with anim.linear(200ms)] {} }").is_empty());
+    }
+
+    #[test]
+    fn with_animation_unknown_curve_is_an_error_with_a_hint() {
+        let e = errs("View V() { Box #[scale: 1 with anim.sprng()] {} }");
+        assert!(matches!(
+            &e[0],
+            CompileError::UnknownAnimation { hint: Some(h), .. } if h == "spring"
+        ));
+    }
+
+    #[test]
+    fn with_animation_on_a_layout_prop_is_rejected() {
+        // Animating `width` would relayout every frame — a compile error, not a
+        // silent slowdown (RFC-0010 §"Layout properties").
+        let e = errs("View V() { Box #[width: 100 with anim.spring()] {} }");
+        assert!(matches!(
+            &e[0],
+            CompileError::LayoutPropNotAnimatable { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_animated_values_still_check_the_innermost_value_and_every_curve() {
+        // A parenthesised `(x with a) with b` must not let its inner value or
+        // curve slip past the checker.
+        let e = errs(
+            "View V() { Box #[radius: (\"hi\" with anim.spring()) with anim.linear(200ms)] {} }",
+        );
+        assert!(
+            e.iter()
+                .any(|err| matches!(err, CompileError::AttributeTypeMismatch { .. })),
+            "innermost `\"hi\"` must be type-checked against `radius`"
+        );
+        let e =
+            errs("View V() { Box #[radius: (3 with anim.sprng()) with anim.linear(200ms)] {} }");
+        assert!(
+            e.iter()
+                .any(|err| matches!(err, CompileError::UnknownAnimation { .. })),
+            "a bad nested curve must still be reported"
+        );
     }
 
     #[test]

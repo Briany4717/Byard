@@ -341,6 +341,18 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// An animated attribute value `value with anim.*(…)` (RFC-0010): `value`
+    /// is the (usually ternary) target and `anim` is the `anim.*` curve call,
+    /// resolved to a typed `Curve` at lowering. `with` binds below the ternary,
+    /// so `a ? b : c with k` parses as `(a ? b : c) with k`.
+    Animated {
+        /// The target value expression (scalar/ternary).
+        value: Box<Expr>,
+        /// The `anim.*` curve call, resolved to a typed `Curve` at lower time.
+        anim: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// A parse-error placeholder, so recovery can continue and collect more
     /// diagnostics (RFC-0002 §"Parser").
     Error(Span),
@@ -365,6 +377,7 @@ impl Expr {
             | Self::Assign { span, .. }
             | Self::Postfix { span, .. }
             | Self::Ternary { span, .. }
+            | Self::Animated { span, .. }
             | Self::Error(span) => *span,
         }
     }

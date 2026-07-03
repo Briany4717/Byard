@@ -2084,6 +2084,12 @@ impl Interpreter {
                     Box::new(|_| Value::Unit)
                 }
             }
+            // `value with anim.*(…)` (RFC-0010): lower to the *target* value.
+            // The curve is validated by the checker; the `Motion` runtime that
+            // actually drives the on-screen transition lands in the follow-up
+            // slice, so for now the target resolves instantly (as it did before
+            // any `with` was written), which is a safe, correct fallback.
+            Expr::Animated { value, .. } => self.lower_expr(value, payload_name),
             // Member access needs controller metadata (not modeled in Phase 2);
             // lambdas/assignments are actions, not projected values.
             Expr::Member { .. } | Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),

@@ -179,6 +179,34 @@ pub enum CompileError {
         /// Human-readable description of the conflict.
         message: String,
     },
+    /// A `with` clause named a curve that is not `anim.linear`/`ease`/`spring`
+    /// (RFC-0010); `hint` carries a Levenshtein "did you mean …?".
+    UnknownAnimation {
+        /// Source range of the offending `anim.*` call.
+        span: Span,
+        /// The unknown curve name.
+        name: String,
+        /// The closest known curve name, if any.
+        hint: Option<String>,
+    },
+    /// A `with` clause attached an animation to a layout-affecting property
+    /// (`width`/`height`/`p`/`m`/`gap`/…), which cannot animate on the GPU
+    /// because it would require a per-frame relayout (RFC-0010 §"Layout
+    /// properties", INV-8).
+    LayoutPropNotAnimatable {
+        /// Source range of the animated attribute.
+        span: Span,
+        /// The offending layout property name.
+        prop: String,
+    },
+    /// A curve call had a malformed argument list (RFC-0010): a missing
+    /// duration, a non-numeric value, or an unknown parameter name.
+    InvalidAnimation {
+        /// Source range of the offending call or argument.
+        span: Span,
+        /// Human-readable description of the problem.
+        message: String,
+    },
 }
 
 impl CompileError {
@@ -202,7 +230,10 @@ impl CompileError {
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
             | Self::DynamicStyleForbidden { span }
-            | Self::ConflictingSpacingField { span, .. } => *span,
+            | Self::ConflictingSpacingField { span, .. }
+            | Self::UnknownAnimation { span, .. }
+            | Self::LayoutPropNotAnimatable { span, .. }
+            | Self::InvalidAnimation { span, .. } => *span,
         }
     }
 
@@ -228,6 +259,9 @@ impl CompileError {
             Self::UnexpectedChildren { .. } => "UnexpectedChildren",
             Self::DynamicStyleForbidden { .. } => "DynamicStyleForbidden",
             Self::ConflictingSpacingField { .. } => "ConflictingSpacingField",
+            Self::UnknownAnimation { .. } => "UnknownAnimation",
+            Self::LayoutPropNotAnimatable { .. } => "LayoutPropNotAnimatable",
+            Self::InvalidAnimation { .. } => "InvalidAnimation",
         }
     }
 
@@ -288,7 +322,15 @@ impl CompileError {
             Self::DynamicStyleForbidden { .. } => {
                 "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()
             }
-            Self::ConflictingSpacingField { message, .. } => message.clone(),
+            Self::ConflictingSpacingField { message, .. }
+            | Self::InvalidAnimation { message, .. } => message.clone(),
+            Self::UnknownAnimation { name, hint, .. } => {
+                with_hint(format!("unknown animation curve `{name}`"), hint.as_deref())
+            }
+            Self::LayoutPropNotAnimatable { prop, .. } => format!(
+                "`{prop}` is a layout property and cannot be animated with `with` \
+                 (it would relayout every frame); animate a `scale` transform instead"
+            ),
         }
     }
 

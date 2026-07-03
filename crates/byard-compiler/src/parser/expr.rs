@@ -50,6 +50,12 @@ impl Parser<'_> {
                 self.advance();
                 Expr::AngleLit(rad, span)
             }
+            // A `200ms` duration folds to a plain integer count of milliseconds
+            // (RFC-0010) — only read inside an `anim.*` curve call, as ms.
+            Some(Token::DurationLit(ms)) => {
+                self.advance();
+                Expr::IntLit(i64::from(ms), span)
+            }
             Some(Token::StrLit) => {
                 self.advance();
                 let parts = self.parse_string_literal(span);
@@ -117,8 +123,16 @@ impl Parser<'_> {
                 left: 18,
                 right: 19,
             }),
-            // Ternary (right-assoc).
-            Token::Question => Some(Bp { left: 4, right: 3 }),
+            // Ternary (right-assoc). `right: 4` (not 3) so the else-branch is
+            // parsed one power *above* the `with` operator (left: 3) below — this
+            // is what makes `a ? b : c with k` group as `(a ? b : c) with k`
+            // (RFC-0010): the whole conditional is the animated value, not just
+            // the else-branch. Nothing else has left bp 3, so this is invisible
+            // to every other expression.
+            Token::Question => Some(Bp { left: 4, right: 4 }),
+            // `with` animation operator (RFC-0010): below the ternary, above
+            // assignment, so `(cond ? a : b) with anim.spring()` is the value.
+            Token::With => Some(Bp { left: 3, right: 3 }),
             // Assignment (right-assoc), lowest.
             Token::Eq | Token::PlusEq | Token::MinusEq => Some(Bp { left: 2, right: 1 }),
             _ => None,
@@ -173,6 +187,18 @@ impl Parser<'_> {
                     cond: Box::new(lhs),
                     then,
                     els,
+                    span: self.span_from(start),
+                }
+            }
+            // `value with anim.*(…)` (RFC-0010): `lhs` is the target value; the
+            // RHS is the `anim.*` curve call, resolved to a typed `Curve` at
+            // lowering. Parsed at `right_bp` (3) so it stops before an assignment.
+            Some(Token::With) => {
+                self.advance();
+                let anim = Box::new(self.parse_expr(right_bp));
+                Expr::Animated {
+                    value: Box::new(lhs),
+                    anim,
                     span: self.span_from(start),
                 }
             }
