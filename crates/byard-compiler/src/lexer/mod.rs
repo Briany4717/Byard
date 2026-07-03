@@ -111,8 +111,8 @@ pub enum Token {
     /// A duration literal with a `ms` suffix (RFC-0010: `anim.linear(200ms)`),
     /// value in **milliseconds**. Listed before the plain number rules so
     /// `logos`'s longest-match prefers `200ms` over `200` + `ms`. The parser
-    /// folds it to a plain [`Token::IntLit`]: a duration is only meaningful
-    /// inside an `anim.*` curve call, read there as milliseconds.
+    /// lowers it to an `Expr::IntLit` node (see `parser/expr.rs`): a duration is
+    /// only meaningful inside an `anim.*` curve call, read there as milliseconds.
     #[regex(r"[0-9]+ms", |lex| lex.slice()[..lex.slice().len() - 2].parse::<u32>().ok())]
     DurationLit(u32),
     /// A floating-point literal. Listed before [`Token::IntLit`] because

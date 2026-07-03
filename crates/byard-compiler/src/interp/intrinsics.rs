@@ -440,24 +440,31 @@ pub fn validate_element(el: &ElementNode, known_views: &[&str]) -> Vec<CompileEr
 
         // Rule 6 — attribute value type.
         if let (AttrKind::Prop { value }, Some(ty)) = (&attr.kind, prop_ty) {
-            // RFC-0010: `value with anim.*(…)` — validate the curve and reject
-            // an animation on a layout property (it can't animate on the GPU),
-            // then fall through to type-check the target `value` itself.
-            if let Expr::Animated {
-                value: target,
-                anim,
-                span,
-            } = value
-            {
+            // RFC-0010: `value with anim.*(…)` — reject an animation on a layout
+            // property (it can't animate on the GPU), otherwise validate every
+            // curve in the (possibly nested) chain and type-check the innermost
+            // target value. The chain walk matters: `(x with a) with b` must not
+            // let its inner curve or value slip past unchecked.
+            if let Expr::Animated { span, .. } = value {
                 if is_layout_prop(an) {
                     errs.push(CompileError::LayoutPropNotAnimatable {
                         span: *span,
                         prop: an.to_string(),
                     });
-                } else if let Err(err) = crate::interp::anim::resolve_curve(anim) {
-                    errs.push(err);
-                } else if let Some(err) = check_value_type(ty, target) {
-                    errs.push(err);
+                } else {
+                    let mut target = value;
+                    while let Expr::Animated {
+                        value: inner, anim, ..
+                    } = target
+                    {
+                        if let Err(err) = crate::interp::anim::resolve_curve(anim) {
+                            errs.push(err);
+                        }
+                        target = inner;
+                    }
+                    if let Some(err) = check_value_type(ty, target) {
+                        errs.push(err);
+                    }
                 }
             } else if let Some(err) = check_value_type(ty, value) {
                 errs.push(err);
@@ -685,6 +692,27 @@ mod tests {
             &e[0],
             CompileError::LayoutPropNotAnimatable { .. }
         ));
+    }
+
+    #[test]
+    fn nested_animated_values_still_check_the_innermost_value_and_every_curve() {
+        // A parenthesised `(x with a) with b` must not let its inner value or
+        // curve slip past the checker.
+        let e = errs(
+            "View V() { Box #[radius: (\"hi\" with anim.spring()) with anim.linear(200ms)] {} }",
+        );
+        assert!(
+            e.iter()
+                .any(|err| matches!(err, CompileError::AttributeTypeMismatch { .. })),
+            "innermost `\"hi\"` must be type-checked against `radius`"
+        );
+        let e =
+            errs("View V() { Box #[radius: (3 with anim.sprng()) with anim.linear(200ms)] {} }");
+        assert!(
+            e.iter()
+                .any(|err| matches!(err, CompileError::UnknownAnimation { .. })),
+            "a bad nested curve must still be reported"
+        );
     }
 
     #[test]

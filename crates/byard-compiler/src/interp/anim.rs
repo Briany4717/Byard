@@ -171,25 +171,41 @@ fn resolve_spring(args: &[Arg], call_span: Span) -> Result<Curve, CompileError> 
     })
 }
 
-/// Extracts the single positional duration (in ms) from `anim.linear`/`ease`.
+/// Extracts the single positional duration (whole milliseconds) from
+/// `anim.linear`/`ease`. A duration is a non-negative *integer* count of
+/// milliseconds — a fractional value (`200.5`) is rejected rather than silently
+/// truncated, and a value beyond `u32` is a range error.
 fn single_duration(args: &[Arg], call_span: Span, curve: &str) -> Result<u32, CompileError> {
-    match args {
-        [arg] if arg.name.is_none() => {
-            let ms = literal_f32(&arg.value)?;
-            if ms < 0.0 {
-                return Err(CompileError::InvalidAnimation {
-                    span: arg.value.span(),
-                    message: format!("`anim.{curve}` duration must not be negative"),
-                });
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Ok(ms as u32)
-        }
-        _ => Err(CompileError::InvalidAnimation {
+    let [arg] = args else {
+        return Err(CompileError::InvalidAnimation {
             span: call_span,
             message: format!(
                 "`anim.{curve}` takes exactly one duration, e.g. `anim.{curve}(200ms)`"
             ),
+        });
+    };
+    if arg.name.is_some() {
+        return Err(CompileError::InvalidAnimation {
+            span: arg.value.span(),
+            message: format!("`anim.{curve}`'s duration is positional, e.g. `anim.{curve}(200ms)`"),
+        });
+    }
+    match &arg.value {
+        Expr::IntLit(ms, span) => u32::try_from(*ms).map_err(|_| CompileError::InvalidAnimation {
+            span: *span,
+            message: format!(
+                "`anim.{curve}` duration must be between 0 and {} milliseconds",
+                u32::MAX
+            ),
+        }),
+        // `200.5` folds to a `FloatLit`; a duration must be whole ms.
+        Expr::FloatLit(_, span) => Err(CompileError::InvalidAnimation {
+            span: *span,
+            message: format!("`anim.{curve}` duration must be a whole number of milliseconds"),
+        }),
+        other => Err(CompileError::InvalidAnimation {
+            span: other.span(),
+            message: format!("`anim.{curve}` duration must be a millisecond literal, e.g. `200ms`"),
         }),
     }
 }
@@ -293,6 +309,23 @@ mod tests {
     fn linear_without_a_duration_is_an_error() {
         assert!(matches!(
             curve_of("anim.linear()").unwrap_err(),
+            CompileError::InvalidAnimation { .. }
+        ));
+    }
+
+    #[test]
+    fn fractional_duration_is_rejected_not_truncated() {
+        // `200.5` must be a hard error, not silently floored to 200ms.
+        assert!(matches!(
+            curve_of("anim.linear(200.5)").unwrap_err(),
+            CompileError::InvalidAnimation { .. }
+        ));
+    }
+
+    #[test]
+    fn negative_duration_is_a_range_error() {
+        assert!(matches!(
+            curve_of("anim.ease(-5)").unwrap_err(),
             CompileError::InvalidAnimation { .. }
         ));
     }
