@@ -184,6 +184,11 @@ pub enum Token {
     /// `?` (ternary)
     #[token("?")]
     Question,
+    /// `-` (sign of a negative numeric literal). Byld has no binary arithmetic
+    /// operators, so a lone `-` only ever prefixes a number (e.g. `translate:
+    /// (-8, 0)`). Longest-match keeps `->`, `-=` and `--` as their own tokens.
+    #[token("-")]
+    Minus,
 }
 
 /// State of the two-state string-scanning stack.

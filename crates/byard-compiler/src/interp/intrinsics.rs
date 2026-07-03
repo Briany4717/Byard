@@ -466,6 +466,17 @@ fn check_value_type(ty: PropType, value: &Expr) -> Option<CompileError> {
         (PropType::Angle, Expr::StrLit(..) | Expr::IntLit(..) | Expr::FloatLit(..)) => {
             mismatch("an angle (e.g. 90deg, 1.5rad)")
         }
+        (PropType::Angle, Expr::Tuple(args, _)) => {
+            // Verbose `rotate: (angle: <expr>)` — recurse into the field so a
+            // bare number can't slip past the terse-form rejection by hiding in
+            // the tuple wrapper (which is otherwise not type-checked).
+            match args.as_slice() {
+                [arg] if arg.name.as_ref().is_some_and(|n| n.as_str() == "angle") => {
+                    check_value_type(PropType::Angle, &arg.value)
+                }
+                _ => mismatch("an angle (e.g. 90deg) or the verbose form `(angle: 90deg)`"),
+            }
+        }
         (PropType::Str, Expr::IntLit(..) | Expr::FloatLit(..)) => mismatch("a string"),
         (PropType::Bool, Expr::IntLit(..) | Expr::StrLit(..) | Expr::FloatLit(..)) => {
             mismatch("a boolean")
@@ -607,6 +618,19 @@ mod tests {
     #[test]
     fn rotate_rejects_a_bare_number_without_a_deg_or_rad_suffix() {
         let e = errs("View V() { Box #[rotate: 90] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn rotate_verbose_form_still_rejects_a_bare_number() {
+        // The verbose `(angle: N)` wrapper must not let a bare number bypass the
+        // deg/rad requirement — recurse into the field.
+        let e = errs("View V() { Box #[rotate: (angle: 90)] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+        // …but the properly-suffixed verbose form is accepted.
+        assert!(errs("View V() { Box #[rotate: (angle: 90deg)] {} }").is_empty());
+        // A verbose tuple with the wrong field name is a mismatch too.
+        let e = errs("View V() { Box #[rotate: (deg: 90deg)] {} }");
         assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
     }
 

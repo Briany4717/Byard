@@ -360,6 +360,43 @@ fn angle_literal_parses_as_an_angle_lit_expr() {
 }
 
 #[test]
+fn negative_numeric_literals_parse() {
+    // Byld has no binary arithmetic; a leading `-` is the sign of a numeric
+    // literal. `translate: (-8, 4)` must parse, not raise a parse error.
+    let view = one_view("View V() { Box #[translate: (-8, 4)] }");
+    let el = as_element(&view.body[0]);
+    let AttrKind::Prop {
+        value: Expr::Tuple(args, _),
+    } = &el.attrs[0].kind
+    else {
+        panic!("expected a tuple value");
+    };
+    assert!(matches!(&args[0].value, Expr::IntLit(-8, _)));
+    assert!(matches!(&args[1].value, Expr::IntLit(4, _)));
+
+    // Negative float and negative angle literals too.
+    let view = one_view("View V() { Box #[scale: -1.5, rotate: -90deg] }");
+    let el = as_element(&view.body[0]);
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop { value: Expr::FloatLit(f, _) } if (*f + 1.5).abs() < 1e-9
+    ));
+    assert!(matches!(
+        &el.attrs[1].kind,
+        AttrKind::Prop { value: Expr::AngleLit(rad, _) }
+            if (*rad + std::f64::consts::FRAC_PI_2).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn bare_minus_without_a_number_is_a_targeted_error() {
+    // `-` not followed by a number must report the specific diagnostic, not a
+    // silent drop or a generic "expected an expression".
+    let parsed = parse("View V() { Box #[translate: (-, 4)] }");
+    assert!(!parsed.errors.is_empty());
+}
+
+#[test]
 fn function_types_parse() {
     let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
     let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {

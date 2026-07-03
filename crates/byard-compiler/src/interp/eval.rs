@@ -686,6 +686,13 @@ impl Interpreter {
                         rect.width,
                         rect.height,
                     );
+                    // Resolve the paint-time transform once, up front, so it can
+                    // be applied both to a plain container's `bg` fill *and* to
+                    // the self-owned visuals of `Toggle`/`Slider`/`TextField`
+                    // (their track/fill/thumb/underline/caret are the element's
+                    // own quads, so RFC-0011's element-local transform applies to
+                    // them exactly as it does to a `Box` fill).
+                    let transform = self.resolve_transform(attrs, current_rect);
                     let bg = self.eval_color_prop(attrs, "bg");
                     let radii = self.resolve_radii(attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
@@ -713,7 +720,6 @@ impl Interpreter {
                     // painting the rect here would draw a slab behind the control.
                     let owns_visuals = matches!(name.as_str(), "Toggle" | "Slider");
                     if let (false, Some(color)) = (owns_visuals, bg) {
-                        let transform = self.resolve_transform(attrs, current_rect);
                         let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
@@ -784,6 +790,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -794,6 +801,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -804,6 +812,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -893,6 +902,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
@@ -912,7 +922,7 @@ impl Interpreter {
             rect: [rect.x, rect.y, rect.w, rect.h],
             color: track_color,
             radii: [radius; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Thumb: a white circle inset from the track edges, sliding L↔R.
@@ -928,7 +938,7 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [thumb_size / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Tap handler to flip the bool (M16).
@@ -952,6 +962,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         // Keep the authored `f64` values for the value-write path: computing the
@@ -990,7 +1001,7 @@ impl Interpreter {
             rect: [rect.x, track_y, rect.w, track_h],
             color: [0.40, 0.42, 0.48, 1.0],
             radii: [track_r; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Fill up to the thumb.
@@ -1000,7 +1011,7 @@ impl Interpreter {
                 rect: [rect.x, track_y, fill_w, track_h],
                 color: accent_rgba,
                 radii: [track_r; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
@@ -1013,14 +1024,14 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: accent_rgba,
             radii: [thumb_size / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
         let inner = thumb_size - 5.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [inner / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Handlers: PointerDown + PointerDrag (M16).
@@ -1071,6 +1082,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let placeholder = self.eval_str_prop(attrs, "placeholder").unwrap_or_default();
@@ -1103,13 +1115,17 @@ impl Interpreter {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
                 color: super::intrinsics::color_to_rgba(self.theme.primary, false),
                 radii: [0.0; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
         let pad_x = 10.0_f32;
         let text_x = rect.x + pad_x;
         let text_y = rect.y + (rect.h - font_size) / 2.0;
+        // NOTE: `TextLine` carries no `Transform` field (RFC-0011 engine slice:
+        // only box primitives were given one), so the field's *text* does not
+        // follow `translate`/`scale`/`rotate` — the box visuals below (underline,
+        // caret) and its `bg` fill do. Same limitation as the `Text` intrinsic.
         if !display_text.is_empty() {
             frame.push_text(byard_core::TextLine {
                 x: text_x,
@@ -1132,7 +1148,7 @@ impl Interpreter {
                 rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
                 color: [1.0, 1.0, 1.0, 1.0],
                 radii: [0.0; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
@@ -1877,7 +1893,19 @@ impl Interpreter {
             }
             other => other,
         };
-        spacing_value(&self.eval_pure(inner))
+        let val = self.eval_pure(inner);
+        let Some(rad) = spacing_value(&val) else {
+            // A non-numeric `rotate` (e.g. `rotate: center`, or a reactive var
+            // that didn't resolve to a number) is a real mistake, not a no-op —
+            // flag it the same way `translate`/`scale` flag theirs instead of
+            // silently painting with no rotation.
+            self.errors.push(CompileError::AttributeTypeMismatch {
+                span: inner.span(),
+                expected: "an angle (e.g. 90deg, 1.5rad)".to_string(),
+            });
+            return None;
+        };
+        Some(rad)
     }
 
     /// Resolves `origin` (RFC-0011 T2) to an absolute logical-pixel pivot in
