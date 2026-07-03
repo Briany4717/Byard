@@ -371,6 +371,17 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `left merge right` (RFC-0016 M3): composes two style values into one; on
+    /// a conflicting attribute the right operand wins. Both operands resolve to
+    /// styles at lower time.
+    Merge {
+        /// The base style.
+        left: Box<Expr>,
+        /// The overriding style.
+        right: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// A parse-error placeholder, so recovery can continue and collect more
     /// diagnostics (RFC-0002 §"Parser").
     Error(Span),
@@ -397,6 +408,7 @@ impl Expr {
             | Self::Ternary { span, .. }
             | Self::Animated { span, .. }
             | Self::StyleValue { span, .. }
+            | Self::Merge { span, .. }
             | Self::Error(span) => *span,
         }
     }

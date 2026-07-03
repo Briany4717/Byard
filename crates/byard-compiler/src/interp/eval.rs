@@ -242,11 +242,18 @@ impl Interpreter {
                 self.define_var(name.clone(), init);
             }
             Member::Let { name, init, .. } => {
-                // `let x = style { … }` (RFC-0016) registers a style value in the
-                // view-scoped table rather than a reactive memo; a `..x` spread
-                // splices its attributes at lower time.
-                if let Expr::StyleValue { attrs, .. } = init {
-                    self.styles.insert(name.clone(), attrs.clone());
+                // `let x = style { … }` / `let x = a merge b` (RFC-0016) register
+                // a style value in the view-scoped table rather than a reactive
+                // memo; a `..x` spread splices its attributes at lower time.
+                if matches!(init, Expr::StyleValue { .. } | Expr::Merge { .. }) {
+                    match self.resolve_style_expr(init) {
+                        Some(attrs) => {
+                            self.styles.insert(name.clone(), attrs);
+                        }
+                        None => self
+                            .errors
+                            .push(CompileError::NotAStyle { span: init.span() }),
+                    }
                 } else {
                     self.define_let(name.clone(), init);
                 }
@@ -496,7 +503,7 @@ impl Interpreter {
         // 1) Spreads first, in written order.
         for a in attrs {
             if let AttrKind::Spread { value } = &a.kind {
-                match self.resolve_spread(value) {
+                match self.resolve_style_expr(value) {
                     Some(spread_attrs) => {
                         for sa in spread_attrs {
                             override_attr(&mut resolved, sa);
@@ -517,10 +524,18 @@ impl Interpreter {
 
     /// Resolves a spread's expression to a style's attributes: a `let`-bound
     /// style name, or an inline `style { … }` value.
-    fn resolve_spread(&self, value: &Expr) -> Option<Vec<Attr>> {
+    fn resolve_style_expr(&self, value: &Expr) -> Option<Vec<Attr>> {
         match value {
             Expr::Ident(name, _) => self.styles.get(name).cloned(),
             Expr::StyleValue { attrs, .. } => Some(attrs.clone()),
+            // `a merge b` (RFC-0016): the right style overrides the left.
+            Expr::Merge { left, right, .. } => {
+                let mut base = self.resolve_style_expr(left)?;
+                for a in self.resolve_style_expr(right)? {
+                    override_attr(&mut base, a);
+                }
+                Some(base)
+            }
             _ => None,
         }
     }
@@ -2309,7 +2324,7 @@ impl Interpreter {
             // (see `register_style`/`expand_style_spreads`) — never projected as
             // a scalar. Reaching here means it was used where a value was
             // expected, which has no meaning; yield Unit.
-            Expr::StyleValue { .. } => Box::new(|_| Value::Unit),
+            Expr::StyleValue { .. } | Expr::Merge { .. } => Box::new(|_| Value::Unit),
             // `value with anim.*(…)` (RFC-0010): lower to the *target* value.
             // The curve is validated by the checker; the `Motion` runtime that
             // actually drives the on-screen transition lands in the follow-up
@@ -3573,6 +3588,34 @@ mod tests {
             "inline bg overrides the spread, got {:?}",
             insts[1].color
         );
+    }
+
+    #[test]
+    fn merge_composes_two_styles_right_wins() {
+        // RFC-0016: `base merge overrides` — the right style wins on conflicts,
+        // the left's non-conflicting attributes survive.
+        let parsed = parse(
+            "View V() { \
+             let base = style { bg: 0x111111, radius: 8 } \
+             let hot = base merge style { bg: 0x445566 } \
+             Box #[..hot, width: 10, height: 10] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let inst = frame.instances()[0];
+        // `bg` comes from the right side of the merge (0x44 red channel)…
+        assert!(
+            (inst.color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "right style's bg wins, got {:?}",
+            inst.color
+        );
+        // …while `radius` (only on the base) survives (radii != 0).
+        assert!(inst.radii[0] > 0.0, "base radius survives the merge");
     }
 
     #[test]
