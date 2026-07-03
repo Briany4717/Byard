@@ -210,6 +210,261 @@ impl Default for Transform {
     }
 }
 
+/// A packed, POD animation curve (RFC-0010) — a `u32` tag plus three `f32`
+/// parameters, so it crosses the frame boundary as plain data and the engine
+/// never needs to know the compiler's typed `Curve`. The compiler packs its
+/// resolved curve into this at lower time; both the CPU (settling) and the GPU
+/// (drawing) read the same closed forms from it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MotionCurve {
+    /// The curve family — one of the `MotionCurve::*` tag constants.
+    pub kind: u32,
+    /// Curve parameters, interpreted by `kind`:
+    /// - linear / ease: `[duration_ms, _, _]`
+    /// - spring: `[stiffness, damping, initial_velocity]`
+    pub params: [f32; 3],
+}
+
+impl MotionCurve {
+    /// Fixed-duration linear ramp; `params[0]` is the duration in ms.
+    pub const LINEAR: u32 = 0;
+    /// Ease-in (cubic); `params[0]` is the duration in ms.
+    pub const EASE_IN: u32 = 1;
+    /// Ease-out (cubic); `params[0]` is the duration in ms.
+    pub const EASE_OUT: u32 = 2;
+    /// Ease-in-out (cubic); `params[0]` is the duration in ms.
+    pub const EASE_IN_OUT: u32 = 3;
+    /// Damped spring; `params` is `[stiffness, damping, initial_velocity]`.
+    pub const SPRING: u32 = 4;
+}
+
+/// A paint-time animatable scalar (RFC-0010 §"The animatable value model").
+///
+/// Carries only endpoints and a curve — **no per-frame CPU work**: the CPU
+/// rewrites `to` (and reseeds `from`/`start_ms`) once, on a target change, and
+/// the shader interpolates every active frame. The CPU also evaluates the same
+/// closed forms ([`sample`](Self::sample)/[`velocity`](Self::velocity)) to
+/// decide when a motion has [`settled`](Self::is_settled) so the app can stop
+/// requesting frames. Times are absolute engine milliseconds.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Motion {
+    /// The value at the moment `to` last changed (the interruption point).
+    pub from: f32,
+    /// The current target (rewritten `O(1)` on mutation).
+    pub to: f32,
+    /// Absolute engine time (ms) when `to` was set.
+    pub start_ms: u32,
+    /// The curve driving `from` → `to`.
+    pub curve: MotionCurve,
+}
+
+impl Motion {
+    /// Default settling threshold on position (RFC-0010 A4): below half a
+    /// logical pixel a transition is imperceptible. This is a safe scalar
+    /// default; per-property callers whose unit isn't pixels (opacity 0..1,
+    /// a colour channel, degrees) should pass their own to
+    /// [`is_settled_with_eps`](Self::is_settled_with_eps).
+    pub const DEFAULT_EPS_POS: f32 = 0.5;
+    /// Default settling threshold on velocity, in units per second (RFC-0010 A4).
+    pub const DEFAULT_EPS_VEL: f32 = 0.5;
+
+    /// A settled motion pinned at `value` (no movement) with a linear curve.
+    #[must_use]
+    pub fn resting(value: f32) -> Self {
+        Self {
+            from: value,
+            to: value,
+            start_ms: 0,
+            curve: MotionCurve {
+                kind: MotionCurve::LINEAR,
+                params: [0.0, 0.0, 0.0],
+            },
+        }
+    }
+
+    /// The animated value at absolute engine time `now_ms`.
+    #[must_use]
+    pub fn sample(&self, now_ms: u32) -> f32 {
+        let t = seconds_since(self.start_ms, now_ms);
+        match self.curve.kind {
+            MotionCurve::SPRING => spring_position(self, t),
+            MotionCurve::LINEAR => self.from + (self.to - self.from) * duration_progress(self, t),
+            _ => {
+                let p = ease(self.curve.kind, duration_progress(self, t));
+                self.from + (self.to - self.from) * p
+            }
+        }
+    }
+
+    /// The analytic velocity (units per second) at `now_ms`.
+    #[must_use]
+    pub fn velocity(&self, now_ms: u32) -> f32 {
+        let t = seconds_since(self.start_ms, now_ms);
+        if self.curve.kind == MotionCurve::SPRING {
+            spring_velocity(self, t)
+        } else {
+            // Finite-difference the eased/linear ramp — cheap and only used for
+            // settling, where a derivative-free estimate is plenty.
+            const H: f32 = 1.0 / 240.0;
+            (self.sample_at(t + H) - self.sample_at(t)) / H
+        }
+    }
+
+    /// Position at an explicit elapsed time `t` seconds (used by the
+    /// finite-difference velocity of the non-spring curves).
+    fn sample_at(&self, t: f32) -> f32 {
+        match self.curve.kind {
+            MotionCurve::SPRING => spring_position(self, t),
+            MotionCurve::LINEAR => self.from + (self.to - self.from) * clamp01(progress(self, t)),
+            _ => {
+                self.from
+                    + (self.to - self.from) * ease(self.curve.kind, clamp01(progress(self, t)))
+            }
+        }
+    }
+
+    /// Whether the motion has effectively reached rest, using the default
+    /// per-pixel epsilons ([`DEFAULT_EPS_POS`](Self::DEFAULT_EPS_POS) /
+    /// [`DEFAULT_EPS_VEL`](Self::DEFAULT_EPS_VEL)).
+    #[must_use]
+    pub fn is_settled(&self, now_ms: u32) -> bool {
+        self.is_settled_with_eps(now_ms, Self::DEFAULT_EPS_POS, Self::DEFAULT_EPS_VEL)
+    }
+
+    /// Whether the motion has reached rest under caller-supplied thresholds —
+    /// within `eps_pos` of `to` and moving slower than `eps_vel`. The runtime
+    /// scales these to the animated property's unit (px vs. opacity vs. colour
+    /// channel) so settling is neither too eager nor too lax.
+    #[must_use]
+    pub fn is_settled_with_eps(&self, now_ms: u32, eps_pos: f32, eps_vel: f32) -> bool {
+        (self.sample(now_ms) - self.to).abs() < eps_pos && self.velocity(now_ms).abs() < eps_vel
+    }
+}
+
+/// Elapsed seconds from `start_ms` to `now_ms`, never negative.
+fn seconds_since(start_ms: u32, now_ms: u32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let ms = now_ms.saturating_sub(start_ms) as f32;
+    ms / 1000.0
+}
+
+/// Clamps `x` to `[0, 1]`.
+fn clamp01(x: f32) -> f32 {
+    x.clamp(0.0, 1.0)
+}
+
+/// Raw (unclamped) progress `t / duration` for a fixed-duration curve; a
+/// zero/absent duration is treated as an instant jump (progress ≥ 1).
+fn progress(m: &Motion, t_seconds: f32) -> f32 {
+    let dur_s = m.curve.params[0] / 1000.0;
+    if dur_s <= 0.0 { 1.0 } else { t_seconds / dur_s }
+}
+
+/// Clamped progress for a fixed-duration curve.
+fn duration_progress(m: &Motion, t_seconds: f32) -> f32 {
+    clamp01(progress(m, t_seconds))
+}
+
+/// Cubic easing remap of a `0..=1` progress for the ease-* curve kinds.
+fn ease(kind: u32, p: f32) -> f32 {
+    match kind {
+        MotionCurve::EASE_IN => p * p * p,
+        MotionCurve::EASE_OUT => {
+            let q = 1.0 - p;
+            1.0 - q * q * q
+        }
+        // EASE_IN_OUT and any unknown kind fall back to symmetric cubic.
+        _ => {
+            if p < 0.5 {
+                4.0 * p * p * p
+            } else {
+                let q = -2.0 * p + 2.0;
+                1.0 - (q * q * q) / 2.0
+            }
+        }
+    }
+}
+
+/// Damping ratios within this band of `1.0` are treated as critically damped.
+///
+/// A computed `zeta` never lands exactly on `1.0`, and the under-/over-damped
+/// closed forms divide by `wd = ω√(1−ζ²)` / `r1−r2 = 2ω√(ζ²−1)`, both of which
+/// vanish as `ζ → 1` and would amplify float error into extreme values. Routing
+/// the whole neighbourhood through the (division-free) critical form is exact at
+/// `ζ = 1` and an imperceptibly-close approximation across so narrow a band.
+const SPRING_CRITICAL_BAND: f32 = 1e-2;
+
+/// Analytic damped-spring position at elapsed time `t` seconds (RFC-0010).
+/// `params` = `[stiffness, damping, initial_velocity]`; handles the under-,
+/// critically-, and over-damped closed forms with an initial velocity. A
+/// negative damping is clamped to zero so a mistuned curve can never turn into
+/// unbounded exponential growth.
+#[allow(clippy::many_single_char_names)] // standard spring-physics notation
+fn spring_position(m: &Motion, t: f32) -> f32 {
+    let [k, c, v0] = m.curve.params;
+    let c = c.max(0.0);
+    let d = m.from - m.to; // displacement from target at t=0
+    let omega = k.max(0.0).sqrt();
+    if omega == 0.0 {
+        return m.to + d; // no restoring force: stays put
+    }
+    let zeta = c / (2.0 * omega);
+    if (zeta - 1.0).abs() < SPRING_CRITICAL_BAND {
+        // Critically damped (and the near-critical neighbourhood).
+        let e = (-omega * t).exp();
+        m.to + e * (d + (v0 + omega * d) * t)
+    } else if zeta < 1.0 {
+        // Underdamped.
+        let wd = omega * (1.0 - zeta * zeta).sqrt();
+        let e = (-zeta * omega * t).exp();
+        let a = d;
+        let b = (v0 + zeta * omega * d) / wd;
+        m.to + e * (a * (wd * t).cos() + b * (wd * t).sin())
+    } else {
+        // Overdamped: two real roots.
+        let s = omega * (zeta * zeta - 1.0).sqrt();
+        let r1 = -zeta * omega + s;
+        let r2 = -zeta * omega - s;
+        let a = (v0 - r2 * d) / (r1 - r2);
+        let b = d - a;
+        m.to + a * (r1 * t).exp() + b * (r2 * t).exp()
+    }
+}
+
+/// Analytic damped-spring velocity (units/second) at elapsed time `t` — the
+/// exact derivative of [`spring_position`], so it is accurate even at `t = 0`
+/// where the initial acceleration is large. Each branch satisfies `v(0) = v0`.
+#[allow(clippy::many_single_char_names)] // standard spring-physics notation
+fn spring_velocity(m: &Motion, t: f32) -> f32 {
+    let [k, c, v0] = m.curve.params;
+    let c = c.max(0.0);
+    let d = m.from - m.to;
+    let omega = k.max(0.0).sqrt();
+    if omega == 0.0 {
+        return 0.0;
+    }
+    let zeta = c / (2.0 * omega);
+    if (zeta - 1.0).abs() < SPRING_CRITICAL_BAND {
+        let e = (-omega * t).exp();
+        e * (v0 - omega * (v0 + omega * d) * t)
+    } else if zeta < 1.0 {
+        let wd = omega * (1.0 - zeta * zeta).sqrt();
+        let b = (v0 + zeta * omega * d) / wd;
+        let e = (-zeta * omega * t).exp();
+        e * ((b * wd - zeta * omega * d) * (wd * t).cos()
+            - (d * wd + zeta * omega * b) * (wd * t).sin())
+    } else {
+        let s = omega * (zeta * zeta - 1.0).sqrt();
+        let r1 = -zeta * omega + s;
+        let r2 = -zeta * omega - s;
+        let a = (v0 - r2 * d) / (r1 - r2);
+        let b = d - a;
+        a * r1 * (r1 * t).exp() + b * r2 * (r2 * t).exp()
+    }
+}
+
 /// GPU-ready instance data for a single solid rectangle.
 ///
 /// Shared between the logic thread (which populates [`RenderFrame::instances`])
@@ -903,5 +1158,139 @@ mod tests {
         assert_eq!(frame.rects().len(), 1, "can push after clear");
         assert_eq!(frame.rects()[0].x, 99.0);
         assert_eq!(frame.dirty(), &[true]);
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    fn spring(from: f32, to: f32, start_ms: u32) -> Motion {
+        Motion {
+            from,
+            to,
+            start_ms,
+            curve: MotionCurve {
+                kind: MotionCurve::SPRING,
+                // The RFC-0010 A2 default: snappy 210/20, no initial velocity.
+                params: [210.0, 20.0, 0.0],
+            },
+        }
+    }
+
+    #[test]
+    fn spring_starts_at_from_and_approaches_to() {
+        let m = spring(10.0, 3.0, 1_000);
+        // At the start instant, the value is exactly `from`.
+        assert!((m.sample(1_000) - 10.0).abs() < 1e-4);
+        // Far in the future it has settled onto `to`.
+        assert!((m.sample(1_000 + 10_000) - 3.0).abs() < Motion::DEFAULT_EPS_POS);
+    }
+
+    #[test]
+    fn spring_velocity_starts_near_its_initial_velocity() {
+        let mut m = spring(0.0, 100.0, 0);
+        m.curve.params[2] = 50.0; // initial velocity
+        assert!(
+            (m.velocity(0) - 50.0).abs() < 2.0,
+            "v(0) should be ~50, got {}",
+            m.velocity(0)
+        );
+    }
+
+    #[test]
+    fn spring_is_unsettled_in_flight_and_settled_at_rest() {
+        let m = spring(0.0, 100.0, 0);
+        assert!(!m.is_settled(0), "a just-started spring is moving");
+        assert!(
+            m.is_settled(10_000),
+            "a spring long past its start has settled"
+        );
+    }
+
+    #[test]
+    fn overdamped_and_critically_damped_springs_still_reach_the_target() {
+        // Critically damped: c = 2*sqrt(k). k=100 -> c=20.
+        let mut m = spring(0.0, 5.0, 0);
+        m.curve.params = [100.0, 20.0, 0.0];
+        assert!((m.sample(0)).abs() < 1e-4);
+        assert!((m.sample(6_000) - 5.0).abs() < Motion::DEFAULT_EPS_POS);
+        // Overdamped: c well above 2*sqrt(k).
+        m.curve.params = [100.0, 60.0, 0.0];
+        assert!((m.sample(0)).abs() < 1e-4);
+        assert!((m.sample(6_000) - 5.0).abs() < Motion::DEFAULT_EPS_POS);
+    }
+
+    #[test]
+    fn linear_curve_interpolates_over_its_duration() {
+        let m = Motion {
+            from: 0.0,
+            to: 200.0,
+            start_ms: 0,
+            curve: MotionCurve {
+                kind: MotionCurve::LINEAR,
+                params: [200.0, 0.0, 0.0], // 200 ms
+            },
+        };
+        assert!((m.sample(0) - 0.0).abs() < 1e-4);
+        assert!((m.sample(100) - 100.0).abs() < 1e-3, "halfway at 100ms");
+        assert!((m.sample(200) - 200.0).abs() < 1e-4, "arrived at 200ms");
+        assert!((m.sample(999) - 200.0).abs() < 1e-4, "clamped past the end");
+        assert!(m.is_settled(200));
+    }
+
+    #[test]
+    fn ease_in_out_hits_its_endpoints_and_midpoint() {
+        let m = Motion {
+            from: 0.0,
+            to: 1.0,
+            start_ms: 0,
+            curve: MotionCurve {
+                kind: MotionCurve::EASE_IN_OUT,
+                params: [100.0, 0.0, 0.0],
+            },
+        };
+        assert!((m.sample(0) - 0.0).abs() < 1e-4);
+        assert!((m.sample(100) - 1.0).abs() < 1e-4);
+        // Symmetric ease passes through 0.5 at the temporal midpoint.
+        assert!((m.sample(50) - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_is_pod_and_resting_is_settled() {
+        // A resting motion never moves and reports settled immediately.
+        let m = Motion::resting(42.0);
+        assert!((m.sample(0) - 42.0).abs() < 1e-6);
+        assert!((m.sample(9_999) - 42.0).abs() < 1e-6);
+        assert!(m.is_settled(0));
+        // POD round-trip (crosses the frame boundary as bytes).
+        let bytes = bytemuck::bytes_of(&m);
+        let back: Motion = *bytemuck::from_bytes(bytes);
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn near_critical_and_negative_damping_stay_finite() {
+        // A damping ratio a hair off critical must not divide by a vanishing
+        // `wd`/`r1−r2` and blow up — the near-critical band routes it through
+        // the division-free form.
+        let mut m = spring(0.0, 10.0, 0);
+        m.curve.params = [100.0, 20.05, 0.0]; // critical is c = 2√k = 20
+        for t_ms in [0_u32, 1, 8, 100, 1_000, 6_000] {
+            assert!(m.sample(t_ms).is_finite(), "sample must stay finite");
+            assert!(m.velocity(t_ms).is_finite(), "velocity must stay finite");
+        }
+        assert!((m.sample(6_000) - 10.0).abs() < Motion::DEFAULT_EPS_POS);
+
+        // Negative damping is clamped to zero, so the worst case is an undamped
+        // (bounded) oscillation — never unbounded exponential growth.
+        m.curve.params = [100.0, -50.0, 0.0];
+        for t_ms in [0_u32, 100, 1_000, 5_000] {
+            let v = m.sample(t_ms);
+            assert!(
+                v.is_finite() && v.abs() < 1.0e4,
+                "clamped damping stays bounded"
+            );
+        }
     }
 }
