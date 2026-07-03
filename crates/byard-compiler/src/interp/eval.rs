@@ -47,6 +47,17 @@ fn step_decimals(step: f64) -> i32 {
     }
 }
 
+/// Settling thresholds for the CPU-sampled animation path (RFC-0010).
+///
+/// `eval_pure` animates opacity, scale, rotate, and translate through one
+/// generic path that doesn't carry the property's unit, so the epsilons must be
+/// tight enough to be correct for the *tightest* unit (ratios, ~0..1) — which is
+/// simply conservative (settles a hair later) for pixels and radians. Position
+/// is the final-value accuracy gate; a tight velocity gate keeps a spring's
+/// overshoot alive rather than freezing it at the first crossing of the target.
+const ANIM_SETTLE_EPS_POS: f32 = 0.002;
+const ANIM_SETTLE_EPS_VEL: f32 = 0.02;
+
 /// Rounds `val` to `decimals` decimal places (half-away-from-zero).
 fn round_to_decimals(val: f64, decimals: i32) -> f64 {
     let factor = 10f64.powi(decimals);
@@ -121,9 +132,15 @@ pub struct Interpreter {
     fn_table: Vec<(Vec<Symbol>, Expr)>,
     /// Current engine time (ms since the runner's epoch), set once per frame by
     /// the runner via [`set_now_ms`](Self::set_now_ms). Drives `with`
-    /// animations (RFC-0010); `0` when the host never advances the clock (tests
-    /// and non-animating paths), which simply leaves every animation settled.
+    /// animations (RFC-0010).
     now_ms: u32,
+    /// Whether a host has ever advanced the clock. Distinguishes a real
+    /// `set_now_ms(0)` start from "the clock was never set" — without it, a host
+    /// that never ticks the clock would pin an animation at `t = 0` (never
+    /// settling, `has_active_animations` latched true, an infinite redraw loop
+    /// on a wait-based runner). Unset ⇒ animations resolve to their target
+    /// instantly.
+    clock_set: bool,
     /// Persisted per-property animation state (RFC-0010), keyed by the `with`
     /// node's source span so it survives the whole-tree re-render each frame.
     /// A mid-flight target change reseeds `from` to the current sampled value
@@ -167,6 +184,7 @@ impl Interpreter {
     /// frame, before [`render`](Self::render).
     pub fn set_now_ms(&mut self, ms: u32) {
         self.now_ms = ms;
+        self.clock_set = true;
     }
 
     /// Whether any `with` animation was still in flight as of the last
@@ -2306,6 +2324,12 @@ impl Interpreter {
             // untouched (the checker already restricts `with` to numeric props).
             other => return other,
         };
+        // No advancing clock (a host that never calls `set_now_ms`, e.g. a
+        // non-animating test path): resolve straight to the target so an
+        // animation can never latch `has_active_animations` on `t = 0` forever.
+        if !self.clock_set {
+            return Value::Float(f64::from(target_val));
+        }
         let Ok(curve) = crate::interp::anim::resolve_curve(anim) else {
             // The checker already reported this; render the target inertly.
             return Value::Float(f64::from(target_val));
@@ -2332,7 +2356,13 @@ impl Interpreter {
         // Keep the curve in sync (a hot-reload may have edited it).
         motion.curve = packed;
         let sampled = motion.sample(now);
-        let settled = motion.is_settled(now);
+        // `Motion::DEFAULT_EPS_*` are pixel-scaled (0.5), far too loose for the
+        // ratio/opacity/radian props that also animate through this one generic
+        // path — with them an ease-out could read "settled" while still visibly
+        // short of the target. Use tight, unit-agnostic epsilons: position is
+        // the final-value accuracy gate; the velocity gate keeps a spring's
+        // overshoot alive instead of freezing it at the first target crossing.
+        let settled = motion.is_settled_with_eps(now, ANIM_SETTLE_EPS_POS, ANIM_SETTLE_EPS_VEL);
         if !settled {
             self.any_active = true;
         }
@@ -3136,6 +3166,32 @@ mod tests {
         assert!(
             !interp.has_active_animations(),
             "settles once the ramp completes"
+        );
+    }
+
+    #[test]
+    fn animation_is_inert_until_the_clock_is_advanced() {
+        // A host that never advances the clock must resolve the value to its
+        // target and never mark it active — otherwise a wait-based runner would
+        // spin forever redrawing a motion pinned at t=0.
+        let parsed = parse(
+            "View V() { var on: Bool = true \
+             Box #[bg: 0x808080, width: 10, height: 10, \
+             scale: on ? 2.0 : 1.0 with anim.spring()] }",
+        );
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (frame.instances()[0].transform.scale[0] - 2.0).abs() < 1e-6,
+            "with no clock the value jumps straight to its target"
+        );
+        assert!(
+            !interp.has_active_animations(),
+            "an un-advanced clock must never leave an animation active"
         );
     }
 
