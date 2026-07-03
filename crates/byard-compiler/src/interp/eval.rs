@@ -578,6 +578,7 @@ impl Interpreter {
                         &flat_ids,
                         &mut flat_idx,
                         parent_rect,
+                        1.0,
                     );
                 }
             }
@@ -669,6 +670,7 @@ impl Interpreter {
     }
 
     #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_arguments)]
     fn render_node_with_atlas(
         &mut self,
         node: &RenderNode,
@@ -677,6 +679,11 @@ impl Interpreter {
         flat_ids: &[byard_core::atlas::layout::AtlasNodeId],
         flat_idx: &mut usize,
         parent_rect: crate::interp::intrinsics::Rect,
+        // Opacity inherited from ancestors (RFC-0011 T4 approximation): folded
+        // into this element's own `opacity` and multiplied into the alpha of
+        // every primitive it emits, so a translucent parent dims its text and
+        // widgets too — not only its own background.
+        inherited_opacity: f32,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
@@ -702,12 +709,14 @@ impl Interpreter {
                         self.eval_int_prop(attrs, "size")
                             .or(typo_size)
                             .unwrap_or(self.theme.font_size as i64) as f32;
+                    let mut rgba = super::intrinsics::color_to_rgba(color, false);
+                    rgba[3] *= inherited_opacity;
                     frame.push_text(byard_core::TextLine {
                         x: rect.x,
                         y: rect.y,
                         text,
                         font_size: size,
-                        color: super::intrinsics::color_to_rgba(color, false),
+                        color: rgba,
                         dirty: true,
                     });
 
@@ -736,6 +745,10 @@ impl Interpreter {
                 bound_sig,
             } => {
                 let mut current_rect = parent_rect;
+                // Opacity children inherit from this box: its effective opacity
+                // when it has a resolved rect (set below), else whatever it
+                // inherited unchanged.
+                let mut child_opacity = inherited_opacity;
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     current_rect = crate::interp::intrinsics::Rect::new(
                         rect.x,
@@ -766,9 +779,15 @@ impl Interpreter {
                             Some(_) => (3.0, 8.0, Some(0x5500_0000)),
                         };
                     let shadow_dx = 0.0_f32;
-                    let opacity = self
-                        .eval_float_prop(attrs, "opacity")
-                        .map_or(1.0, |v| v as f32);
+                    // The element's *effective* opacity: its own `opacity` prop
+                    // folded with whatever it inherited (RFC-0011 T4). Used for
+                    // this box's own fill and passed down so children (a Button's
+                    // label, a widget's visuals) dim with it.
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
+                    child_opacity = opacity;
                     let is_decorated = border_width > 0.0
                         || shadow_blur > 0.0
                         || (opacity - 1.0).abs() > f32::EPSILON;
@@ -857,6 +876,7 @@ impl Interpreter {
                                 hit_rect,
                                 elem_idx,
                                 transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -868,6 +888,7 @@ impl Interpreter {
                                 hit_rect,
                                 elem_idx,
                                 transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -879,6 +900,7 @@ impl Interpreter {
                                 hit_rect,
                                 elem_idx,
                                 transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -927,6 +949,7 @@ impl Interpreter {
                         flat_ids,
                         flat_idx,
                         current_rect,
+                        child_opacity,
                     );
                 }
             }
@@ -938,9 +961,10 @@ impl Interpreter {
                         .unwrap_or_default();
                     let fit = self.eval_fit_prop(attrs);
                     let radii = self.resolve_radii(attrs, "radius");
-                    let opacity = self
-                        .eval_float_prop(attrs, "opacity")
-                        .map_or(1.0, |v| v as f32);
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
                     frame.push_texture(byard_core::frame::TextureSampler {
                         rect: [rect.x, rect.y, rect.width, rect.height],
                         src: src_val,
@@ -969,6 +993,7 @@ impl Interpreter {
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
         transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
@@ -986,7 +1011,7 @@ impl Interpreter {
         let radius = rect.h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [rect.x, rect.y, rect.w, rect.h],
-            color: track_color,
+            color: dim_alpha(track_color, opacity),
             radii: [radius; 4],
             transform,
         });
@@ -1002,7 +1027,7 @@ impl Interpreter {
         };
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
             radii: [thumb_size / 2.0; 4],
             transform,
         });
@@ -1029,6 +1054,7 @@ impl Interpreter {
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
         transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         // Keep the authored `f64` values for the value-write path: computing the
@@ -1065,7 +1091,7 @@ impl Interpreter {
         let track_r = track_h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [rect.x, track_y, rect.w, track_h],
-            color: [0.40, 0.42, 0.48, 1.0],
+            color: dim_alpha([0.40, 0.42, 0.48, 1.0], opacity),
             radii: [track_r; 4],
             transform,
         });
@@ -1075,7 +1101,7 @@ impl Interpreter {
         if fill_w > 0.0 {
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, track_y, fill_w, track_h],
-                color: accent_rgba,
+                color: dim_alpha(accent_rgba, opacity),
                 radii: [track_r; 4],
                 transform,
             });
@@ -1088,14 +1114,14 @@ impl Interpreter {
         let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
-            color: accent_rgba,
+            color: dim_alpha(accent_rgba, opacity),
             radii: [thumb_size / 2.0; 4],
             transform,
         });
         let inner = thumb_size - 5.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
             radii: [inner / 2.0; 4],
             transform,
         });
@@ -1149,6 +1175,7 @@ impl Interpreter {
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
         transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let placeholder = self.eval_str_prop(attrs, "placeholder").unwrap_or_default();
@@ -1179,7 +1206,10 @@ impl Interpreter {
             let bar_h = 2.0_f32;
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
-                color: super::intrinsics::color_to_rgba(self.theme.primary, false),
+                color: dim_alpha(
+                    super::intrinsics::color_to_rgba(self.theme.primary, false),
+                    opacity,
+                ),
                 radii: [0.0; 4],
                 transform,
             });
@@ -1198,7 +1228,7 @@ impl Interpreter {
                 y: text_y,
                 text: display_text.clone(),
                 font_size,
-                color: super::intrinsics::color_to_rgba(text_color, false),
+                color: dim_alpha(super::intrinsics::color_to_rgba(text_color, false), opacity),
                 dirty: true,
             });
         }
@@ -1212,7 +1242,7 @@ impl Interpreter {
             };
             frame.push_instance(byard_core::BoxInstance {
                 rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
-                color: [1.0, 1.0, 1.0, 1.0],
+                color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
                 radii: [0.0; 4],
                 transform,
             });
@@ -2542,6 +2572,14 @@ fn spacing_value(v: &Value) -> Option<f32> {
     }
 }
 
+/// Multiplies a colour's alpha by `opacity` — folds an element's effective
+/// opacity into the widget/text primitives it emits so a translucent control
+/// dims as a whole, not just its background (RFC-0011 T4 approximation).
+fn dim_alpha(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
+    color[3] *= opacity;
+    color
+}
+
 /// Converts a packed `0xRRGGBB` colour to OKLab `[L, a, b]` for perceptually
 /// uniform interpolation (RFC-0010 A3).
 #[allow(
@@ -3399,6 +3437,34 @@ mod tests {
         assert!(
             !interp.has_active_animations(),
             "an un-advanced clock must never leave an animation active"
+        );
+    }
+
+    #[test]
+    fn opacity_dims_descendant_text_not_only_the_background() {
+        // Regression: a translucent Button dims its *label* too, not just its
+        // background — `opacity` folds into the alpha of every primitive the
+        // element and its descendants emit.
+        let parsed = parse(
+            "View V() { var c: Int = 0 \
+             Button(\"x\") #[bg: 0x6495ED, opacity: 0.4, width: 100, height: 44] => c++ }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let label = frame
+            .texts()
+            .iter()
+            .find(|t| t.text == "x")
+            .expect("the button's label was emitted");
+        assert!(
+            (label.color[3] - 0.4).abs() < 1e-3,
+            "label alpha should inherit the 0.4 opacity, got {}",
+            label.color[3]
         );
     }
 
