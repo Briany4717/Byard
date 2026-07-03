@@ -143,7 +143,7 @@ On every save, the view's shape is diffed: reactive-compatible patches apply
 instantly (signal state preserved); structure-incompatible patches are held past
 any in-flight pointer gesture, then applied cleanly.
 
-The foundational design is specified across six RFCs in [`docs/rfcs/`](docs/rfcs/):
+The foundational design is specified across the core RFCs 0001–0006 in [`docs/rfcs/`](docs/rfcs/):
 
 | RFC | Topic |
 |-----|-------|
