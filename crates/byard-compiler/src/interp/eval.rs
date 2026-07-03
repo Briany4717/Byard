@@ -24,7 +24,8 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StrPart, ViewDecl,
+    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StateBlock, StrPart,
+    StyleStateKind, ViewDecl,
 };
 use crate::symbol::Symbol;
 
@@ -64,6 +65,19 @@ fn round_to_decimals(val: f64, decimals: i32) -> f64 {
     (val * factor).round() / factor
 }
 
+/// A resolved first-class style value (RFC-0016): a flat base attribute set
+/// plus its `on <state> { … }` interaction-state blocks. Produced by
+/// [`Interpreter::resolve_style_expr`] from a `style { … }` value, a `let`-bound
+/// style name, or a `merge` of two styles. Static and view-scoped — no cascade.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyleDef {
+    /// The base attributes, last-write-wins in written order.
+    pub base: Vec<Attr>,
+    /// The state blocks, in written order (a later block of the same state
+    /// wins, which is how `merge` layers the right operand over the left).
+    pub states: Vec<StateBlock>,
+}
+
 /// A lowered render-tree node: the interpreter's plan for one element. Reactive
 /// fields are reactive-scope ids the engine reads each tick (M14).
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +88,9 @@ pub enum RenderNode {
         name: Symbol,
         /// Styling attributes.
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016), overlaid onto `attrs` at render
+        /// time when their engine state is active. Empty for the common case.
+        state_blocks: Vec<StateBlock>,
         /// Child render nodes.
         children: Vec<RenderNode>,
         /// Event shorthand action.
@@ -85,6 +102,8 @@ pub enum RenderNode {
     Text {
         /// Styling attributes.
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016) overlaid at render time.
+        state_blocks: Vec<StateBlock>,
         /// The reactive scope projecting the text content.
         content: ScopeId,
     },
@@ -94,6 +113,8 @@ pub enum RenderNode {
     Image {
         /// Styling attributes (width, height, fit, radii, opacity, …).
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016) overlaid at render time.
+        state_blocks: Vec<StateBlock>,
         /// The reactive scope that evaluates to the image source path/URL.
         src: ScopeId,
     },
@@ -158,9 +179,10 @@ pub struct Interpreter {
     /// [`has_active_animations`]: Self::has_active_animations
     any_active: bool,
     /// First-class style values (RFC-0016): `let name = style { … }` registers
-    /// its attributes here, and a `..name` spread on an element splices them in
-    /// at lower time. Static and view-scoped — no cascade.
-    styles: std::collections::HashMap<Symbol, Vec<Attr>>,
+    /// its base attributes and `on <state>` blocks here, and a `..name` spread
+    /// on an element splices them in at lower time. Static and view-scoped — no
+    /// cascade.
+    styles: std::collections::HashMap<Symbol, StyleDef>,
 }
 
 impl Interpreter {
@@ -247,8 +269,8 @@ impl Interpreter {
                 // memo; a `..x` spread splices its attributes at lower time.
                 if matches!(init, Expr::StyleValue { .. } | Expr::Merge { .. }) {
                     match self.resolve_style_expr(init) {
-                        Some(attrs) => {
-                            self.styles.insert(name.clone(), attrs);
+                        Some(def) => {
+                            self.styles.insert(name.clone(), def);
                         }
                         None => self
                             .errors
@@ -428,9 +450,14 @@ impl Interpreter {
         // RFC-0016: expand `..style` spreads into a flat attribute set *before*
         // validating or lowering, so everything downstream sees ordinary
         // resolved attributes (and a spread can never leak into the checker).
-        let attrs = self.expand_style_spreads(&el.attrs);
+        let (attrs, state_blocks) = self.expand_style_spreads(&el.attrs);
+        // Validate the base *and* every state block's attributes against the
+        // intrinsic's contract (an `on hover { bg: … }` must obey the same §5
+        // rules as an inline `bg:`); the state attrs are validation-only and do
+        // not affect the emitted base set.
+        let to_validate = attrs_with_states(&attrs, &state_blocks);
         self.errors
-            .extend(validate_element(el, &attrs, known_views));
+            .extend(validate_element(el, &to_validate, known_views));
         match el.name.as_str() {
             "Text" | "Button" if !el.content.is_empty() => {
                 let content = self.bind_value(&el.content[0].value);
@@ -439,15 +466,21 @@ impl Interpreter {
                     RenderNode::Box {
                         name: Symbol::intern("Button"),
                         attrs,
+                        state_blocks,
                         children: vec![RenderNode::Text {
                             attrs: Vec::new(),
+                            state_blocks: Vec::new(),
                             content,
                         }],
                         action: el.action.clone(),
                         bound_sig: None,
                     }
                 } else {
-                    RenderNode::Text { attrs, content }
+                    RenderNode::Text {
+                        attrs,
+                        state_blocks,
+                        content,
+                    }
                 }
             }
             "Spacer" => RenderNode::Spacer,
@@ -459,7 +492,11 @@ impl Interpreter {
                     |c| c.value.clone(),
                 );
                 let src = self.bind_value(&src_expr);
-                RenderNode::Image { attrs, src }
+                RenderNode::Image {
+                    attrs,
+                    state_blocks,
+                    src,
+                }
             }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
@@ -467,6 +504,7 @@ impl Interpreter {
                 RenderNode::Box {
                     name: el.name.clone(),
                     attrs,
+                    state_blocks,
                     children: Vec::new(),
                     action: el.action.clone(),
                     bound_sig,
@@ -478,6 +516,7 @@ impl Interpreter {
                 RenderNode::Box {
                     name: el.name.clone(),
                     attrs,
+                    state_blocks,
                     children,
                     action: el.action.clone(),
                     bound_sig: None,
@@ -492,22 +531,26 @@ impl Interpreter {
     /// override every spread. The common, spread-free case returns a plain
     /// clone with no work. A spread that doesn't resolve to a known style is a
     /// [`CompileError::NotAStyle`].
-    fn expand_style_spreads(&mut self, attrs: &[Attr]) -> Vec<Attr> {
+    fn expand_style_spreads(&mut self, attrs: &[Attr]) -> (Vec<Attr>, Vec<StateBlock>) {
         if !attrs
             .iter()
             .any(|a| matches!(a.kind, AttrKind::Spread { .. }))
         {
-            return attrs.to_vec();
+            return (attrs.to_vec(), Vec::new());
         }
         let mut resolved: Vec<Attr> = Vec::new();
-        // 1) Spreads first, in written order.
+        let mut states: Vec<StateBlock> = Vec::new();
+        // 1) Spreads first, in written order. Each spread contributes its base
+        //    attributes (last-write-wins) and appends its `on <state>` blocks
+        //    (a later spread's block of the same state wins at resolve time).
         for a in attrs {
             if let AttrKind::Spread { value } = &a.kind {
                 match self.resolve_style_expr(value) {
-                    Some(spread_attrs) => {
-                        for sa in spread_attrs {
+                    Some(def) => {
+                        for sa in def.base {
                             override_attr(&mut resolved, sa);
                         }
+                        states.extend(def.states);
                     }
                     None => self.errors.push(CompileError::NotAStyle { span: a.span }),
                 }
@@ -519,22 +562,30 @@ impl Interpreter {
                 override_attr(&mut resolved, a.clone());
             }
         }
-        resolved
+        (resolved, states)
     }
 
-    /// Resolves a spread's expression to a style's attributes: a `let`-bound
-    /// style name, or an inline `style { … }` value.
-    fn resolve_style_expr(&self, value: &Expr) -> Option<Vec<Attr>> {
+    /// Resolves a style expression to a [`StyleDef`] (base attributes + state
+    /// blocks): a `let`-bound style name, an inline `style { … }` value, or a
+    /// `merge` of two styles.
+    fn resolve_style_expr(&self, value: &Expr) -> Option<StyleDef> {
         match value {
             Expr::Ident(name, _) => self.styles.get(name).cloned(),
-            Expr::StyleValue { attrs, .. } => Some(attrs.clone()),
-            // `a merge b` (RFC-0016): the right style overrides the left.
+            Expr::StyleValue { attrs, states, .. } => Some(StyleDef {
+                base: attrs.clone(),
+                states: states.clone(),
+            }),
+            // `a merge b` (RFC-0016): the right style overrides the left — its
+            // base attributes overlay last-write-wins, and its state blocks are
+            // appended so a later block of the same state wins at resolve time.
             Expr::Merge { left, right, .. } => {
-                let mut base = self.resolve_style_expr(left)?;
-                for a in self.resolve_style_expr(right)? {
-                    override_attr(&mut base, a);
+                let mut def = self.resolve_style_expr(left)?;
+                let over = self.resolve_style_expr(right)?;
+                for a in over.base {
+                    override_attr(&mut def.base, a);
                 }
-                Some(base)
+                def.states.extend(over.states);
+                Some(def)
             }
             _ => None,
         }
@@ -675,7 +726,7 @@ impl Interpreter {
                 flat_ids.push(id);
                 Ok(id)
             }
-            RenderNode::Text { attrs, content } => {
+            RenderNode::Text { attrs, content, .. } => {
                 let text = match self.binding_value(*content) {
                     Some(Value::Str(s)) => s,
                     other => other.map_or_else(String::new, |v| format!("{v:?}")),
@@ -761,8 +812,21 @@ impl Interpreter {
 
         match node {
             RenderNode::Spacer => {}
-            RenderNode::Text { attrs, content } => {
+            RenderNode::Text {
+                attrs,
+                state_blocks,
+                content,
+            } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // RFC-0016: overlay any active `on <state>` block against the
+                    // live engine mask before reading paint properties.
+                    let elem_idx = self.atlas.node_index(atlas_node);
+                    let state = elem_idx
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let attrs = resolve_state_attrs(attrs, state_blocks, state);
+                    let attrs = attrs.as_ref();
                     let text = match self.binding_value(*content) {
                         Some(Value::Str(s)) => s,
                         other => other.map_or_else(String::new, |v| format!("{v:?}")),
@@ -803,7 +867,6 @@ impl Interpreter {
                         );
                         let hit_rect =
                             crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect);
-                        let elem_idx = self.atlas.node_index(atlas_node);
                         self.register_event_attrs(attrs, hit_rect, elem_idx);
                     }
                 }
@@ -811,6 +874,7 @@ impl Interpreter {
             RenderNode::Box {
                 name,
                 attrs,
+                state_blocks,
                 children,
                 action,
                 bound_sig,
@@ -827,23 +891,45 @@ impl Interpreter {
                         rect.width,
                         rect.height,
                     );
+                    let elem_idx = self.atlas.node_index(atlas_node);
+                    // RFC-0012 S5: a `disabled:` element still lays out and paints,
+                    // but the router gates every handler it registers below and
+                    // reports the `DISABLED` interaction state. Marked here, before
+                    // resolving state styles, so an `on disabled { … }` block takes
+                    // effect on the very frame the element becomes disabled.
+                    if self.eval_bool_prop(attrs, "disabled") == Some(true) {
+                        if let Some(idx) = elem_idx {
+                            self.router.set_disabled(idx);
+                        }
+                    }
+                    // RFC-0016: overlay any active `on <state>` block over the
+                    // base attributes against the live engine `StyleState` mask
+                    // *before* reading paint properties. Stateless boxes borrow
+                    // `attrs` unchanged (no clone). The base `attrs` still drive
+                    // event/handler registration below so hit targets are stable.
+                    let paint_state = elem_idx
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let paint_attrs = resolve_state_attrs(attrs, state_blocks, paint_state);
+                    let paint_attrs = paint_attrs.as_ref();
                     // Resolve the paint-time transform once, up front, so it can
                     // be applied both to a plain container's `bg` fill *and* to
                     // the self-owned visuals of `Toggle`/`Slider`/`TextField`
                     // (their track/fill/thumb/underline/caret are the element's
                     // own quads, so RFC-0011's element-local transform applies to
                     // them exactly as it does to a `Box` fill).
-                    let transform = self.resolve_transform(attrs, current_rect);
-                    let bg = self.eval_color_prop(attrs, "bg");
-                    let radii = self.resolve_radii(attrs, "radius");
+                    let transform = self.resolve_transform(paint_attrs, current_rect);
+                    let bg = self.eval_color_prop(paint_attrs, "bg");
+                    let radii = self.resolve_radii(paint_attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
                     // draws a 2px ring of that colour.
-                    let border_color = self.eval_color_prop(attrs, "border");
+                    let border_color = self.eval_color_prop(paint_attrs, "border");
                     let border_width = if border_color.is_some() { 2.0 } else { 0.0 };
                     // `shadow` is a token (`sm`/`md`/`lg`) → an offset+blur drop
                     // shadow; any other non-empty value falls back to `md`.
                     let (shadow_dy, shadow_blur, shadow_color) =
-                        match self.eval_str_prop(attrs, "shadow").as_deref() {
+                        match self.eval_str_prop(paint_attrs, "shadow").as_deref() {
                             Some("sm") => (1.0_f32, 3.0_f32, Some(0x4400_0000_i64)),
                             Some("lg") => (6.0, 16.0, Some(0x6600_0000)),
                             Some("none") | None => (0.0, 0.0, None),
@@ -856,7 +942,7 @@ impl Interpreter {
                     // label, a widget's visuals) dim with it.
                     let opacity = inherited_opacity
                         * self
-                            .eval_float_prop(attrs, "opacity")
+                            .eval_float_prop(paint_attrs, "opacity")
                             .map_or(1.0, |v| v as f32);
                     child_opacity = opacity;
                     let is_decorated = border_width > 0.0
@@ -926,14 +1012,15 @@ impl Interpreter {
                     let element_name = name.as_str();
                     let hit_rect =
                         crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
-                    let elem_idx = self.atlas.node_index(atlas_node);
 
-                    // RFC-0012 S5: a `disabled:` element still lays out and paints,
-                    // but the router gates every handler it registers below and
-                    // reports the `DISABLED` interaction state.
-                    if self.eval_bool_prop(attrs, "disabled") == Some(true) {
-                        if let Some(idx) = elem_idx {
-                            self.router.set_disabled(idx);
+                    // RFC-0016: an element that styles `on hover`/`on pressed` but
+                    // registers no handler still needs the engine to track the
+                    // pointer over it, so register a bare hover/press hit region.
+                    if let Some(idx) = elem_idx {
+                        if state_blocks.iter().any(|sb| {
+                            matches!(sb.state, StyleStateKind::Hover | StyleStateKind::Pressed)
+                        }) {
+                            self.router.track_region(idx, hit_rect);
                         }
                     }
 
@@ -1024,8 +1111,22 @@ impl Interpreter {
                     );
                 }
             }
-            RenderNode::Image { attrs, src } => {
+            RenderNode::Image {
+                attrs,
+                state_blocks,
+                src,
+            } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // RFC-0016: overlay active `on <state>` blocks before reading
+                    // paint properties (fit/radius/opacity).
+                    let state = self
+                        .atlas
+                        .node_index(atlas_node)
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let attrs = resolve_state_attrs(attrs, state_blocks, state);
+                    let attrs = attrs.as_ref();
                     let src_val = self
                         .binding_value(*src)
                         .and_then(|v| if let Value::Str(s) = v { Some(s) } else { None })
@@ -2663,6 +2764,67 @@ fn override_attr(set: &mut Vec<Attr>, attr: Attr) {
     }
 }
 
+/// Builds a flat attribute list for *validation only* (RFC-0016): the base
+/// attributes followed by every `on <state>` block's attributes, so a state
+/// block's `bg:`/`scale:`/… is checked against the intrinsic's §5 contract just
+/// like an inline attribute. Never emitted — rendering keeps base and states
+/// separate so states resolve per-frame against the live mask.
+fn attrs_with_states(base: &[Attr], states: &[StateBlock]) -> Vec<Attr> {
+    if states.is_empty() {
+        return base.to_vec();
+    }
+    let mut all = base.to_vec();
+    for sb in states {
+        all.extend(sb.attrs.iter().cloned());
+    }
+    all
+}
+
+/// Resolves an element's effective attributes for the current interaction state
+/// (RFC-0016 §"Resolution order"): the base set overlaid, last-wins, with each
+/// active `on <state>` block in **ascending** priority so the highest-priority
+/// active state wins — `hover < focused < pressed < disabled`. Blocks of the
+/// same state apply in written order (this is how `merge`/spread layering wins).
+///
+/// The common stateless case (no blocks) borrows the base with no allocation.
+fn resolve_state_attrs<'a>(
+    base: &'a [Attr],
+    state_blocks: &[StateBlock],
+    active: crate::interp::events::StyleState,
+) -> std::borrow::Cow<'a, [Attr]> {
+    use crate::interp::events::StyleState;
+    // Fixed ascending-priority order: a later state in this list overrides an
+    // earlier one when both are active (RFC-0012 S3 / RFC-0016).
+    const ORDER: [(StyleStateKind, StyleState); 4] = [
+        (StyleStateKind::Hover, StyleState::HOVER),
+        (StyleStateKind::Focused, StyleState::FOCUSED),
+        (StyleStateKind::Pressed, StyleState::PRESSED),
+        (StyleStateKind::Disabled, StyleState::DISABLED),
+    ];
+    if state_blocks.is_empty() {
+        return std::borrow::Cow::Borrowed(base);
+    }
+    let mut resolved = base.to_vec();
+    let mut touched = false;
+    for (kind, bit) in ORDER {
+        if !active.contains(bit) {
+            continue;
+        }
+        for sb in state_blocks.iter().filter(|sb| sb.state == kind) {
+            for a in &sb.attrs {
+                override_attr(&mut resolved, a.clone());
+            }
+            touched = true;
+        }
+    }
+    if touched {
+        std::borrow::Cow::Owned(resolved)
+    } else {
+        // No active block matched — avoid handing back a needless clone.
+        std::borrow::Cow::Borrowed(base)
+    }
+}
+
 /// Multiplies a colour's alpha by `opacity` — folds an element's effective
 /// opacity into the widget/text primitives it emits so a translucent control
 /// dims as a whole, not just its background (RFC-0011 T4 approximation).
@@ -3616,6 +3778,145 @@ mod tests {
         );
         // …while `radius` (only on the base) survives (radii != 0).
         assert!(inst.radii[0] > 0.0, "base radius survives the merge");
+    }
+
+    #[test]
+    fn resolve_state_attrs_applies_priority_disabled_wins() {
+        // RFC-0016 resolution order: `disabled > pressed > focused > hover`.
+        use crate::interp::events::StyleState;
+        let sp = crate::diagnostics::Span::new(0, 0);
+        let prop = |name: &str, v: i64| Attr {
+            name: Symbol::intern(name),
+            axis: None,
+            kind: AttrKind::Prop {
+                value: Expr::IntLit(v, sp),
+            },
+            span: sp,
+        };
+        let base = vec![prop("bg", 1)];
+        let blocks = vec![
+            StateBlock {
+                state: StyleStateKind::Hover,
+                attrs: vec![prop("bg", 2)],
+                span: sp,
+            },
+            StateBlock {
+                state: StyleStateKind::Disabled,
+                attrs: vec![prop("bg", 3)],
+                span: sp,
+            },
+        ];
+
+        // No state active → base survives, and the borrow is cheap (no clone).
+        let none = resolve_state_attrs(&base, &blocks, StyleState::empty());
+        assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(find_int(&none, "bg"), Some(1));
+
+        // Hover alone → the hover block overlays.
+        let hov = resolve_state_attrs(&base, &blocks, StyleState::HOVER);
+        assert_eq!(find_int(&hov, "bg"), Some(2));
+
+        // Hover *and* disabled → disabled wins (highest priority).
+        let both = resolve_state_attrs(
+            &base,
+            &blocks,
+            StyleState::HOVER.union(StyleState::DISABLED),
+        );
+        assert_eq!(find_int(&both, "bg"), Some(3));
+    }
+
+    fn find_int(attrs: &[Attr], name: &str) -> Option<i64> {
+        attrs
+            .iter()
+            .find(|a| a.name == Symbol::intern(name))
+            .and_then(|a| match &a.kind {
+                AttrKind::Prop {
+                    value: Expr::IntLit(n, _),
+                } => Some(*n),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn disabled_state_block_recolours_in_the_same_frame() {
+        // A `disabled:` box with an `on disabled { bg }` block resolves the
+        // DISABLED state on the very frame it renders (the router is marked
+        // before state styles resolve), so the disabled bg wins immediately.
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x111111 on disabled { bg: 0x445566 } } \
+             Box #[..btn, disabled: true, width: 40, height: 20] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let inst = frame.instances()[0];
+        assert!(
+            (inst.color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "disabled bg overlays the base, got {:?}",
+            inst.color
+        );
+    }
+
+    #[test]
+    fn hover_state_block_recolours_after_pointer_enters() {
+        // RFC-0016: an `on hover { bg }` block lights up once the pointer moves
+        // over the element — even though the element registers no handler of its
+        // own (it is tracked as a bare hover region).
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x111111 on hover { bg: 0x445566 } } \
+             Box #[..btn, width: 40, height: 20] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        // First frame: pointer hasn't entered, base bg (0x11 red channel).
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (frame.instances()[0].color[0] - f32::from(0x11u8) / 255.0).abs() < 1e-3,
+            "base bg before hover, got {:?}",
+            frame.instances()[0].color
+        );
+
+        // Move the pointer inside the box, then re-render.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerMove,
+            pos: (10.0, 10.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+        let mut frame2 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame2, 400.0, 300.0);
+        assert!(
+            (frame2.instances()[0].color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "hover bg overlays after the pointer enters, got {:?}",
+            frame2.instances()[0].color
+        );
+    }
+
+    #[test]
+    fn unknown_state_name_is_an_error_with_a_hint() {
+        let parsed =
+            parse("View V() { let s = style { bg: 1 on hoover { bg: 2 } } Box #[..s] {} }");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownStyleState { .. })),
+            "an unknown state name must be an UnknownStyleState error, got {:?}",
+            parsed.errors
+        );
     }
 
     #[test]

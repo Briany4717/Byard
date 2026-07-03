@@ -492,3 +492,22 @@ fn error_recovery_collects_multiple_diagnostics() {
     assert_eq!(parsed.views.len(), 1);
     assert_eq!(parsed.views[0].body.len(), 2);
 }
+
+#[test]
+fn style_value_captures_base_attrs_and_state_blocks() {
+    // RFC-0016: `style { … on <state> { … } }` collects base attributes and
+    // interaction-state blocks into `Expr::StyleValue`.
+    let view = one_view(
+        "View V() {\n let b = style { bg: 1 on hover { bg: 2 } on pressed { scale: 0.97 } }\n}",
+    );
+    let Member::Let { init, .. } = &view.body[0] else {
+        panic!("expected a let binding, got {:?}", view.body[0]);
+    };
+    let Expr::StyleValue { attrs, states, .. } = init else {
+        panic!("expected a StyleValue, got {init:?}");
+    };
+    assert_eq!(attrs.len(), 1, "one base attribute");
+    assert_eq!(states.len(), 2, "two state blocks");
+    assert_eq!(states[0].state, StyleStateKind::Hover);
+    assert_eq!(states[1].state, StyleStateKind::Pressed);
+}

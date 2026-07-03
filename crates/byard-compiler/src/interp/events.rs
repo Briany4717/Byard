@@ -175,6 +175,12 @@ impl StyleState {
         self.0 & other.0 == other.0
     }
 
+    /// The union of two states (every flag set in either).
+    #[must_use]
+    pub const fn union(self, other: StyleState) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// The raw bits (for a resolver's `(class, state)` keying).
     #[must_use]
     pub const fn bits(self) -> u8 {
@@ -201,6 +207,12 @@ pub struct EventRouter {
     /// Rebuilt every render like the handler set; a disabled element reports the
     /// `DISABLED` state and never dispatches an action.
     disabled: std::collections::HashSet<u32>,
+    /// Hit regions of elements that carry `on hover`/`on pressed` style blocks
+    /// but register no event handler of their own (RFC-0016). They take part in
+    /// hover/press hit-testing so [`style_state`](Self::style_state) reports the
+    /// pointer state a purely-declarative interactive style depends on. Rebuilt
+    /// every render like the handler set.
+    hover_regions: Vec<(u32, Rect)>,
 }
 
 impl EventRouter {
@@ -219,6 +231,14 @@ impl EventRouter {
         self.handlers.clear();
         self.focusables.clear();
         self.disabled.clear();
+        self.hover_regions.clear();
+    }
+
+    /// Registers `elem`'s `rect` as a hover/press hit region (RFC-0016) so an
+    /// element styled with `on hover`/`on pressed` but no event handler still
+    /// reports those interaction states. Rebuilt every render.
+    pub fn track_region(&mut self, elem: u32, rect: Rect) {
+        self.hover_regions.push((elem, rect));
     }
 
     /// Marks `elem` disabled for this tick (RFC-0012 S5): it reports the
@@ -568,6 +588,15 @@ impl EventRouter {
             .rev()
             .find(|h| contains(h.rect, pos))
             .map(|h| h.elem)
+            // Fall back to declarative hover/press regions (RFC-0016) for
+            // elements that style interaction states but register no handler.
+            .or_else(|| {
+                self.hover_regions
+                    .iter()
+                    .rev()
+                    .find(|(_, rect)| contains(*rect, pos))
+                    .map(|(elem, _)| *elem)
+            })
     }
 
     fn focusable_at(
