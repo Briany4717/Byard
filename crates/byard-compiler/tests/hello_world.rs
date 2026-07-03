@@ -95,11 +95,11 @@ fn hello_world_renders_reacts_and_hot_reloads() {
     );
 
     // ── hot-reload (case-1 body edit) preserves `count` ────────────────
-    // Identical declaration shape as the demo (var×11, fn, let×2 incl. the
-    // `style` value) → a reactive-compatible (body-only) edit; only the element
-    // tree changes.
+    // Identical declaration shape as the demo (var×11, fn, let×3 incl. the
+    // `style` value and its `merge`) → a reactive-compatible (body-only) edit;
+    // only the element tree changes.
     let edited = parse(
-        "View Main() {\n var count = 0\n var liked = true\n var volume = 0.5\n var name = \"\"\n var note = \"\"\n var hovered = false\n var eventFocused = false\n var pokes = 0\n var wheelTicks = 0\n var scrollTicks = 0\n var cardHovered = false\n fn describe(n: Int) => \"the counter is {n}\"\n let summary = describe(count)\n let chip = style { bg: 0x3C3C52, radius: 6 }\n Column #[bg: 0x222222] {\n Text(\"Total: {count}\")\n }\n}",
+        "View Main() {\n var count = 0\n var liked = true\n var volume = 0.5\n var name = \"\"\n var note = \"\"\n var hovered = false\n var eventFocused = false\n var pokes = 0\n var wheelTicks = 0\n var scrollTicks = 0\n var cardHovered = false\n fn describe(n: Int) => \"the counter is {n}\"\n let summary = describe(count)\n let chip = style { bg: 0x3C3C52, radius: 6 }\n let hotChip = chip merge style { bg: 0x964747 }\n Column #[bg: 0x222222] {\n Text(\"Total: {count}\")\n }\n}",
     );
     let new_view = &edited.views[0];
     let kind = diff_view(&view, new_view);

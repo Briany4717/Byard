@@ -29,6 +29,8 @@ View Main() {
     // A first-class style value (RFC-0016): a named, reusable bundle of
     // attributes, spread onto elements below with `..chip`.
     let chip = style { bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10) }
+    // Composed with `merge` — the accent chip is `chip` with its bg overridden.
+    let hotChip = chip merge style { bg: 0x964747 }
 
     // Two columns side by side → a landscape ~16:9 frame instead of one tall
     // strip. `align: start` keeps both columns pinned to the top.
@@ -90,6 +92,10 @@ View Main() {
                         Box #[..chip] {
                             Text("{tag}") #[color: 0xC9C9D4, size: 13]
                         }
+                    }
+                    // The accent chip spreads the `merge`d style.
+                    Box #[..hotChip] {
+                        Text("gpu") #[color: 0xFFFFFF, size: 13]
                     }
                 }
             }

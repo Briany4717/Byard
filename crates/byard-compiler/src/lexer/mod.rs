@@ -85,6 +85,10 @@ pub enum Token {
     /// value position.
     #[token("with")]
     With,
+    /// `merge` (RFC-0016 M3): the infix style-composition operator —
+    /// `base merge overrides` produces a new `Style` whose right operand wins.
+    #[token("merge")]
+    Merge,
 
     // ---- identifiers & literals ----
     /// An identifier (interned).
@@ -345,7 +349,7 @@ mod tests {
     #[test]
     fn keywords_lex_to_their_tokens() {
         assert_eq!(
-            kinds("View var let fn inject as for in when else style untrack with"),
+            kinds("View var let fn inject as for in when else style untrack with merge"),
             vec![
                 Token::View,
                 Token::Var,
@@ -360,6 +364,7 @@ mod tests {
                 Token::Style,
                 Token::Untrack,
                 Token::With,
+                Token::Merge,
             ]
         );
     }

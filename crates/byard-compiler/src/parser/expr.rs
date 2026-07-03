@@ -162,6 +162,9 @@ impl Parser<'_> {
             // `with` animation operator (RFC-0010): below the ternary, above
             // assignment, so `(cond ? a : b) with anim.spring()` is the value.
             Token::With => Some(Bp { left: 3, right: 3 }),
+            // `merge` style composition (RFC-0016): binds tighter than the
+            // ternary so `a merge b` is a single composed style; right-assoc.
+            Token::Merge => Some(Bp { left: 5, right: 6 }),
             // Assignment (right-assoc), lowest.
             Token::Eq | Token::PlusEq | Token::MinusEq => Some(Bp { left: 2, right: 1 }),
             _ => None,
@@ -228,6 +231,16 @@ impl Parser<'_> {
                 Expr::Animated {
                     value: Box::new(lhs),
                     anim,
+                    span: self.span_from(start),
+                }
+            }
+            // `left merge right` (RFC-0016): compose two styles, right wins.
+            Some(Token::Merge) => {
+                self.advance();
+                let right = Box::new(self.parse_expr(right_bp));
+                Expr::Merge {
+                    left: Box::new(lhs),
+                    right,
                     span: self.span_from(start),
                 }
             }
