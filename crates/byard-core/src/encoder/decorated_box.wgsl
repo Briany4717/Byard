@@ -85,10 +85,12 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
         instance.t_origin,
     );
 
+    // misc.y carries the draw-order depth (NDC-z); the encoder writes it per
+    // instance so decorated boxes honour global paint order against solids/text.
     out.position = vec4<f32>(
         (transformed.x / viewport_size.x) * 2.0 - 1.0,
         1.0 - (transformed.y / viewport_size.y) * 2.0,
-        0.0,
+        instance.misc.y,
         1.0
     );
 

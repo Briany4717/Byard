@@ -14,6 +14,13 @@ struct InstanceInput {
     @location(8) t_opacity: f32,
 };
 
+// Draw-order depth (NDC-z), fed from a separate per-instance vertex buffer so
+// `BoxInstance`'s Pod layout stays unchanged. Earlier-emitted primitives get a
+// value nearer 1.0 (farther); later ones nearer 0.0 (closer). See `draw_depth`.
+struct DepthInput {
+    @location(9) depth: f32,
+};
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     /// Fragment position relative to the rectangle centre, in logical pixels.
@@ -64,7 +71,7 @@ fn apply_transform(
 }
 
 @vertex
-fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
+fn vs_main(vertex: VertexInput, instance: InstanceInput, depth: DepthInput) -> VertexOutput {
     var out: VertexOutput;
 
     let w = instance.rect.z;
@@ -104,7 +111,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.position = vec4<f32>(
         (transformed.x / viewport_size.x) * 2.0 - 1.0,
         1.0 - (transformed.y / viewport_size.y) * 2.0,
-        0.0,
+        depth.depth,
         1.0
     );
 

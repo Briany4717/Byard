@@ -421,6 +421,29 @@ pub struct RenderFrame {
     /// Text lines populated by the Logic thread each tick.
     texts: Vec<TextLine>,
 
+    /// Per-primitive **draw-order depth**, one parallel vec per drawable pool.
+    ///
+    /// The Encoder draws in four type-grouped passes (solids → decorated →
+    /// textures → text), which alone can never honour paint order *across*
+    /// passes — a container's border (decorated) would always sit above its
+    /// children (solids), and text above everything. To fix that coherently we
+    /// stamp every primitive, in global emission order, with a monotonically
+    /// *nearer* NDC-z (see [`draw_depth`]) and let a shared depth buffer
+    /// (cleared to the far plane every frame, `LessEqual` test) resolve
+    /// visibility. Emission order is tree pre-order = the intended painter's
+    /// order, so a later-emitted primitive correctly wins.
+    ///
+    /// Kept as parallel `f32` vecs (not fields on the primitives) so the `Pod`
+    /// instance structs and their vertex layouts stay byte-for-byte unchanged.
+    solid_depths: Vec<f32>,
+    decorated_depths: Vec<f32>,
+    texture_depths: Vec<f32>,
+    text_depths: Vec<f32>,
+
+    /// Running global emission counter, mapped to a depth by [`draw_depth`].
+    /// Reset each [`clear`](Self::clear); advanced by every `push_*` drawable.
+    draw_seq: u32,
+
     /// Monotonic version counter, incremented by the Logic thread whenever any
     /// content in this frame changes relative to the previous tick.
     ///
@@ -433,6 +456,26 @@ pub struct RenderFrame {
     /// the existing atomic frame swap instead of a dedicated channel. Empty
     /// when the `telemetry` feature is off or nothing was profiled this tick.
     telemetry: crate::telemetry::SampleBlock,
+}
+
+/// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
+/// start of every frame. Every drawable's [`draw_depth`] is strictly nearer, so
+/// it passes the `LessEqual` test against this cleared value.
+pub const DRAW_DEPTH_CLEAR: f32 = 1.0;
+
+/// NDC-z granted per emitted primitive. `1/65536` spaces ~65k primitives across
+/// the usable near-1.0 range while staying far above f32 depth resolution
+/// (~6e-8 near 1.0), so adjacent primitives never z-fight.
+const DRAW_DEPTH_STEP: f32 = 1.0 / 65_536.0;
+
+/// Maps a global emission sequence number to a draw-order NDC-z: earlier =
+/// farther (toward `1.0`), later = nearer (toward `0.0`). Saturating, so a
+/// pathologically deep frame clamps to the near plane rather than wrapping.
+#[must_use]
+pub fn draw_depth(seq: u32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let steps = seq.saturating_add(1) as f32 * DRAW_DEPTH_STEP;
+    (DRAW_DEPTH_CLEAR - steps).max(0.0)
 }
 
 impl RenderFrame {
@@ -455,6 +498,11 @@ impl RenderFrame {
         self.decorated.clear();
         self.textures.clear();
         self.texts.clear();
+        self.solid_depths.clear();
+        self.decorated_depths.clear();
+        self.texture_depths.clear();
+        self.text_depths.clear();
+        self.draw_seq = 0;
         self.version = 0;
         // `Vec::clear` only, not `SampleBlock::default()` — the latter would
         // drop the block's existing allocation and defeat the capacity
@@ -469,24 +517,43 @@ impl RenderFrame {
         self.dirty.push(dirty);
     }
 
+    /// Advances the global emission counter and returns the draw-order depth
+    /// (NDC-z) for the primitive about to be pushed. See [`solid_depths`] for
+    /// the ordering model.
+    ///
+    /// [`solid_depths`]: Self::solid_depths
+    fn next_depth(&mut self) -> f32 {
+        let d = draw_depth(self.draw_seq);
+        self.draw_seq = self.draw_seq.saturating_add(1);
+        d
+    }
+
     /// Appends a [`BoxInstance`] to the frame.
     pub fn push_instance(&mut self, instance: BoxInstance) {
+        let d = self.next_depth();
         self.instances.push(instance);
+        self.solid_depths.push(d);
     }
 
     /// Appends a [`DecoratedBox`] (border/shadow/opacity) to the frame (M21).
     pub fn push_decorated(&mut self, d: DecoratedBox) {
+        let depth = self.next_depth();
         self.decorated.push(d);
+        self.decorated_depths.push(depth);
     }
 
     /// Appends a [`TextureSampler`] (image) to the frame (M21).
     pub fn push_texture(&mut self, t: TextureSampler) {
+        let d = self.next_depth();
         self.textures.push(t);
+        self.texture_depths.push(d);
     }
 
     /// Appends a [`TextLine`] to the frame.
     pub fn push_text(&mut self, text: TextLine) {
+        let d = self.next_depth();
         self.texts.push(text);
+        self.text_depths.push(d);
     }
 
     /// Sets the frame's version counter.
@@ -528,6 +595,30 @@ impl RenderFrame {
     #[must_use]
     pub fn texts(&self) -> &[TextLine] {
         &self.texts
+    }
+
+    /// Draw-order depths parallel to [`instances`](Self::instances).
+    #[must_use]
+    pub fn solid_depths(&self) -> &[f32] {
+        &self.solid_depths
+    }
+
+    /// Draw-order depths parallel to [`decorated`](Self::decorated).
+    #[must_use]
+    pub fn decorated_depths(&self) -> &[f32] {
+        &self.decorated_depths
+    }
+
+    /// Draw-order depths parallel to [`textures`](Self::textures).
+    #[must_use]
+    pub fn texture_depths(&self) -> &[f32] {
+        &self.texture_depths
+    }
+
+    /// Draw-order depths parallel to [`texts`](Self::texts).
+    #[must_use]
+    pub fn text_depths(&self) -> &[f32] {
+        &self.text_depths
     }
 
     /// Returns the monotonic version counter for this frame.

@@ -144,7 +144,7 @@ pub async fn build_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(super::draw_depth_stencil()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -169,11 +169,26 @@ pub fn draw(
     bind_group: &wgpu::BindGroup,
     quad_buffer: &wgpu::Buffer,
     boxes: &[DecoratedBox],
+    depths: &[f32],
 ) {
     if boxes.is_empty() {
         return;
     }
-    let instances: Vec<DecoratedInstance> = boxes.iter().map(DecoratedInstance::from).collect();
+    // Stamp each instance's draw-order depth into `misc.y` (the shader reads it
+    // as NDC-z). `depths` is parallel to `boxes`; a short/empty slice falls back
+    // to the far plane so a missing depth can't push a box in front of others.
+    let instances: Vec<DecoratedInstance> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let mut inst = DecoratedInstance::from(b);
+            inst.misc[1] = depths
+                .get(i)
+                .copied()
+                .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR);
+            inst
+        })
+        .collect();
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ByardCore - DecoratedBox Instance Buffer"),
         contents: bytemuck::cast_slice(&instances),
