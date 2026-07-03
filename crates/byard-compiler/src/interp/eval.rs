@@ -146,6 +146,11 @@ pub struct Interpreter {
     /// A mid-flight target change reseeds `from` to the current sampled value
     /// (interruptible springs).
     animations: std::collections::HashMap<Span, byard_core::frame::Motion>,
+    /// Persisted colour-animation state (RFC-0010 A3): one `Motion` per OKLab
+    /// channel (`L`, `a`, `b`), so a `bg`/`color`/`border` transition
+    /// interpolates in a perceptually-uniform space — no muddy mid-points — and
+    /// is interruptible like the scalar props. Keyed by the `with` node's span.
+    color_animations: std::collections::HashMap<Span, [byard_core::frame::Motion; 3]>,
     /// Set true during a render whenever an animation sampled this frame has not
     /// yet settled — the runner reads it (via [`has_active_animations`]) to keep
     /// requesting frames until motion stops (idle → 0 frames).
@@ -1355,15 +1360,70 @@ impl Interpreter {
     }
 
     fn eval_color_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
-        attrs.iter().find_map(|a| {
-            if a.name.as_str() == name {
-                if let AttrKind::Prop { value } = &a.kind {
-                    let val = self.eval_pure(value);
-                    return val.as_int();
-                }
+        // Resolve the matching attribute value; a `with` colour animation
+        // (RFC-0010 A3) is driven through the OKLab path rather than the scalar
+        // one, since a packed `0xRRGGBB` can't be interpolated component-wise.
+        let value = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == name => Some(value),
+            _ => None,
+        })?;
+        if let Expr::Animated {
+            value: target,
+            anim,
+            span,
+        } = value
+        {
+            return Some(self.eval_animated_color(target, anim, *span));
+        }
+        self.eval_pure(value).as_int()
+    }
+
+    /// Drives one colour `with` animation (RFC-0010 A3): interpolates from the
+    /// current colour to the target in OKLab (one [`Motion`] per channel), so
+    /// the transition is perceptually uniform and interruptible. Returns the
+    /// current colour packed as `0xRRGGBB`.
+    ///
+    /// [`Motion`]: byard_core::frame::Motion
+    fn eval_animated_color(&mut self, target: &Expr, anim: &Expr, key: Span) -> i64 {
+        let target_int = self.eval_pure(target).as_int().unwrap_or(0);
+        // Without an advancing clock, jump straight to the target (mirrors the
+        // scalar path — never latch `has_active_animations` on t=0).
+        if !self.clock_set {
+            return target_int;
+        }
+        let Ok(curve) = crate::interp::anim::resolve_curve(anim) else {
+            return target_int;
+        };
+        let packed = pack_curve(curve);
+        let now = self.now_ms;
+        let target_oklab = oklab_from_hex(target_int);
+        let motions = self.color_animations.entry(key).or_insert_with(|| {
+            [0, 1, 2].map(|i| byard_core::frame::Motion {
+                from: target_oklab[i],
+                to: target_oklab[i],
+                start_ms: now,
+                curve: packed,
+            })
+        });
+        let mut current = [0.0_f32; 3];
+        let mut all_settled = true;
+        for (i, m) in motions.iter_mut().enumerate() {
+            if (m.to - target_oklab[i]).abs() > 1e-5 {
+                let here = m.sample(now);
+                m.from = here;
+                m.to = target_oklab[i];
+                m.start_ms = now;
             }
-            None
-        })
+            m.curve = packed;
+            current[i] = m.sample(now);
+            if !m.is_settled_with_eps(now, ANIM_SETTLE_EPS_POS, ANIM_SETTLE_EPS_VEL) {
+                all_settled = false;
+            }
+        }
+        if !all_settled {
+            self.any_active = true;
+        }
+        hex_from_oklab(current)
     }
 
     fn eval_int_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
@@ -2460,6 +2520,68 @@ fn spacing_value(v: &Value) -> Option<f32> {
     }
 }
 
+/// Converts a packed `0xRRGGBB` colour to OKLab `[L, a, b]` for perceptually
+/// uniform interpolation (RFC-0010 A3).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)] // standard colour-space notation
+fn oklab_from_hex(hex: i64) -> [f32; 3] {
+    let r = srgb_to_linear(((hex >> 16) & 0xFF) as f32 / 255.0);
+    let g = srgb_to_linear(((hex >> 8) & 0xFF) as f32 / 255.0);
+    let b = srgb_to_linear((hex & 0xFF) as f32 / 255.0);
+    // Björn Ottosson's linear-sRGB → OKLab.
+    let l = 0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b;
+    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
+    let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+    let (l_, m_, s_) = (l.cbrt(), m.cbrt(), s.cbrt());
+    [
+        0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_,
+        1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_,
+        0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_,
+    ]
+}
+
+/// Converts OKLab `[L, a, b]` back to a packed `0xRRGGBB` colour, clamping any
+/// out-of-gamut result (a spring can overshoot a channel).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names
+)] // standard colour-space notation
+fn hex_from_oklab(lab: [f32; 3]) -> i64 {
+    let [big_l, a, b] = lab;
+    let l_ = big_l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = big_l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = big_l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let r = 4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s;
+    let g = -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s;
+    let bl = -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s;
+    let to_byte = |c: f32| -> i64 { (linear_to_srgb(c).clamp(0.0, 1.0) * 255.0).round() as i64 };
+    (to_byte(r) << 16) | (to_byte(g) << 8) | to_byte(bl)
+}
+
+/// sRGB gamma → linear (per channel).
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear → sRGB gamma (per channel).
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 /// Packs the compiler's typed [`Curve`](crate::interp::anim::Curve) into the
 /// engine's POD [`MotionCurve`](byard_core::frame::MotionCurve) (RFC-0010), so
 /// a resolved curve crosses the frame boundary as plain data.
@@ -3167,6 +3289,69 @@ mod tests {
             !interp.has_active_animations(),
             "settles once the ramp completes"
         );
+    }
+
+    #[test]
+    fn oklab_hex_round_trips_within_one_lsb() {
+        for hex in [
+            0x00_0000_i64,
+            0xFF_FFFF,
+            0x64_95ED,
+            0xEF_4444,
+            0x10_B981,
+            0x80_8080,
+        ] {
+            let back = hex_from_oklab(oklab_from_hex(hex));
+            for shift in [16, 8, 0] {
+                let a = (hex >> shift) & 0xFF;
+                let b = (back >> shift) & 0xFF;
+                assert!(
+                    (a - b).abs() <= 1,
+                    "channel drift for {hex:#08x}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_animation_lerps_color_in_oklab_and_settles() {
+        let parsed = parse(
+            "View V() { var on: Bool = false \
+             Box #[width: 10, height: 10, \
+             bg: on ? 0x000000 : 0xFFFFFF with anim.linear(1000)] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+
+        let render_r = |interp: &mut Interpreter, now: u32| -> f32 {
+            interp.set_now_ms(now);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame.instances()[0].color[0]
+        };
+
+        // At rest the target is white; nothing is animating.
+        assert!((render_r(&mut interp, 0) - 1.0).abs() < 1e-2);
+        assert!(!interp.has_active_animations());
+
+        // Flip toward black: starts near white and is active.
+        let sig = interp.var_signal(&Symbol::intern("on")).unwrap();
+        interp.write_var(sig, Value::Bool(true));
+        interp.tick();
+        let start = render_r(&mut interp, 0);
+        assert!(start > 0.9, "starts near white, got {start}");
+        assert!(interp.has_active_animations());
+
+        // Mid-flight it's a grey between the endpoints, still moving.
+        let mid = render_r(&mut interp, 500);
+        assert!((0.05..0.95).contains(&mid), "mid-flight grey, got {mid}");
+
+        // Arrives at black and settles (idle again).
+        assert!(render_r(&mut interp, 1000) < 1e-2, "arrives black");
+        assert!(!interp.has_active_animations());
     }
 
     #[test]
