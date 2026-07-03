@@ -212,6 +212,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("direction", PropType::Enum(DIRECTION));
         }
         props.insert("focused", PropType::Bool);
+        props.insert("disabled", PropType::Bool);
         Intrinsic {
             arity: 0,
             content: None,
@@ -249,6 +250,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         "Button" => {
             let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS, TRANSFORM]);
             props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
             Intrinsic {
                 arity: 1,
                 content: Some(PropType::Str),
@@ -265,6 +267,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("value", PropType::Str);
             props.insert("bind", PropType::Str);
             props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
             Intrinsic {
                 arity: 0,
                 content: None,
@@ -280,6 +283,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("value", PropType::Bool);
             props.insert("bind", PropType::Bool);
             props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
             Intrinsic {
                 arity: 0,
                 content: None,
@@ -298,6 +302,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("value", PropType::Float);
             props.insert("bind", PropType::Float);
             props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
             Intrinsic {
                 arity: 0,
                 content: None,

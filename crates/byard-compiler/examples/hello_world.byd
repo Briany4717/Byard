@@ -49,6 +49,9 @@ View Main() {
                     Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
                     Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
                     Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
+                    // Disabled (RFC-0012 S5): dimmed and inert — the router gates
+                    // its handler, so clicking it never resets the counter.
+                    Button("reset") #[bg: 0x3C3C52, radius: 10, p: (vertical: 10, horizontal: 14), color: 0xC9C9D4, size: 13, disabled: true, opacity: 0.4] => count = 0
                     Spacer
                     Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
                 }
@@ -109,7 +112,7 @@ View Main() {
                     // (RFC-0010) instead of snapping. Hover on and off to see it
                     // interruptible: reversing mid-flight starts from where it is.
                     Box #[
-                        bg: 0x6495ED,
+                        bg: cardHovered ? 0x6495ED : 0xFFFFFF with anim.spring(),
                         radius: 12,
                         width: 90,
                         height: 56,

@@ -146,6 +146,46 @@ struct DownState {
     secondary: bool,
 }
 
+/// The interaction-state mask of one element (RFC-0012 Part B): the engine-owned
+/// booleans a stateful style layer (a future `on <state> {}`) resolves against,
+/// reported by [`EventRouter::style_state`]. A small bit set rather than four
+/// `bool`s so a whole state can be passed and matched at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StyleState(u8);
+
+impl StyleState {
+    /// The pointer is over the element.
+    pub const HOVER: StyleState = StyleState(1 << 0);
+    /// The element is the target of the in-flight pointer press.
+    pub const PRESSED: StyleState = StyleState(1 << 1);
+    /// The element holds keyboard focus.
+    pub const FOCUSED: StyleState = StyleState(1 << 2);
+    /// The element's `disabled:` prop resolved true.
+    pub const DISABLED: StyleState = StyleState(1 << 3);
+
+    /// The empty state (no interaction flags).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Whether every bit in `other` is set in `self`.
+    #[must_use]
+    pub const fn contains(self, other: StyleState) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The raw bits (for a resolver's `(class, state)` keying).
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    fn insert(&mut self, other: StyleState) {
+        self.0 |= other.0;
+    }
+}
+
 /// Routes input events to registered handlers, on the logic thread.
 #[derive(Default)]
 pub struct EventRouter {
@@ -157,6 +197,10 @@ pub struct EventRouter {
     hovered: Option<u32>,
     /// Time and element of the most recent tap (for double-tap detection, M24).
     last_tap: Option<(u64, Option<u32>)>,
+    /// Elements whose `disabled:` prop resolved true this tick (RFC-0012 S5).
+    /// Rebuilt every render like the handler set; a disabled element reports the
+    /// `DISABLED` state and never dispatches an action.
+    disabled: std::collections::HashSet<u32>,
 }
 
 impl EventRouter {
@@ -174,6 +218,36 @@ impl EventRouter {
     pub fn clear_handlers(&mut self) {
         self.handlers.clear();
         self.focusables.clear();
+        self.disabled.clear();
+    }
+
+    /// Marks `elem` disabled for this tick (RFC-0012 S5): it reports the
+    /// `DISABLED` [`StyleState`] and its handlers never fire. Rebuilt every
+    /// render, so an element re-enabled by a `var` flip simply isn't re-marked.
+    pub fn set_disabled(&mut self, elem: u32) {
+        self.disabled.insert(elem);
+    }
+
+    /// The interaction-state mask of `elem` (RFC-0012 Part B): `HOVER`/`PRESSED`/
+    /// `FOCUSED` from the live gesture state, `DISABLED` from [`set_disabled`].
+    ///
+    /// [`set_disabled`]: Self::set_disabled
+    #[must_use]
+    pub fn style_state(&self, elem: u32) -> StyleState {
+        let mut s = StyleState::empty();
+        if self.hovered == Some(elem) {
+            s.insert(StyleState::HOVER);
+        }
+        if self.down.as_ref().and_then(|d| d.elem) == Some(elem) {
+            s.insert(StyleState::PRESSED);
+        }
+        if self.focused == Some(elem) {
+            s.insert(StyleState::FOCUSED);
+        }
+        if self.disabled.contains(&elem) {
+            s.insert(StyleState::DISABLED);
+        }
+        s
     }
 
     /// Registers a handler for `kind` on element `elem`'s `rect`.
@@ -400,6 +474,10 @@ impl EventRouter {
         payload: Option<&Value>,
     ) {
         let Some(target) = elem_id else { return };
+        // A disabled element dispatches nothing (RFC-0012 S5).
+        if self.disabled.contains(&target) {
+            return;
+        }
         let i = self
             .handlers
             .iter()
@@ -426,6 +504,10 @@ impl EventRouter {
         let Some(i) = self.hit(atlas, pos, kind) else {
             return;
         };
+        // A disabled element dispatches nothing (RFC-0012 S5).
+        if self.disabled.contains(&self.handlers[i].elem) {
+            return;
+        }
         // Take the action out to avoid aliasing `self` while it runs.
         let mut action = std::mem::replace(&mut self.handlers[i].action, Box::new(|_, _| {}));
         action(ctx, payload);
@@ -506,6 +588,10 @@ impl EventRouter {
         let Some(focused) = self.focused else {
             return;
         };
+        // A disabled element dispatches nothing (RFC-0012 S5).
+        if self.disabled.contains(&focused) {
+            return;
+        }
         let i = self
             .handlers
             .iter()
@@ -596,6 +682,30 @@ mod tests {
 
     fn rect() -> Rect {
         Rect::new(0.0, 0.0, 100.0, 100.0)
+    }
+
+    #[test]
+    fn style_state_reports_disabled_and_is_a_proper_bit_set() {
+        let mut r = EventRouter::new();
+        // Nothing set → empty; a marked element reports DISABLED, others don't.
+        assert_eq!(r.style_state(9), StyleState::empty());
+        r.set_disabled(9);
+        assert!(r.style_state(9).contains(StyleState::DISABLED));
+        assert!(!r.style_state(9).contains(StyleState::HOVER));
+        assert_eq!(r.style_state(10), StyleState::empty());
+        // `clear_handlers` rebuilds the per-tick disabled set.
+        r.clear_handlers();
+        assert!(!r.style_state(9).contains(StyleState::DISABLED));
+
+        // Bit-set semantics: `contains` is subset containment.
+        let hover_focus = {
+            let mut s = StyleState::HOVER;
+            s.insert(StyleState::FOCUSED);
+            s
+        };
+        assert!(hover_focus.contains(StyleState::HOVER));
+        assert!(hover_focus.contains(StyleState::FOCUSED));
+        assert!(!hover_focus.contains(StyleState::PRESSED));
     }
 
     /// Increments `sig` (the `count++` action).
