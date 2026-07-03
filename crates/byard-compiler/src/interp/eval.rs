@@ -686,6 +686,13 @@ impl Interpreter {
                         rect.width,
                         rect.height,
                     );
+                    // Resolve the paint-time transform once, up front, so it can
+                    // be applied both to a plain container's `bg` fill *and* to
+                    // the self-owned visuals of `Toggle`/`Slider`/`TextField`
+                    // (their track/fill/thumb/underline/caret are the element's
+                    // own quads, so RFC-0011's element-local transform applies to
+                    // them exactly as it does to a `Box` fill).
+                    let transform = self.resolve_transform(attrs, current_rect);
                     let bg = self.eval_color_prop(attrs, "bg");
                     let radii = self.resolve_radii(attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
@@ -717,7 +724,7 @@ impl Interpreter {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
                             radii,
-                            transform: byard_core::frame::Transform::IDENTITY,
+                            transform,
                         };
                         let border_rgba = border_color
                             .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
@@ -783,6 +790,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -793,6 +801,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -803,6 +812,7 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
                                 frame,
                             );
                         }
@@ -892,6 +902,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
@@ -911,7 +922,7 @@ impl Interpreter {
             rect: [rect.x, rect.y, rect.w, rect.h],
             color: track_color,
             radii: [radius; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Thumb: a white circle inset from the track edges, sliding L↔R.
@@ -927,7 +938,7 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [thumb_size / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Tap handler to flip the bool (M16).
@@ -951,6 +962,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         // Keep the authored `f64` values for the value-write path: computing the
@@ -989,7 +1001,7 @@ impl Interpreter {
             rect: [rect.x, track_y, rect.w, track_h],
             color: [0.40, 0.42, 0.48, 1.0],
             radii: [track_r; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Fill up to the thumb.
@@ -999,7 +1011,7 @@ impl Interpreter {
                 rect: [rect.x, track_y, fill_w, track_h],
                 color: accent_rgba,
                 radii: [track_r; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
@@ -1012,14 +1024,14 @@ impl Interpreter {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
             color: accent_rgba,
             radii: [thumb_size / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
         let inner = thumb_size - 5.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
             color: [1.0, 1.0, 1.0, 1.0],
             radii: [inner / 2.0; 4],
-            transform: byard_core::frame::Transform::IDENTITY,
+            transform,
         });
 
         // Handlers: PointerDown + PointerDrag (M16).
@@ -1070,6 +1082,7 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let placeholder = self.eval_str_prop(attrs, "placeholder").unwrap_or_default();
@@ -1102,13 +1115,17 @@ impl Interpreter {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
                 color: super::intrinsics::color_to_rgba(self.theme.primary, false),
                 radii: [0.0; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
         let pad_x = 10.0_f32;
         let text_x = rect.x + pad_x;
         let text_y = rect.y + (rect.h - font_size) / 2.0;
+        // NOTE: `TextLine` carries no `Transform` field (RFC-0011 engine slice:
+        // only box primitives were given one), so the field's *text* does not
+        // follow `translate`/`scale`/`rotate` — the box visuals below (underline,
+        // caret) and its `bg` fill do. Same limitation as the `Text` intrinsic.
         if !display_text.is_empty() {
             frame.push_text(byard_core::TextLine {
                 x: text_x,
@@ -1131,7 +1148,7 @@ impl Interpreter {
                 rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
                 color: [1.0, 1.0, 1.0, 1.0],
                 radii: [0.0; 4],
-                transform: byard_core::frame::Transform::IDENTITY,
+                transform,
             });
         }
 
@@ -1693,6 +1710,267 @@ impl Interpreter {
         }
     }
 
+    /// Resolves the paint-time transform attributes (RFC-0011:
+    /// `translate`/`scale`/`rotate`/`origin`; `opacity` stays on its own
+    /// existing path — see the doc comment on `DecoratedBox`/`Transform` in
+    /// `frame.rs` for why). `rect` is the element's own laid-out rect,
+    /// logical pixels, needed to resolve a token/fractional `origin` into an
+    /// absolute pivot.
+    fn resolve_transform(
+        &mut self,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+    ) -> byard_core::frame::Transform {
+        let translate = self.resolve_axis_pair(attrs, "translate", (0.0, 0.0));
+        let scale = self.resolve_axis_pair(attrs, "scale", (1.0, 1.0));
+        let rotate = self.resolve_rotate(attrs).unwrap_or(0.0);
+        let origin = self.resolve_origin(attrs, rect);
+        byard_core::frame::Transform {
+            translate: [translate.0, translate.1],
+            scale: [scale.0, scale.1],
+            rotate,
+            origin: [origin.0, origin.1],
+            opacity: 1.0,
+        }
+    }
+
+    /// Resolves a two-axis prop (`translate`/`scale`) to `(x, y)` — RFC-0011's
+    /// dual surface: a bare scalar fills both axes; `(a, b)` binds positionally;
+    /// `(x: a, y: b)` sets any subset, order-independent, leaving the rest at
+    /// `default`. The sub-property form (`name.x: v` / `name.y: v`, a separate
+    /// `Attr` with `axis: Some(_)`) then overrides individual axes on top of
+    /// whatever the base `name: value` attribute (if any) already resolved —
+    /// so `translate.y: 2` alone is exactly `translate: (y: 2)`.
+    fn resolve_axis_pair(&mut self, attrs: &[Attr], name: &str, default: (f32, f32)) -> (f32, f32) {
+        let mut result = default;
+        if let Some(attr) = attrs
+            .iter()
+            .find(|a| a.name.as_str() == name && a.axis.is_none())
+        {
+            if let AttrKind::Prop { value } = &attr.kind {
+                result = self.resolve_axis_pair_value(value, default);
+            }
+        }
+        for attr in attrs
+            .iter()
+            .filter(|a| a.name.as_str() == name && a.axis.is_some())
+        {
+            let AttrKind::Prop { value } = &attr.kind else {
+                continue;
+            };
+            let span = value.span();
+            let val = self.eval_pure(value);
+            let Some(v) = spacing_value(&val) else {
+                self.errors.push(CompileError::AttributeTypeMismatch {
+                    span,
+                    expected: "a number".to_string(),
+                });
+                continue;
+            };
+            let Some(axis) = attr.axis.as_ref() else {
+                continue;
+            };
+            match axis.as_str() {
+                "x" => result.0 = v,
+                "y" => result.1 = v,
+                unknown => {
+                    let hint = crate::util::closest_match(unknown, ["x", "y"]).map(String::from);
+                    self.errors.push(CompileError::UnknownAttribute {
+                        span: attr.span,
+                        name: format!("{name}.{unknown}"),
+                        hint: hint.map(|h| format!("{name}.{h}")),
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// Parses one `translate`/`scale`-shaped [`Expr`] (scalar, positional
+    /// tuple, or named tuple) into `(x, y)` — the value-shape half of
+    /// [`Self::resolve_axis_pair`], factored out so [`Self::resolve_origin`]
+    /// can reuse the exact same tuple grammar for its own fractional pair.
+    fn resolve_axis_pair_value(&mut self, value: &Expr, default: (f32, f32)) -> (f32, f32) {
+        match value {
+            Expr::Tuple(args, span) => {
+                let any_named = args.iter().any(|a| a.name.is_some());
+                let all_named = args.iter().all(|a| a.name.is_some());
+                if any_named && !all_named {
+                    self.errors.push(CompileError::ConflictingSpacingField {
+                        span: *span,
+                        message: "cannot mix named and positional fields".to_string(),
+                    });
+                    return default;
+                }
+                if all_named {
+                    let (mut x, mut y) = (None, None);
+                    for arg in args {
+                        let Some(name) = &arg.name else { continue };
+                        let span = arg.value.span();
+                        let val = self.eval_pure(&arg.value);
+                        let Some(v) = spacing_value(&val) else {
+                            self.errors.push(CompileError::AttributeTypeMismatch {
+                                span,
+                                expected: "a number".to_string(),
+                            });
+                            continue;
+                        };
+                        match name.as_str() {
+                            "x" => assign_side(&mut x, v, "x", span, &mut self.errors),
+                            "y" => assign_side(&mut y, v, "y", span, &mut self.errors),
+                            unknown => {
+                                let hint = crate::util::closest_match(unknown, ["x", "y"])
+                                    .map(String::from);
+                                self.errors.push(CompileError::UnknownAttribute {
+                                    span,
+                                    name: unknown.to_string(),
+                                    hint,
+                                });
+                            }
+                        }
+                    }
+                    (x.unwrap_or(default.0), y.unwrap_or(default.1))
+                } else if args.len() == 2 {
+                    let x = self.eval_pure(&args[0].value);
+                    let y = self.eval_pure(&args[1].value);
+                    let x = spacing_value(&x).unwrap_or_else(|| {
+                        self.errors.push(CompileError::AttributeTypeMismatch {
+                            span: args[0].value.span(),
+                            expected: "a number".to_string(),
+                        });
+                        default.0
+                    });
+                    let y = spacing_value(&y).unwrap_or_else(|| {
+                        self.errors.push(CompileError::AttributeTypeMismatch {
+                            span: args[1].value.span(),
+                            expected: "a number".to_string(),
+                        });
+                        default.1
+                    });
+                    (x, y)
+                } else {
+                    self.errors.push(CompileError::ArityMismatch {
+                        span: *span,
+                        name: "translate/scale/origin".to_string(),
+                        expected: 2,
+                        found: args.len(),
+                    });
+                    default
+                }
+            }
+            other => {
+                let val = self.eval_pure(other);
+                if let Some(v) = spacing_value(&val) {
+                    (v, v)
+                } else {
+                    self.errors.push(CompileError::AttributeTypeMismatch {
+                        span: other.span(),
+                        expected: "a number".to_string(),
+                    });
+                    default
+                }
+            }
+        }
+    }
+
+    /// Resolves `rotate` (RFC-0011): the terse `rotate: 90deg` form or the
+    /// verbose `rotate: (angle: 90deg)` single-field tuple — both already
+    /// canonicalized to radians by the lexer's `Expr::AngleLit`. Absent →
+    /// `None` (caller defaults to `0.0`, no rotation).
+    fn resolve_rotate(&mut self, attrs: &[Attr]) -> Option<f32> {
+        let attr = attrs
+            .iter()
+            .find(|a| a.name.as_str() == "rotate" && a.axis.is_none())?;
+        let AttrKind::Prop { value } = &attr.kind else {
+            return None;
+        };
+        let inner = match value {
+            Expr::Tuple(args, _)
+                if args.len() == 1
+                    && args[0].name.as_ref().map(Symbol::as_str) == Some("angle") =>
+            {
+                &args[0].value
+            }
+            other => other,
+        };
+        let val = self.eval_pure(inner);
+        let Some(rad) = spacing_value(&val) else {
+            // A non-numeric `rotate` (e.g. `rotate: center`, or a reactive var
+            // that didn't resolve to a number) is a real mistake, not a no-op —
+            // flag it the same way `translate`/`scale` flag theirs instead of
+            // silently painting with no rotation.
+            self.errors.push(CompileError::AttributeTypeMismatch {
+                span: inner.span(),
+                expected: "an angle (e.g. 90deg, 1.5rad)".to_string(),
+            });
+            return None;
+        };
+        Some(rad)
+    }
+
+    /// Resolves `origin` (RFC-0011 T2) to an absolute logical-pixel pivot in
+    /// the same coordinate space as `rect`: a named token (`center` and the
+    /// four corners/edges), or a fractional `(fx, fy)` tuple relative to
+    /// `rect` (positional or named, reusing [`Self::resolve_axis_pair_value`]'s
+    /// tuple grammar). Absent, or an unrecognized token, defaults to `center`
+    /// — RFC-0011's own stated default — rather than hard-failing.
+    ///
+    /// Deliberately out of scope for now: the `px` absolute-origin suffix
+    /// (T2's third form) needs a new lexer literal this slice doesn't add;
+    /// only the token and fractional forms are implemented.
+    fn resolve_origin(
+        &mut self,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+    ) -> (f32, f32) {
+        let center = (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let Some(attr) = attrs
+            .iter()
+            .find(|a| a.name.as_str() == "origin" && a.axis.is_none())
+        else {
+            return center;
+        };
+        let AttrKind::Prop { value } = &attr.kind else {
+            return center;
+        };
+        if let Expr::Ident(sym, span) = value {
+            const TOKENS: &[&str] = &[
+                "center",
+                "top_left",
+                "top_right",
+                "bottom_left",
+                "bottom_right",
+                "top",
+                "bottom",
+                "left",
+                "right",
+            ];
+            return match sym.as_str() {
+                "center" => center,
+                "top_left" => (rect.x, rect.y),
+                "top_right" => (rect.x + rect.w, rect.y),
+                "bottom_left" => (rect.x, rect.y + rect.h),
+                "bottom_right" => (rect.x + rect.w, rect.y + rect.h),
+                "top" => (rect.x + rect.w * 0.5, rect.y),
+                "bottom" => (rect.x + rect.w * 0.5, rect.y + rect.h),
+                "left" => (rect.x, rect.y + rect.h * 0.5),
+                "right" => (rect.x + rect.w, rect.y + rect.h * 0.5),
+                unknown => {
+                    let hint = crate::util::closest_match(unknown, TOKENS.iter().copied())
+                        .map(String::from);
+                    self.errors.push(CompileError::UnknownAttribute {
+                        span: *span,
+                        name: format!("origin: {unknown}"),
+                        hint,
+                    });
+                    center
+                }
+            };
+        }
+        let (fx, fy) = self.resolve_axis_pair_value(value, (0.5, 0.5));
+        (rect.x + fx * rect.w, rect.y + fy * rect.h)
+    }
+
     /// Processes a whole `View`: its declarations first (so bindings can resolve
     /// names), then lowers its top-level elements into a render tree, handling
     /// `when`/`for` structural members (M20).
@@ -1713,6 +1991,12 @@ impl Interpreter {
             Expr::FloatLit(f, _) => {
                 let f = *f;
                 Box::new(move |_| Value::Float(f))
+            }
+            // Already canonicalized to radians by the lexer (RFC-0011 T1) —
+            // from here on an angle is just a plain `Float`.
+            Expr::AngleLit(rad, _) => {
+                let rad = *rad;
+                Box::new(move |_| Value::Float(rad))
             }
             Expr::StrLit(parts, _) => self.lower_strlit(parts, payload_name),
             Expr::Ident(name, _) => self.lower_ident(name, payload_name),
@@ -2653,6 +2937,116 @@ mod tests {
         let instances = frame.instances();
         assert_eq!(instances.len(), 1, "expected exactly one BoxInstance");
         assert_eq!(instances[0].radii, [4.0, 8.0, 12.0, 16.0]);
+    }
+
+    // ── RFC-0011: paint-time transform attribute surface ─────────────────
+
+    #[test]
+    fn transform_attrs_reach_the_box_instance() {
+        let parsed = parse(
+            "View C() { Box #[bg: 0xFF0000, width: 50, height: 50, \
+             translate: (5, 10), scale: 1.5, rotate: 90deg] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let instances = frame.instances();
+        assert_eq!(instances.len(), 1);
+        let t = instances[0].transform;
+        assert_eq!(t.translate, [5.0, 10.0]);
+        assert_eq!(t.scale, [1.5, 1.5]);
+        assert!((t.rotate - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        // Unset `origin` defaults to the element's own center, not (0,0).
+        assert_eq!(t.origin, [25.0, 25.0]);
+    }
+
+    #[test]
+    fn no_transform_attrs_produces_identity() {
+        let parsed = parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50] }");
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // `origin` alone isn't checked against `Transform::IDENTITY`'s [0,0]:
+        // the compiler defaults an unset `origin` to the element's own
+        // center (RFC-0011's stated default), which is a real but *inert*
+        // difference from the engine's raw identity — pivot is irrelevant
+        // when scale = 1 and rotate = 0, so the render is pixel-identical.
+        let t = frame.instances()[0].transform;
+        assert_eq!(t.translate, [0.0, 0.0]);
+        assert_eq!(t.scale, [1.0, 1.0]);
+        assert_eq!(t.rotate, 0.0);
+        assert_eq!(t.opacity, 1.0);
+    }
+
+    #[test]
+    fn sub_property_axis_sets_one_axis_and_leaves_the_other_default() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, translate.y: 7] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(frame.instances()[0].transform.translate, [0.0, 7.0]);
+    }
+
+    #[test]
+    fn named_tuple_scale_sets_one_axis_and_leaves_the_other_at_one() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, scale: (y: 2.0)] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(frame.instances()[0].transform.scale, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn origin_token_resolves_relative_to_the_laid_out_rect() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 40, height: 20, origin: top_left] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        // The Box lays out at the view's origin (0,0) by default.
+        assert_eq!(frame.instances()[0].transform.origin, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn unknown_origin_token_is_a_compile_error_with_a_hint() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, origin: centre] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(matches!(
+            &interp.errors()[0],
+            CompileError::UnknownAttribute { hint: Some(h), .. } if h.contains("center")
+        ));
     }
 
     // ── M16: Toggle/Slider/TextField write-back ──────────────────────────

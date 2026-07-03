@@ -84,6 +84,24 @@ pub enum Token {
     /// An identifier (interned).
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| Symbol::intern(lex.slice()))]
     Ident(Symbol),
+    /// An angle literal with a unit suffix (RFC-0011 T1: `360deg`, `1.5rad`).
+    /// Listed before [`Token::FloatLit`]/[`Token::IntLit`] so `logos`'s
+    /// longest-match prefers the suffixed form over a bare number followed by
+    /// an `Ident` — same principle as hex-before-decimal below. The value is
+    /// canonicalized to **radians** right here at lex time: the deg→rad
+    /// conversion is a pure, infallible numeric transform (nothing here can
+    /// fail the way string/number parsing can), so there is no benefit to
+    /// deferring it to a later compiler pass the way D9 defers *type*
+    /// inference — this is unit normalization, not semantic analysis.
+    #[regex(r"[0-9]+(\.[0-9]+)?deg", |lex| {
+        let s = lex.slice();
+        s[..s.len() - 3].parse::<f64>().ok().map(f64::to_radians)
+    })]
+    #[regex(r"[0-9]+(\.[0-9]+)?rad", |lex| {
+        let s = lex.slice();
+        s[..s.len() - 3].parse::<f64>().ok()
+    })]
+    AngleLit(f64),
     /// A floating-point literal. Listed before [`Token::IntLit`] because
     /// `logos` longest-match makes `3.14` a float, `3` an int.
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
@@ -166,6 +184,11 @@ pub enum Token {
     /// `?` (ternary)
     #[token("?")]
     Question,
+    /// `-` (sign of a negative numeric literal). Byld has no binary arithmetic
+    /// operators, so a lone `-` only ever prefixes a number (e.g. `translate:
+    /// (-8, 0)`). Longest-match keeps `->`, `-=` and `--` as their own tokens.
+    #[token("-")]
+    Minus,
 }
 
 /// State of the two-state string-scanning stack.
@@ -373,6 +396,33 @@ mod tests {
         assert_eq!(
             kinds("42 1.5"),
             vec![Token::IntLit(42), Token::FloatLit(1.5)]
+        );
+    }
+
+    #[test]
+    fn angle_literals_lex_as_one_token_and_canonicalize_to_radians() {
+        let toks = kinds("360deg 180deg 1.5rad");
+        let Token::AngleLit(full_turn) = &toks[0] else {
+            panic!("expected AngleLit, got {:?}", toks[0]);
+        };
+        assert!((full_turn - std::f64::consts::TAU).abs() < 1e-9);
+
+        let Token::AngleLit(half_turn) = &toks[1] else {
+            panic!("expected AngleLit, got {:?}", toks[1]);
+        };
+        assert!((half_turn - std::f64::consts::PI).abs() < 1e-9);
+
+        // `rad` is already radians — passed through unchanged.
+        assert_eq!(toks[2], Token::AngleLit(1.5));
+    }
+
+    #[test]
+    fn angle_suffix_wins_over_a_bare_number_then_identifier() {
+        // Longest-match must prefer `360deg` as one AngleLit, never
+        // `IntLit(360)` followed by `Ident("deg")`.
+        assert_eq!(
+            kinds("360deg"),
+            vec![Token::AngleLit(std::f64::consts::TAU)]
         );
     }
 

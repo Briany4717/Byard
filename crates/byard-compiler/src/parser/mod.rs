@@ -472,7 +472,9 @@ impl<'a> Parser<'a> {
     }
 
     /// `attr := prop_attr | event_attr`, distinguished by the separator:
-    /// `IDENT ":" expr` (property) vs `IDENT ("(" IDENT ")")? "=>" expr` (event).
+    /// `IDENT ("." IDENT)? ":" expr` (property, the optional sub-property
+    /// axis is RFC-0011's `translate.y: 2`) vs `IDENT ("(" IDENT ")")? "=>"
+    /// expr` (event — no sub-property form).
     fn parse_attr(&mut self) -> Option<Attr> {
         let start = self.cur_span();
         let name = self.expect_name("an attribute name")?;
@@ -483,13 +485,27 @@ impl<'a> Parser<'a> {
             let action = self.parse_expr(0);
             Some(Attr {
                 name,
+                axis: None,
                 kind: AttrKind::Event { payload, action },
+                span: self.span_from(start),
+            })
+        } else if self.eat(&Token::Dot) {
+            // Sub-property access (RFC-0011): `translate.y: 2`. Only the
+            // property form takes an axis — an event never does.
+            let axis = self.expect_name("a sub-property axis (e.g. `x`, `y`)")?;
+            self.expect(&Token::Colon, "':'");
+            let value = self.parse_expr(0);
+            Some(Attr {
+                name,
+                axis: Some(axis),
+                kind: AttrKind::Prop { value },
                 span: self.span_from(start),
             })
         } else if self.eat(&Token::Colon) {
             let value = self.parse_expr(0);
             Some(Attr {
                 name,
+                axis: None,
                 kind: AttrKind::Prop { value },
                 span: self.span_from(start),
             })
@@ -497,6 +513,7 @@ impl<'a> Parser<'a> {
             let action = self.parse_expr(0);
             Some(Attr {
                 name,
+                axis: None,
                 kind: AttrKind::Event {
                     payload: None,
                     action,

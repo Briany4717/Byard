@@ -46,6 +46,10 @@ impl Parser<'_> {
                 self.advance();
                 Expr::FloatLit(f, span)
             }
+            Some(Token::AngleLit(rad)) => {
+                self.advance();
+                Expr::AngleLit(rad, span)
+            }
             Some(Token::StrLit) => {
                 self.advance();
                 let parts = self.parse_string_literal(span);
@@ -55,6 +59,7 @@ impl Parser<'_> {
                 self.advance();
                 Expr::Ident(sym, span)
             }
+            Some(Token::Minus) => self.parse_negative(),
             Some(Token::LBrack) => self.parse_array(),
             Some(Token::LParen) => self.parse_paren_or_lambda(),
             Some(Token::Pipe) => self.parse_pipe_lambda(),
@@ -63,6 +68,34 @@ impl Parser<'_> {
                 self.error("an expression");
                 // Do not consume: let the caller's recovery decide.
                 Expr::Error(span)
+            }
+        }
+    }
+
+    /// A negative numeric literal `-<number>`. Byld has no binary arithmetic
+    /// operators, so a leading `-` is only meaningful as the sign of a numeric
+    /// literal (e.g. `translate: (-8, 0)`, `rotate: -90deg`). Anything else
+    /// gets a targeted "a number after `-`" diagnostic instead of the generic
+    /// "expected an expression", so the dev-overlay message is actionable.
+    fn parse_negative(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // '-'
+        match self.cur().cloned() {
+            Some(Token::IntLit(n)) => {
+                self.advance();
+                Expr::IntLit(-n, self.span_from(start))
+            }
+            Some(Token::FloatLit(f)) => {
+                self.advance();
+                Expr::FloatLit(-f, self.span_from(start))
+            }
+            Some(Token::AngleLit(rad)) => {
+                self.advance();
+                Expr::AngleLit(-rad, self.span_from(start))
+            }
+            _ => {
+                self.error("a number after `-`");
+                Expr::Error(self.span_from(start))
             }
         }
     }

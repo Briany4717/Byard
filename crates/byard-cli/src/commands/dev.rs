@@ -53,7 +53,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
 
     // Poll mode: the event loop spins continuously so file-change frames
     // appear without waiting for the next mouse event (RFC-0006 §3.2).
-    let host = WinitHost::new(&title, 800, 600).with_poll();
+    let host = WinitHost::new(&title, 1280, 720).with_poll();
     host.run(App {
         engine: None,
         width_bits: None,
@@ -156,9 +156,13 @@ impl LogicRuntime for ByldRuntime {
         let h = f32::from_bits(self.height_bits.load(Ordering::Relaxed));
 
         if let Some(errors) = &self.error_state {
-            // Render view first, then overlay on top (C4: overlay path is
-            // independent of the interpreter).
-            self.interp.render(&self.tree, frame, w, h);
+            // Render *only* the overlay — deliberately NOT the last-good view
+            // underneath it. Text is drawn in a single global pass after every
+            // box (the flat 4-pass encoder order), so any app text painted here
+            // would bleed *over* the overlay's scrim. Drawing the overlay alone
+            // on an opaque background sidesteps that and reads as a dedicated
+            // "fix your file" error screen (C4: overlay path is independent of
+            // the interpreter).
             render_error_overlay(frame, errors, w, h);
         } else {
             self.interp.render(&self.tree, frame, w, h);
@@ -177,10 +181,12 @@ const OVERLAY_MAX_HEADLINE_CHARS: usize = 60;
 /// Truncates to [`OVERLAY_MAX_ERRORS`] errors and [`OVERLAY_MAX_HEADLINE_CHARS`]
 /// chars per headline to keep the overlay bounded without needing Taffy layout.
 fn render_error_overlay(frame: &mut RenderFrame, errors: &[CompileError], w: f32, h: f32) {
-    // Dark semi-opaque background covering the full viewport.
+    // Opaque dark background covering the full viewport. Opaque (not a scrim)
+    // because the underlying view is intentionally not drawn while errors are
+    // shown — see the call site in `App::render`.
     frame.push_instance(BoxInstance {
         rect: [0.0, 0.0, w, h],
-        color: [0.0, 0.0, 0.0, 0.8],
+        color: [0.09, 0.09, 0.11, 1.0],
         radii: [0.0; 4],
         transform: byard_core::frame::Transform::IDENTITY,
     });

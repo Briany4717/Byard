@@ -51,6 +51,9 @@ pub enum PropType {
     Class,
     /// A `Vec2` `(Float, Float)`.
     Vec2,
+    /// An angle (`360deg`/`1.5rad`, RFC-0011 T1) — canonicalized to radians
+    /// by the lexer.
+    Angle,
     /// A function-valued callback prop.
     Fn,
 }
@@ -89,6 +92,22 @@ const DECORATION: &[(&str, PropType)] = &[
     ("opacity", PropType::Float),
     ("border", PropType::Color),
     ("shadow", PropType::Str),
+];
+/// Paint-time transform props (RFC-0011). `opacity` is deliberately **not**
+/// repeated here — it already lives in [`DECORATION`] and is wired end to
+/// end (a non-1.0 `opacity` already promotes a box to the `DecoratedBox`
+/// pipeline); this group is only the four props that are new with this RFC.
+///
+/// Attached everywhere [`DECORATION`] is (every intrinsic sharing the
+/// generic container/`Box` render path: `Box`/`Column`/`Row`/`Button`/
+/// `TextField`/`Toggle`/`Slider`/`ScrollView`) — **not** `Text`/`Image`,
+/// whose engine primitives (`TextLine`/`TextureSampler`) have no `Transform`
+/// field yet (see the RFC-0011 engine-slice decision log).
+const TRANSFORM: &[(&str, PropType)] = &[
+    ("translate", PropType::Vec2),
+    ("scale", PropType::Vec2),
+    ("rotate", PropType::Angle),
+    ("origin", PropType::Vec2),
 ];
 const TEXT_PROPS: &[(&str, PropType)] = &[
     ("typo", PropType::Typo),
@@ -188,7 +207,7 @@ fn events_from(focusable: bool, extra: &[&'static str]) -> HashSet<&'static str>
 #[must_use]
 pub fn lookup(name: &str) -> Option<Intrinsic> {
     let container = |dir_default: bool| {
-        let mut props = props_from(&[LAYOUT, DECORATION]);
+        let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
         if dir_default {
             props.insert("direction", PropType::Enum(DIRECTION));
         }
@@ -228,7 +247,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             events: events_from(false, &[]),
         },
         "Button" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS]);
+            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS, TRANSFORM]);
             props.insert("focused", PropType::Bool);
             Intrinsic {
                 arity: 1,
@@ -241,7 +260,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "TextField" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS]);
+            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS, TRANSFORM]);
             props.insert("placeholder", PropType::Str);
             props.insert("value", PropType::Str);
             props.insert("bind", PropType::Str);
@@ -257,7 +276,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "Toggle" => {
-            let mut props = props_from(&[LAYOUT, DECORATION]);
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
             props.insert("value", PropType::Bool);
             props.insert("bind", PropType::Bool);
             props.insert("focused", PropType::Bool);
@@ -272,7 +291,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "Slider" => {
-            let mut props = props_from(&[LAYOUT, DECORATION]);
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
             for k in ["min", "max", "step"] {
                 props.insert(k, PropType::Float);
             }
@@ -305,7 +324,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "ScrollView" => {
-            let mut props = props_from(&[LAYOUT, DECORATION]);
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
             props.insert("axis", PropType::Enum(AXIS));
             props.insert("offset", PropType::Vec2);
             Intrinsic {
@@ -444,6 +463,20 @@ fn check_value_type(ty: PropType, value: &Expr) -> Option<CompileError> {
     match (ty, value) {
         (PropType::Color, Expr::StrLit(..) | Expr::FloatLit(..)) => mismatch("a color (0xRRGGBB)"),
         (PropType::Int | PropType::Len, Expr::StrLit(..)) => mismatch("an integer length"),
+        (PropType::Angle, Expr::StrLit(..) | Expr::IntLit(..) | Expr::FloatLit(..)) => {
+            mismatch("an angle (e.g. 90deg, 1.5rad)")
+        }
+        (PropType::Angle, Expr::Tuple(args, _)) => {
+            // Verbose `rotate: (angle: <expr>)` — recurse into the field so a
+            // bare number can't slip past the terse-form rejection by hiding in
+            // the tuple wrapper (which is otherwise not type-checked).
+            match args.as_slice() {
+                [arg] if arg.name.as_ref().is_some_and(|n| n.as_str() == "angle") => {
+                    check_value_type(PropType::Angle, &arg.value)
+                }
+                _ => mismatch("an angle (e.g. 90deg) or the verbose form `(angle: 90deg)`"),
+            }
+        }
         (PropType::Str, Expr::IntLit(..) | Expr::FloatLit(..)) => mismatch("a string"),
         (PropType::Bool, Expr::IntLit(..) | Expr::StrLit(..) | Expr::FloatLit(..)) => {
             mismatch("a boolean")
@@ -558,6 +591,47 @@ mod tests {
         assert!(errs("View V() { Text(\"hi\") #[color: 0xFFFFFF, align: center] }").is_empty());
         assert!(errs("View V() { Column #[gap: 8, p: 16] { } }").is_empty());
         assert!(errs("View V() { Button(\"+\") #[bg: 0x3B82F6] => x }").is_empty());
+    }
+
+    #[test]
+    fn transform_props_are_accepted_on_containers_but_not_text_or_image() {
+        assert!(
+            errs(
+                "View V() { Box #[translate: (0, 2), scale: 1.05, rotate: 90deg, origin: center] {} }"
+            )
+            .is_empty()
+        );
+        assert!(
+            errs("View V() { Row #[scale.y: 1.2] {} }").is_empty(),
+            "sub-property axis form"
+        );
+
+        // `Text`/`Image` don't have a `Transform` field on their engine
+        // primitives yet (RFC-0011 engine-slice decision log) — these must
+        // still report `UnknownAttribute`, not silently accept and drop.
+        let e = errs("View V() { Text(\"hi\") #[rotate: 90deg] }");
+        assert!(matches!(&e[0], CompileError::UnknownAttribute { .. }));
+        let e = errs("View V() { Image(\"x\") #[translate: (0, 2)] }");
+        assert!(matches!(&e[0], CompileError::UnknownAttribute { .. }));
+    }
+
+    #[test]
+    fn rotate_rejects_a_bare_number_without_a_deg_or_rad_suffix() {
+        let e = errs("View V() { Box #[rotate: 90] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn rotate_verbose_form_still_rejects_a_bare_number() {
+        // The verbose `(angle: N)` wrapper must not let a bare number bypass the
+        // deg/rad requirement — recurse into the field.
+        let e = errs("View V() { Box #[rotate: (angle: 90)] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+        // …but the properly-suffixed verbose form is accepted.
+        assert!(errs("View V() { Box #[rotate: (angle: 90deg)] {} }").is_empty());
+        // A verbose tuple with the wrong field name is a mismatch too.
+        let e = errs("View V() { Box #[rotate: (deg: 90deg)] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
     }
 
     #[test]

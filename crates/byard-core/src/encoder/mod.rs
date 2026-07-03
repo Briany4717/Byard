@@ -217,6 +217,11 @@ pub struct EncoderSubsystem {
     /// View of [`persistent_color`](Self::persistent_color), cached to avoid
     /// recreating it every frame.
     persistent_view: wgpu::TextureView,
+    /// Frame-local draw-order depth buffer (RFC-0011 cross-pass paint order):
+    /// cleared to the far plane every pass and rebuilt from the current
+    /// primitive list, so it needs no cross-frame bookkeeping. Recreated
+    /// alongside `persistent_color` on resize so the two always match in size.
+    persistent_depth_view: wgpu::TextureView,
     /// Pixel format shared by `persistent_color` and the swapchain surface.
     ///
     /// Stored so [`update_viewport`](Self::update_viewport) can recreate
@@ -391,6 +396,7 @@ impl EncoderSubsystem {
             quad_layout,
             surface_format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
+            draw_depth_stencil(),
             "ByardCore - SolidBox Render Pipeline",
         )
         .await?;
@@ -412,6 +418,7 @@ impl EncoderSubsystem {
             },
             surface_format,
             None,
+            clear_depth_stencil(),
             "ByardCore - SolidBox Clear Pipeline",
         )
         .await?;
@@ -424,6 +431,7 @@ impl EncoderSubsystem {
 
         let (persistent_color, persistent_view) =
             create_persistent_target(&device, surface_format, width, height);
+        let persistent_depth_view = create_depth_target(&device, width, height);
 
         let gpu_timer = GpuTimer::new(&device, &queue, &[GPU_UI_PASS_SCOPE]);
 
@@ -444,6 +452,7 @@ impl EncoderSubsystem {
             io: None,
             scale_factor,
             viewport_dirty: false,
+            persistent_depth_view,
             persistent_color,
             persistent_view,
             surface_format,
@@ -552,6 +561,7 @@ impl EncoderSubsystem {
                 create_persistent_target(&self.device, self.surface_format, phys_w, phys_h);
             self.persistent_color = persistent_color;
             self.persistent_view = persistent_view;
+            self.persistent_depth_view = create_depth_target(&self.device, phys_w, phys_h);
             self.phys_w = phys_w;
             self.phys_h = phys_h;
             self.needs_full_redraw = true;
@@ -610,12 +620,22 @@ impl EncoderSubsystem {
         instances: &[BoxInstance],
         texts: &[TextLine],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
-        self.encode_frame_with_decorations(target, instances, texts, &[], &[])
+        // No `RenderFrame` here (raw solid+text convenience path): empty depths
+        // → far-plane fallback, i.e. the pre-depth type-grouped pass order.
+        self.encode_frame_with_decorations(
+            target,
+            instances,
+            texts,
+            &[],
+            &[],
+            DrawDepths::default(),
+        )
     }
 
     /// Full encode path including the M21 `DecoratedBox`/`TextureSampler`
     /// primitives. [`encode_frame`](Self::encode_frame) forwards here with empty
     /// decoration slices, keeping the common (solid + text) path byte-identical.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn encode_frame_with_decorations(
         &mut self,
         target: &wgpu::Texture,
@@ -623,6 +643,7 @@ impl EncoderSubsystem {
         texts: &[TextLine],
         decorated: &[crate::frame::DecoratedBox],
         textures: &[crate::frame::TextureSampler],
+        depths: DrawDepths<'_>,
     ) -> Result<wgpu::CommandBuffer, ByardError> {
         self.request_textures(textures);
 
@@ -685,6 +706,7 @@ impl EncoderSubsystem {
                 &self.device,
                 &self.queue,
                 texts,
+                depths.text,
                 self.scale_factor,
                 viewport_dirty,
             )?;
@@ -702,6 +724,7 @@ impl EncoderSubsystem {
             draw_ui_pass(
                 &mut encoder,
                 &self.persistent_view,
+                &self.persistent_depth_view,
                 &self.device,
                 &DrawPipelines {
                     solid: &self.render_pipeline,
@@ -720,6 +743,9 @@ impl EncoderSubsystem {
                     decorated,
                     textures,
                     texture_cache: &self.texture_cache,
+                    solid_depths: depths.solid,
+                    decorated_depths: depths.decorated,
+                    texture_depths: depths.texture,
                 },
                 self.gpu_timer.as_ref(),
             )?;
@@ -808,6 +834,7 @@ impl EncoderSubsystem {
                 &texts_dirty,
                 frame.decorated(),
                 frame.textures(),
+                frame_draw_depths(frame),
             )?;
             self.last_relay_version = frame.version();
             return Ok(cmd);
@@ -818,6 +845,7 @@ impl EncoderSubsystem {
             frame.texts(),
             frame.decorated(),
             frame.textures(),
+            frame_draw_depths(frame),
         )?;
         self.last_relay_version = frame.version();
         Ok(cmd)
@@ -931,6 +959,32 @@ struct DrawPipelines<'a> {
     texture: &'a wgpu::RenderPipeline,
 }
 
+/// Draw-order depth slices for one frame (RFC-0011 cross-pass paint order),
+/// parallel to the four primitive pools. Bundled so the encode entry points
+/// stay within the argument-count lint. An empty slice means "no depth info"
+/// and falls back to the far plane, reproducing the pre-depth pass order.
+#[derive(Clone, Copy, Default)]
+pub struct DrawDepths<'a> {
+    /// Parallel to solid `BoxInstance`s.
+    pub solid: &'a [f32],
+    /// Parallel to `DecoratedBox`es.
+    pub decorated: &'a [f32],
+    /// Parallel to `TextureSampler`s.
+    pub texture: &'a [f32],
+    /// Parallel to `TextLine`s (applied via glyphon per-glyph metadata).
+    pub text: &'a [f32],
+}
+
+/// Bundles a frame's parallel draw-order depth slices into a [`DrawDepths`].
+fn frame_draw_depths(frame: &RenderFrame) -> DrawDepths<'_> {
+    DrawDepths {
+        solid: frame.solid_depths(),
+        decorated: frame.decorated_depths(),
+        texture: frame.texture_depths(),
+        text: frame.text_depths(),
+    }
+}
+
 /// The per-frame primitive lists `draw_ui_pass` draws, similarly bundled.
 #[derive(Clone, Copy)]
 struct DrawPrimitives<'a> {
@@ -939,12 +993,19 @@ struct DrawPrimitives<'a> {
     decorated: &'a [crate::frame::DecoratedBox],
     textures: &'a [crate::frame::TextureSampler],
     texture_cache: &'a texture_sampler::TextureCache,
+    /// Draw-order depths, parallel to `instances`/`decorated`/`textures`
+    /// respectively (RFC-0011 cross-pass paint order). `texts` depth is applied
+    /// inside `TextGlyphPipeline::prepare` via glyphon's per-glyph metadata.
+    solid_depths: &'a [f32],
+    decorated_depths: &'a [f32],
+    texture_depths: &'a [f32],
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_ui_pass(
     encoder: &mut wgpu::CommandEncoder,
     persistent_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
     device: &wgpu::Device,
     pipelines: &DrawPipelines<'_>,
     viewport_bind_group: &wgpu::BindGroup,
@@ -967,6 +1028,9 @@ fn draw_ui_pass(
         decorated,
         textures,
         texture_cache,
+        solid_depths,
+        decorated_depths,
+        texture_depths,
     } = *primitives;
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("ByardCore - UI Render Pass"),
@@ -984,7 +1048,20 @@ fn draw_ui_pass(
             // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
             depth_slice: None,
         })],
-        depth_stencil_attachment: None,
+        // The draw-order depth buffer is frame-local scratch: every primitive is
+        // re-emitted (and re-depth-stamped) each frame, so it's cleared to the
+        // far plane every pass, even incremental ones. That keeps depth ordering
+        // correct within the frame without any cross-frame depth bookkeeping,
+        // and (colour is `Load`ed on incremental frames) doesn't disturb the
+        // preserved pixels outside the scissor.
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(crate::frame::DRAW_DEPTH_CLEAR),
+                store: wgpu::StoreOp::Discard,
+            }),
+            stencil_ops: None,
+        }),
         timestamp_writes: gpu_timer.and_then(|t| t.timestamp_writes(GPU_UI_PASS_SCOPE)),
         occlusion_query_set: None,
         // wgpu 28: new required field; None disables multiview rendering.
@@ -1024,11 +1101,15 @@ fn draw_ui_pass(
             viewport_bind_group,
             quad_buffer,
             instances,
+            solid_depths,
         );
     }
 
-    // M21: decorated boxes (border/shadow/opacity), then textured images, drawn
-    // above the solid fills and below the text, sharing the same pass/scissor.
+    // M21: decorated boxes (border/shadow/opacity), then textured images. The
+    // pass order is unchanged, but the shared depth buffer (each primitive
+    // carrying its emission-order z) is now what resolves visibility — so a
+    // container's border no longer paints over a child that was emitted after
+    // it, and text (below) no longer sits unconditionally on top.
     decorated_box::draw(
         &mut render_pass,
         device,
@@ -1036,6 +1117,7 @@ fn draw_ui_pass(
         viewport_bind_group,
         quad_buffer,
         decorated,
+        decorated_depths,
     );
     texture_sampler::draw(
         &mut render_pass,
@@ -1045,6 +1127,7 @@ fn draw_ui_pass(
         quad_buffer,
         texture_cache,
         textures,
+        texture_depths,
     );
 
     // Always the full, unfiltered `texts` slice (the `prepare` call before
@@ -1094,6 +1177,29 @@ fn create_persistent_target(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+/// Creates the frame-local draw-order depth target's view (RFC-0011). Sized to
+/// match [`create_persistent_target`]; `RENDER_ATTACHMENT` only (never copied to
+/// the swapchain — depth is scratch, discarded at the end of each pass).
+fn create_depth_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    let width = width.max(1);
+    let height = height.max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ByardCore - Draw-Order Depth Target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 /// Deliberately generous (over-estimating) bounding box for a [`TextLine`],
@@ -1423,12 +1529,43 @@ async fn build_m21_pipelines(
     ))
 }
 
+/// Depth-buffer format used to resolve draw order across the four UI pipelines.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Depth-stencil state for the *drawing* pipelines (solid/decorated/texture/
+/// text): write each primitive's draw-order z and keep the nearest — i.e. the
+/// later-emitted — fragment (`LessEqual`, since later = smaller z, buffer
+/// cleared to the far plane).
+fn draw_depth_stencil() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Depth-stencil state for the clear pipeline: never tests or writes depth
+/// (`Always` + no write), so wiping colour in the incremental scissor region
+/// leaves the draw-order depth buffer (already cleared this frame) untouched.
+fn clear_depth_stencil() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
 async fn build_solid_box_pipeline(
     device: &wgpu::Device,
     bind_group_layout: &wgpu::BindGroupLayout,
     quad_layout: wgpu::VertexBufferLayout<'static>,
     surface_format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
+    depth_stencil: wgpu::DepthStencilState,
     debug_name: &str,
 ) -> Result<wgpu::RenderPipeline, ByardError> {
     // --- GPU VALIDATION ERROR SCOPE (RFC §8) ---
@@ -1458,7 +1595,7 @@ async fn build_solid_box_pipeline(
         vertex: wgpu::VertexState {
             module: &shader_module,
             entry_point: Some("vs_main"),
-            buffers: &[quad_layout, BoxInstance::layout()],
+            buffers: &[quad_layout, BoxInstance::layout(), solid_depth_layout()],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -1480,7 +1617,7 @@ async fn build_solid_box_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(depth_stencil),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -1524,11 +1661,22 @@ fn draw_clear_quad(
         contents: bytemuck::bytes_of(&clear_instance),
         usage: wgpu::BufferUsages::VERTEX,
     });
+    // The clear pipeline shares `solid_box.wgsl`, which now reads a depth at
+    // location 9, so the clear draw must still supply the buffer. The value is
+    // irrelevant: the clear pipeline runs with depth-write disabled and an
+    // `Always` compare (see `build_solid_box_pipeline`), so it never touches the
+    // depth buffer — it only wipes colour in the scissor region.
+    let depth_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ByardCore - Clear Quad Depth Buffer"),
+        contents: bytemuck::bytes_of(&crate::frame::DRAW_DEPTH_CLEAR),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
 
     render_pass.set_pipeline(pipeline);
     render_pass.set_bind_group(0, bind_group, &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+    render_pass.set_vertex_buffer(2, depth_buffer.slice(..));
     render_pass.draw(0..4, 0..1);
 }
 
@@ -1548,10 +1696,22 @@ fn draw_solid_box_instances(
     bind_group: &wgpu::BindGroup,
     quad_buffer: &wgpu::Buffer,
     instances: &[BoxInstance],
+    depths: &[f32],
 ) {
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ByardCore - SolidBox Instance Buffer"),
         contents: bytemuck::cast_slice(instances),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    // Draw-order depths, parallel to `instances`, fed as a second per-instance
+    // vertex buffer (shader location 9) — keeps `BoxInstance`'s Pod layout
+    // untouched. Padded to the instance count with the far plane so a
+    // length mismatch can never index out of range on the GPU.
+    let mut depth_data = depths.to_vec();
+    depth_data.resize(instances.len(), crate::frame::DRAW_DEPTH_CLEAR);
+    let depth_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ByardCore - SolidBox Depth Buffer"),
+        contents: bytemuck::cast_slice(&depth_data),
         usage: wgpu::BufferUsages::VERTEX,
     });
 
@@ -1559,11 +1719,23 @@ fn draw_solid_box_instances(
     render_pass.set_bind_group(0, bind_group, &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+    render_pass.set_vertex_buffer(2, depth_buffer.slice(..));
     // Safety: no UI frame will ever hold 2^32 instances. The cast is
     // bounded by system memory (each BoxInstance is 80 bytes, so 2^32
     // would require 320 GiB of RAM before reaching this code).
     #[allow(clippy::cast_possible_truncation)]
     render_pass.draw(0..4, 0..instances.len() as u32);
+}
+
+/// Vertex buffer layout for the `SolidBox` pipeline's parallel draw-order depth
+/// buffer (a lone `f32` per instance at shader location 9).
+fn solid_depth_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] = &wgpu::vertex_attr_array![9 => Float32];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<f32>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: ATTRS,
+    }
 }
 
 #[cfg(test)]

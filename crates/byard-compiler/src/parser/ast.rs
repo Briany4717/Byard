@@ -181,6 +181,10 @@ pub struct ElementNode {
 pub struct Attr {
     /// Attribute name.
     pub name: Symbol,
+    /// The sub-property axis, if written as `name.axis: value` (RFC-0011
+    /// §"Dual surface", e.g. `translate.y: 2`). `None` for the ordinary
+    /// `name: value` / `name(payload)? => action` forms.
+    pub axis: Option<Symbol>,
     /// Whether this is a property binding or an engine event.
     pub kind: AttrKind,
     /// Source span.
@@ -262,6 +266,9 @@ pub enum Expr {
     IntLit(i64, Span),
     /// A float literal (`f64`; D9).
     FloatLit(f64, Span),
+    /// An angle literal (`360deg`/`1.5rad`, RFC-0011 T1), already
+    /// canonicalized to radians by the lexer.
+    AngleLit(f64, Span),
     /// A string literal, possibly interpolated.
     StrLit(Vec<StrPart>, Span),
     /// An identifier reference.
@@ -346,6 +353,7 @@ impl Expr {
         match self {
             Self::IntLit(_, span)
             | Self::FloatLit(_, span)
+            | Self::AngleLit(_, span)
             | Self::StrLit(_, span)
             | Self::Ident(_, span)
             | Self::Array(_, span)
@@ -394,6 +402,7 @@ mod tests {
             }],
             attrs: vec![Attr {
                 name: Symbol::intern("bg"),
+                axis: None,
                 kind: AttrKind::Prop {
                     value: Expr::IntLit(1, sp()),
                 },
@@ -434,6 +443,7 @@ mod tests {
     fn event_attr_carries_optional_payload() {
         let attr = Attr {
             name: Symbol::intern("pointer_move"),
+            axis: None,
             kind: AttrKind::Event {
                 payload: Some(Symbol::intern("e")),
                 action: Expr::Error(sp()),

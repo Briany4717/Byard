@@ -3,7 +3,10 @@
 // interpolation, ternaries, the full intrinsic catalog, two-way `bind:`,
 // keyboard focus + Tab, structural `for`/`when … else`, themed typography,
 // the four `Len` padding forms, decoration (radius/border/shadow/opacity),
-// and a textured `Image`. Run with: `byard dev` (or the example runner).
+// paint-time transforms, coherent paint order, and a textured `Image`.
+//
+// Laid out as two side-by-side columns in a ~16:9 landscape frame. Run with:
+//   cargo run -p byard-cli -- dev crates/byard-compiler/examples/hello_world.byd
 
 View Main() {
     // ── Reactive state (Int / Bool / Float / Str) ───────────────────────────
@@ -17,106 +20,167 @@ View Main() {
     var pokes: Int = 0
     var wheelTicks: Int = 0
     var scrollTicks: Int = 0
+    var cardHovered: Bool = false
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
     let summary = describe(count)
 
-    Column #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 20, width: 540] {
+    // Two columns side by side → a landscape ~16:9 frame instead of one tall
+    // strip. `align: start` keeps both columns pinned to the top.
+    Row #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 24, align: start] {
 
-        // ── Header: textured Image + themed typography ───────────────────────
-        Row #[gap: 16, align: center] {
-            Image("logo.png") #[width: 56, height: 56, radius: 14, fit: cover]
-            Column #[gap: 2] {
-                Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
-                Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
-            }
-        }
+        // ══ LEFT COLUMN ═════════════════════════════════════════════════════
+        Column #[gap: 20, width: 560] {
 
-        // ── Counter card: events (=>), ternary, fn + interpolation ───────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
-            Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
-            Row #[gap: 12, align: center] {
-                Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
-                Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
-                Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
-                Spacer
-                Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
+            // ── Header: textured Image + themed typography ───────────────────
+            Row #[gap: 16, align: center] {
+                Image("logo.png") #[width: 56, height: 56, radius: 14, fit: cover]
+                Column #[gap: 2] {
+                    Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
+                    Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
+                }
             }
-        }
 
-        // ── Interactive widgets bound two-way to the vars above ──────────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 16, border: 0x3C3C52] {
-            Row #[align: center, justify: between] {
-                Text("Favourite") #[color: 0x9AA0AC, size: 15]
-                Toggle #[bind: liked, width: 52, height: 30]
+            // ── Counter card: events (=>), ternary, fn + interpolation ───────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
+                Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
+                Row #[gap: 12, align: center] {
+                    Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
+                    Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
+                    Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
+                    Spacer
+                    Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
+                }
             }
-            Row #[align: center, justify: between, gap: 16] {
-                Text("Volume {volume}") #[color: 0x9AA0AC, size: 15]
-                Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
-            }
-            // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
-            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            Text("Hi {name}") #[color: 0x10B981, size: 14]
-        }
 
-        // ── Structural: when … else, and a for-loop over a list ──────────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
-            when liked {
-                Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
-            } else {
-                Text("tap the toggle to favourite") #[color: 0xEF4444, weight: medium]
+            // ── Interactive widgets bound two-way to the vars above ──────────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 16, border: 0x3C3C52] {
+                Row #[align: center, justify: between] {
+                    Text("Favourite") #[color: 0x9AA0AC, size: 15]
+                    Toggle #[bind: liked, width: 52, height: 30]
+                }
+                Row #[align: center, justify: between, gap: 16] {
+                    Text("Volume {volume}") #[color: 0x9AA0AC, size: 15]
+                    Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
+                }
+                // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
+                TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+                TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+                Text("Hi {name}") #[color: 0x10B981, size: 14]
             }
-            Row #[gap: 8] {
-                for tag in ["reactive", "typed", "native"] {
-                    Box #[bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10)] {
-                        Text("{tag}") #[color: 0xC9C9D4, size: 13]
+
+            // ── Structural: when … else, and a for-loop over a list ──────────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
+                when liked {
+                    Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
+                } else {
+                    Text("tap the toggle to favourite") #[color: 0xEF4444, weight: medium]
+                }
+                Row #[gap: 8] {
+                    for tag in ["reactive", "typed", "native"] {
+                        Box #[bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                            Text("{tag}") #[color: 0xC9C9D4, size: 13]
+                        }
                     }
                 }
             }
         }
 
-        // ── Decoration showcase: radius / border / shadow / opacity ──────────
-        Row #[gap: 16] {
-            Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
-            Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
-            Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
-            Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
-        }
+        // ══ RIGHT COLUMN ════════════════════════════════════════════════════
+        Column #[gap: 20, width: 560] {
 
-        // ── Full event exposure (RFC-0012 §A): hover/enter/exit, long_press,
-        // double_tap, secondary (right-click), the `click` alias, and the
-        // `focus =>`/`blur =>` sugar — hover the box, left/right/double-click
-        // it, hold it, then Tab to move focus in and out.
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
-            Text("Event exposure") #[color: 0x9AA0AC, size: 15]
-            Box #[
-                bg: hovered ? 0x6495ED : 0x34344A,
-                radius: 10,
-                p: (vertical: 14, horizontal: 18),
-                width: 320,
-                hover => hovered = true,
-                pointer_exit => hovered = false,
-                click => pokes++,
-                double_tap => pokes += 10,
-                long_press => pokes += 100,
-                secondary => pokes = 0,
-                focused: eventFocused,
-                focus => eventFocused = true,
-                blur => eventFocused = false,
-            ] {
-                Text(eventFocused ? "focused — click, right-click, hold, or double-click" : "click to focus me") #[color: 0xFFFFFF, size: 14]
+            // ── Decoration showcase: radius / border / shadow / opacity ──────
+            Row #[gap: 16] {
+                Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
+                Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
+                Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
+                Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
             }
-            Text("pokes: {pokes} (click +1, double-tap +10, long-press +100, right-click resets)") #[color: 0x9AA0AC, size: 13]
 
-            // Hardware wheel/scroll origin (RFC-0012 §A loose end): hover
-            // this area and use a physical mouse wheel (`wheelTicks`) or a
-            // trackpad scroll gesture (`scrollTicks`) over it. `scroll` is
-            // only in `ScrollView`'s accepted vocabulary today; `wheel` is
-            // universal.
-            ScrollView #[bg: 0x1E1E2A, radius: 10, p: (vertical: 14, horizontal: 18), width: 320, wheel => wheelTicks++, scroll => scrollTicks++] {
-                Text("wheel: {wheelTicks}   scroll: {scrollTicks}") #[color: 0xFFFFFF, size: 14]
+            // ── Paint-time transforms (RFC-0011): translate/scale/rotate/origin
+            // never re-run layout — the boxes below sit in a plain Row, and
+            // moving/rotating/scaling them doesn't reflow their siblings.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52] {
+                Text("Paint-time transforms") #[color: 0x9AA0AC, size: 15]
+                Row #[gap: 24, align: center] {
+                    // Hover to lift: scale up around the box's own center (the
+                    // default origin), a common card/button micro-interaction.
+                    Box #[
+                        bg: 0x6495ED,
+                        radius: 12,
+                        width: 90,
+                        height: 56,
+                        scale: cardHovered ? 1.12 : 1.0,
+                        hover => cardHovered = true,
+                        pointer_exit => cardHovered = false,
+                    ]
+                    // Nudged 14px right and 10px down from its laid-out position.
+                    Box #[bg: 0x9C27B0, radius: 12, width: 90, height: 56, translate: (34, 10)]
+                    // Verbose named-tuple form (coherent with `p: (top:…, left:…)`):
+                    // negative x moves it left, positive y moves it down.
+                    Box #[bg: 0xEF4444, radius: 12, width: 90, height: 56, translate: (x: -18, y: 30)]
+                    // Sub-property axis form: only the y-axis translate is set.
+                    Box #[bg: 0xF97316, radius: 12, width: 90, height: 56, translate.y: 20]
+                    // Rotated 90deg around its own center (the default origin).
+                    Box #[bg: 0x10B981, radius: 12, width: 90, height: 56, rotate: 90deg]
+                    // Rotated around its top-left corner instead of its center —
+                    // visibly swings the whole box, not just its fill.
+                    Box #[bg: 0xFBC02D, radius: 12, width: 90, height: 56, rotate: 10deg, origin: top_right]
+                }
+            }
+
+            // ── Paint order (z-order): one rule — later-emitted paints on top.
+            // Text is depth-sorted like every box now, NOT forced to the front.
+            // Boxes are translated to overlap the labels (text can't transform,
+            // so the boxes move instead); the paint result follows source order.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 14, border: 0x3C3C52] {
+                Text("Paint order — text is depth-sorted, not always on top") #[color: 0x9AA0AC, size: 15]
+
+                // (a) label first, then an OPAQUE bar emitted after it and nudged
+                // up onto it → the bar paints OVER the label (text is not on top).
+                Text("this label is BEHIND the blue bar") #[color: 0xE6E1E5, size: 18]
+                Box #[bg: 0x6495ED, radius: 6, width: 320, height: 24, translate.y: -22]
+
+                // (b) a bar first, then a label emitted after it; the bar is
+                // nudged down onto the label → the label paints OVER the bar.
+                Box #[bg: 0x964747, radius: 6, width: 320, height: 24, translate.y: 30]
+                Text("this label is IN FRONT of the red bar") #[color: 0xFFFFFF, size: 18, weight: bold]
+            }
+
+            // ── Full event exposure (RFC-0012 §A): hover/enter/exit, long_press,
+            // double_tap, secondary (right-click), the `click` alias, and the
+            // `focus =>`/`blur =>` sugar — hover the box, left/right/double-click
+            // it, hold it, then Tab to move focus in and out.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
+                Text("Event exposure") #[color: 0x9AA0AC, size: 15]
+                Box #[
+                    bg: hovered ? 0x6495ED : 0x34344A,
+                    radius: 10,
+                    p: (vertical: 14, horizontal: 18),
+                    width: 320,
+                    hover => hovered = true,
+                    pointer_exit => hovered = false,
+                    click => pokes++,
+                    double_tap => pokes += 10,
+                    long_press => pokes += 100,
+                    secondary => pokes = 0,
+                    focused: eventFocused,
+                    focus => eventFocused = true,
+                    blur => eventFocused = false,
+                ] {
+                    Text(eventFocused ? "focused — click, right-click, hold, or double-click" : "click to focus me") #[color: 0xFFFFFF, size: 14]
+                }
+                Text("pokes: {pokes} (click +1, double-tap +10, long-press +100, right-click resets)") #[color: 0x9AA0AC, size: 13]
+
+                // Hardware wheel/scroll origin (RFC-0012 §A loose end): hover
+                // this area and use a physical mouse wheel (`wheelTicks`) or a
+                // trackpad scroll gesture (`scrollTicks`) over it. `scroll` is
+                // only in `ScrollView`'s accepted vocabulary today; `wheel` is
+                // universal.
+                ScrollView #[bg: 0x1E1E2A, radius: 10, p: (vertical: 14, horizontal: 18), width: 320, wheel => wheelTicks++, scroll => scrollTicks++] {
+                    Text("wheel: {wheelTicks}   scroll: {scrollTicks}") #[color: 0xFFFFFF, size: 14]
+                }
             }
         }
     }
