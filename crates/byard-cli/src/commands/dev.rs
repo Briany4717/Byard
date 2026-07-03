@@ -86,6 +86,9 @@ struct ByldRuntime {
     error_state: Option<Vec<CompileError>>,
     width_bits: Arc<AtomicU32>,
     height_bits: Arc<AtomicU32>,
+    /// Epoch for the animation clock (RFC-0010): `with` animations sample
+    /// against ms elapsed since the logic runtime started.
+    start: std::time::Instant,
 }
 
 impl ByldRuntime {
@@ -152,6 +155,10 @@ impl LogicRuntime for ByldRuntime {
         self.interp.tick();
 
         // ── Step 3: render ────────────────────────────────────────────────────
+        // Advance the animation clock (RFC-0010) before rendering so `with`
+        // curves sample against the current elapsed time.
+        let elapsed = u32::try_from(self.start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.interp.set_now_ms(elapsed);
         let w = f32::from_bits(self.width_bits.load(Ordering::Relaxed));
         let h = f32::from_bits(self.height_bits.load(Ordering::Relaxed));
 
@@ -391,6 +398,7 @@ impl PlatformHost for App {
                 error_state: initial_errors,
                 width_bits: w_clone,
                 height_bits: h_clone,
+                start: std::time::Instant::now(),
             })
         })?;
 
