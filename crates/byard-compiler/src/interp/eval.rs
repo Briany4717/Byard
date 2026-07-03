@@ -838,6 +838,15 @@ impl Interpreter {
                         crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
                     let elem_idx = self.atlas.node_index(atlas_node);
 
+                    // RFC-0012 S5: a `disabled:` element still lays out and paints,
+                    // but the router gates every handler it registers below and
+                    // reports the `DISABLED` interaction state.
+                    if self.eval_bool_prop(attrs, "disabled") == Some(true) {
+                        if let Some(idx) = elem_idx {
+                            self.router.set_disabled(idx);
+                        }
+                    }
+
                     // ── Widget-specific visual lowering & handler registration (M16/M19) ──
                     match element_name {
                         "Toggle" => {
@@ -1448,6 +1457,19 @@ impl Interpreter {
                         Value::Int(n) => Some(n as f64),
                         _ => None,
                     };
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_bool_prop(&mut self, attrs: &[Attr], name: &str) -> Option<bool> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    if let Value::Bool(b) = self.eval_pure(value) {
+                        return Some(b);
+                    }
                 }
             }
             None
