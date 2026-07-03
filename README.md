@@ -8,11 +8,18 @@
 
 ---
 
-> **Project status: pre-alpha — interactive widgets phase.**
-> The engine, compiler, and dev toolchain are functional. You can write a `.byd`
-> file, run `byard dev`, and see it live-reload on every save. The next phase
-> (M16–M20) wires up interactivity for `Toggle`, `Slider`, and `TextField`.
-> Public APIs and the `byld` syntax will change before the first stable release.
+> **Project status: pre-alpha.**
+> The engine, compiler, and dev toolchain are functional and tested — you can
+> write a `.byd` file today and run it live-reloading in a native window.
+> Working end to end: interactive widgets (`Toggle`/`Slider`/`TextField`) with
+> focus and keyboard input; decorated rendering (border, shadow, opacity,
+> per-corner `radius`); paint-time transforms (`translate`/`scale`/`rotate`)
+> with coherent cross-pass paint ordering; a theme system; the
+> `#[byard_controller]` Rust boundary; dirty-rectangle incremental redraw; async
+> image loading; and a zero-allocation frame profiler. Per-property animations,
+> interactive style states, and richer view composition are actively in
+> progress. Public APIs and the `byld` syntax will change before the first
+> stable release.
 
 ## What is Byard?
 
@@ -79,6 +86,14 @@ View Counter() {
 Wrapper components (`Padding`, `Align`, …) are intentionally absent — spatial and
 decorative properties are inline arguments on the element they affect.
 
+`radius` also accepts a positional 4-tuple for independent per-corner control —
+`radius: (4, 8, 12, 16)` in CSS-style `top_left, top_right, bottom_right,
+bottom_left` order — with a plain scalar still broadcasting to all four corners.
+
+Paint-time transforms move, resize, and rotate an element *visually* without
+touching layout: a hover-to-lift card is just `scale: hovered ? 1.03 : 1.0`, and
+its siblings never reflow.
+
 ## Getting started
 
 ```sh
@@ -96,6 +111,18 @@ byard check
 Edit `main.byd` and save — the window updates within one frame. No recompile,
 no `cargo run`, no hot key.
 
+> **Running from this repo (pre-release).** `byard` isn't published yet, so
+> there's no `byard` on your `PATH`. Invoke the CLI through Cargo and pass a
+> `.byd` path directly (no `byard.toml` needed):
+>
+> ```sh
+> # Live-reload dev window for the bundled demo
+> cargo run -p byard-cli -- dev crates/byard-compiler/examples/hello_world.byd
+>
+> # Validate only (no window)
+> cargo run -p byard-cli -- check crates/byard-compiler/examples/hello_world.byd
+> ```
+
 ## Architecture at a glance
 
 The engine is four concurrent subsystems:
@@ -105,7 +132,9 @@ The engine is four concurrent subsystems:
 - **Spatial subsystem** — Taffy-based layout plus a spatial hash grid for `O(1)`
   hit-testing, decoupled from the UI tree.
 - **Render subsystem** — a multi-pipeline `wgpu` command dispatcher (`SolidBox`,
-  `TextGlyph`, and planned `DecoratedBox`/`TextureSampler`).
+  `TextGlyph`, `DecoratedBox`, `TextureSampler`), with dirty-rectangle tracking
+  and GPU scissor clipping so an incremental frame only repaints what changed
+  (RFC-0001 §3.3).
 - **Concurrency subsystem** — double-buffered visual state, the Relay signal bus,
   and a Tokio pool for async I/O.
 
@@ -114,7 +143,7 @@ On every save, the view's shape is diffed: reactive-compatible patches apply
 instantly (signal state preserved); structure-incompatible patches are held past
 any in-flight pointer gesture, then applied cleanly.
 
-The full design is specified across six RFCs in [`docs/rfcs/`](docs/rfcs/):
+The foundational design is specified across six RFCs in [`docs/rfcs/`](docs/rfcs/):
 
 | RFC | Topic |
 |-----|-------|
@@ -125,6 +154,10 @@ The full design is specified across six RFCs in [`docs/rfcs/`](docs/rfcs/):
 | [0005](docs/rfcs/0005-intrinsic-view-catalog.md) | Built-in view catalog (`Column`, `Button`, `TextField`, …) |
 | [0006](docs/rfcs/0006-cli-and-dev-runner.md) | `byard` CLI, dev runner, live-reload wiring |
 
+Later subsystems — transforms, animations, interactive styling, telemetry, and
+view composition — are specified in their own RFCs, each landing alongside the
+feature it describes.
+
 ## Crate layout
 
 ```
@@ -133,7 +166,7 @@ crates/
   byard-compiler/   — byld lexer, parser, reactive interpreter, hot-reload logic
   byard-platform/   — PlatformHost implementations (winit + wgpu)
   byard-cli/        — the `byard` binary (new / dev / check / build)
-  byard-macro/      — #[byard_controller] proc-macro (Phase 4)
+  byard-macro/      — #[byard_controller] proc-macro (the byld ↔ Rust boundary)
   byld-lsp/         — language server (in progress)
 ```
 
@@ -141,19 +174,13 @@ crates/
 
 | Phase | Status | Scope |
 |-------|--------|-------|
-| **0 — Design** | ✅ complete | RFCs 0001–0006, architecture, crate layout |
+| **0 — Design** | ✅ complete | Core architecture, crate layering, memory model |
 | **1 — Engine core** | ✅ complete | `wgpu` renderer, Taffy layout, Relay threading, `PlatformHost` |
-| **2 — `byld` compiler & dev toolchain** | ✅ complete | Lexer, parser, reactive interpreter (Mark-and-Pull), event router, hot-reload, `byard-cli`, 370+ tests |
-| **3 — Interactive widgets** | 🔲 next | `Toggle`/`Slider`/`TextField` interactivity, keyboard input, focus, `for`/`when` in render |
-| **4 — Production pipelines** | 🔲 planned | `DecoratedBox`/`TextureSampler`, theming, `#[byard_controller]` bridge |
-| **5 — Production transpiler** | 🔲 planned | `byld` → native Rust AOT, accessibility `AccessBridge` |
-
-**Phase 3 milestones (M16–M20):**
-- **M16** `bind:`/`value:` write-back → widgets mutate their bound `var` on interaction
-- **M17** Keyboard & text delivery → `TextField` receives characters
-- **M18** Focus system → Tab, click-to-focus, key routing to the focused element
-- **M19** Visual lowering → `Toggle`/`Slider`/`TextField` render their actual visual structure
-- **M20** `for`/`when` in render → reactive lists and conditionals in the view tree
+| **2 — `byld` compiler & dev toolchain** | ✅ complete | Lexer, parser, reactive interpreter (Mark-and-Pull), event router, hot-reload, `byard-cli` |
+| **3 — Interactive widgets & rendering polish** | ✅ complete | `Toggle`/`Slider`/`TextField`, focus and keyboard input, `for`/`when` in render, decorated rendering, theming, the controller boundary, dirty-rect redraw, async assets |
+| **4 — Motion & interactive styling** | 🟡 in progress | Paint-time transforms and coherent cross-pass paint order (done); a zero-allocation frame profiler (done); per-property `with` animations and interactive style states (underway) |
+| **5 — View composition & packages** | 🔲 planned | Composing user `View`s within and across files; modules, dependencies, and distribution |
+| **6 — Production transpiler** | 🔲 planned | `byld` → native Rust AOT compilation and an accessibility bridge |
 
 ## Contributing
 
