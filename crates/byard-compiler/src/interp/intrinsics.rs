@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::CompileError;
-use crate::parser::ast::{AttrKind, ElementNode, Expr};
+use crate::parser::ast::{Attr, AttrKind, ElementNode, Expr};
 use crate::util::closest_match;
 
 /// The closed set of intrinsic names (RFC-0005 §4).
@@ -350,7 +350,11 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
 /// produces (possibly several). `known_views` are the user `ViewDecl` names in
 /// scope, so a non-intrinsic element that resolves to a view is not an error.
 #[must_use]
-pub fn validate_element(el: &ElementNode, known_views: &[&str]) -> Vec<CompileError> {
+pub fn validate_element(
+    el: &ElementNode,
+    attrs: &[Attr],
+    known_views: &[&str],
+) -> Vec<CompileError> {
     let mut errs = Vec::new();
     let name = el.name.as_str();
 
@@ -401,7 +405,7 @@ pub fn validate_element(el: &ElementNode, known_views: &[&str]) -> Vec<CompileEr
     }
 
     // Rules 4–6 — per attribute.
-    for attr in &el.attrs {
+    for attr in attrs {
         let an = attr.name.as_str();
         let is_prop = matches!(attr.kind, AttrKind::Prop { .. });
         let prop_ty = info.props.get(an).copied();
@@ -621,7 +625,8 @@ mod tests {
     }
 
     fn errs(src: &str) -> Vec<CompileError> {
-        validate_element(&first_element(src), &[])
+        let el = first_element(src);
+        validate_element(&el, &el.attrs, &[])
     }
 
     #[test]
@@ -732,10 +737,8 @@ mod tests {
     #[test]
     fn rule1_known_user_view_is_ok() {
         // `Card` is not an intrinsic but is a known view in scope.
-        assert!(
-            validate_element(&first_element("View V() { Card #[gap: 8] {} }"), &["Card"])
-                .is_empty()
-        );
+        let el = first_element("View V() { Card #[gap: 8] {} }");
+        assert!(validate_element(&el, &el.attrs, &["Card"]).is_empty());
     }
 
     #[test]

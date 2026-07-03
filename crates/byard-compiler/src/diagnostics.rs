@@ -207,6 +207,12 @@ pub enum CompileError {
         /// Human-readable description of the problem.
         message: String,
     },
+    /// A `..` spread's operand did not resolve to a `style { … }` value
+    /// (RFC-0016) — e.g. `..x` where `x` is not a `let`-bound style.
+    NotAStyle {
+        /// Source range of the offending spread.
+        span: Span,
+    },
 }
 
 impl CompileError {
@@ -233,7 +239,8 @@ impl CompileError {
             | Self::ConflictingSpacingField { span, .. }
             | Self::UnknownAnimation { span, .. }
             | Self::LayoutPropNotAnimatable { span, .. }
-            | Self::InvalidAnimation { span, .. } => *span,
+            | Self::InvalidAnimation { span, .. }
+            | Self::NotAStyle { span } => *span,
         }
     }
 
@@ -262,6 +269,7 @@ impl CompileError {
             Self::UnknownAnimation { .. } => "UnknownAnimation",
             Self::LayoutPropNotAnimatable { .. } => "LayoutPropNotAnimatable",
             Self::InvalidAnimation { .. } => "InvalidAnimation",
+            Self::NotAStyle { .. } => "NotAStyle",
         }
     }
 
@@ -331,6 +339,7 @@ impl CompileError {
                 "`{prop}` is a layout property and cannot be animated with `with` \
                  (it would relayout every frame); animate a `scale` transform instead"
             ),
+            Self::NotAStyle { .. } => "`..` can only spread a `style { … }` value".to_string(),
         }
     }
 

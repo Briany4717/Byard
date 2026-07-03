@@ -429,6 +429,32 @@ fn with_animation_optional_parens_and_named_args_parse() {
 }
 
 #[test]
+fn style_value_and_spread_parse() {
+    // RFC-0016: `let s = style { … }` binds a style value; `#[..s]` spreads it.
+    let view = one_view(
+        "View V() { let s = style { bg: 0x111111, radius: 4 } Box #[..s, color: 0xFFFFFF] }",
+    );
+    let Member::Let {
+        init: Expr::StyleValue { attrs, .. },
+        ..
+    } = &view.body[0]
+    else {
+        panic!("expected `let = style {{}}`, got {:?}", view.body[0]);
+    };
+    assert_eq!(attrs.len(), 2, "the style holds two attributes");
+
+    let el = as_element(&view.body[1]);
+    assert!(
+        matches!(&el.attrs[0].kind, AttrKind::Spread { .. }),
+        "the first element attribute is a `..` spread"
+    );
+    assert!(
+        matches!(&el.attrs[1].kind, AttrKind::Prop { .. }),
+        "the inline attribute follows the spread"
+    );
+}
+
+#[test]
 fn function_types_parse() {
     let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
     let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {

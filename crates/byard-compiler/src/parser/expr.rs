@@ -66,6 +66,7 @@ impl Parser<'_> {
                 Expr::Ident(sym, span)
             }
             Some(Token::Minus) => self.parse_negative(),
+            Some(Token::Style) => self.parse_style_value(),
             Some(Token::LBrack) => self.parse_array(),
             Some(Token::LParen) => self.parse_paren_or_lambda(),
             Some(Token::Pipe) => self.parse_pipe_lambda(),
@@ -75,6 +76,34 @@ impl Parser<'_> {
                 // Do not consume: let the caller's recovery decide.
                 Expr::Error(span)
             }
+        }
+    }
+
+    /// A first-class style value `style { name: value, … }` (RFC-0016) in
+    /// expression position (e.g. `let btn = style { … }`). Attributes are the
+    /// same `name: value` / `..spread` forms as an element's `#[…]`, separated
+    /// by commas or newlines. (The member-level `style { .class … }` rules
+    /// block is a separate, statement-level form.)
+    fn parse_style_value(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // `style`
+        self.expect(&Token::LBrace, "'{' after `style`");
+        let mut attrs = Vec::new();
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            if let Some(a) = self.parse_attr() {
+                attrs.push(a);
+            }
+            if self.pos == before {
+                self.advance(); // guarantee progress on a malformed attr
+            }
+            // Commas are optional (newlines separate too, but aren't tokens).
+            self.eat(&Token::Comma);
+        }
+        self.expect(&Token::RBrace, "'}' to close the style");
+        Expr::StyleValue {
+            attrs,
+            span: self.span_from(start),
         }
     }
 

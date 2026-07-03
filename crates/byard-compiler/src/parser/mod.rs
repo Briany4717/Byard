@@ -477,6 +477,17 @@ impl<'a> Parser<'a> {
     /// expr` (event — no sub-property form).
     fn parse_attr(&mut self) -> Option<Attr> {
         let start = self.cur_span();
+        // `..style` spread (RFC-0016): no name — it splices a style value's
+        // attributes into this list.
+        if self.eat(&Token::DotDot) {
+            let value = self.parse_expr(0);
+            return Some(Attr {
+                name: Symbol::intern(""),
+                axis: None,
+                kind: AttrKind::Spread { value },
+                span: self.span_from(start),
+            });
+        }
         let name = self.expect_name("an attribute name")?;
         if self.eat(&Token::LParen) {
             let payload = self.expect_ident("an event payload name");

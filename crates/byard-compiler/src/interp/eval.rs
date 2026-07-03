@@ -157,6 +157,10 @@ pub struct Interpreter {
     ///
     /// [`has_active_animations`]: Self::has_active_animations
     any_active: bool,
+    /// First-class style values (RFC-0016): `let name = style { … }` registers
+    /// its attributes here, and a `..name` spread on an element splices them in
+    /// at lower time. Static and view-scoped — no cascade.
+    styles: std::collections::HashMap<Symbol, Vec<Attr>>,
 }
 
 impl Interpreter {
@@ -238,7 +242,14 @@ impl Interpreter {
                 self.define_var(name.clone(), init);
             }
             Member::Let { name, init, .. } => {
-                self.define_let(name.clone(), init);
+                // `let x = style { … }` (RFC-0016) registers a style value in the
+                // view-scoped table rather than a reactive memo; a `..x` spread
+                // splices its attributes at lower time.
+                if let Expr::StyleValue { attrs, .. } = init {
+                    self.styles.insert(name.clone(), attrs.clone());
+                } else {
+                    self.define_let(name.clone(), init);
+                }
             }
             Member::Fn {
                 name, params, body, ..
@@ -407,7 +418,12 @@ impl Interpreter {
     /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
     /// `known_views` are user `ViewDecl` names in scope.
     pub fn lower_element(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
-        self.errors.extend(validate_element(el, known_views));
+        // RFC-0016: expand `..style` spreads into a flat attribute set *before*
+        // validating or lowering, so everything downstream sees ordinary
+        // resolved attributes (and a spread can never leak into the checker).
+        let attrs = self.expand_style_spreads(&el.attrs);
+        self.errors
+            .extend(validate_element(el, &attrs, known_views));
         match el.name.as_str() {
             "Text" | "Button" if !el.content.is_empty() => {
                 let content = self.bind_value(&el.content[0].value);
@@ -415,7 +431,7 @@ impl Interpreter {
                     // A Button is a decorated box wrapping its label.
                     RenderNode::Box {
                         name: Symbol::intern("Button"),
-                        attrs: el.attrs.clone(),
+                        attrs,
                         children: vec![RenderNode::Text {
                             attrs: Vec::new(),
                             content,
@@ -424,10 +440,7 @@ impl Interpreter {
                         bound_sig: None,
                     }
                 } else {
-                    RenderNode::Text {
-                        attrs: el.attrs.clone(),
-                        content,
-                    }
+                    RenderNode::Text { attrs, content }
                 }
             }
             "Spacer" => RenderNode::Spacer,
@@ -439,17 +452,14 @@ impl Interpreter {
                     |c| c.value.clone(),
                 );
                 let src = self.bind_value(&src_expr);
-                RenderNode::Image {
-                    attrs: el.attrs.clone(),
-                    src,
-                }
+                RenderNode::Image { attrs, src }
             }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
-                let bound_sig = self.resolve_bind_sig(&el.attrs);
+                let bound_sig = self.resolve_bind_sig(&attrs);
                 RenderNode::Box {
                     name: el.name.clone(),
-                    attrs: el.attrs.clone(),
+                    attrs,
                     children: Vec::new(),
                     action: el.action.clone(),
                     bound_sig,
@@ -460,12 +470,58 @@ impl Interpreter {
                 let children = self.lower_members(&el.children, known_views);
                 RenderNode::Box {
                     name: el.name.clone(),
-                    attrs: el.attrs.clone(),
+                    attrs,
                     children,
                     action: el.action.clone(),
                     bound_sig: None,
                 }
             }
+        }
+    }
+
+    /// Expands `..style` spreads (RFC-0016) in an attribute list into a flat
+    /// set: each spread splices the referenced style's attributes in written
+    /// order (a later spread overrides an earlier one), then inline attributes
+    /// override every spread. The common, spread-free case returns a plain
+    /// clone with no work. A spread that doesn't resolve to a known style is a
+    /// [`CompileError::NotAStyle`].
+    fn expand_style_spreads(&mut self, attrs: &[Attr]) -> Vec<Attr> {
+        if !attrs
+            .iter()
+            .any(|a| matches!(a.kind, AttrKind::Spread { .. }))
+        {
+            return attrs.to_vec();
+        }
+        let mut resolved: Vec<Attr> = Vec::new();
+        // 1) Spreads first, in written order.
+        for a in attrs {
+            if let AttrKind::Spread { value } = &a.kind {
+                match self.resolve_spread(value) {
+                    Some(spread_attrs) => {
+                        for sa in spread_attrs {
+                            override_attr(&mut resolved, sa);
+                        }
+                    }
+                    None => self.errors.push(CompileError::NotAStyle { span: a.span }),
+                }
+            }
+        }
+        // 2) Inline attributes win over the spreads.
+        for a in attrs {
+            if !matches!(a.kind, AttrKind::Spread { .. }) {
+                override_attr(&mut resolved, a.clone());
+            }
+        }
+        resolved
+    }
+
+    /// Resolves a spread's expression to a style's attributes: a `let`-bound
+    /// style name, or an inline `style { … }` value.
+    fn resolve_spread(&self, value: &Expr) -> Option<Vec<Attr>> {
+        match value {
+            Expr::Ident(name, _) => self.styles.get(name).cloned(),
+            Expr::StyleValue { attrs, .. } => Some(attrs.clone()),
+            _ => None,
         }
     }
 
@@ -2248,6 +2304,12 @@ impl Interpreter {
                     Box::new(|_| Value::Unit)
                 }
             }
+            // A `style { … }` value (RFC-0016) is consumed structurally — bound
+            // via `let` into the style table and spliced by `..` at lower time
+            // (see `register_style`/`expand_style_spreads`) — never projected as
+            // a scalar. Reaching here means it was used where a value was
+            // expected, which has no meaning; yield Unit.
+            Expr::StyleValue { .. } => Box::new(|_| Value::Unit),
             // `value with anim.*(…)` (RFC-0010): lower to the *target* value.
             // The curve is validated by the checker; the `Motion` runtime that
             // actually drives the on-screen transition lands in the follow-up
@@ -2569,6 +2631,20 @@ fn spacing_value(v: &Value) -> Option<f32> {
         Value::Int(n) => Some(*n as f32),
         Value::Float(f) => Some(*f as f32),
         _ => None,
+    }
+}
+
+/// Inserts `attr` into a resolved style set, replacing any existing attribute
+/// with the same name and sub-property axis (last-wins) or appending it — so a
+/// spread/inline override cleanly supersedes an earlier value (RFC-0016).
+fn override_attr(set: &mut Vec<Attr>, attr: Attr) {
+    if let Some(existing) = set
+        .iter_mut()
+        .find(|a| a.name == attr.name && a.axis == attr.axis)
+    {
+        *existing = attr;
+    } else {
+        set.push(attr);
     }
 }
 
@@ -3465,6 +3541,53 @@ mod tests {
             (label.color[3] - 0.4).abs() < 1e-3,
             "label alpha should inherit the 0.4 opacity, got {}",
             label.color[3]
+        );
+    }
+
+    #[test]
+    fn style_value_spreads_onto_an_element_and_inline_overrides() {
+        // RFC-0016: a `let`-bound style is spliced by `..`, and inline attrs win.
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x112233, radius: 8 } \
+             Box #[..btn, width: 10, height: 10] {} \
+             Box #[..btn, bg: 0x445566, width: 10, height: 10] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let insts = frame.instances();
+        // First box takes `bg` from the spread (0x11 red channel).
+        assert!(
+            (insts[0].color[0] - f32::from(0x11u8) / 255.0).abs() < 1e-3,
+            "spread bg reaches the box, got {:?}",
+            insts[0].color
+        );
+        // Second box: inline `bg` overrides the spread (0x44 red channel).
+        assert!(
+            (insts[1].color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "inline bg overrides the spread, got {:?}",
+            insts[1].color
+        );
+    }
+
+    #[test]
+    fn spreading_a_non_style_is_an_error() {
+        let parsed = parse("View V() { let x = 5 Box #[..x, width: 10, height: 10] {} }");
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let _ = interp.lower_view(view, &[]);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::NotAStyle { .. })),
+            "spreading a non-style must be a NotAStyle error, got {:?}",
+            interp.errors()
         );
     }
 
