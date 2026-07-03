@@ -440,7 +440,7 @@ fn find_in_members(
                             });
                         }
                         match &attr.kind {
-                            AttrKind::Prop { value } => {
+                            AttrKind::Prop { value } | AttrKind::Spread { value } => {
                                 if let Some(target) = find_in_expr(value, offset) {
                                     return Some(target);
                                 }
@@ -1135,7 +1135,7 @@ fn find_class_ref_in_members(members: &[Member], offset: usize) -> Option<String
             Member::Element(el) => {
                 for attr in &el.attrs {
                     match &attr.kind {
-                        AttrKind::Prop { value } => {
+                        AttrKind::Prop { value } | AttrKind::Spread { value } => {
                             if let Some(name) = find_class_ref_in_expr(value, offset) {
                                 return Some(name);
                             }

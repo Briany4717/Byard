@@ -26,6 +26,10 @@ View Main() {
     fn describe(n: Int) => "the counter is {n}"
     let summary = describe(count)
 
+    // A first-class style value (RFC-0016): a named, reusable bundle of
+    // attributes, spread onto elements below with `..chip`.
+    let chip = style { bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10) }
+
     // Two columns side by side → a landscape ~16:9 frame instead of one tall
     // strip. `align: start` keeps both columns pinned to the top.
     Row #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 24, align: start] {
@@ -82,7 +86,8 @@ View Main() {
                 }
                 Row #[gap: 8] {
                     for tag in ["reactive", "typed", "native"] {
-                        Box #[bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                        // Each chip spreads the shared `chip` style (RFC-0016).
+                        Box #[..chip] {
                             Text("{tag}") #[color: 0xC9C9D4, size: 13]
                         }
                     }

@@ -164,6 +164,10 @@ pub enum Token {
     /// `.`
     #[token(".")]
     Dot,
+    /// `..` (RFC-0016 spread: `#[..style]`). Longest-match keeps this distinct
+    /// from a single `.` (member access / sub-property axis).
+    #[token("..")]
+    DotDot,
     /// `=>` (event / lambda arrow)
     #[token("=>")]
     Arrow,

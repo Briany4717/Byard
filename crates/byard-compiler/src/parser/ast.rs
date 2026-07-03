@@ -208,6 +208,15 @@ pub enum AttrKind {
         /// The action expression.
         action: Expr,
     },
+    /// `..expr` — a style spread (RFC-0016): splice the attributes of the
+    /// [`StyleValue`](Expr::StyleValue) `expr` resolves to into this list, in
+    /// written order, before any inline attributes override them. The owning
+    /// [`Attr`]'s `name` is empty for a spread.
+    Spread {
+        /// The style expression being spread (an identifier bound to a style,
+        /// or an inline `style { … }`).
+        value: Expr,
+    },
 }
 
 /// A style rule: `. IDENT #[ attrs ]` (D5).
@@ -353,6 +362,15 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A first-class style value `style { name: value, … }` (RFC-0016): an
+    /// ordered bundle of attributes, `let`-bound and applied to an element with
+    /// the `..` spread. Static and composable; no cascade.
+    StyleValue {
+        /// The style's attributes, in written order.
+        attrs: Vec<Attr>,
+        /// Source span.
+        span: Span,
+    },
     /// A parse-error placeholder, so recovery can continue and collect more
     /// diagnostics (RFC-0002 §"Parser").
     Error(Span),
@@ -378,6 +396,7 @@ impl Expr {
             | Self::Postfix { span, .. }
             | Self::Ternary { span, .. }
             | Self::Animated { span, .. }
+            | Self::StyleValue { span, .. }
             | Self::Error(span) => *span,
         }
     }
