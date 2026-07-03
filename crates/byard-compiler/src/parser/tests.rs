@@ -397,6 +397,38 @@ fn bare_minus_without_a_number_is_a_targeted_error() {
 }
 
 #[test]
+fn with_animation_binds_the_whole_ternary_as_the_value() {
+    // RFC-0010: `a ? b : c with k` groups as `(a ? b : c) with k` — the whole
+    // conditional is the animated value, not just the else-branch.
+    let view = one_view("View V() { Box #[radius: pressed ? 3 : 10 with anim.spring()] }");
+    let el = as_element(&view.body[0]);
+    let AttrKind::Prop {
+        value: Expr::Animated { value, anim, .. },
+    } = &el.attrs[0].kind
+    else {
+        panic!("expected an Animated value, got {:?}", el.attrs[0].kind);
+    };
+    assert!(
+        matches!(value.as_ref(), Expr::Ternary { .. }),
+        "the ternary must be the animated value"
+    );
+    assert!(
+        matches!(anim.as_ref(), Expr::Call { .. }),
+        "the anim side must be the `anim.spring()` call"
+    );
+}
+
+#[test]
+fn with_animation_optional_parens_and_named_args_parse() {
+    // Bare call, named-arg call, and a `200ms` duration literal all parse.
+    one_view("View V() { Box #[scale: hovered ? 1.05 : 1.0 with anim.spring()] }");
+    one_view(
+        "View V() { Box #[scale: hovered ? 1.05 : 1.0 with anim.spring(stiffness: 210, damping: 20)] }",
+    );
+    one_view("View V() { Box #[opacity: shown ? 1.0 : 0.0 with anim.linear(200ms)] }");
+}
+
+#[test]
 fn function_types_parse() {
     let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
     let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {
