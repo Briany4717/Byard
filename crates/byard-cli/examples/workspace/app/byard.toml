@@ -1,0 +1,6 @@
+[project]
+name = "app"
+entry = "src/main.byd"
+
+[dependencies]
+kit = { path = "../kit" }

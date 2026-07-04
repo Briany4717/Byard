@@ -89,6 +89,13 @@ pub enum Token {
     /// `base merge overrides` produces a new `Style` whose right operand wins.
     #[token("merge")]
     Merge,
+    /// `use` (RFC-0008 D-F): a package-qualified symbol import at file top —
+    /// `use material`, `use material as m`, `use material.{Card}`. The name
+    /// is resolved by the module resolver against the *manifest-declared*
+    /// dependency set; no path string ever appears in `byld` source (the
+    /// two-layer rule, RFC-0001 §1).
+    #[token("use")]
+    Use,
 
     // ---- identifiers & literals ----
     /// An identifier (interned).
@@ -349,7 +356,7 @@ mod tests {
     #[test]
     fn keywords_lex_to_their_tokens() {
         assert_eq!(
-            kinds("View var let fn inject as for in when else style untrack with merge"),
+            kinds("View var let fn inject as for in when else style untrack with merge use"),
             vec![
                 Token::View,
                 Token::Var,
@@ -365,6 +372,7 @@ mod tests {
                 Token::Untrack,
                 Token::With,
                 Token::Merge,
+                Token::Use,
             ]
         );
     }

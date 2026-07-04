@@ -12,6 +12,13 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0008 package ecosystem.** The `use` import surface with explicit
+  namespacing (`use material as m` → `m.Card`, `use material.{Card}`); a
+  module resolver in `byard_compiler::resolve` with package-cycle detection
+  and a program-wide span `SourceMap`; strict `[dependencies]` parsing;
+  `byard add`/`byard install`/`byard get` with a content-hashed `byard.lock`
+  and a global `~/.byard/cache`; multi-file + `path`-dependency hot-reload; and
+  package-aware LSP completions (`use <TAB>`, `m.<TAB>`, package-view params).
 - Repository scaffolding: README, licenses, contributing guide, CI workflow.
 - `docs/rfcs/0001-core-architecture.md` — consolidated design document covering
   the memory model, multi-pipeline renderer, spatial hit-testing grid, threading

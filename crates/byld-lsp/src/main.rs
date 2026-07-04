@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use byard_compiler::diagnostics::Span;
 use byard_compiler::interp::eval::Interpreter;
-use byard_compiler::parser::ast::{AttrKind, Expr, Member, StrPart, ViewDecl};
+use byard_compiler::parser::ast::{AttrKind, Expr, Member, StrPart, UseDecl, ViewDecl};
 use byard_compiler::parser::parse;
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
@@ -97,7 +97,13 @@ fn main_loop(
                         let pos = params.text_document_position.position;
 
                         let response = if let Some(content) = documents.get(&uri) {
-                            let completion_info = handle_completion(content, pos);
+                            // The document's path anchors the RFC-0008 package
+                            // index (walk up to byard.toml → [dependencies]).
+                            let doc_path = url::Url::parse(uri.as_str())
+                                .ok()
+                                .and_then(|u| u.to_file_path().ok());
+                            let completion_info =
+                                handle_completion(content, pos, doc_path.as_deref());
                             Response::new_ok(id, completion_info)
                         } else {
                             Response::new_ok(id, None::<CompletionResponse>)
@@ -710,7 +716,11 @@ fn is_style_rule_before_attr(content: &str, attr_start: usize) -> bool {
         i -= 1;
     }
     if i > 0 && bytes[i - 1] == b'.' {
-        return true;
+        // `.card #[…]` is a style rule, but `m.Card #[…]` is a
+        // package-qualified element (RFC-0008 Pillar B) — a style rule's dot
+        // is never preceded by an identifier character.
+        let qualified = i >= 2 && (bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_');
+        return !qualified;
     }
     false
 }
@@ -748,6 +758,17 @@ fn find_element_name_before_attr(content: &str, attr_start: usize) -> Option<Str
     let name_end = i;
     while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
         i -= 1;
+    }
+    // A package-qualified reference (`m.Card`, RFC-0008 Pillar B): include
+    // the alias prefix so completions can resolve through the import.
+    if i > 1 && bytes[i - 1] == b'.' {
+        let mut j = i - 1;
+        while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+            j -= 1;
+        }
+        if j < i - 1 {
+            i = j;
+        }
     }
     if i < name_end {
         let name = &content[i..name_end];
@@ -906,8 +927,162 @@ fn collect_locals_in_members(
     }
 }
 
-fn handle_completion(content: &str, pos: Position) -> Option<CompletionResponse> {
+// ── RFC-0008 package index (editor support for `use`) ────────────────────────
+
+/// The exported views of every package the document's manifest declares —
+/// what powers `m.<TAB>` completions and package-view parameter completions.
+///
+/// Resolution is a light, per-request re-read (files are small and completion
+/// is human-paced). `path` dependencies resolve directly; git dependencies
+/// resolve only after `byard get` put them in the cache and require the CLI's
+/// cache-key — the LSP skips them for now (roadmap: share the provider).
+#[derive(Default)]
+struct PackageIndex {
+    /// package name → its exported views.
+    exports: std::collections::HashMap<String, Vec<ViewDecl>>,
+    /// Every declared dependency name (even unresolvable ones), for
+    /// `use <TAB>` completions.
+    declared: Vec<String>,
+}
+
+impl PackageIndex {
+    /// Builds the index for the document at `doc_path` by walking up to its
+    /// `byard.toml` and reading `[dependencies]`.
+    fn build(doc_path: Option<&std::path::Path>) -> Self {
+        let Some(doc_path) = doc_path else {
+            return Self::default();
+        };
+        let Some(manifest_dir) = doc_path
+            .ancestors()
+            .skip(1)
+            .find(|d| d.join("byard.toml").exists())
+        else {
+            return Self::default();
+        };
+        let Ok(src) = std::fs::read_to_string(manifest_dir.join("byard.toml")) else {
+            return Self::default();
+        };
+        let Ok(table) = src.parse::<toml::Table>() else {
+            return Self::default();
+        };
+        let Some(deps) = table.get("dependencies").and_then(|d| d.as_table()) else {
+            return Self::default();
+        };
+
+        let mut index = Self::default();
+        for (name, spec) in deps {
+            index.declared.push(name.clone());
+            let Some(rel) = spec.get("path").and_then(|p| p.as_str()) else {
+                continue; // git deps: cache-key lives in the CLI (see docs above)
+            };
+            let root = manifest_dir.join(rel);
+            let scan = if root.join("src").is_dir() {
+                root.join("src")
+            } else {
+                root.clone()
+            };
+            let mut views = Vec::new();
+            collect_package_views(&scan, &mut views);
+            index.exports.insert(name.clone(), views);
+        }
+        index
+    }
+
+    /// The exported view named `view` of package `pkg`, if indexed.
+    fn view(&self, pkg: &str, view: &str) -> Option<&ViewDecl> {
+        self.exports
+            .get(pkg)?
+            .iter()
+            .find(|v| v.name.as_str() == view)
+    }
+}
+
+/// Recursively parses every `.byd` under `dir` and collects its views.
+fn collect_package_views(dir: &std::path::Path, out: &mut Vec<ViewDecl>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if path.is_dir() {
+            if name
+                .as_deref()
+                .is_some_and(|n| n.starts_with('.') || n == "target")
+            {
+                continue;
+            }
+            collect_package_views(&path, out);
+        } else if path.extension().is_some_and(|e| e == "byd") {
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                out.extend(parse(&src).views);
+            }
+        }
+    }
+}
+
+/// Resolves an element name to a package-exported view through this file's
+/// imports: `m.Card` through an alias import, bare `Card` through a selective
+/// one (RFC-0008 Pillar B).
+fn resolve_package_view<'i>(
+    el_name: &str,
+    imports: &[UseDecl],
+    index: &'i PackageIndex,
+) -> Option<&'i ViewDecl> {
+    if let Some((head, rest)) = el_name.split_once('.') {
+        let import = imports.iter().find(|i| {
+            i.symbols.is_none()
+                && i.alias
+                    .as_ref()
+                    .map_or(i.package.as_str(), byard_compiler::Symbol::as_str)
+                    == head
+        })?;
+        return index.view(import.package.as_str(), rest);
+    }
+    imports.iter().find_map(|i| {
+        i.symbols.as_ref().and_then(|symbols| {
+            symbols
+                .iter()
+                .find(|(s, _)| s.as_str() == el_name)
+                .and_then(|_| index.view(i.package.as_str(), el_name))
+        })
+    })
+}
+
+/// Whether the cursor sits on a `use` line, after the keyword — the position
+/// where a dependency name completes.
+fn in_use_decl(content: &str, offset: usize) -> bool {
+    let line_start = content[..offset.min(content.len())]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
+    let line = &content[line_start..offset.min(content.len())];
+    let trimmed = line.trim_start();
+    trimmed == "use" || (trimmed.starts_with("use ") && !trimmed.contains('.'))
+}
+
+fn handle_completion(
+    content: &str,
+    pos: Position,
+    doc_path: Option<&std::path::Path>,
+) -> Option<CompletionResponse> {
     let offset = lsp_pos_to_byte_offset(content, pos.line, pos.character)?;
+    let index = PackageIndex::build(doc_path);
+
+    // `use <TAB>` → the manifest's declared dependencies (RFC-0008).
+    if in_use_decl(content, offset) {
+        let items = index
+            .declared
+            .iter()
+            .map(|name| CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("Package (byard.toml [dependencies])".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        return Some(CompletionResponse::Array(items));
+    }
 
     if let Some(attr_context) = find_active_attribute_context(content, offset) {
         let mut items = Vec::new();
@@ -945,7 +1120,9 @@ fn handle_completion(content: &str, pos: Position) -> Option<CompletionResponse>
                     }
                 } else {
                     let parsed = parse(content);
-                    if let Some(view) = parsed.views.iter().find(|v| v.name.as_str() == el_name) {
+                    let pkg_view = resolve_package_view(&el_name, &parsed.imports, &index);
+                    let local_view = parsed.views.iter().find(|v| v.name.as_str() == el_name);
+                    if let Some(view) = pkg_view.or(local_view) {
                         for param in &view.params {
                             items.push(CompletionItem {
                                 label: param.name.to_string(),
@@ -965,7 +1142,7 @@ fn handle_completion(content: &str, pos: Position) -> Option<CompletionResponse>
     let mut items = Vec::new();
 
     let keywords = &[
-        "var", "let", "fn", "inject", "for", "in", "when", "else", "style",
+        "use", "var", "let", "fn", "inject", "for", "in", "when", "else", "style",
     ];
     for kw in keywords {
         items.push(CompletionItem {
@@ -993,6 +1170,41 @@ fn handle_completion(content: &str, pos: Position) -> Option<CompletionResponse>
             detail: Some("User View".to_string()),
             ..Default::default()
         });
+    }
+
+    // Imported package views (RFC-0008 Pillars A/B): one item per export,
+    // spelled the way this file can reach it (`m.Card` under an alias,
+    // bare `Card` under a selective import).
+    for import in &parsed.imports {
+        let pkg = import.package.as_str();
+        let Some(exports) = index.exports.get(pkg) else {
+            continue;
+        };
+        if let Some(symbols) = &import.symbols {
+            for (sym, _) in symbols {
+                if let Some(view) = index.view(pkg, sym.as_str()) {
+                    items.push(CompletionItem {
+                        label: view.name.to_string(),
+                        kind: Some(CompletionItemKind::INTERFACE),
+                        detail: Some(format!("View · package `{pkg}`")),
+                        ..Default::default()
+                    });
+                }
+            }
+        } else {
+            let alias = import
+                .alias
+                .as_ref()
+                .map_or(pkg, byard_compiler::Symbol::as_str);
+            for view in exports {
+                items.push(CompletionItem {
+                    label: format!("{alias}.{}", view.name.as_str()),
+                    kind: Some(CompletionItemKind::INTERFACE),
+                    detail: Some(format!("View · package `{pkg}`")),
+                    ..Default::default()
+                });
+            }
+        }
     }
 
     if let Some(active_view) = parsed.views.iter().find(|v| span_contains(v.span, offset)) {
@@ -1393,7 +1605,7 @@ mod tests {
         let content = "View Main {\n  Column {\n  }\n}";
         // Position at line 2, character 2 (inside the Column children area)
         let pos = Position::new(2, 2);
-        let resp = handle_completion(content, pos).unwrap();
+        let resp = handle_completion(content, pos, None).unwrap();
         if let CompletionResponse::Array(items) = resp {
             assert!(items.iter().any(|item| item.label == "Column"));
             assert!(items.iter().any(|item| item.label == "Button"));
@@ -1409,7 +1621,7 @@ mod tests {
         let content = "View Main {\n  Column #[wi] {\n  }\n}";
         // Position inside `#[wi]`
         let pos = Position::new(1, 11);
-        let resp = handle_completion(content, pos).unwrap();
+        let resp = handle_completion(content, pos, None).unwrap();
         if let CompletionResponse::Array(items) = resp {
             assert!(items.iter().any(|item| item.label == "width"));
             assert!(items.iter().any(|item| item.label == "height"));
@@ -1425,7 +1637,7 @@ mod tests {
         let content = "View Main {\n  style {\n    .title #[ra] {}\n  }\n}";
         // Position inside `#[ra]`
         let pos = Position::new(2, 13);
-        let resp = handle_completion(content, pos).unwrap();
+        let resp = handle_completion(content, pos, None).unwrap();
         if let CompletionResponse::Array(items) = resp {
             assert!(items.iter().any(|item| item.label == "radius"));
             assert!(items.iter().any(|item| item.label == "bg"));
@@ -1441,7 +1653,7 @@ mod tests {
         let content = "View Main(title: Str) {\n  var my_var = 10\n  let my_let = \"hello\"\n  \n}";
         // Position in view body
         let pos = Position::new(3, 2);
-        let resp = handle_completion(content, pos).unwrap();
+        let resp = handle_completion(content, pos, None).unwrap();
         if let CompletionResponse::Array(items) = resp {
             assert!(items.iter().any(|item| item.label == "title"));
             assert!(items.iter().any(|item| item.label == "my_var"));

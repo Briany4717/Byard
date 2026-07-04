@@ -1,0 +1,12 @@
+// RFC-0008: `use` a local package, then instantiate its views (RFC-0007).
+use kit as k
+
+View Main() {
+    Column #[bg: 0x14141C, p: 24, gap: 12, width: 420] {
+        Text("app + package") #[color: 0xFFFFFF, size: 20, weight: bold]
+        // A view from the `kit` package, namespaced by the `k` alias.
+        k.Card("hello from the kit package")
+        // A view from a sibling file in *this* project's namespace (bare name).
+        Sidebar()
+    }
+}

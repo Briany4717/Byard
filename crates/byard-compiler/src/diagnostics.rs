@@ -284,6 +284,79 @@ pub enum CompileError {
         /// The closest known state, if one is near (D4-style suggestion).
         hint: Option<String>,
     },
+    /// A `use` declaration appeared after the first `View` — imports are legal
+    /// only at file top (RFC-0008 Pillar A).
+    ImportAfterView {
+        /// Source range of the offending `use` declaration.
+        span: Span,
+    },
+    /// A `use` (or a qualified `alias.View` reference) named a package that is
+    /// not in the resolved dependency set (RFC-0008 Pillar A).
+    UnknownPackage {
+        /// Source range of the reference.
+        span: Span,
+        /// The unresolved package or alias name.
+        name: String,
+        /// Why resolution failed (e.g. "not declared in `[dependencies]`").
+        detail: String,
+    },
+    /// A selective import or qualified reference named a `View` the package
+    /// does not export (RFC-0008 Pillar B); `hint` carries a Levenshtein
+    /// "did you mean …?" over the package's exports.
+    UnknownImportSymbol {
+        /// Source range of the symbol.
+        span: Span,
+        /// The package searched.
+        package: String,
+        /// The missing view name.
+        name: String,
+        /// The closest exported name, if any.
+        hint: Option<String>,
+    },
+    /// A name became ambiguous — two imports (or an import and a local view)
+    /// bind the same bare name. Resolution is deterministic and
+    /// order-independent, so ambiguity is an error demanding an explicit
+    /// alias (RFC-0008 D-G).
+    NameCollision {
+        /// Source range of the later binding.
+        span: Span,
+        /// The colliding name.
+        name: String,
+        /// Where the two bindings come from (package or "this file").
+        first: String,
+        /// The second origin.
+        second: String,
+    },
+    /// The package dependency graph contains a cycle (RFC-0008 Pillar A —
+    /// module-graph cycle detection, one level above RFC-0007 §4's intra-file
+    /// call cycles).
+    PackageCycle {
+        /// Source range of the `use` that closed the cycle.
+        span: Span,
+        /// The cycle path, e.g. `a → b → a`.
+        path: String,
+    },
+    /// The same `View` name is declared twice within one package namespace
+    /// (across its files) — exports must be unambiguous (RFC-0008 Pillar B).
+    DuplicateViewName {
+        /// Source range of the second declaration.
+        span: Span,
+        /// The duplicated view name.
+        name: String,
+        /// The package whose namespace is ambiguous ("this project" for the
+        /// root package).
+        package: String,
+    },
+    /// A project-level failure outside any single source file — a broken
+    /// `byard.toml`, an unreadable dependency, a corrupt lockfile. Carried as
+    /// a `CompileError` so the dev overlay and `check` report it through the
+    /// same channel as source diagnostics (RFC-0008 Pillar C).
+    Project {
+        /// Anchor span (typically zero — there is no source to point at).
+        span: Span,
+        /// The failure, human-readable.
+        message: String,
+    },
 }
 
 impl CompileError {
@@ -318,7 +391,61 @@ impl CompileError {
             | Self::LayoutPropNotAnimatable { span, .. }
             | Self::InvalidAnimation { span, .. }
             | Self::NotAStyle { span }
-            | Self::UnknownStyleState { span, .. } => *span,
+            | Self::UnknownStyleState { span, .. }
+            | Self::ImportAfterView { span }
+            | Self::UnknownPackage { span, .. }
+            | Self::UnknownImportSymbol { span, .. }
+            | Self::NameCollision { span, .. }
+            | Self::PackageCycle { span, .. }
+            | Self::DuplicateViewName { span, .. }
+            | Self::Project { span, .. } => *span,
+        }
+    }
+
+    /// Shifts this error's span by `delta` bytes (may be negative) — used by
+    /// the module resolver to rebase per-file spans into the program-wide
+    /// source map and back (RFC-0008).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn shift_span(&mut self, delta: i64) {
+        match self {
+            Self::UnexpectedChar { span }
+            | Self::UnexpectedToken { span, .. }
+            | Self::StringNestingTooDeep { span }
+            | Self::UnterminatedString { span }
+            | Self::MissingAnnotation { span, .. }
+            | Self::CannotInfer { span }
+            | Self::TextUsedAsType { span }
+            | Self::UnresolvedInject { span, .. }
+            | Self::NotAssignable { span }
+            | Self::UnknownView { span, .. }
+            | Self::UnknownAttribute { span, .. }
+            | Self::WrongAttributeSeparator { span, .. }
+            | Self::ArityMismatch { span, .. }
+            | Self::AttributeTypeMismatch { span, .. }
+            | Self::UnexpectedChildren { span, .. }
+            | Self::DynamicStyleForbidden { span }
+            | Self::ConflictingSpacingField { span, .. }
+            | Self::ViewArityMismatch { span, .. }
+            | Self::UnknownParam { span, .. }
+            | Self::MissingParam { span, .. }
+            | Self::DuplicateParam { span, .. }
+            | Self::IntrinsicShadowed { span, .. }
+            | Self::RecursiveView { span, .. }
+            | Self::UnknownAnimation { span, .. }
+            | Self::LayoutPropNotAnimatable { span, .. }
+            | Self::InvalidAnimation { span, .. }
+            | Self::NotAStyle { span }
+            | Self::UnknownStyleState { span, .. }
+            | Self::ImportAfterView { span }
+            | Self::UnknownPackage { span, .. }
+            | Self::UnknownImportSymbol { span, .. }
+            | Self::NameCollision { span, .. }
+            | Self::PackageCycle { span, .. }
+            | Self::DuplicateViewName { span, .. }
+            | Self::Project { span, .. } => {
+                span.start = (i64::from(span.start) + delta).max(0) as u32;
+                span.end = (i64::from(span.end) + delta).max(0) as u32;
+            }
         }
     }
 
@@ -355,6 +482,13 @@ impl CompileError {
             Self::InvalidAnimation { .. } => "InvalidAnimation",
             Self::NotAStyle { .. } => "NotAStyle",
             Self::UnknownStyleState { .. } => "UnknownStyleState",
+            Self::ImportAfterView { .. } => "ImportAfterView",
+            Self::UnknownPackage { .. } => "UnknownPackage",
+            Self::UnknownImportSymbol { .. } => "UnknownImportSymbol",
+            Self::NameCollision { .. } => "NameCollision",
+            Self::PackageCycle { .. } => "PackageCycle",
+            Self::DuplicateViewName { .. } => "DuplicateViewName",
+            Self::Project { .. } => "Project",
         }
     }
 
@@ -416,7 +550,8 @@ impl CompileError {
                 "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()
             }
             Self::ConflictingSpacingField { message, .. }
-            | Self::InvalidAnimation { message, .. } => message.clone(),
+            | Self::InvalidAnimation { message, .. }
+            | Self::Project { message, .. } => message.clone(),
             Self::ViewArityMismatch {
                 name,
                 expected,
@@ -457,6 +592,36 @@ impl CompileError {
                 ),
                 hint.as_deref(),
             ),
+            Self::ImportAfterView { .. } => {
+                "`use` imports must appear at the top of the file, before any `View`".to_string()
+            }
+            Self::UnknownPackage { name, detail, .. } => {
+                format!("unknown package `{name}`: {detail}")
+            }
+            Self::UnknownImportSymbol {
+                package,
+                name,
+                hint,
+                ..
+            } => with_hint(
+                format!("package `{package}` does not export a view `{name}`"),
+                hint.as_deref(),
+            ),
+            Self::NameCollision {
+                name,
+                first,
+                second,
+                ..
+            } => format!(
+                "`{name}` is ambiguous — bound by both {first} and {second}; \
+                 disambiguate with an explicit alias (`use <pkg> as <alias>`)"
+            ),
+            Self::PackageCycle { path, .. } => {
+                format!("package dependency cycle: {path}")
+            }
+            Self::DuplicateViewName { name, package, .. } => {
+                format!("view `{name}` is declared more than once in {package}")
+            }
         }
     }
 

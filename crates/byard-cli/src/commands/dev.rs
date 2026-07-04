@@ -4,7 +4,12 @@
 //!   Main/winit thread → `on_resume` → `start_logic_from_view` (logic thread)
 //!                     → `start_watcher` (OS notify thread)
 //!   Logic thread: drain channel → `dispatch_events` → tick → render / error overlay
-//!   Watcher thread: file change → re-parse → `LatestWins::publish`
+//!   Watcher thread: file change → re-resolve the module graph → `LatestWins::publish`
+//!
+//! RFC-0008: the watcher covers the whole project directory plus every `path`
+//! dependency (cooperative dev, D-J); a change to any `.byd` or `byard.toml`
+//! re-runs the module resolver, so package edits hot-reload like local ones.
+//! Fetched, lock-pinned cache packages are immutable and not watched.
 
 use byard_compiler::CompileError;
 use byard_compiler::interp::eval::{Interpreter, RenderNode};
@@ -13,43 +18,64 @@ use byard_compiler::interp::reload::{
     LatestWins, ParsedFile, ReloadKind, diff_program, gate, start_watcher,
 };
 use byard_compiler::parser::ast::ViewDecl;
-use byard_compiler::parser::parse;
 use byard_core::frame::{BoxInstance, RenderFrame, TargetId, TextLine};
 use byard_core::{
     ByardError, Engine, LogicRuntime, PlatformHost, PointerButton, PointerState, WindowSize,
 };
 use byard_platform::WinitHost;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::deps::{cache_dir, resolve_project};
 use crate::manifest::Manifest;
 
 pub fn run(file: Option<&Path>) -> Result<(), String> {
     let manifest = Manifest::discover(file)?;
 
-    // Initial parse on the main thread: catch errors before opening the window.
-    let src = std::fs::read_to_string(&manifest.entry)
-        .map_err(|e| format!("{}: {e}", manifest.entry.display()))?;
-    let parsed = parse(&src);
+    // Initial resolve on the main thread: catch errors before opening the
+    // window. This covers the whole module graph (RFC-0008), not just the
+    // entry file.
+    let (program, provider) = resolve_project(&manifest)?;
 
     let title = format!("Byard dev — {}", manifest.name);
     println!("  Byard 0.0.0 — dev mode");
     println!("  Entry: {}", manifest.entry.display());
+    let n_pkgs = program.packages.len().saturating_sub(1);
+    if n_pkgs > 0 {
+        println!("  Packages: {}", program.packages[1..].join(", "));
+    }
     println!("  Watching for changes…");
-    if parsed.errors.is_empty() {
-        println!("  Loaded ({} views, 0 errors)", parsed.views.len());
+    if program.errors.is_empty() {
+        println!("  Loaded ({} views, 0 errors)", program.views.len());
     } else {
         println!(
             "  Loaded with {} error(s) — see overlay",
-            parsed.errors.len()
+            program.errors.len()
         );
+        for err in &program.errors {
+            eprintln!("  {}", program.source_map.render_line(err));
+        }
     }
 
-    let initial_views = parsed.views;
-    let initial_errors = parsed.errors;
-    let entry_path = manifest.entry.clone();
+    // Watch the project source directory plus every resolved `path`
+    // dependency (D-J); cache checkouts are pinned/immutable → not watched.
+    let cache = cache_dir();
+    let entry_dir = manifest
+        .entry
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut watch_paths = vec![entry_dir];
+    for root in provider.resolved_roots().values() {
+        if !root.starts_with(&cache) {
+            watch_paths.push(root.clone());
+        }
+    }
+
+    let initial_views = program.views;
+    let initial_errors = program.errors;
 
     // Poll mode: the event loop spins continuously so file-change frames
     // appear without waiting for the next mouse event (RFC-0006 §3.2).
@@ -58,13 +84,34 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         engine: None,
         width_bits: None,
         height_bits: None,
-        entry_path,
+        file_override: file.map(Path::to_path_buf),
+        watch_paths,
         initial_views,
         initial_errors,
         last_gpu_telemetry: byard_core::telemetry::SampleBlock::default(),
         last_telemetry_print: std::time::Instant::now(),
     })
     .map_err(|e| format!("event loop error: {e}"))
+}
+
+/// Re-derives the whole program for the watcher thread (RFC-0008 Pillar E):
+/// re-discovers the manifest (so `byard.toml` edits apply live), re-runs the
+/// module resolver, and folds any project-level failure into the same error
+/// channel the overlay renders.
+fn reresolve(file_override: Option<&Path>) -> ParsedFile {
+    match Manifest::discover(file_override).and_then(|m| resolve_project(&m)) {
+        Ok((program, _)) => ParsedFile {
+            views: program.views,
+            errors: program.errors,
+        },
+        Err(message) => ParsedFile {
+            views: Vec::new(),
+            errors: vec![CompileError::Project {
+                span: byard_compiler::Span::new(0, 0),
+                message,
+            }],
+        },
+    }
 }
 
 fn now_ms() -> u64 {
@@ -104,7 +151,7 @@ impl ByldRuntime {
             let diff_kind = byard_compiler::interp::reload::diff_view(old_root, new_root);
             self.interp.reload(new_root, diff_kind);
             // Rebuild the user-`View` registry so reloaded sibling views resolve
-            // and expand (RFC-0007 §1/§5, M30/M34).
+            // and expand (RFC-0007 §1/§5).
             self.interp.load_views(new_views);
             if affected.contains(&new_root.name) {
                 let known: Vec<&str> = new_views.iter().map(|v| v.name.as_str()).collect();
@@ -293,7 +340,11 @@ struct App {
     engine: Option<Engine>,
     width_bits: Option<Arc<AtomicU32>>,
     height_bits: Option<Arc<AtomicU32>>,
-    entry_path: std::path::PathBuf,
+    /// The `byard dev [file]` override, threaded into the watcher's
+    /// re-resolve closure so it re-discovers the same manifest.
+    file_override: Option<PathBuf>,
+    /// Directories the watcher covers: project sources + `path` deps (D-J).
+    watch_paths: Vec<PathBuf>,
     initial_views: Vec<ViewDecl>,
     initial_errors: Vec<CompileError>,
     /// This (render/main) thread's GPU telemetry ring, drained on **every**
@@ -363,8 +414,11 @@ impl PlatformHost for App {
         // we drop the watcher when the engine drops. We keep it in a Box::leak
         // for now so the OS thread stays alive for the session.
         // TODO: store in App struct properly once Engine exposes a cleanup hook.
-        let watcher = start_watcher(&self.entry_path, watcher_channel)
-            .map_err(|e| ByardError::RenderSurface(format!("file watcher error: {e}")))?;
+        let file_override = self.file_override.clone();
+        let watcher = start_watcher(&self.watch_paths, watcher_channel, move || {
+            reresolve(file_override.as_deref())
+        })
+        .map_err(|e| ByardError::RenderSurface(format!("file watcher error: {e}")))?;
         // Keep the watcher alive for the entire process lifetime.
         // This is intentional: we want file watching to persist even if the
         // logic thread is restarted due to a structure-incompatible reload.

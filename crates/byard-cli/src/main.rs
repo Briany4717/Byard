@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
+mod deps;
 mod manifest;
 mod telemetry_overlay;
 
@@ -42,6 +43,26 @@ enum Command {
     },
     /// (Phase 3+) Compile to a production binary.
     Build,
+    /// Add a dependency to byard.toml, then fetch and lock it (RFC-0008).
+    #[command(alias = "install")]
+    Add {
+        /// Package name (a byld identifier, e.g. `material`).
+        name: String,
+        /// Use a local directory as the package source.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Use a git repository as the package source.
+        #[arg(long)]
+        git: Option<String>,
+        /// Pin the git source to a tag.
+        #[arg(long, conflicts_with = "rev")]
+        tag: Option<String>,
+        /// Pin the git source to an exact commit.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Fetch dependencies and write byard.lock (the only lock writer).
+    Get,
 }
 
 fn main() {
@@ -51,6 +72,20 @@ fn main() {
         Command::Dev { file } => commands::dev::run(file.as_deref()),
         Command::Check { file } => commands::check::run(file.as_deref()),
         Command::Build => commands::build::run(),
+        Command::Add {
+            name,
+            path,
+            git,
+            tag,
+            rev,
+        } => commands::add::run(&commands::add::AddArgs {
+            name: &name,
+            path: path.as_deref(),
+            git: git.as_deref(),
+            tag: tag.as_deref(),
+            rev: rev.as_deref(),
+        }),
+        Command::Get => commands::get::run(),
     };
     if let Err(e) = result {
         // An empty message is a silent failure sentinel (e.g. `check` already
