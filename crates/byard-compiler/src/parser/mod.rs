@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            // Optional default value (`= expr`), RFC-0007 D-B / IMPL-47.
+            // Optional default value (`= expr`), RFC-0007 D-B.
             let default = if self.eat(&Token::Eq) {
                 Some(self.parse_expr(0))
             } else {

@@ -107,7 +107,7 @@ pub fn diff_program(old: &[ViewDecl], new: &[ViewDecl]) -> Vec<(Symbol, ViewRelo
 /// (RFC-0007 §5): every **changed** view (body or shape differs, or added)
 /// unioned with its **transitive callers**, because a caller embeds the callee's
 /// expanded body. Instantiation widens per-`ViewDecl` reload (D11) to chase
-/// callers through the M33 call graph — the single source of truth for both
+/// callers through the call graph — the single source of truth for both
 /// cycle detection and reload blast-radius.
 ///
 /// A *removed* view's own name is included so the caller can drop it; its

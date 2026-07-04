@@ -204,7 +204,7 @@ pub enum CompileError {
         hint: Option<String>,
     },
     /// A required callee parameter (no default) received no argument at the call
-    /// site (RFC-0007 §6, interacts with IMPL-47 defaults).
+    /// site (RFC-0007 §6, interacts with D-B defaults).
     MissingParam {
         /// Source range of the call site.
         span: Span,
@@ -224,7 +224,7 @@ pub enum CompileError {
         callee: String,
     },
     /// A `ViewDecl` is named like an RFC-0005 intrinsic; the intrinsic always
-    /// wins and the user view is unreachable (RFC-0007 §6, IMPL-50).
+    /// wins and the user view is unreachable (RFC-0007 §6).
     IntrinsicShadowed {
         /// Source range of the offending view declaration.
         span: Span,
@@ -232,7 +232,7 @@ pub enum CompileError {
         name: String,
     },
     /// A user-`View` call cycle is not guarded by a `when`/`for` structural
-    /// boundary, so instantiation would diverge (RFC-0007 §4, IMPL-48).
+    /// boundary, so instantiation would diverge (RFC-0007 §4).
     RecursiveView {
         /// Source range of the offending view declaration.
         span: Span,

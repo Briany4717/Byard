@@ -38,8 +38,8 @@ use crate::util::closest_match;
 const SLIDER_DEFAULT_DECIMALS: i32 = 3;
 
 /// Maximum user-`View` instantiation depth before lowering truncates with a
-/// diagnostic rather than risking a native stack overflow (RFC-0007 §4, D-C /
-/// IMPL-48). Far beyond any hand-written nesting, shallow enough to never
+/// diagnostic rather than risking a native stack overflow (RFC-0007 §4, D-C).
+/// Far beyond any hand-written nesting, shallow enough to never
 /// approach the stack limit. The static cycle check (`load_views`) catches
 /// *unguarded* cycles at load; this bound is the backstop for a guarded
 /// recursion whose runtime guard never terminates at lower time.
@@ -127,7 +127,7 @@ pub enum RenderNode {
         /// The reactive scope that evaluates to the image source path/URL.
         src: ScopeId,
     },
-    /// An MSDF vector glyph — the `VectorIcon` intrinsic (RFC-0009 §1, M50)
+    /// An MSDF vector glyph — the `VectorIcon` intrinsic (RFC-0009 §1)
     /// routed to the `VectorMSDF` pipeline.
     Vector {
         /// Styling attributes (`size`, `color`, `m`, `opacity`, `style`).
@@ -141,7 +141,7 @@ pub enum RenderNode {
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
 
 /// The per-instance parameter bindings produced by binding a user-view call's
-/// arguments to the callee's declared parameters (RFC-0007 §3, M31). Each entry
+/// arguments to the callee's declared parameters (RFC-0007 §3). Each entry
 /// is a reactive memo projecting the argument expression over the *parent*
 /// scope, so a parameter fed a parent `var` stays live (RFC-0004); a literal
 /// argument lowers to a constant memo with no dirty edges.
@@ -153,14 +153,14 @@ pub struct InstanceBindings {
 }
 
 /// The default-value expression of a parameter, if it declares one (RFC-0007
-/// D-B / IMPL-47). A parameter with a default is not required at the call site;
+/// D-B). A parameter with a default is not required at the call site;
 /// the default is evaluated in the callee scope when the argument is omitted.
 fn param_default(param: &Param) -> Option<&Expr> {
     param.default.as_ref()
 }
 
 /// The reserved parameter/element name for a user view's child-block slot
-/// (RFC-0007 D-A / IMPL-46). A `View` declaring a `content` parameter accepts a
+/// (RFC-0007 D-A). A `View` declaring a `content` parameter accepts a
 /// `{ ... }` block at its call sites; referencing `content` as an element inside
 /// the body splices the caller-supplied block.
 const RESERVED_CONTENT: &str = "content";
@@ -193,16 +193,16 @@ pub struct Interpreter {
     /// Parameterized fn definitions: `fn f(params) => body` stored as
     /// `(param names, body expr)`, indexed by `AstId` (M25).
     fn_table: Vec<(Vec<Symbol>, Expr)>,
-    /// The resolved user-`View` registry for this program (RFC-0007 §1, M30).
+    /// The resolved user-`View` registry for this program (RFC-0007 §1).
     /// Built once from `ParsedFile::views` via [`Interpreter::load_views`]; a
     /// call whose name resolves here is a user-view instantiation, not a
     /// container.
     view_table: super::views::ViewTable,
     /// Current user-view instantiation depth, bounded by [`MAX_INSTANCE_DEPTH`]
-    /// to guard against runaway guarded recursion (RFC-0007 §4, IMPL-48, M33).
+    /// to guard against runaway guarded recursion (RFC-0007 §4).
     instance_depth: u32,
     /// Stack of caller-supplied child-block slots, one frame per active
-    /// user-view instance (RFC-0007 D-A / IMPL-46, M35). The block is
+    /// user-view instance (RFC-0007 D-A). The block is
     /// pre-lowered in the *caller* scope so a `content` element reference inside
     /// the callee body splices nodes that capture the caller's environment.
     slot_stack: Vec<Vec<RenderNode>>,
@@ -259,15 +259,15 @@ impl Interpreter {
         &self.errors
     }
 
-    /// Builds the user-`View` registry (RFC-0007 §1, M30) from a whole file's
+    /// Builds the user-`View` registry (RFC-0007 §1) from a whole file's
     /// views and stores it on the interpreter, so subsequent `lower_view`/
-    /// `lower_element` calls can recognize and (M32+) expand user-view calls.
-    /// Returns the load-time diagnostics — `IntrinsicShadowed` (IMPL-50) and any
-    /// unguarded-cycle `RecursiveView` (RFC-0007 §4, M33) — which are also
+    /// `lower_element` calls can recognize and expand user-view calls.
+    /// Returns the load-time diagnostics — `IntrinsicShadowed` and any
+    /// unguarded-cycle `RecursiveView` (RFC-0007 §4) — which are also
     /// recorded in [`Interpreter::errors`].
     pub fn load_views(&mut self, views: &[ViewDecl]) -> Vec<CompileError> {
         let (table, mut diags) = super::views::ViewTable::build(views);
-        // Static cycle detection over the call graph (M33).
+        // Static cycle detection over the call graph.
         let graph = super::views::CallGraph::build(&table);
         if let Some((view, path)) = graph.unguarded_cycle(&table) {
             diags.push(CompileError::RecursiveView {
@@ -509,7 +509,7 @@ impl Interpreter {
         self.ctx.read_memo(scope)
     }
 
-    // ── M31: argument → parameter binding (RFC-0007 §3) ──────────────────
+    // ── argument → parameter binding (RFC-0007 §3) ──────────────────
 
     /// Projects one call argument into a reactive memo over the **parent** scope
     /// (the env active at the call site), so a parameter fed a parent `var` stays
@@ -531,7 +531,7 @@ impl Interpreter {
         slots: &mut [Option<ScopeId>],
     ) {
         // The reserved `content` slot is filled by the child block, never a
-        // named value (IMPL-46).
+        // named value.
         if name.as_str() == RESERVED_CONTENT {
             return;
         }
@@ -569,7 +569,7 @@ impl Interpreter {
         let callee_name = callee.name.as_str().to_string();
         let mut slots: Vec<Option<ScopeId>> = vec![None; params.len()];
         // Positional arguments map only to *value* parameters; the reserved
-        // `content` slot (IMPL-46) is filled by the child block, not a value.
+        // `content` slot is filled by the child block, not a value.
         let value_param_idx: Vec<usize> = params
             .iter()
             .enumerate()
@@ -622,7 +622,7 @@ impl Interpreter {
         }
 
         // 4) Missing required parameters: an unbound parameter with no default
-        //    (IMPL-47). The reserved `content` slot is never required — it
+        //   . The reserved `content` slot is never required — it
         //    defaults to an empty block.
         for (i, slot) in slots.iter().enumerate() {
             if slot.is_none()
@@ -723,7 +723,7 @@ impl Interpreter {
                     src,
                 }
             }
-            // VectorIcon intrinsic → VectorMSDF pipeline (M50). Content is an
+            // VectorIcon intrinsic → VectorMSDF pipeline. Content is an
             // asset handle (a `Str` path), like Image's source.
             "VectorIcon" => {
                 let src_expr = el.content.first().map_or_else(
@@ -764,14 +764,14 @@ impl Interpreter {
     }
 
     /// Whether `el` is a user-`View` call: a name that resolves in the view
-    /// table and is not an RFC-0005 intrinsic, which always wins (IMPL-50).
+    /// table and is not an RFC-0005 intrinsic, which always wins.
     fn is_user_view_call(&self, el: &ElementNode) -> bool {
         super::intrinsics::lookup(el.name.as_str()).is_none() && self.view_table.contains(&el.name)
     }
 
     /// Expands a user-`View` call site into its instantiated subtree, spliced as
     /// siblings at `out` (RFC-0007 §2). Opens a fresh instance scope holding the
-    /// argument bindings (M31) plus the callee's own local `var`/`let`/`fn`
+    /// argument bindings plus the callee's own local `var`/`let`/`fn`
     /// (isolated per instance), lowers the callee body, then truncates the scope
     /// so the parent environment is untouched.
     fn lower_user_view_call(
@@ -791,7 +791,7 @@ impl Interpreter {
         // the `&mut self` lowering below (the table is `Send`/owned, INV-3).
         let callee = self.view_table.decl(id).clone();
 
-        // Runtime depth bound (RFC-0007 §4, IMPL-48): a guarded recursion whose
+        // Runtime depth bound (RFC-0007 §4): a guarded recursion whose
         // guard never terminates at lower time is truncated with a diagnostic
         // rather than overflowing the native stack.
         if self.instance_depth >= MAX_INSTANCE_DEPTH {
@@ -806,7 +806,7 @@ impl Interpreter {
         }
         self.instance_depth += 1;
 
-        // Slot (RFC-0007 D-A / IMPL-46): a `{ ... }` block is allowed only when
+        // Slot (RFC-0007 D-A): a `{ ... }` block is allowed only when
         // the callee declares a `content` parameter; the block is pre-lowered in
         // the *caller* scope (capturing caller `var`s) and pushed as this
         // instance's slot. A block passed to a slot-less callee is
@@ -830,9 +830,9 @@ impl Interpreter {
         // 1) Bind arguments → parameters in the *parent* scope (RFC-0007 §3).
         let bindings = self.bind_args(&callee, el);
 
-        // 2) Open the per-instance lexical frame (D-D / IMPL-49): push each
+        // 2) Open the per-instance lexical frame (D-D): push each
         //    parameter in declaration order — a bound argument's memo, else a
-        //    default evaluated in the callee scope (IMPL-47) — then the callee's
+        //    default evaluated in the callee scope — then the callee's
         //    own declarations.
         let snapshot = self.env.len();
         for param in &callee.params {
@@ -948,7 +948,7 @@ impl Interpreter {
     ) {
         match member {
             // A `content` reference inside a user-view body splices the slot the
-            // current instance was called with (RFC-0007 D-A / IMPL-46). The slot
+            // current instance was called with (RFC-0007 D-A). The slot
             // nodes were pre-lowered in the caller scope.
             Member::Element(e)
                 if e.name.as_str() == RESERVED_CONTENT && !self.slot_stack.is_empty() =>
@@ -2729,7 +2729,25 @@ impl Interpreter {
     /// `when`/`for` structural members (M20).
     pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {
         self.eval_view_decls(view);
-        self.lower_members(&view.body, known_views)
+        // A view that declares a `content` slot (RFC-0007 D-A) may reference it in
+        // its body. When the view is lowered *standalone* — e.g. `byard check`
+        // validates each `ViewDecl` independently, or a slot view is a root —
+        // there is no calling instance, so push an empty slot frame: the bare
+        // `content` reference then splices nothing instead of being mistaken for
+        // an `UnknownView`. A real call (`lower_user_view_call`) pushes the
+        // caller's block over this before lowering the body.
+        let has_content_slot = view
+            .params
+            .iter()
+            .any(|p| p.name.as_str() == RESERVED_CONTENT);
+        if has_content_slot {
+            self.slot_stack.push(Vec::new());
+        }
+        let nodes = self.lower_members(&view.body, known_views);
+        if has_content_slot {
+            self.slot_stack.pop();
+        }
+        nodes
     }
 
     // ── lowering ────────────────────────────────────────────────────────
@@ -3387,7 +3405,7 @@ mod tests {
         }
     }
 
-    // ── M30: user-view registry & call-site recognition ──────────────────
+    // ── user-view registry & call-site recognition ──────────────────
 
     /// Loads a multi-view file and lowers the named view to a render tree.
     fn lower_named(src: &str, name: &str) -> (Interpreter, Vec<RenderNode>) {
@@ -3446,7 +3464,7 @@ mod tests {
         );
     }
 
-    // ── M31: argument → parameter binding ────────────────────────────────
+    // ── argument → parameter binding ────────────────────────────────
 
     /// Parses `callee_src` (a single view) and a call element from `call_src`'s
     /// first view body, returning `(callee, call_element)`.
@@ -3585,7 +3603,7 @@ mod tests {
         assert_eq!(interp.read_memo(memo), Value::Int(5));
     }
 
-    // ── M32: body expansion & per-instance scope ─────────────────────────
+    // ── body expansion & per-instance scope ─────────────────────────
 
     /// The string value of a `Text` node's content scope, after a tick.
     fn text_value(interp: &mut Interpreter, node: &RenderNode) -> String {
@@ -3701,7 +3719,7 @@ mod tests {
         }
     }
 
-    // ── M33: recursion & cycle protection ────────────────────────────────
+    // ── recursion & cycle protection ────────────────────────────────
 
     #[test]
     fn unguarded_self_call_is_recursive_view_at_load() {
@@ -3765,7 +3783,7 @@ mod tests {
         );
     }
 
-    // ── M34: hot-reload across instances ─────────────────────────────────
+    // ── hot-reload across instances ─────────────────────────────────
 
     #[test]
     fn reloading_a_leaf_view_updates_all_its_instances() {
@@ -3801,7 +3819,7 @@ mod tests {
         assert_eq!(text_value(&mut interp, &children[1]), "new");
     }
 
-    // ── M35: slots & parameter defaults ──────────────────────────────────
+    // ── slots & parameter defaults ──────────────────────────────────
 
     #[test]
     fn omitted_defaulted_param_uses_its_default() {

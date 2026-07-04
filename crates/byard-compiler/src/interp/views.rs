@@ -7,7 +7,7 @@
 //! `Send`), maps each name to a dense [`ViewId`], and is built once per program
 //! load from `ParsedFile::views`. The intrinsic catalog (RFC-0005) stays closed
 //! and takes precedence: a `ViewDecl` named like an intrinsic is reported as
-//! [`CompileError::IntrinsicShadowed`] (IMPL-50) and is never reachable, because
+//! [`CompileError::IntrinsicShadowed`] and is never reachable, because
 //! intrinsic dispatch runs first.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub struct ViewTable {
 impl ViewTable {
     /// Builds the table from a file's views, returning it alongside the
     /// [`CompileError::IntrinsicShadowed`] diagnostics for any view that
-    /// collides with an RFC-0005 intrinsic (IMPL-50).
+    /// collides with an RFC-0005 intrinsic.
     #[must_use]
     pub fn build(views: &[ViewDecl]) -> (Self, Vec<CompileError>) {
         let mut by_name = HashMap::with_capacity(views.len());
@@ -40,7 +40,7 @@ impl ViewTable {
         let mut errors = Vec::new();
         for view in views {
             if lookup(view.name.as_str()).is_some() {
-                // The intrinsic always wins (IMPL-50); the view is unreachable.
+                // The intrinsic always wins; the view is unreachable.
                 errors.push(CompileError::IntrinsicShadowed {
                     span: view.span,
                     name: view.name.as_str().to_string(),
@@ -123,7 +123,7 @@ fn collect_refs(members: &[Member], guarded: bool, out: &mut Vec<(Symbol, bool)>
 
 /// A directed call graph over a [`ViewTable`]: an edge `A → B` (with a `guarded`
 /// flag) exists when `A`'s body references user view `B` (RFC-0007 §4). Used for
-/// static cycle detection (M33) and reload blast-radius (M34).
+/// static cycle detection and reload blast-radius.
 #[derive(Clone, Debug)]
 pub struct CallGraph {
     /// `edges[a]` is the list of `(callee, guarded)` references in view `a`.
@@ -155,7 +155,7 @@ impl CallGraph {
     }
 
     /// Detects an **unguarded** call cycle reachable from any view, returning the
-    /// offending view and the human-readable cycle path (RFC-0007 §4, IMPL-48).
+    /// offending view and the human-readable cycle path (RFC-0007 §4).
     /// A cycle that passes through at least one `when`/`for` guard is legal
     /// recursion and is not reported.
     #[must_use]

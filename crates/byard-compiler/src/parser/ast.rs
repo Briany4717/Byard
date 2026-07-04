@@ -55,9 +55,9 @@ pub struct Param {
     pub name: Symbol,
     /// Declared type, if written.
     pub ty: Option<Type>,
-    /// Default value expression (`= expr`), if written (RFC-0007 D-B /
-    /// IMPL-47). A defaulted parameter omitted at a user-view call site
-    /// evaluates this in the callee scope.
+    /// Default value expression (`= expr`), if written (RFC-0007 D-B). A
+    /// defaulted parameter omitted at a user-view call site evaluates this in
+    /// the callee scope.
     pub default: Option<Expr>,
     /// Source span.
     pub span: Span,

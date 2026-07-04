@@ -594,7 +594,7 @@ impl Rect {
 pub const HIT_MIN: f32 = 44.0;
 
 /// Default MSDF distance range in atlas texels for a `VectorIcon` (RFC-0009
-/// §2-E / IMPL-62), used by the placeholder lowering until the generator bakes a
+/// §2-E), used by the placeholder lowering until the generator bakes a
 /// per-glyph value. Ties to the generation grid (a 32² grid with a 4-texel
 /// range gives a clean edge under heavy magnification).
 pub const VECTOR_DEFAULT_PX_RANGE: f32 = 4.0;
