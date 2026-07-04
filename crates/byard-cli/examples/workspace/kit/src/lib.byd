@@ -1,0 +1,6 @@
+// A package view with a parameter (RFC-0007), consumed as `kit.Card` / `k.Card`.
+View Card(label) {
+    Box #[bg: 0x262636, radius: 12, p: 14, border: 0x3C3C52] {
+        Text(label) #[color: 0xE6E1E5, size: 15]
+    }
+}

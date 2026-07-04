@@ -63,6 +63,32 @@ pub struct Param {
     pub span: Span,
 }
 
+/// A top-of-file package import (RFC-0008 Pillar A/B, decisions D-F/D-G).
+///
+/// Three surface forms, all resolved against the manifest-declared dependency
+/// set (never a path string — the two-layer rule, RFC-0001 §1):
+///
+/// - `use material` — qualified access as `material.Card`;
+/// - `use material as m` — qualified access under an explicit alias, `m.Card`;
+/// - `use material.{Card, Chip}` — selective bare imports (`Card`, `Chip`),
+///   legal only while unambiguous (a collision is a `NameCollision` demanding
+///   an alias, D-G).
+///
+/// `alias` and `symbols` are grammatically exclusive: the selective form has
+/// no `as` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UseDecl {
+    /// The imported package name, as declared in `[dependencies]`.
+    pub package: Symbol,
+    /// The explicit alias (`as m`), if written.
+    pub alias: Option<Symbol>,
+    /// Selective bare imports (`.{A, B}`), each with its own span for precise
+    /// per-symbol diagnostics. `None` for the whole-package forms.
+    pub symbols: Option<Vec<(Symbol, Span)>>,
+    /// Source span of the whole declaration.
+    pub span: Span,
+}
+
 /// A whole `.byd` file is a list of [`ViewDecl`]s (D11: multiple `View`s per
 /// file are allowed).
 #[derive(Clone, Debug, PartialEq)]
@@ -491,6 +517,7 @@ const _: () = {
     assert_send::<Member>();
     assert_send::<Expr>();
     assert_send::<Type>();
+    assert_send::<UseDecl>();
 };
 
 #[cfg(test)]

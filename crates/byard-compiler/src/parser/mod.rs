@@ -10,7 +10,7 @@
 pub mod ast;
 mod expr;
 
-use ast::{Attr, AttrKind, ElementNode, Member, Param, StyleRule, Type, ViewDecl};
+use ast::{Attr, AttrKind, ElementNode, Member, Param, StyleRule, Type, UseDecl, ViewDecl};
 
 use crate::diagnostics::{CompileError, Span};
 use crate::lexer::{SpannedToken, Token, lex};
@@ -19,6 +19,9 @@ use crate::symbol::Symbol;
 /// The result of parsing a whole `.byd` file.
 #[derive(Debug, Default)]
 pub struct ParsedFile {
+    /// The file's `use` imports (RFC-0008 Pillar A), consumed by the module
+    /// resolver. Empty in an already-resolved program.
+    pub imports: Vec<UseDecl>,
     /// The parsed views (D11: a file may declare several).
     pub views: Vec<ViewDecl>,
     /// All diagnostics from lexing and parsing, in source order.
@@ -29,8 +32,9 @@ pub struct ParsedFile {
 #[must_use]
 pub fn parse(source: &str) -> ParsedFile {
     let mut parser = Parser::new(source);
-    let views = parser.parse_file();
+    let (imports, views) = parser.parse_file();
     ParsedFile {
+        imports,
         views,
         errors: parser.errors,
     }
@@ -163,20 +167,69 @@ impl<'a> Parser<'a> {
 
     // ---- file / view ----
 
-    fn parse_file(&mut self) -> Vec<ViewDecl> {
+    fn parse_file(&mut self) -> (Vec<UseDecl>, Vec<ViewDecl>) {
+        let mut imports = Vec::new();
         let mut views = Vec::new();
         while self.cur().is_some() {
             let before = self.pos;
-            if matches!(self.cur(), Some(Token::View)) {
-                views.push(self.parse_view());
-            } else {
-                self.error("'View'");
+            match self.cur() {
+                Some(Token::View) => views.push(self.parse_view()),
+                Some(Token::Use) => {
+                    let import = self.parse_use();
+                    // Imports are legal only at file top, before any `View`
+                    // (RFC-0008 Pillar A). Record the decl anyway so the
+                    // resolver can still do useful work during recovery.
+                    if !views.is_empty() {
+                        self.errors
+                            .push(CompileError::ImportAfterView { span: import.span });
+                    }
+                    imports.push(import);
+                }
+                _ => self.error("'View' or 'use'"),
             }
             if self.pos == before {
                 self.advance(); // guaranteed progress on unrecognized input
             }
         }
-        views
+        (imports, views)
+    }
+
+    /// `use_decl := "use" IDENT ("as" IDENT | "." "{" IDENT ("," IDENT)* "}")?`
+    /// (RFC-0008 D-F/D-G). The alias and selective forms are exclusive.
+    fn parse_use(&mut self) -> UseDecl {
+        let start = self.cur_span();
+        self.advance(); // use
+        let package = self
+            .expect_ident("a package name")
+            .unwrap_or_else(|| Symbol::intern(""));
+
+        let mut alias = None;
+        let mut symbols = None;
+        if self.eat(&Token::As) {
+            alias = self.expect_ident("an alias name");
+        } else if self.eat(&Token::Dot) {
+            self.expect(&Token::LBrace, "'{' to open a symbol list");
+            let mut list = Vec::new();
+            while !matches!(self.cur(), Some(Token::RBrace) | None) {
+                let sym_span = self.cur_span();
+                match self.expect_ident("an imported view name") {
+                    Some(sym) => list.push((sym, self.span_from(sym_span))),
+                    None => break,
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RBrace, "'}'");
+            symbols = Some(list);
+        }
+
+        UseDecl {
+            package,
+            alias,
+            symbols,
+            span: self.span_from(start),
+        }
     }
 
     fn parse_view(&mut self) -> ViewDecl {
@@ -417,12 +470,21 @@ impl<'a> Parser<'a> {
 
     // ---- elements & attributes ----
 
-    /// `element := IDENT ("(" arg_list? ")")? attr_block? element_tail?`.
+    /// `element := element_name ("(" arg_list? ")")? attr_block? element_tail?`,
+    /// `element_name := IDENT ("." IDENT)?` — the qualified form is a
+    /// package-namespaced user-`View` reference (`m.Card`, RFC-0008 Pillar B),
+    /// interned as one dotted symbol and resolved by the module resolver.
     fn parse_element(&mut self) -> ElementNode {
         let start = self.cur_span();
-        let name = self
+        let mut name = self
             .expect_ident("an element name")
             .unwrap_or_else(|| Symbol::intern(""));
+        if matches!(self.cur(), Some(Token::Dot)) && matches!(self.peek2(), Some(Token::Ident(_))) {
+            self.advance(); // .
+            if let Some(member) = self.expect_ident("a view name after '.'") {
+                name = Symbol::intern(&format!("{}.{}", name.as_str(), member.as_str()));
+            }
+        }
 
         let content = if matches!(self.cur(), Some(Token::LParen)) {
             self.advance();
@@ -612,6 +674,7 @@ fn is_keyword(tok: &Token) -> bool {
             | Token::Else
             | Token::Style
             | Token::Untrack
+            | Token::Use
     )
 }
 

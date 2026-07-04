@@ -45,7 +45,7 @@
       "patterns": [
         {
           "name": "keyword.control.byld",
-          "match": "\\b(var|let|fn|inject|for|in|when|else|style|untrack)\\b"
+          "match": "\\b(View|var|let|fn|inject|as|for|in|when|else|style|untrack|with|merge|use)\\b"
         },
         {
           "name": "keyword.other.byld",
@@ -73,7 +73,7 @@
       "patterns": [
         {
           "name": "constant.numeric.byld",
-          "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+          "match": "\\b[0-9]+(\\.[0-9]+)?(deg|rad|ms)?\\b"
         }
       ]
     },

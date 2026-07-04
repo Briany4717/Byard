@@ -17,7 +17,9 @@ byard-compiler = { path = "../byard-compiler" }
 byard-platform = { path = "../byard-platform" }
 byard-core     = { path = "../byard-core" }
 clap           = { version = "4", features = ["derive"] }
-toml           = "0.8"
+toml           = { version = "0.8", features = ["preserve_order"] }
+toml_edit      = "0.22"
+sha2           = "0.10"
 pollster       = "0.3"
 wgpu           = "29.0"
 

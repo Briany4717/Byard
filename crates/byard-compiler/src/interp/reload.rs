@@ -214,8 +214,16 @@ pub struct ParsedFile {
     pub errors: Vec<crate::diagnostics::CompileError>,
 }
 
-/// Spawns a background OS thread that watches `path` with `notify` and publishes
-/// fresh [`ParsedFile`]s to `channel` on every change (M25).
+/// Spawns a background OS thread that watches `paths` with `notify` and
+/// publishes the result of `reparse()` to `channel` on every relevant change
+/// (M25; generalized to the module graph by RFC-0008 Pillar E).
+///
+/// `reparse` re-derives the *whole program* — for a single-file project that
+/// is one `parse`, for a multi-file/package project the CLI passes a closure
+/// that re-runs the module resolver. Directories are watched recursively
+/// (project sources and cooperative-dev `path` dependencies, D-J); events for
+/// anything other than `.byd` sources or `byard.toml` are ignored. Fetched,
+/// lock-pinned cache packages are immutable and must not be in `paths`.
 ///
 /// A parse error keeps `views` empty so the caller retains the last-good view.
 /// Returns the watcher handle — drop it to stop watching.
@@ -223,32 +231,40 @@ pub struct ParsedFile {
 /// # Errors
 ///
 /// Returns an error if `notify` fails to initialize the watcher or to register
-/// the path (e.g. file does not exist).
-pub fn start_watcher(
-    path: &std::path::Path,
+/// a path (e.g. file does not exist).
+pub fn start_watcher<F>(
+    paths: &[std::path::PathBuf],
     channel: std::sync::Arc<LatestWins<ParsedFile>>,
-) -> Result<notify::RecommendedWatcher, notify::Error> {
+    reparse: F,
+) -> Result<notify::RecommendedWatcher, notify::Error>
+where
+    F: Fn() -> ParsedFile + Send + 'static,
+{
     use notify::{EventKind, RecursiveMode, Watcher};
 
-    let watcher_path = path.to_path_buf();
     let mut watcher = notify::RecommendedWatcher::new(
         move |result: notify::Result<notify::Event>| {
             if let Ok(event) = result {
-                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    // Re-read and re-parse the file on every change event.
-                    if let Ok(src) = std::fs::read_to_string(&watcher_path) {
-                        let parsed = crate::parser::parse(&src);
-                        channel.publish(ParsedFile {
-                            views: parsed.views,
-                            errors: parsed.errors,
-                        });
-                    }
+                let relevant = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+                    && event.paths.iter().any(|p| {
+                        p.extension().is_some_and(|e| e == "byd")
+                            || p.file_name().is_some_and(|f| f == "byard.toml")
+                    });
+                if relevant {
+                    channel.publish(reparse());
                 }
             }
         },
         notify::Config::default(),
     )?;
-    watcher.watch(path, RecursiveMode::NonRecursive)?;
+    for path in paths {
+        let mode = if path.is_dir() {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(path, mode)?;
+    }
     Ok(watcher)
 }
 

@@ -1,0 +1,7 @@
+// Same project namespace as main.byd — referenced by its bare name.
+View Sidebar() {
+    Row #[gap: 8, p: (vertical: 8) ] {
+        Text("·") #[color: 0x6495ED]
+        Text("a sibling-file view, same project namespace") #[color: 0x9AA0AC, size: 13]
+    }
+}

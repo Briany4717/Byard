@@ -22,6 +22,7 @@ pub mod infer;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+pub mod resolve;
 pub mod symbol;
 pub mod util;
 
