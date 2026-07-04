@@ -202,6 +202,71 @@ impl Transform {
     pub fn is_identity(&self) -> bool {
         *self == Self::IDENTITY
     }
+
+    /// Maps a point (in the same absolute logical-pixel space as `origin`)
+    /// through this transform: scale and rotate it about `origin`, then translate.
+    /// Used to propagate an ancestor transform onto a descendant's laid-out
+    /// geometry (RFC-0011 group transforms).
+    #[must_use]
+    pub fn apply_point(&self, p: [f32; 2]) -> [f32; 2] {
+        let dx = (p[0] - self.origin[0]) * self.scale[0];
+        let dy = (p[1] - self.origin[1]) * self.scale[1];
+        let (sin, cos) = self.rotate.sin_cos();
+        [
+            self.origin[0] + dx * cos - dy * sin + self.translate[0],
+            self.origin[1] + dx * sin + dy * cos + self.translate[1],
+        ]
+    }
+
+    /// Maps a free vector (a displacement) through this transform: scale and
+    /// rotate only — no pivot, no translation.
+    #[must_use]
+    fn apply_vec(&self, v: [f32; 2]) -> [f32; 2] {
+        let dx = v[0] * self.scale[0];
+        let dy = v[1] * self.scale[1];
+        let (sin, cos) = self.rotate.sin_cos();
+        [dx * cos - dy * sin, dx * sin + dy * cos]
+    }
+
+    /// The mean of the two scale axes — the single factor a scalar-only sink
+    /// (text `font_size`, a uniform glyph scale) uses when an ancestor's group
+    /// transform is non-uniform. Exact for the common uniform-scale case.
+    #[must_use]
+    pub fn uniform_scale(&self) -> f32 {
+        (self.scale[0] + self.scale[1]) * 0.5
+    }
+
+    /// Composes `self` (the outer / ancestor transform) with `inner` (a
+    /// descendant's own transform), yielding the single [`Transform`] that maps
+    /// the descendant's laid-out geometry as if `inner` were applied first and
+    /// `self` after it — the basis of RFC-0011 group transforms (a scaled or
+    /// translated container carries its children, text, and widgets with it).
+    ///
+    /// Exact when the outer transform has no rotation (the common scale/translate
+    /// inheritance) or when scales are uniform. A rotating, *non-uniformly* scaled
+    /// ancestor is approximated: a general affine no longer decomposes to a single
+    /// pivot-based TRS, so full fidelity there would need render-to-texture
+    /// (RFC-0011 T4). Opacity multiplies.
+    #[must_use]
+    pub fn compose(&self, inner: &Transform) -> Transform {
+        let moved_origin = self.apply_point(inner.origin);
+        let moved_translate = self.apply_vec(inner.translate);
+        Transform {
+            translate: [
+                moved_translate[0] + moved_origin[0] - inner.origin[0],
+                moved_translate[1] + moved_origin[1] - inner.origin[1],
+            ],
+            scale: [
+                self.scale[0] * inner.scale[0],
+                self.scale[1] * inner.scale[1],
+            ],
+            rotate: self.rotate + inner.rotate,
+            // Keep the descendant's own pivot (in absolute coords); the ancestor's
+            // effect is folded into `translate`/`scale`/`rotate` above.
+            origin: inner.origin,
+            opacity: self.opacity * inner.opacity,
+        }
+    }
 }
 
 impl Default for Transform {
@@ -906,6 +971,72 @@ impl RenderFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether two 2-vectors agree within a tight float tolerance.
+    fn approx(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
+    }
+
+    #[test]
+    fn compose_with_identity_is_a_no_op() {
+        let t = Transform {
+            translate: [3.0, -4.0],
+            scale: [1.5, 2.0],
+            rotate: 0.3,
+            origin: [10.0, 20.0],
+            opacity: 0.8,
+        };
+        // An identity *outer* preserves the inner transform field-for-field.
+        assert_eq!(Transform::IDENTITY.compose(&t), t);
+        // An identity *inner* re-anchors the pivot to (0,0) but stays the same
+        // mapping — check a couple of sample points rather than the fields.
+        let reanchored = t.compose(&Transform::IDENTITY);
+        for p in [[0.0, 0.0], [12.0, -7.0], [30.0, 40.0]] {
+            let a = t.apply_point(p);
+            let b = reanchored.apply_point(p);
+            assert!(
+                (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4,
+                "identity-inner compose maps {p:?} the same: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_scale_carries_a_child_point_and_scale() {
+        // A parent scaling 2× about the origin (0,0) should map a child point at
+        // (10, 5) to (20, 10) and double the child's scale — the group transform.
+        let parent = Transform {
+            scale: [2.0, 2.0],
+            origin: [0.0, 0.0],
+            ..Transform::IDENTITY
+        };
+        // Child is an unscaled box pivoting at its own centre (10, 5).
+        let child = Transform {
+            origin: [10.0, 5.0],
+            ..Transform::IDENTITY
+        };
+        let composed = parent.compose(&child);
+        assert!(approx(composed.scale, [2.0, 2.0]), "scale multiplies");
+        // The composed transform, applied to the child pivot, lands where the
+        // parent would have put it: 2×(10,5) = (20,10).
+        assert!(approx(composed.apply_point([10.0, 5.0]), [20.0, 10.0]));
+    }
+
+    #[test]
+    fn parent_translate_offsets_children() {
+        let parent = Transform {
+            translate: [7.0, -3.0],
+            ..Transform::IDENTITY
+        };
+        let child = Transform {
+            origin: [4.0, 4.0],
+            ..Transform::IDENTITY
+        };
+        let composed = parent.compose(&child);
+        // A pure translate just shifts the child's mapped geometry.
+        assert!(approx(composed.apply_point([4.0, 4.0]), [11.0, 1.0]));
+        assert!(approx(composed.scale, [1.0, 1.0]));
+    }
 
     #[test]
     fn round_trip_preserves_all_fields() {

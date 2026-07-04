@@ -701,6 +701,7 @@ impl Interpreter {
                         &mut flat_idx,
                         parent_rect,
                         1.0,
+                        byard_core::frame::Transform::IDENTITY,
                     );
                 }
             }
@@ -806,6 +807,11 @@ impl Interpreter {
         // every primitive it emits, so a translucent parent dims its text and
         // widgets too — not only its own background.
         inherited_opacity: f32,
+        // Paint-time transform inherited from ancestors (RFC-0011 group
+        // transforms): composed with this element's own transform so a scaled or
+        // translated container carries its children, text, and widgets with it —
+        // not only its own background box. `IDENTITY` at the root.
+        inherited_transform: byard_core::frame::Transform,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
@@ -846,11 +852,19 @@ impl Interpreter {
                             .unwrap_or(self.theme.font_size as i64) as f32;
                     let mut rgba = super::intrinsics::color_to_rgba(color, false);
                     rgba[3] *= inherited_opacity;
+                    // RFC-0011 group transforms: a `Text` carries no transform of
+                    // its own, so an ancestor's scale/translate is baked into the
+                    // baseline anchor and the font size (glyph extents scale from
+                    // the anchor, so this scales the run about the ancestor pivot).
+                    // Rotation can't be baked per-glyph and is left to box
+                    // primitives (shader-applied) — a documented limitation.
+                    let anchor = inherited_transform.apply_point([rect.x, rect.y]);
+                    let scaled_size = size * inherited_transform.uniform_scale();
                     frame.push_text(byard_core::TextLine {
-                        x: rect.x,
-                        y: rect.y,
+                        x: anchor[0],
+                        y: anchor[1],
                         text,
-                        font_size: size,
+                        font_size: scaled_size,
                         color: rgba,
                         dirty: true,
                     });
@@ -884,6 +898,10 @@ impl Interpreter {
                 // when it has a resolved rect (set below), else whatever it
                 // inherited unchanged.
                 let mut child_opacity = inherited_opacity;
+                // Likewise the composed paint transform children inherit (RFC-0011
+                // group transforms): this box's own transform ∘ its ancestors',
+                // set once the rect is known, else passed through unchanged.
+                let mut child_transform = inherited_transform;
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     current_rect = crate::interp::intrinsics::Rect::new(
                         rect.x,
@@ -919,7 +937,13 @@ impl Interpreter {
                     // (their track/fill/thumb/underline/caret are the element's
                     // own quads, so RFC-0011's element-local transform applies to
                     // them exactly as it does to a `Box` fill).
-                    let transform = self.resolve_transform(paint_attrs, current_rect);
+                    // The element's own transform, then composed with the one
+                    // inherited from its ancestors (RFC-0011 group transforms) so
+                    // this box's fill, its widget visuals, its children, and its
+                    // text all move/scale as a group. Passed on to children below.
+                    let own_transform = self.resolve_transform(paint_attrs, current_rect);
+                    let transform = inherited_transform.compose(&own_transform);
+                    child_transform = transform;
                     let bg = self.eval_color_prop(paint_attrs, "bg");
                     let radii = self.resolve_radii(paint_attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
@@ -1108,6 +1132,7 @@ impl Interpreter {
                         flat_idx,
                         current_rect,
                         child_opacity,
+                        child_transform,
                     );
                 }
             }
@@ -1137,8 +1162,16 @@ impl Interpreter {
                         * self
                             .eval_float_prop(attrs, "opacity")
                             .map_or(1.0, |v| v as f32);
+                    // RFC-0011 group transforms: an `Image` carries no transform
+                    // field, so an ancestor's scale/translate is baked into its
+                    // rect (top-left through the transform, extents scaled per
+                    // axis). Rotation isn't representable here and is left to box
+                    // primitives — same limitation as `Text`.
+                    let tl = inherited_transform.apply_point([rect.x, rect.y]);
+                    let tw = rect.width * inherited_transform.scale[0];
+                    let th = rect.height * inherited_transform.scale[1];
                     frame.push_texture(byard_core::frame::TextureSampler {
-                        rect: [rect.x, rect.y, rect.width, rect.height],
+                        rect: [tl[0], tl[1], tw, th],
                         src: src_val,
                         fit,
                         radii,
@@ -3778,6 +3811,46 @@ mod tests {
         );
         // …while `radius` (only on the base) survives (radii != 0).
         assert!(inst.radii[0] > 0.0, "base radius survives the merge");
+    }
+
+    #[test]
+    fn parent_scale_is_inherited_by_child_text_and_boxes() {
+        // RFC-0011 group transforms: a scaled container carries its descendants —
+        // the reported bug was that a scaled parent's *text* stayed the same size.
+        let parsed = parse(
+            "View V() {\n Column #[scale: 2.0, width: 100, height: 100, bg: 0x111111] {\n \
+             Text(\"hi\") #[size: 10]\n Box #[bg: 0x222222, width: 20, height: 20]\n }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // The child text's font size doubled with the parent scale (the fix).
+        let line = frame
+            .texts()
+            .iter()
+            .find(|t| t.text == "hi")
+            .expect("the child text line is emitted");
+        assert!(
+            (line.font_size - 20.0).abs() < 1e-3,
+            "child text scaled 2× with its parent (10 → 20), got {}",
+            line.font_size
+        );
+
+        // Both boxes carry a 2× scale: the parent's own, and the child's inherited.
+        for inst in frame.instances() {
+            assert!(
+                (inst.transform.scale[0] - 2.0).abs() < 1e-3
+                    && (inst.transform.scale[1] - 2.0).abs() < 1e-3,
+                "every box in the group inherits the 2× scale, got {:?}",
+                inst.transform.scale
+            );
+        }
     }
 
     #[test]
