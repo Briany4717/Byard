@@ -40,6 +40,13 @@ View Main() {
         on pressed  { scale: 0.96 }
         on disabled { opacity: 0.4 }
     }
+    // Group transform (RFC-0011): scaling a container carries its whole subtree —
+    // text and inner boxes scale with it, not just the background. Hover to zoom
+    // the entire card as one unit.
+    let zoomCard = style {
+        bg: 0x262636, radius: 16, p: 18, gap: 8, border: 0x3C3C52
+        on hover { scale: 1.08 }
+    }
 
     // Two columns side by side → a landscape ~16:9 frame instead of one tall
     // strip. `align: start` keeps both columns pinned to the top.
@@ -171,6 +178,17 @@ View Main() {
                     Box #[..pill, disabled: true] {
                         Text("disabled") #[color: 0xFFFFFF, size: 14]
                     }
+                }
+            }
+
+            // ── Group transform (RFC-0011): a scaled container carries its whole
+            // subtree. Hover this card to zoom it as one unit — the heading, the
+            // body text, and the inner chip all scale together, not just the box.
+            Box #[..zoomCard, width: 300] {
+                Text("Group transform") #[color: 0xE6E1E5, size: 16, weight: bold]
+                Text("hover me — my text scales too") #[color: 0x9AA0AC, size: 13]
+                Box #[bg: 0x6495ED, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                    Text("child chip") #[color: 0xFFFFFF, size: 12]
                 }
             }
 
