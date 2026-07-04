@@ -652,6 +652,74 @@ pub struct TextureSampler {
     pub dirty: bool,
 }
 
+/// GPU-ready instance data for a single MSDF vector glyph (RFC-0009 §1, the
+/// fifth pipeline). A `VectorIcon` lowers to one of these; the render thread
+/// samples the multi-channel signed-distance-field atlas to draw a crisp,
+/// resolution-independent monochrome glyph at any scale.
+///
+/// `#[repr(C)]` + `bytemuck` so the slice uploads to the instance buffer with
+/// zero copy, exactly like [`BoxInstance`]. The shape is identical in dev (JIT
+/// atlas) and release (AOT-baked atlas) — INV-7 — so the render path is the same
+/// in both modes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VectorInstance {
+    /// UV rectangle within the MSDF atlas `[u0, v0, u1, v1]` (normalised 0–1).
+    pub atlas_uv_rect: [f32; 4],
+    /// Taffy-resolved screen rectangle in logical pixels `[x, y, width, height]`.
+    pub screen_rect: [f32; 4],
+    /// Linear-space tint colour `[r, g, b, a]` (monochrome glyph, RFC-0009).
+    pub color: [f32; 4],
+    /// Distance range baked at generation time, in atlas texels (§2-E). Drives
+    /// the screen-space anti-aliasing in the fragment shader.
+    pub px_range: f32,
+    /// Array-texture layer holding this glyph's cell.
+    pub atlas_layer: u32,
+}
+
+impl VectorInstance {
+    /// Builds an instance from logical-pixel screen geometry and an atlas UV
+    /// rect (both as [`Rect`]), a colour, the baked `px_range`, and the atlas
+    /// layer.
+    #[must_use]
+    pub fn new(screen: Rect, atlas_uv: Rect, color: [f32; 4], px_range: f32, layer: u32) -> Self {
+        Self {
+            atlas_uv_rect: [
+                atlas_uv.x,
+                atlas_uv.y,
+                atlas_uv.x + atlas_uv.width,
+                atlas_uv.y + atlas_uv.height,
+            ],
+            screen_rect: [screen.x, screen.y, screen.width, screen.height],
+            color,
+            px_range,
+            atlas_layer: layer,
+        }
+    }
+}
+
+/// An owned MSDF-field upload destined for the vector atlas (RFC-0009 §2-C /
+/// INV-8). A background worker generates the field and sends this record over a
+/// channel; the **logic thread** allocates the UV slot and records the upload on
+/// the next [`RenderFrame`]; only the **render thread** performs the actual
+/// `Queue::write_texture` during frame application. Workers never touch the GPU
+/// queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtlasUpload {
+    /// Destination array-texture layer.
+    pub layer: u32,
+    /// Destination pixel x within the layer.
+    pub x: u32,
+    /// Destination pixel y within the layer.
+    pub y: u32,
+    /// Field cell width in pixels.
+    pub width: u32,
+    /// Field cell height in pixels.
+    pub height: u32,
+    /// The RGBA8 MSDF field bytes (`width * height * 4`), owned (INV-3).
+    pub bytes: Vec<u8>,
+}
+
 /// A single line of text to be rendered in a frame.
 ///
 /// Shared between the logic thread (which populates [`RenderFrame::texts`]) and
@@ -741,6 +809,14 @@ pub struct RenderFrame {
     /// Text lines populated by the Logic thread each tick.
     texts: Vec<TextLine>,
 
+    /// MSDF vector-glyph instances (RFC-0009 §1, the fifth pipeline).
+    vector_instances: Vec<VectorInstance>,
+
+    /// Pending MSDF-atlas uploads recorded by the logic thread this tick
+    /// (RFC-0009 §2-C / INV-8). Applied by the render thread via a single
+    /// `Queue::write_texture` each, during frame application, before the draw.
+    atlas_uploads: Vec<AtlasUpload>,
+
     /// Per-primitive **draw-order depth**, one parallel vec per drawable pool.
     ///
     /// The Encoder draws in four type-grouped passes (solids → decorated →
@@ -818,6 +894,8 @@ impl RenderFrame {
         self.decorated.clear();
         self.textures.clear();
         self.texts.clear();
+        self.vector_instances.clear();
+        self.atlas_uploads.clear();
         self.solid_depths.clear();
         self.decorated_depths.clear();
         self.texture_depths.clear();
@@ -876,6 +954,17 @@ impl RenderFrame {
         self.text_depths.push(d);
     }
 
+    /// Appends a [`VectorInstance`] (MSDF glyph) to the frame (RFC-0009 §1).
+    pub fn push_vector(&mut self, v: VectorInstance) {
+        self.vector_instances.push(v);
+    }
+
+    /// Records a pending [`AtlasUpload`] for the render thread to apply before
+    /// drawing this frame (RFC-0009 §2-C / INV-8).
+    pub fn push_atlas_upload(&mut self, upload: AtlasUpload) {
+        self.atlas_uploads.push(upload);
+    }
+
     /// Sets the frame's version counter.
     pub fn set_version(&mut self, version: u64) {
         self.version = version;
@@ -915,6 +1004,18 @@ impl RenderFrame {
     #[must_use]
     pub fn texts(&self) -> &[TextLine] {
         &self.texts
+    }
+
+    /// Returns the MSDF vector-glyph instances in this frame (RFC-0009 §1).
+    #[must_use]
+    pub fn vector_instances(&self) -> &[VectorInstance] {
+        &self.vector_instances
+    }
+
+    /// Returns the pending atlas uploads recorded this frame (RFC-0009 §2-C).
+    #[must_use]
+    pub fn atlas_uploads(&self) -> &[AtlasUpload] {
+        &self.atlas_uploads
     }
 
     /// Draw-order depths parallel to [`instances`](Self::instances).
@@ -1061,6 +1162,40 @@ mod tests {
         assert_eq!(id.index(), 0);
         assert_eq!(id.generation(), 0);
         assert_eq!(id.kind(), 0);
+    }
+
+    #[test]
+    fn vector_instance_is_pod_and_round_trips_through_the_frame() {
+        let v = VectorInstance::new(
+            Rect::new(10.0, 20.0, 16.0, 16.0),
+            Rect::new(0.0, 0.0, 0.25, 0.25),
+            [1.0, 1.0, 1.0, 1.0],
+            4.0,
+            0,
+        );
+        // UV rect is stored as [u0, v0, u1, v1].
+        let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        assert!(close(v.atlas_uv_rect, [0.0, 0.0, 0.25, 0.25]));
+        assert!(close(v.screen_rect, [10.0, 20.0, 16.0, 16.0]));
+        // Pod: 14 × 4-byte fields, no padding (so it uploads zero-copy).
+        assert_eq!(std::mem::size_of::<VectorInstance>(), 56);
+        let _bytes: &[u8] = bytemuck::bytes_of(&v);
+
+        let mut frame = RenderFrame::new();
+        frame.push_vector(v);
+        frame.push_atlas_upload(AtlasUpload {
+            layer: 0,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            bytes: vec![0u8; 2 * 2 * 4],
+        });
+        assert_eq!(frame.vector_instances().len(), 1);
+        assert_eq!(frame.atlas_uploads().len(), 1);
+        frame.clear();
+        assert!(frame.vector_instances().is_empty());
+        assert!(frame.atlas_uploads().is_empty());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The 11 Phase-2 intrinsics and the RFC-0005 §5 attribute contract.
+//! The twelve intrinsics (eleven Phase-2 + `VectorIcon`, RFC-0009) and the
+//! RFC-0005 §5 attribute contract.
 //!
 //! A closed table maps each reserved intrinsic name to its content arity,
 //! accepted property/event vocabulary, focusability, and children policy.
@@ -26,6 +27,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "Slider",
     "Image",
     "ScrollView",
+    "VectorIcon",
 ];
 
 /// The scalar type an attribute value must have (RFC-0005 §1).
@@ -342,6 +344,28 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
                 events: events_from(false, &["scroll"]),
             }
         }
+        // The twelfth intrinsic (RFC-0009 §1, RFC-0005 amendment): an MSDF vector
+        // glyph. Content arity 1 = an asset handle (a `Str` path resolved against
+        // the asset table, like `Image`). Props: `size`, `color`, `m`, `opacity`,
+        // universal `style`; pointer events match `Image`. No children. Routes to
+        // the `VectorMSDF` pipeline.
+        "VectorIcon" => {
+            let mut props: HashMap<&'static str, PropType> = HashMap::new();
+            props.insert("size", PropType::Int);
+            props.insert("color", PropType::Color);
+            props.insert("m", PropType::Len);
+            props.insert("opacity", PropType::Float);
+            props.insert("style", PropType::Class);
+            Intrinsic {
+                arity: 1,
+                content: Some(PropType::Str),
+                children: false,
+                focusable: false,
+                interactive: true,
+                props,
+                events: events_from(false, &[]),
+            }
+        }
         _ => return None,
     })
 }
@@ -568,6 +592,12 @@ impl Rect {
 
 /// Minimum hit-target size in logical pixels (RFC-0003 E8).
 pub const HIT_MIN: f32 = 44.0;
+
+/// Default MSDF distance range in atlas texels for a `VectorIcon` (RFC-0009
+/// §2-E), used by the placeholder lowering until the generator bakes a
+/// per-glyph value. Ties to the generation grid (a 32² grid with a 4-texel
+/// range gives a clean edge under heavy magnification).
+pub const VECTOR_DEFAULT_PX_RANGE: f32 = 4.0;
 
 /// Inflates an interactive element's collision rect to at least 44×44, centered
 /// on the original rect and clamped to `parent` (RFC-0003 E8).
@@ -826,6 +856,45 @@ mod tests {
         assert!(inflated.x >= parent.x && inflated.y >= parent.y);
         assert!(inflated.x + inflated.w <= parent.x + parent.w);
         assert!(inflated.y + inflated.h <= parent.y + parent.h);
+    }
+
+    #[test]
+    fn vector_icon_validates_like_an_asset_handle_intrinsic() {
+        // Valid: arity-1 asset handle + size/color props.
+        assert!(
+            errs("View V() { VectorIcon(\"icons/gear.svg\") #[size: 24, color: 0xFFFFFF] }")
+                .is_empty()
+        );
+        // Arity 0 and 2 → ArityMismatch.
+        assert!(
+            errs("View V() { VectorIcon() }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 1, .. }))
+        );
+        assert!(
+            errs("View V() { VectorIcon(\"a.svg\", \"b.svg\") }")
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    CompileError::ArityMismatch {
+                        expected: 1,
+                        found: 2,
+                        ..
+                    }
+                ))
+        );
+        // A child block → UnexpectedChildren.
+        assert!(
+            errs("View V() { VectorIcon(\"a.svg\") { Text(\"no\") } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnexpectedChildren { .. }))
+        );
+        // An unknown attribute (e.g. gradient) → UnknownAttribute.
+        assert!(
+            errs("View V() { VectorIcon(\"a.svg\") #[gradient: 0x00FF00] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
     }
 
     #[test]

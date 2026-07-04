@@ -24,10 +24,11 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, PostfixOp, StateBlock, StrPart,
-    StyleStateKind, ViewDecl,
+    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
+    StrPart, StyleStateKind, ViewDecl,
 };
 use crate::symbol::Symbol;
+use crate::util::closest_match;
 
 /// Decimal places a `Slider` without an explicit `step` quantises its value to.
 ///
@@ -35,6 +36,14 @@ use crate::symbol::Symbol;
 /// pixel-derived ratio (e.g. `0.6035294…`); rounding keeps the bound value
 /// readable. Authors who need a specific granularity set `step:` instead.
 const SLIDER_DEFAULT_DECIMALS: i32 = 3;
+
+/// Maximum user-`View` instantiation depth before lowering truncates with a
+/// diagnostic rather than risking a native stack overflow (RFC-0007 §4, D-C).
+/// Far beyond any hand-written nesting, shallow enough to never
+/// approach the stack limit. The static cycle check (`load_views`) catches
+/// *unguarded* cycles at load; this bound is the backstop for a guarded
+/// recursion whose runtime guard never terminates at lower time.
+const MAX_INSTANCE_DEPTH: u32 = 64;
 
 /// Decimal places implied by `step`, via its shortest round-trip form
 /// (`0.1 → 1`, `0.25 → 2`, `1.0 → 0`). Used so a stepped slider never emits a
@@ -118,10 +127,43 @@ pub enum RenderNode {
         /// The reactive scope that evaluates to the image source path/URL.
         src: ScopeId,
     },
+    /// An MSDF vector glyph — the `VectorIcon` intrinsic (RFC-0009 §1)
+    /// routed to the `VectorMSDF` pipeline.
+    Vector {
+        /// Styling attributes (`size`, `color`, `m`, `opacity`, `style`).
+        attrs: Vec<Attr>,
+        /// The reactive scope evaluating to the asset handle (a `Str` path).
+        src: ScopeId,
+    },
 }
 
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
+
+/// The per-instance parameter bindings produced by binding a user-view call's
+/// arguments to the callee's declared parameters (RFC-0007 §3). Each entry
+/// is a reactive memo projecting the argument expression over the *parent*
+/// scope, so a parameter fed a parent `var` stays live (RFC-0004); a literal
+/// argument lowers to a constant memo with no dirty edges.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct InstanceBindings {
+    /// Successfully bound `(param name, projecting memo)` pairs, in parameter
+    /// declaration order.
+    pub bindings: Vec<(Symbol, ScopeId)>,
+}
+
+/// The default-value expression of a parameter, if it declares one (RFC-0007
+/// D-B). A parameter with a default is not required at the call site;
+/// the default is evaluated in the callee scope when the argument is omitted.
+fn param_default(param: &Param) -> Option<&Expr> {
+    param.default.as_ref()
+}
+
+/// The reserved parameter/element name for a user view's child-block slot
+/// (RFC-0007 D-A). A `View` declaring a `content` parameter accepts a
+/// `{ ... }` block at its call sites; referencing `content` as an element inside
+/// the body splices the caller-supplied block.
+const RESERVED_CONTENT: &str = "content";
 
 thread_local! {
     /// Thread-local storage holding the active payload of the event currently being processed.
@@ -151,6 +193,19 @@ pub struct Interpreter {
     /// Parameterized fn definitions: `fn f(params) => body` stored as
     /// `(param names, body expr)`, indexed by `AstId` (M25).
     fn_table: Vec<(Vec<Symbol>, Expr)>,
+    /// The resolved user-`View` registry for this program (RFC-0007 §1).
+    /// Built once from `ParsedFile::views` via [`Interpreter::load_views`]; a
+    /// call whose name resolves here is a user-view instantiation, not a
+    /// container.
+    view_table: super::views::ViewTable,
+    /// Current user-view instantiation depth, bounded by [`MAX_INSTANCE_DEPTH`]
+    /// to guard against runaway guarded recursion (RFC-0007 §4).
+    instance_depth: u32,
+    /// Stack of caller-supplied child-block slots, one frame per active
+    /// user-view instance (RFC-0007 D-A). The block is
+    /// pre-lowered in the *caller* scope so a `content` element reference inside
+    /// the callee body splices nodes that capture the caller's environment.
+    slot_stack: Vec<Vec<RenderNode>>,
     /// Current engine time (ms since the runner's epoch), set once per frame by
     /// the runner via [`set_now_ms`](Self::set_now_ms). Drives `with`
     /// animations (RFC-0010).
@@ -202,6 +257,33 @@ impl Interpreter {
     #[must_use]
     pub fn errors(&self) -> &[CompileError] {
         &self.errors
+    }
+
+    /// Builds the user-`View` registry (RFC-0007 §1) from a whole file's
+    /// views and stores it on the interpreter, so subsequent `lower_view`/
+    /// `lower_element` calls can recognize and expand user-view calls.
+    /// Returns the load-time diagnostics — `IntrinsicShadowed` and any
+    /// unguarded-cycle `RecursiveView` (RFC-0007 §4) — which are also
+    /// recorded in [`Interpreter::errors`].
+    pub fn load_views(&mut self, views: &[ViewDecl]) -> Vec<CompileError> {
+        let (table, mut diags) = super::views::ViewTable::build(views);
+        // Static cycle detection over the call graph.
+        let graph = super::views::CallGraph::build(&table);
+        if let Some((view, path)) = graph.unguarded_cycle(&table) {
+            diags.push(CompileError::RecursiveView {
+                span: table.decl(view).span,
+                path,
+            });
+        }
+        self.view_table = table;
+        self.errors.extend(diags.iter().cloned());
+        diags
+    }
+
+    /// The resolved user-`View` registry (for the reload pass and tests).
+    #[must_use]
+    pub fn view_table(&self) -> &super::views::ViewTable {
+        &self.view_table
     }
 
     /// Runs one tick: begins an epoch and pulls all dirty scopes.
@@ -421,6 +503,149 @@ impl Interpreter {
         self.ctx.open_value_binding(target, compute)
     }
 
+    /// Reads a memo's current value (for the engine bridge and tests). Pulls it
+    /// on demand if dirty.
+    pub fn read_memo(&mut self, scope: ScopeId) -> Value {
+        self.ctx.read_memo(scope)
+    }
+
+    // ── argument → parameter binding (RFC-0007 §3) ──────────────────
+
+    /// Projects one call argument into a reactive memo over the **parent** scope
+    /// (the env active at the call site), so a parameter fed a parent `var` stays
+    /// live (RFC-0004); a literal lowers to a constant memo with no dirty edges.
+    fn project_arg(&mut self, expr: &Expr) -> ScopeId {
+        let compute = self.lower_expr(expr, None);
+        self.ctx.open_memo(compute)
+    }
+
+    /// Binds a single named argument (`name: value`, from `(...)` or `#[...]`) to
+    /// the callee parameter of the same `Symbol`, filling `slots[i]` and emitting
+    /// `UnknownParam`/`DuplicateParam` as needed (RFC-0007 §3/§6).
+    fn bind_named_arg(
+        &mut self,
+        params: &[Param],
+        callee: &str,
+        name: &Symbol,
+        value: &Expr,
+        slots: &mut [Option<ScopeId>],
+    ) {
+        // The reserved `content` slot is filled by the child block, never a
+        // named value.
+        if name.as_str() == RESERVED_CONTENT {
+            return;
+        }
+        match params.iter().position(|p| &p.name == name) {
+            Some(i) if slots[i].is_none() => {
+                slots[i] = Some(self.project_arg(value));
+            }
+            Some(_) => self.errors.push(CompileError::DuplicateParam {
+                span: value.span(),
+                name: name.as_str().to_string(),
+                callee: callee.to_string(),
+            }),
+            None => {
+                let hint = closest_match(name.as_str(), params.iter().map(|p| p.name.as_str()))
+                    .map(str::to_string);
+                self.errors.push(CompileError::UnknownParam {
+                    span: value.span(),
+                    name: name.as_str().to_string(),
+                    callee: callee.to_string(),
+                    hint,
+                });
+            }
+        }
+    }
+
+    /// Binds a user-view call's positional `content` and named `content`/`attrs`
+    /// arguments to the callee's declared parameters, producing one reactive memo
+    /// per bound parameter (RFC-0007 §3) and the §6 diagnostics
+    /// (`ViewArityMismatch`/`UnknownParam`/`MissingParam`/`DuplicateParam`).
+    ///
+    /// Positional arguments (unnamed `(...)` entries) match by declaration order;
+    /// named arguments (`name:` in `(...)` or `#[name: value]`) match by symbol.
+    pub fn bind_args(&mut self, callee: &ViewDecl, call: &ElementNode) -> InstanceBindings {
+        let params = &callee.params;
+        let callee_name = callee.name.as_str().to_string();
+        let mut slots: Vec<Option<ScopeId>> = vec![None; params.len()];
+        // Positional arguments map only to *value* parameters; the reserved
+        // `content` slot is filled by the child block, not a value.
+        let value_param_idx: Vec<usize> = params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.name.as_str() != RESERVED_CONTENT)
+            .map(|(i, _)| i)
+            .collect();
+        let mut positional_count = 0usize;
+        let mut next_positional = 0usize;
+
+        // 1) `(...)` content: unnamed → positional by order; named → by symbol.
+        for arg in &call.content {
+            if let Some(name) = &arg.name {
+                self.bind_named_arg(params, &callee_name, name, &arg.value, &mut slots);
+            } else {
+                positional_count += 1;
+                if let Some(&i) = value_param_idx.get(next_positional) {
+                    next_positional += 1;
+                    let scope = self.project_arg(&arg.value);
+                    if slots[i].is_some() {
+                        self.errors.push(CompileError::DuplicateParam {
+                            span: arg.value.span(),
+                            name: params[i].name.as_str().to_string(),
+                            callee: callee_name.clone(),
+                        });
+                    } else {
+                        slots[i] = Some(scope);
+                    }
+                }
+                // Excess positional args are reported once via the arity check
+                // below.
+            }
+        }
+
+        // 2) `#[name: value]` attrs: named arguments (events are not parameters).
+        for attr in &call.attrs {
+            if let AttrKind::Prop { value } = &attr.kind {
+                self.bind_named_arg(params, &callee_name, &attr.name, value, &mut slots);
+            }
+        }
+
+        // 3) Arity: more positional args than the callee declares value
+        //    parameters (RFC-0007 §6).
+        if positional_count > value_param_idx.len() {
+            self.errors.push(CompileError::ViewArityMismatch {
+                span: call.span,
+                name: callee_name.clone(),
+                expected: value_param_idx.len(),
+                found: positional_count,
+            });
+        }
+
+        // 4) Missing required parameters: an unbound parameter with no default
+        //   . The reserved `content` slot is never required — it
+        //    defaults to an empty block.
+        for (i, slot) in slots.iter().enumerate() {
+            if slot.is_none()
+                && param_default(&params[i]).is_none()
+                && params[i].name.as_str() != RESERVED_CONTENT
+            {
+                self.errors.push(CompileError::MissingParam {
+                    span: call.span,
+                    name: params[i].name.as_str().to_string(),
+                    callee: callee_name.clone(),
+                });
+            }
+        }
+
+        InstanceBindings {
+            bindings: slots
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.map(|sc| (params[i].name.clone(), sc)))
+                .collect(),
+        }
+    }
+
     // ── element lowering (RFC-0005) ─────────────────────────────────────
 
     /// Resolves the `bind:` or `value:` attribute of a value widget to a
@@ -498,6 +723,19 @@ impl Interpreter {
                     src,
                 }
             }
+            // VectorIcon intrinsic → VectorMSDF pipeline. Content is an
+            // asset handle (a `Str` path), like Image's source.
+            "VectorIcon" => {
+                let src_expr = el.content.first().map_or_else(
+                    || Expr::StrLit(vec![], crate::diagnostics::Span::new(0, 0)),
+                    |c| c.value.clone(),
+                );
+                let src = self.bind_value(&src_expr);
+                RenderNode::Vector {
+                    attrs: el.attrs.clone(),
+                    src,
+                }
+            }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
                 let bound_sig = self.resolve_bind_sig(&attrs);
@@ -523,6 +761,107 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    /// Whether `el` is a user-`View` call: a name that resolves in the view
+    /// table and is not an RFC-0005 intrinsic, which always wins.
+    fn is_user_view_call(&self, el: &ElementNode) -> bool {
+        super::intrinsics::lookup(el.name.as_str()).is_none() && self.view_table.contains(&el.name)
+    }
+
+    /// Expands a user-`View` call site into its instantiated subtree, spliced as
+    /// siblings at `out` (RFC-0007 §2). Opens a fresh instance scope holding the
+    /// argument bindings plus the callee's own local `var`/`let`/`fn`
+    /// (isolated per instance), lowers the callee body, then truncates the scope
+    /// so the parent environment is untouched.
+    fn lower_user_view_call(
+        &mut self,
+        el: &ElementNode,
+        known_views: &[&str],
+        out: &mut Vec<RenderNode>,
+    ) {
+        // A user view is not validated by the intrinsic contract; its argument
+        // diagnostics come from `bind_args` (RFC-0007 §3/§6).
+        let Some(id) = self.view_table.resolve(&el.name) else {
+            // Unreachable in practice (caller checked), but degrade gracefully.
+            out.push(self.lower_element(el, known_views));
+            return;
+        };
+        // Own the callee so the `&self.view_table` borrow does not conflict with
+        // the `&mut self` lowering below (the table is `Send`/owned, INV-3).
+        let callee = self.view_table.decl(id).clone();
+
+        // Runtime depth bound (RFC-0007 §4): a guarded recursion whose
+        // guard never terminates at lower time is truncated with a diagnostic
+        // rather than overflowing the native stack.
+        if self.instance_depth >= MAX_INSTANCE_DEPTH {
+            self.errors.push(CompileError::RecursiveView {
+                span: el.span,
+                path: format!(
+                    "{} (instantiation depth bound {MAX_INSTANCE_DEPTH} exceeded)",
+                    el.name.as_str()
+                ),
+            });
+            return; // truncate the subtree; never recurse past the bound
+        }
+        self.instance_depth += 1;
+
+        // Slot (RFC-0007 D-A): a `{ ... }` block is allowed only when
+        // the callee declares a `content` parameter; the block is pre-lowered in
+        // the *caller* scope (capturing caller `var`s) and pushed as this
+        // instance's slot. A block passed to a slot-less callee is
+        // `UnexpectedChildren`.
+        let has_content_param = callee
+            .params
+            .iter()
+            .any(|p| p.name.as_str() == RESERVED_CONTENT);
+        let slot_nodes = if el.children.is_empty() {
+            Vec::new()
+        } else if has_content_param {
+            self.lower_members(&el.children, known_views)
+        } else {
+            self.errors.push(CompileError::UnexpectedChildren {
+                span: el.span,
+                name: el.name.as_str().to_string(),
+            });
+            Vec::new()
+        };
+
+        // 1) Bind arguments → parameters in the *parent* scope (RFC-0007 §3).
+        let bindings = self.bind_args(&callee, el);
+
+        // 2) Open the per-instance lexical frame (D-D): push each
+        //    parameter in declaration order — a bound argument's memo, else a
+        //    default evaluated in the callee scope — then the callee's
+        //    own declarations.
+        let snapshot = self.env.len();
+        for param in &callee.params {
+            if let Some((_, scope)) = bindings.bindings.iter().find(|(n, _)| n == &param.name) {
+                self.env.push(param.name.clone(), Value::Memo(*scope));
+            } else if let Some(default) = param_default(param) {
+                // Lowered in the current (callee) frame, so a default may
+                // reference earlier parameters.
+                let scope = self.project_arg(default);
+                self.env.push(param.name.clone(), Value::Memo(scope));
+            }
+            // An unbound, defaultless parameter already produced a `MissingParam`
+            // diagnostic in `bind_args`; leave it unbound.
+        }
+        // Local `var`/`let`/`fn`/`inject` open in the instance frame, so two
+        // instances of the same view keep independent state.
+        self.eval_view_decls(&callee);
+
+        // 3) Lower the callee body and splice the roots as siblings (RFC-0007
+        //    §2 step 5; reuses the multi-node `when`/`for` splice shape). The
+        //    slot is live for `content` references within the body.
+        self.slot_stack.push(slot_nodes);
+        let nodes = self.lower_members(&callee.body, known_views);
+        self.slot_stack.pop();
+        out.extend(nodes);
+
+        // 4) Close the instance scope (RFC-0007 §2 step 6).
+        self.env.truncate(snapshot);
+        self.instance_depth -= 1;
     }
 
     /// Expands `..style` spreads (RFC-0016) in an attribute list into a flat
@@ -608,6 +947,21 @@ impl Interpreter {
         out: &mut Vec<RenderNode>,
     ) {
         match member {
+            // A `content` reference inside a user-view body splices the slot the
+            // current instance was called with (RFC-0007 D-A). The slot
+            // nodes were pre-lowered in the caller scope.
+            Member::Element(e)
+                if e.name.as_str() == RESERVED_CONTENT && !self.slot_stack.is_empty() =>
+            {
+                if let Some(slot) = self.slot_stack.last() {
+                    out.extend(slot.clone());
+                }
+            }
+            Member::Element(e) if self.is_user_view_call(e) => {
+                // A user-view call expands into its instantiated subtree, spliced
+                // as siblings here (RFC-0007 §2).
+                self.lower_user_view_call(e, known_views, out);
+            }
             Member::Element(e) => {
                 out.push(self.lower_element(e, known_views));
             }
@@ -724,6 +1078,14 @@ impl Interpreter {
                 let w = self.eval_int_prop(attrs, "width").unwrap_or(100) as f32;
                 let h = self.eval_int_prop(attrs, "height").unwrap_or(100) as f32;
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                flat_ids.push(id);
+                Ok(id)
+            }
+            // A VectorIcon is a square leaf sized by its `size` prop (default 24),
+            // RFC-0009 §1.
+            RenderNode::Vector { attrs, .. } => {
+                let s = self.eval_int_prop(attrs, "size").unwrap_or(24) as f32;
+                let id = self.atlas.add_leaf(LeafSize::new(s, s))?;
                 flat_ids.push(id);
                 Ok(id)
             }
@@ -1180,6 +1542,28 @@ impl Interpreter {
                         // always-dirty lowering.
                         dirty: true,
                     });
+                }
+            }
+            RenderNode::Vector { attrs, src: _ } => {
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // Until the dev JIT atlas resolves the asset handle to a UV
+                    // slot (M46), emit a zero-opacity placeholder so the frame
+                    // ships without stalling (INV-9). The `color` rgb is resolved
+                    // now so a resident glyph tints correctly once M46 lands.
+                    let rgb =
+                        self.eval_color_prop(attrs, "color")
+                            .map_or([1.0, 1.0, 1.0, 0.0], |c| {
+                                let mut c = super::intrinsics::color_to_rgba(c, false);
+                                c[3] = 0.0; // placeholder: not yet resident
+                                c
+                            });
+                    frame.push_vector(byard_core::frame::VectorInstance::new(
+                        byard_core::frame::Rect::new(rect.x, rect.y, rect.width, rect.height),
+                        byard_core::frame::Rect::new(0.0, 0.0, 0.0, 0.0),
+                        rgb,
+                        super::intrinsics::VECTOR_DEFAULT_PX_RANGE,
+                        0,
+                    ));
                 }
             }
         }
@@ -2345,7 +2729,25 @@ impl Interpreter {
     /// `when`/`for` structural members (M20).
     pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {
         self.eval_view_decls(view);
-        self.lower_members(&view.body, known_views)
+        // A view that declares a `content` slot (RFC-0007 D-A) may reference it in
+        // its body. When the view is lowered *standalone* — e.g. `byard check`
+        // validates each `ViewDecl` independently, or a slot view is a root —
+        // there is no calling instance, so push an empty slot frame: the bare
+        // `content` reference then splices nothing instead of being mistaken for
+        // an `UnknownView`. A real call (`lower_user_view_call`) pushes the
+        // caller's block over this before lowering the body.
+        let has_content_slot = view
+            .params
+            .iter()
+            .any(|p| p.name.as_str() == RESERVED_CONTENT);
+        if has_content_slot {
+            self.slot_stack.push(Vec::new());
+        }
+        let nodes = self.lower_members(&view.body, known_views);
+        if has_content_slot {
+            self.slot_stack.pop();
+        }
+        nodes
     }
 
     // ── lowering ────────────────────────────────────────────────────────
@@ -3001,6 +3403,510 @@ mod tests {
             Member::Element(e) => e,
             _ => panic!("expected element"),
         }
+    }
+
+    // ── user-view registry & call-site recognition ──────────────────
+
+    /// Loads a multi-view file and lowers the named view to a render tree.
+    fn lower_named(src: &str, name: &str) -> (Interpreter, Vec<RenderNode>) {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        interp.load_views(&parsed.views);
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let view = parsed
+            .views
+            .iter()
+            .find(|v| v.name.as_str() == name)
+            .unwrap();
+        let tree = interp.lower_view(view, &known);
+        (interp, tree)
+    }
+
+    #[test]
+    fn vector_icon_lowers_to_a_vector_node() {
+        let (_interp, tree) = lower_named(
+            "View App() { VectorIcon(\"icons/gear.svg\") #[size: 24, color: 0xFFFFFF] }",
+            "App",
+        );
+        assert!(
+            matches!(&tree[0], RenderNode::Vector { .. }),
+            "VectorIcon lowers to RenderNode::Vector, got {:?}",
+            tree[0]
+        );
+    }
+
+    #[test]
+    fn user_view_call_is_recognized_and_no_unknown_view_fires() {
+        // `App` calls `Card` (a user view); no `UnknownView` diagnostic fires.
+        let (interp, _tree) =
+            lower_named("View Card() { Text(\"hi\") }\nView App() { Card() }", "App");
+        assert!(
+            !interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownView { .. })),
+            "no UnknownView expected: {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn intrinsic_named_view_reports_shadowed_at_load() {
+        let parsed = parse("View Row() { Text(\"x\") }");
+        let mut interp = Interpreter::new();
+        let diags = interp.load_views(&parsed.views);
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, CompileError::IntrinsicShadowed { .. })),
+            "expected IntrinsicShadowed, got {diags:?}"
+        );
+    }
+
+    // ── argument → parameter binding ────────────────────────────────
+
+    /// Parses `callee_src` (a single view) and a call element from `call_src`'s
+    /// first view body, returning `(callee, call_element)`.
+    fn callee_and_call(callee_src: &str, call_src: &str) -> (ViewDecl, ElementNode) {
+        let callee = parse(callee_src).views.into_iter().next().unwrap();
+        let host = parse(call_src).views.into_iter().next().unwrap();
+        let Member::Element(call) = host.body.into_iter().next().unwrap() else {
+            panic!("expected element")
+        };
+        (callee, call)
+    }
+
+    #[test]
+    fn named_positional_and_mixed_binding() {
+        let (callee, _) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Text(\"x\") }",
+        );
+        // Named.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(url: \"a.png\", size: 40) }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+        assert_eq!(b.bindings[0].0.as_str(), "url");
+        assert_eq!(b.bindings[1].0.as_str(), "size");
+
+        // Positional.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(\"a.png\", 40) }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+
+        // Mixed: positional then named.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call(
+            "View Avatar(url, size) { Text(url) }",
+            "View H() { Avatar(\"a.png\") #[size: 40] }",
+        );
+        let b = interp.bind_args(&callee, &call);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(b.bindings.len(), 2);
+    }
+
+    #[test]
+    fn arity_unknown_duplicate_and_missing_diagnostics() {
+        let (callee, _) = callee_and_call("View A(x, y) { Text(x) }", "View H() { Text(\"_\") }");
+
+        // Over-arity: 3 positional for 2 params.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1, 2, 3) }");
+        interp.bind_args(&callee, &call);
+        assert!(interp.errors().iter().any(|e| matches!(
+            e,
+            CompileError::ViewArityMismatch {
+                expected: 2,
+                found: 3,
+                ..
+            }
+        )));
+
+        // Unknown named param.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(z: 1) }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownParam { .. }))
+        );
+
+        // Duplicate: positional + named bind the same param.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1) #[x: 2] }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::DuplicateParam { .. }))
+        );
+
+        // Missing required.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View A(x, y) { Text(x) }", "View H() { A(1) }");
+        interp.bind_args(&callee, &call);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::MissingParam { name, .. } if name == "y"))
+        );
+    }
+
+    #[test]
+    fn parent_var_arg_is_a_live_memo_literal_is_constant() {
+        // The parent declares `var n = 1`; the call passes `n` to a parameter.
+        // The projecting memo tracks the parent signal: writing `n` and ticking
+        // changes the memo's value (dirty edge preserved).
+        let callee = parse("View Foo(v) { Text(\"{v}\") }")
+            .views
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut interp = Interpreter::new();
+        let init = Expr::IntLit(1, crate::diagnostics::Span::new(0, 1));
+        let n = interp.define_var(Symbol::intern("n"), &init);
+
+        let (_, call) = callee_and_call("View Foo(v) { Text(\"{v}\") }", "View H() { Foo(n) }");
+        let b = interp.bind_args(&callee, &call);
+        let memo = b.bindings[0].1;
+        interp.tick();
+        assert_eq!(interp.read_memo(memo), Value::Int(1));
+        interp.write_var(n, Value::Int(7));
+        interp.tick();
+        assert_eq!(
+            interp.read_memo(memo),
+            Value::Int(7),
+            "memo tracks the parent var"
+        );
+
+        // A literal argument is a constant memo: it never changes.
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View Foo(v) { Text(\"{v}\") }", "View H() { Foo(5) }");
+        let b = interp.bind_args(&callee, &call);
+        let memo = b.bindings[0].1;
+        interp.tick();
+        assert_eq!(interp.read_memo(memo), Value::Int(5));
+    }
+
+    // ── body expansion & per-instance scope ─────────────────────────
+
+    /// The string value of a `Text` node's content scope, after a tick.
+    fn text_value(interp: &mut Interpreter, node: &RenderNode) -> String {
+        let RenderNode::Text { content, .. } = node else {
+            panic!("expected Text node, got {node:?}");
+        };
+        interp.tick();
+        match interp.binding_value(*content) {
+            Some(Value::Str(s)) => s,
+            other => panic!("expected Str binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_view_expands_body_and_binds_a_parameter() {
+        // `App` calls `Greet("Ada")`; the call expands to the callee body with
+        // `name` bound, projecting "Hi Ada".
+        let (mut interp, tree) = lower_named(
+            "View Greet(name) { Text(\"Hi {name}\") }\nView App() { Greet(\"Ada\") }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1, "one spliced root");
+        assert_eq!(text_value(&mut interp, &tree[0]), "Hi Ada");
+    }
+
+    #[test]
+    fn user_view_passes_value_to_an_intrinsic() {
+        // `Avatar(url, size)` lowers `Image(url) #[width: size]`; the call's
+        // arguments flow through to the intrinsic node.
+        let (_interp, tree) = lower_named(
+            "View Avatar(url, size) { Image(url) #[width: size, height: size] }\n\
+             View App() { Avatar(\"ada.png\", 40) }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1);
+        assert!(
+            matches!(&tree[0], RenderNode::Image { .. }),
+            "expected an Image node, got {:?}",
+            tree[0]
+        );
+    }
+
+    #[test]
+    fn a_call_yielding_multiple_roots_splices_as_siblings() {
+        let (_interp, tree) = lower_named(
+            "View Pair() { Text(\"a\")\n Text(\"b\") }\nView App() { Pair() }",
+            "App",
+        );
+        assert_eq!(tree.len(), 2, "both callee roots spliced as siblings");
+    }
+
+    #[test]
+    fn nested_user_view_calls_expand() {
+        // App → Outer → Inner → Text("x").
+        let (mut interp, tree) = lower_named(
+            "View Inner() { Text(\"x\") }\n\
+             View Outer() { Inner() }\n\
+             View App() { Outer() }",
+            "App",
+        );
+        assert_eq!(tree.len(), 1);
+        assert_eq!(text_value(&mut interp, &tree[0]), "x");
+    }
+
+    #[test]
+    fn two_instances_keep_independent_local_state() {
+        // Two `Counter()` instances each lower their own `var n`; their content
+        // scopes are distinct bindings (independent per-instance state).
+        let (_interp, tree) = lower_named(
+            "View Counter() { var n = 0\n Text(\"{n}\") }\n\
+             View App() { Column { Counter()\n Counter() } }",
+            "App",
+        );
+        // App → Column(Box) containing two expanded Counters.
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected a Column box, got {:?}", tree[0]);
+        };
+        let texts: Vec<&RenderNode> = children
+            .iter()
+            .filter(|c| matches!(c, RenderNode::Text { .. }))
+            .collect();
+        assert_eq!(texts.len(), 2, "two independent Counter texts");
+        let scopes: Vec<ScopeId> = texts
+            .iter()
+            .map(|t| match t {
+                RenderNode::Text { content, .. } => *content,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_ne!(scopes[0], scopes[1], "each instance has its own binding");
+    }
+
+    #[test]
+    fn two_level_composition_golden_shape() {
+        // UserRow composes Avatar + Text inside a Row; App stacks two UserRows.
+        let (_interp, tree) = lower_named(
+            "View Avatar(url) { Image(url) }\n\
+             View UserRow(name, avatar) { Row { Avatar(avatar)\n Text(name) } }\n\
+             View App() { Column { UserRow(\"Ada\", \"ada.png\")\n UserRow(\"Alan\", \"alan.png\") } }",
+            "App",
+        );
+        // App → Column(Box) → [Row(Box)[Image, Text], Row(Box)[Image, Text]].
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(children.len(), 2, "two UserRow instances");
+        for row in children {
+            let RenderNode::Box { children: rc, .. } = row else {
+                panic!("expected Row");
+            };
+            assert!(matches!(rc[0], RenderNode::Image { .. }));
+            assert!(matches!(rc[1], RenderNode::Text { .. }));
+        }
+    }
+
+    // ── recursion & cycle protection ────────────────────────────────
+
+    #[test]
+    fn unguarded_self_call_is_recursive_view_at_load() {
+        let parsed = parse("View A() { A() }");
+        let mut interp = Interpreter::new();
+        let diags = interp.load_views(&parsed.views);
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, CompileError::RecursiveView { .. })),
+            "expected RecursiveView at load, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn guarded_recursion_that_terminates_is_legal() {
+        // `Tree` recurses only in the `else` of a guard that is true at lower
+        // time, so it renders to a finite depth with no diagnostic.
+        let (mut interp, tree) = lower_named(
+            "View Tree() { var leaf = true\n when leaf { Text(\"x\") } else { Tree() } }\n\
+             View App() { Tree() }",
+            "App",
+        );
+        assert!(
+            interp.errors().is_empty(),
+            "guarded terminating recursion is legal: {:?}",
+            interp.errors()
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "x");
+    }
+
+    #[test]
+    fn runaway_guarded_recursion_hits_depth_bound_without_panicking() {
+        // `go` is always true, so the guard never terminates at lower time. The
+        // static check does not flag it (the cycle is guarded), so the runtime
+        // depth bound must stop it with a diagnostic — not a stack overflow.
+        let parsed =
+            parse("View Loop() { var go = true\n when go { Loop() } }\nView App() { Loop() }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let load_diags = interp.load_views(&parsed.views);
+        assert!(
+            !load_diags
+                .iter()
+                .any(|d| matches!(d, CompileError::RecursiveView { .. })),
+            "a guarded cycle is not a static error"
+        );
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let app = parsed
+            .views
+            .iter()
+            .find(|v| v.name.as_str() == "App")
+            .unwrap();
+        let _tree = interp.lower_view(app, &known); // must return, not overflow
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::RecursiveView { .. })),
+            "expected a depth-bound RecursiveView diagnostic"
+        );
+    }
+
+    // ── hot-reload across instances ─────────────────────────────────
+
+    #[test]
+    fn reloading_a_leaf_view_updates_all_its_instances() {
+        use crate::interp::reload::{affected_views, diff_view};
+
+        let old = parse("View Leaf() { Text(\"old\") }\nView App() { Column { Leaf()\n Leaf() } }");
+        let new = parse("View Leaf() { Text(\"new\") }\nView App() { Column { Leaf()\n Leaf() } }");
+
+        let mut interp = Interpreter::new();
+        interp.load_views(&old.views);
+        let known_old: Vec<&str> = old.views.iter().map(|v| v.name.as_str()).collect();
+        let app_old = old.views.iter().find(|v| v.name.as_str() == "App").unwrap();
+        let tree = interp.lower_view(app_old, &known_old);
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(text_value(&mut interp, &children[0]), "old");
+
+        // The edit to the leaf transitively affects App (RFC-0007 §5).
+        let affected = affected_views(&old.views, &new.views);
+        assert!(affected.contains(&Symbol::intern("App")));
+
+        // Rebuild the registry and re-derive App; both Leaf instances update.
+        interp.load_views(&new.views);
+        let app_new = new.views.iter().find(|v| v.name.as_str() == "App").unwrap();
+        interp.reload(app_new, diff_view(app_old, app_new));
+        let known_new: Vec<&str> = new.views.iter().map(|v| v.name.as_str()).collect();
+        let tree = interp.lower_view(app_new, &known_new);
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(text_value(&mut interp, &children[0]), "new");
+        assert_eq!(text_value(&mut interp, &children[1]), "new");
+    }
+
+    // ── slots & parameter defaults ──────────────────────────────────
+
+    #[test]
+    fn omitted_defaulted_param_uses_its_default() {
+        // `label` is omitted; the default "?" is evaluated in the callee scope.
+        let (mut interp, tree) = lower_named(
+            "View Tag(label = \"?\") { Text(label) }\nView App() { Tag() }",
+            "App",
+        );
+        assert!(
+            interp.errors().is_empty(),
+            "a defaulted param is not required: {:?}",
+            interp.errors()
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "?");
+    }
+
+    #[test]
+    fn supplied_argument_overrides_the_default() {
+        let (mut interp, tree) = lower_named(
+            "View Tag(label = \"?\") { Text(label) }\nView App() { Tag(\"hi\") }",
+            "App",
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "hi");
+    }
+
+    #[test]
+    fn missing_param_only_fires_for_required_params() {
+        // `a` is required, `b` is defaulted; omitting both reports only `a`.
+        let (callee, _) =
+            callee_and_call("View V(a, b = 1) { Text(a) }", "View H() { Text(\"_\") }");
+        let mut interp = Interpreter::new();
+        let (_, call) = callee_and_call("View V(a, b = 1) { Text(a) }", "View H() { V() }");
+        interp.bind_args(&callee, &call);
+        let missing: Vec<&str> = interp
+            .errors()
+            .iter()
+            .filter_map(|e| match e {
+                CompileError::MissingParam { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(missing, vec!["a"], "only the required param is missing");
+    }
+
+    #[test]
+    fn content_slot_renders_the_passed_block() {
+        // `Card` declares a `content` slot; `App` passes a `Text` block, which is
+        // spliced where `content` appears inside the card body.
+        let (mut interp, tree) = lower_named(
+            "View Card(content) { Column { content } }\n\
+             View App() { Card { Text(\"inside\") } }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let RenderNode::Box { children, .. } = &tree[0] else {
+            panic!("expected the card's Column, got {:?}", tree[0]);
+        };
+        assert_eq!(children.len(), 1, "the passed block is spliced");
+        assert_eq!(text_value(&mut interp, &children[0]), "inside");
+    }
+
+    #[test]
+    fn block_passed_to_a_slotless_view_is_unexpected_children() {
+        let (interp, _tree) = lower_named(
+            "View Plain() { Text(\"x\") }\nView App() { Plain { Text(\"no\") } }",
+            "App",
+        );
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::UnexpectedChildren { .. })),
+            "expected UnexpectedChildren, got {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn slot_block_captures_the_caller_scope() {
+        // The block passed to `Card` reads the *caller's* `name` var, proving the
+        // slot is lowered in the caller scope (not the callee's).
+        let (mut interp, tree) = lower_named(
+            "View Card(content) { content }\n\
+             View App() { var name = \"Ada\"\n Card { Text(\"Hi {name}\") } }",
+            "App",
+        );
+        assert_eq!(text_value(&mut interp, &tree[0]), "Hi Ada");
     }
 
     #[test]

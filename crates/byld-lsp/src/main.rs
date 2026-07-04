@@ -214,6 +214,7 @@ fn validate_and_publish(
 
     // Element & Intrinsic validation
     let mut interp = Interpreter::new();
+    interp.load_views(&parsed.views);
     let known_views: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
     for view in &parsed.views {
         let _ = interp.lower_view(view, &known_views);

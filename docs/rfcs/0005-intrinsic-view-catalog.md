@@ -3,9 +3,10 @@
 - **Status:** Draft
 - **Author(s):** Briany4717
 - **Created:** 2026-06-20
-- **Last updated:** 2026-06-20
+- **Last updated:** 2026-06-26
 - **Depends on:** RFC-0001 (§3.1 render pipelines, §4.1 Taffy layout, §4.2 grid), RFC-0002 (**D4** intrinsic attribute contract, **D5** style precedence, **D9** types/`Str`), RFC-0003 (event catalog, `:` vs `=>` attribute syntax, reflected props).
 - **Implements:** RFC-0002 D4's open item "exact arg names/types per intrinsic" and RFC-0003 §4's pairing of events with reactive props.
+- **Amended by:** RFC-0009 (adds the twelfth intrinsic, `VectorIcon`, and closes the "Image source type" open item — see §4 `VectorIcon` and §"Unresolved").
 
 ---
 
@@ -26,7 +27,8 @@ bottoms out in these. An element name that is neither an intrinsic nor a
 `CompileError::UnknownAttribute` with a Levenshtein hint (D4).
 
 Phase 2 ships eleven intrinsics: **Box, Column, Row, Spacer, Text, Button,
-TextField, Toggle, Slider, Image, ScrollView.**
+TextField, Toggle, Slider, Image, ScrollView.** RFC-0009 adds a twelfth,
+**`VectorIcon`** (the `VectorMSDF` pipeline), specified in §4 below.
 
 ---
 
@@ -236,6 +238,24 @@ plus intrinsic-specific props, **reflected** two-way props, **events**, and the
 - **Events:** all pointer.
 - **Pipeline:** `TextureSampler`.
 
+#### `VectorIcon` — resolution-independent monochrome icon (RFC-0009)
+- **Content:** arity 1, an **asset handle** (`asset("…")` → `Str`/handle). Any
+  other arity is `CompileError::ArityMismatch`.
+- **Children:** none (`CompileError::UnexpectedChildren` otherwise).
+- **Props:** `size: Int` (square edge in logical px; drives Taffy geometry),
+  `color: Color` (the single MSDF tint), `opacity: Float`, `m: Len`, universal
+  `style`.
+- **Events:** all pointer (same set as `Image`); focusable only if it registers
+  focus/key events.
+- **Pipeline:** `VectorMSDF` — samples the MSDF atlas; crisp at any scale.
+- **Constraint:** monochrome paths only. A source SVG with gradients/filters, or
+  exceeding the complexity guardrail, is a hard `CompileError`
+  (`SvgUnsupportedFeatures` / `SvgTooComplexForMssdf`, RFC-0009 §2) that directs
+  the developer to the `Image` (`TextureSampler`) fallback. Design-system
+  packages (`byard-material`, …) expose typed wrappers (`m.Icon(.search)`) that
+  are ordinary user `View`s (RFC-0007) lowering to this primitive; the core stays
+  design-agnostic (RFC-0009 §"Agnostic Usage").
+
 #### `ScrollView` — scroll container
 - **Content:** none. **Children:** any (a single content subtree).
 - **Props:** Layout + Decoration + `axis: (vertical|horizontal|both)` (default
@@ -295,8 +315,10 @@ styles (RFC-0002 D8 → Phase 3).
 
 - **Fixed surface.** A closed intrinsic table means new built-ins require a code
   change, not a library. Intentional for Phase 2 (the set is small and the
-  renderer pipelines are fixed at four), but it is a real extensibility limit
-  until a user-defined-primitive story exists.
+  renderer pipelines are fixed — five since RFC-0009 added `VectorMSDF`), but it
+  is a real extensibility limit until a user-defined-primitive story exists. Each
+  new pipeline-backed intrinsic (like `VectorIcon`) is an explicit, RFC-gated
+  addition, not an open extension point.
 - **`Button` label-only.** No icon+label child form in Phase 2; composite buttons
   must wrap a `Row` in a tappable `Box`. Deferred deliberately.
 - **Enum tokens as bare identifiers** (`align: center`) share the
@@ -349,16 +371,19 @@ presets keeps the intrinsic table small and the lowering uniform.
     defaults come from the theme or are always explicit.
   - [ ] **`ScrollView` nested-scroll** and how `offset` reflects during an active
     drag (ties into RFC-0003 gesture deferral).
-  - [ ] **`Image` source type** — is `Str` a path, an asset handle, or a
-    controller-provided texture id? Affects the `#[byard_controller]` boundary.
+  - [x] **`Image` source type** — *resolved by RFC-0009:* the positional `Str`
+    is an **asset handle** produced by `asset("…")`, resolved against the
+    package/asset table (RFC-0008). The same answer applies to `VectorIcon`. A
+    controller-provided texture id remains a separate, later affordance and does
+    not change this contract.
 
 ---
 
 ## Future possibilities
 
 - **More intrinsics:** `Grid` (CSS-grid via Taffy), `Stack`/`ZStack` (explicit
-  Z-layering), `Divider`, `Icon`, `Checkbox`, `RadioGroup`, `Menu`, `Dialog`
-  (paired with `when`).
+  Z-layering), `Divider`, `Checkbox`, `RadioGroup`, `Menu`, `Dialog`
+  (paired with `when`). (`Icon` has shipped as `VectorIcon` — RFC-0009.)
 - **Composite `Button`** and other child-bearing interactive intrinsics.
 - **User-defined primitives** that register new pipeline lowerings, once the
   closed-table constraint becomes limiting.

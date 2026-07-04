@@ -51,6 +51,9 @@ pub fn check_source(src: &str) -> Vec<CompileError> {
 
     let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
     let mut interp = Interpreter::new();
+    // Build the user-`View` registry once for the whole file so user-view calls
+    // resolve and expand during lowering (RFC-0007 §1, M30).
+    interp.load_views(&parsed.views);
     let mut frame = byard_core::frame::RenderFrame::new();
     for view in &parsed.views {
         let tree = interp.lower_view(view, &known);

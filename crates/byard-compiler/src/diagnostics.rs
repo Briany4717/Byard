@@ -179,6 +179,66 @@ pub enum CompileError {
         /// Human-readable description of the conflict.
         message: String,
     },
+    /// A user-`View` call supplied more positional content arguments than the
+    /// callee declares parameters (RFC-0007 §6).
+    ViewArityMismatch {
+        /// Source range of the call site.
+        span: Span,
+        /// The callee view name.
+        name: String,
+        /// How many parameters the callee declares.
+        expected: usize,
+        /// How many positional arguments were supplied.
+        found: usize,
+    },
+    /// A named argument at a user-`View` call site does not match any declared
+    /// parameter (RFC-0007 §6); `hint` carries a Levenshtein "did you mean …?".
+    UnknownParam {
+        /// Source range of the argument.
+        span: Span,
+        /// The unknown parameter name.
+        name: String,
+        /// The callee view name.
+        callee: String,
+        /// The closest declared parameter, if any.
+        hint: Option<String>,
+    },
+    /// A required callee parameter (no default) received no argument at the call
+    /// site (RFC-0007 §6, interacts with D-B defaults).
+    MissingParam {
+        /// Source range of the call site.
+        span: Span,
+        /// The missing parameter name.
+        name: String,
+        /// The callee view name.
+        callee: String,
+    },
+    /// The same callee parameter was bound twice — positional + named, or named
+    /// twice (RFC-0007 §6).
+    DuplicateParam {
+        /// Source range of the offending argument.
+        span: Span,
+        /// The doubly-bound parameter name.
+        name: String,
+        /// The callee view name.
+        callee: String,
+    },
+    /// A `ViewDecl` is named like an RFC-0005 intrinsic; the intrinsic always
+    /// wins and the user view is unreachable (RFC-0007 §6).
+    IntrinsicShadowed {
+        /// Source range of the offending view declaration.
+        span: Span,
+        /// The shadowing view name (an intrinsic name).
+        name: String,
+    },
+    /// A user-`View` call cycle is not guarded by a `when`/`for` structural
+    /// boundary, so instantiation would diverge (RFC-0007 §4).
+    RecursiveView {
+        /// Source range of the offending view declaration.
+        span: Span,
+        /// The cycle path, e.g. `A → B → A`.
+        path: String,
+    },
     /// A `with` clause named a curve that is not `anim.linear`/`ease`/`spring`
     /// (RFC-0010); `hint` carries a Levenshtein "did you mean …?".
     UnknownAnimation {
@@ -248,6 +308,12 @@ impl CompileError {
             | Self::UnexpectedChildren { span, .. }
             | Self::DynamicStyleForbidden { span }
             | Self::ConflictingSpacingField { span, .. }
+            | Self::ViewArityMismatch { span, .. }
+            | Self::UnknownParam { span, .. }
+            | Self::MissingParam { span, .. }
+            | Self::DuplicateParam { span, .. }
+            | Self::IntrinsicShadowed { span, .. }
+            | Self::RecursiveView { span, .. }
             | Self::UnknownAnimation { span, .. }
             | Self::LayoutPropNotAnimatable { span, .. }
             | Self::InvalidAnimation { span, .. }
@@ -278,6 +344,12 @@ impl CompileError {
             Self::UnexpectedChildren { .. } => "UnexpectedChildren",
             Self::DynamicStyleForbidden { .. } => "DynamicStyleForbidden",
             Self::ConflictingSpacingField { .. } => "ConflictingSpacingField",
+            Self::ViewArityMismatch { .. } => "ViewArityMismatch",
+            Self::UnknownParam { .. } => "UnknownParam",
+            Self::MissingParam { .. } => "MissingParam",
+            Self::DuplicateParam { .. } => "DuplicateParam",
+            Self::IntrinsicShadowed { .. } => "IntrinsicShadowed",
+            Self::RecursiveView { .. } => "RecursiveView",
             Self::UnknownAnimation { .. } => "UnknownAnimation",
             Self::LayoutPropNotAnimatable { .. } => "LayoutPropNotAnimatable",
             Self::InvalidAnimation { .. } => "InvalidAnimation",
@@ -345,6 +417,32 @@ impl CompileError {
             }
             Self::ConflictingSpacingField { message, .. }
             | Self::InvalidAnimation { message, .. } => message.clone(),
+            Self::ViewArityMismatch {
+                name,
+                expected,
+                found,
+                ..
+            } => format!(
+                "view `{name}` declares {expected} parameter(s), found {found} positional argument(s)"
+            ),
+            Self::UnknownParam {
+                name, callee, hint, ..
+            } => with_hint(
+                format!("`{callee}` has no parameter `{name}`"),
+                hint.as_deref(),
+            ),
+            Self::MissingParam { name, callee, .. } => {
+                format!("missing required argument `{name}` for view `{callee}`")
+            }
+            Self::DuplicateParam { name, callee, .. } => {
+                format!("parameter `{name}` of view `{callee}` is bound more than once")
+            }
+            Self::IntrinsicShadowed { name, .. } => {
+                format!("view `{name}` shadows the built-in intrinsic of the same name")
+            }
+            Self::RecursiveView { path, .. } => {
+                format!("recursive view cycle without a `when`/`for` guard: {path}")
+            }
             Self::UnknownAnimation { name, hint, .. } => {
                 with_hint(format!("unknown animation curve `{name}`"), hint.as_deref())
             }

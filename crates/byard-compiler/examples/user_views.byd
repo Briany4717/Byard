@@ -1,0 +1,64 @@
+// user_views.byd — RFC-0007: user-view instantiation, composing `View`s within
+// one file. Parameterized views, named/positional arguments, parameter defaults,
+// reactive params, nesting, and a `content` slot. Run with:
+//   cargo run -p byard-cli -- dev crates/byard-compiler/examples/user_views.byd
+//
+// The dev runner renders the *first* `View` in the file as the root, so `Main`
+// comes first; the helper views it composes are declared below it (forward
+// references resolve — the whole file is registered before lowering).
+
+View Main() {
+    // A caller-local `var` passed *into* a child view stays reactive across the
+    // call boundary (RFC-0007 §3 — arguments are memos, not snapshots).
+    var errors: Int = 7
+
+    Column #[bg: 0x14141C, p: 32, gap: 20, width: 560] {
+        Text("RFC-0007 — user-view instantiation") #[color: 0xFFFFFF, size: 20, weight: bold]
+
+        Row #[gap: 16] {
+            StatCard(title: "Sessions", value: "128", accent: 0x6495ED)
+            // Positional args; the reactive `errors` var flows into the instance.
+            StatCard("Errors", "{errors}", 0x964747)
+        }
+
+        // The trailing block is passed to `Panel`'s `content` slot and rendered
+        // inside the panel — while capturing this caller's scope.
+        Panel("Slotted content") {
+            Row #[gap: 8] {
+                Badge("reactive")
+                Badge(label: "typed", tone: 0x6495ED)
+                Badge(label: "native", tone: 0x10B981)
+            }
+        }
+    }
+}
+
+// A leaf view with a required `label` and a *defaulted* `tone` (RFC-0007 D-B):
+// callers may omit `tone` and get the neutral surface colour.
+View Badge(label, tone = 0x3C3C52) {
+    Box #[bg: tone, radius: 6, p: (vertical: 4, horizontal: 10)] {
+        Text(label) #[color: 0xFFFFFF, size: 13]
+    }
+}
+
+// Composition: `StatCard` calls `Badge` — a user view instantiating another.
+// Two `StatCard`s above are independent instances with their own scope.
+View StatCard(title, value, accent) {
+    Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52, width: 240] {
+        Text(title) #[color: 0x9AA0AC, size: 14]
+        Text(value) #[color: 0xFFFFFF, size: 30, weight: bold]
+        Row #[gap: 8] {
+            Badge(label: "live", tone: accent)   // named args
+            Badge("default")                       // omitted defaulted `tone`
+        }
+    }
+}
+
+// A slot view (RFC-0007 D-A): the reserved `content` parameter receives the
+// caller's trailing `{ … }` block, spliced where `content` appears in the body.
+View Panel(heading, content) {
+    Column #[bg: 0x1E1E2A, radius: 16, p: 18, gap: 10, border: 0x3C3C52] {
+        Text(heading) #[color: 0xE6E1E5, size: 16, weight: bold]
+        content
+    }
+}

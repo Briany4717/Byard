@@ -17,6 +17,9 @@
 //! (E5). The file watcher coalesces rapid saves latest-wins over a `bounded(1)`
 //! channel (D10).
 
+use std::collections::HashSet;
+
+use super::views::{CallGraph, ViewTable};
 use crate::parser::ast::{Member, ViewDecl};
 use crate::symbol::Symbol;
 
@@ -98,6 +101,46 @@ pub fn diff_program(old: &[ViewDecl], new: &[ViewDecl]) -> Vec<(Symbol, ViewRelo
         }
     }
     out
+}
+
+/// The set of view names whose instances must be re-derived after an edit
+/// (RFC-0007 §5): every **changed** view (body or shape differs, or added)
+/// unioned with its **transitive callers**, because a caller embeds the callee's
+/// expanded body. Instantiation widens per-`ViewDecl` reload (D11) to chase
+/// callers through the call graph — the single source of truth for both
+/// cycle detection and reload blast-radius.
+///
+/// A *removed* view's own name is included so the caller can drop it; its
+/// callers are caught as changed in any well-formed edit that also updated them.
+#[must_use]
+pub fn affected_views(old: &[ViewDecl], new: &[ViewDecl]) -> HashSet<Symbol> {
+    let (table, _) = ViewTable::build(new);
+    let graph = CallGraph::build(&table);
+    let mut affected: HashSet<Symbol> = HashSet::new();
+
+    for nv in new {
+        let modified = match old.iter().find(|v| v.name == nv.name) {
+            Some(ov) => ov != nv, // body or shape differs
+            None => true,         // newly added
+        };
+        if modified {
+            affected.insert(nv.name.clone());
+            // Union the changed view with its transitive callers (the view set
+            // `affected_by` returns includes the view itself).
+            if let Some(id) = table.resolve(&nv.name) {
+                for aff in graph.affected_by(id) {
+                    affected.insert(table.decl(aff).name.clone());
+                }
+            }
+        }
+    }
+    // Removed views: include their name so the runtime can unmount them.
+    for ov in old {
+        if !new.iter().any(|v| v.name == ov.name) {
+            affected.insert(ov.name.clone());
+        }
+    }
+    affected
 }
 
 /// Whether a patch is applied now or held (E5 gesture gate).
@@ -299,6 +342,60 @@ mod tests {
         chan.publish(3);
         assert_eq!(chan.take(), Some(3), "only the most recent save applies");
         assert_eq!(chan.take(), None);
+    }
+
+    fn views_of(src: &str) -> Vec<ViewDecl> {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        parsed.views
+    }
+
+    #[test]
+    fn editing_a_leaf_view_affects_its_transitive_callers() {
+        // App → UserRow → Avatar (leaf). Editing Avatar's body re-derives
+        // Avatar, UserRow, and App.
+        let old = views_of(
+            "View Avatar() { Image(\"a.png\") }\n\
+             View UserRow() { Avatar() }\n\
+             View App() { UserRow() }",
+        );
+        let new = views_of(
+            "View Avatar() { Image(\"b.png\") }\n\
+             View UserRow() { Avatar() }\n\
+             View App() { UserRow() }",
+        );
+        let affected = affected_views(&old, &new);
+        assert!(affected.contains(&Symbol::intern("Avatar")));
+        assert!(affected.contains(&Symbol::intern("UserRow")));
+        assert!(affected.contains(&Symbol::intern("App")));
+    }
+
+    #[test]
+    fn editing_a_shared_view_affects_both_callers() {
+        let old = views_of(
+            "View Chip() { Text(\"x\") }\n\
+             View A() { Chip() }\n\
+             View B() { Chip() }",
+        );
+        let new = views_of(
+            "View Chip() { Text(\"y\") }\n\
+             View A() { Chip() }\n\
+             View B() { Chip() }",
+        );
+        let affected = affected_views(&old, &new);
+        assert!(affected.contains(&Symbol::intern("Chip")));
+        assert!(affected.contains(&Symbol::intern("A")));
+        assert!(affected.contains(&Symbol::intern("B")));
+    }
+
+    #[test]
+    fn an_untouched_independent_view_is_not_affected() {
+        // `Lonely` is unrelated to the edited `Chip`; it stays out of the set.
+        let old = views_of("View Chip() { Text(\"x\") }\nView Lonely() { Text(\"z\") }");
+        let new = views_of("View Chip() { Text(\"y\") }\nView Lonely() { Text(\"z\") }");
+        let affected = affected_views(&old, &new);
+        assert!(affected.contains(&Symbol::intern("Chip")));
+        assert!(!affected.contains(&Symbol::intern("Lonely")));
     }
 
     #[test]
