@@ -219,6 +219,67 @@ pub enum AttrKind {
     },
 }
 
+/// One of the four engine-owned interaction states an `on <state> { }` block
+/// (RFC-0016) can target. The engine reports these via `StyleState` (RFC-0012);
+/// when several are active at once the highest-priority block wins, in the fixed
+/// order `Disabled > Pressed > Focused > Hover` (RFC-0016 §"Resolution order").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleStateKind {
+    /// The pointer is over the element.
+    Hover,
+    /// The element is being pressed (pointer down inside it).
+    Pressed,
+    /// The element holds keyboard focus.
+    Focused,
+    /// The element is disabled (also gates event dispatch, RFC-0012 §S5).
+    Disabled,
+}
+
+impl StyleStateKind {
+    /// Parses a state name; `None` for anything not one of the four states (an
+    /// unknown name is a compile error, [`CompileError::UnknownStyleState`]).
+    ///
+    /// [`CompileError::UnknownStyleState`]: crate::diagnostics::CompileError::UnknownStyleState
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "hover" => Some(Self::Hover),
+            "pressed" => Some(Self::Pressed),
+            "focused" => Some(Self::Focused),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    /// The canonical spelling of this state, for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hover => "hover",
+            Self::Pressed => "pressed",
+            Self::Focused => "focused",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// The four state names, for `closest_match` suggestions.
+    pub const NAMES: [&'static str; 4] = ["hover", "pressed", "focused", "disabled"];
+}
+
+/// An `on <state> { attr* }` block inside a `style { }` value (RFC-0016): the
+/// attributes that apply only while the element is in the engine-owned `state`.
+/// Resolved at render time against the live `StyleState` mask — the *only*
+/// sanctioned dynamism in an otherwise-static style (D8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateBlock {
+    /// Which interaction state activates this block.
+    pub state: StyleStateKind,
+    /// The attributes overlaid onto the base while `state` is active.
+    pub attrs: Vec<Attr>,
+    /// Source span.
+    pub span: Span,
+}
+
 /// A style rule: `. IDENT #[ attrs ]` (D5).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleRule {
@@ -366,8 +427,11 @@ pub enum Expr {
     /// ordered bundle of attributes, `let`-bound and applied to an element with
     /// the `..` spread. Static and composable; no cascade.
     StyleValue {
-        /// The style's attributes, in written order.
+        /// The style's base attributes, in written order.
         attrs: Vec<Attr>,
+        /// `on <state> { … }` interaction-state blocks (RFC-0016), applied at
+        /// render time over the base when their state is active.
+        states: Vec<StateBlock>,
         /// Source span.
         span: Span,
     },

@@ -89,9 +89,14 @@ impl Parser<'_> {
         self.advance(); // `style`
         self.expect(&Token::LBrace, "'{' after `style`");
         let mut attrs = Vec::new();
+        let mut states = Vec::new();
         while !matches!(self.cur(), Some(Token::RBrace) | None) {
             let before = self.pos;
-            if let Some(a) = self.parse_attr() {
+            if self.at_state_block() {
+                if let Some(sb) = self.parse_state_block() {
+                    states.push(sb);
+                }
+            } else if let Some(a) = self.parse_attr() {
                 attrs.push(a);
             }
             if self.pos == before {
@@ -103,8 +108,60 @@ impl Parser<'_> {
         self.expect(&Token::RBrace, "'}' to close the style");
         Expr::StyleValue {
             attrs,
+            states,
             span: self.span_from(start),
         }
+    }
+
+    /// True when the cursor is on an `on <state> { … }` interaction-state block
+    /// (RFC-0016). `on` is a *contextual* keyword: it opens a state block only
+    /// here (followed by an identifier), so nothing else that spells `on` breaks.
+    fn at_state_block(&self) -> bool {
+        matches!(self.cur(), Some(Token::Ident(s)) if s.as_str() == "on")
+            && matches!(self.peek2(), Some(Token::Ident(_)))
+    }
+
+    /// Parses `on <state> { attr* }` (RFC-0016). An unknown state name records
+    /// an [`UnknownStyleState`](crate::diagnostics::CompileError::UnknownStyleState)
+    /// but the block body is still consumed so parsing recovers cleanly.
+    fn parse_state_block(&mut self) -> Option<super::ast::StateBlock> {
+        use super::ast::StyleStateKind;
+        let start = self.cur_span();
+        self.advance(); // `on`
+        let name_span = self.cur_span();
+        let name = self.expect_ident("an interaction state (hover/pressed/focused/disabled)")?;
+        let kind = StyleStateKind::from_name(name.as_str());
+        if kind.is_none() {
+            let hint =
+                crate::util::closest_match(name.as_str(), StyleStateKind::NAMES.iter().copied())
+                    .map(str::to_string);
+            self.errors
+                .push(crate::diagnostics::CompileError::UnknownStyleState {
+                    span: name_span,
+                    name: name.as_str().to_string(),
+                    hint,
+                });
+        }
+        self.expect(&Token::LBrace, "'{' after the interaction state");
+        let mut attrs = Vec::new();
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            if let Some(a) = self.parse_attr() {
+                attrs.push(a);
+            }
+            if self.pos == before {
+                self.advance();
+            }
+            self.eat(&Token::Comma);
+        }
+        self.expect(&Token::RBrace, "'}' to close the state block");
+        // Only yield a block for a known state — an unknown one is dropped (the
+        // error is already recorded) rather than silently mis-applied.
+        Some(super::ast::StateBlock {
+            state: kind?,
+            attrs,
+            span: self.span_from(start),
+        })
     }
 
     /// A negative numeric literal `-<number>`. Byld has no binary arithmetic

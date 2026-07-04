@@ -31,6 +31,15 @@ View Main() {
     let chip = style { bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10) }
     // Composed with `merge` — the accent chip is `chip` with its bg overridden.
     let hotChip = chip merge style { bg: 0x964747 }
+    // Interaction states (RFC-0016): the `on <state>` blocks re-style the element
+    // straight from the engine's own hover/pressed/disabled truth — no `var`, no
+    // event handler, no ternary. Priority is disabled > pressed > focused > hover.
+    let pill = style {
+        bg: 0x34344A, radius: 10, p: (vertical: 12, horizontal: 20)
+        on hover    { bg: 0x6495ED }
+        on pressed  { scale: 0.96 }
+        on disabled { opacity: 0.4 }
+    }
 
     // Two columns side by side → a landscape ~16:9 frame instead of one tall
     // strip. `align: start` keeps both columns pinned to the top.
@@ -143,6 +152,25 @@ View Main() {
                     // Rotated around its top-left corner instead of its center —
                     // visibly swings the whole box, not just its fill.
                     Box #[bg: 0xFBC02D, radius: 12, width: 90, height: 56, rotate: 10deg, origin: top_right]
+                }
+            }
+
+            // ── Declarative interaction states (RFC-0016): spread `..pill` and
+            // the `on hover`/`on pressed`/`on disabled` blocks light up from the
+            // engine's live state — hover to tint blue, press to shrink. The
+            // third pill is `disabled: true`, so it dims and never presses.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52] {
+                Text("Interaction states — no vars, no handlers") #[color: 0x9AA0AC, size: 15]
+                Row #[gap: 16, align: center] {
+                    Box #[..pill] {
+                        Text("hover / press me") #[color: 0xFFFFFF, size: 14]
+                    }
+                    Box #[..pill] {
+                        Text("and me") #[color: 0xFFFFFF, size: 14]
+                    }
+                    Box #[..pill, disabled: true] {
+                        Text("disabled") #[color: 0xFFFFFF, size: 14]
+                    }
                 }
             }
 

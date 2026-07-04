@@ -213,6 +213,17 @@ pub enum CompileError {
         /// Source range of the offending spread.
         span: Span,
     },
+    /// An `on <state> { … }` block named a state that isn't one of the four
+    /// engine-owned interaction states (RFC-0016) — `hover`/`pressed`/
+    /// `focused`/`disabled`.
+    UnknownStyleState {
+        /// Source range of the offending state name.
+        span: Span,
+        /// The name as written.
+        name: String,
+        /// The closest known state, if one is near (D4-style suggestion).
+        hint: Option<String>,
+    },
 }
 
 impl CompileError {
@@ -240,7 +251,8 @@ impl CompileError {
             | Self::UnknownAnimation { span, .. }
             | Self::LayoutPropNotAnimatable { span, .. }
             | Self::InvalidAnimation { span, .. }
-            | Self::NotAStyle { span } => *span,
+            | Self::NotAStyle { span }
+            | Self::UnknownStyleState { span, .. } => *span,
         }
     }
 
@@ -270,6 +282,7 @@ impl CompileError {
             Self::LayoutPropNotAnimatable { .. } => "LayoutPropNotAnimatable",
             Self::InvalidAnimation { .. } => "InvalidAnimation",
             Self::NotAStyle { .. } => "NotAStyle",
+            Self::UnknownStyleState { .. } => "UnknownStyleState",
         }
     }
 
@@ -340,6 +353,12 @@ impl CompileError {
                  (it would relayout every frame); animate a `scale` transform instead"
             ),
             Self::NotAStyle { .. } => "`..` can only spread a `style { … }` value".to_string(),
+            Self::UnknownStyleState { name, hint, .. } => with_hint(
+                format!(
+                    "unknown interaction state `{name}` (expected hover/pressed/focused/disabled)"
+                ),
+                hint.as_deref(),
+            ),
         }
     }
 
