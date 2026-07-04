@@ -33,6 +33,12 @@ pollster = "0.4"
 # `create_shader_module` on the GPU without needing a device.
 naga = { version = "29.0", features = ["wgsl-in"] }
 
+[features]
+default = ["telemetry"]
+# Zero-allocation profiler (RFC-0013): `profile_scope!` compiles to nothing
+# when this is off, so a release build pays exactly zero cost for it.
+telemetry = []
+
 [lints]
 workspace = true
 

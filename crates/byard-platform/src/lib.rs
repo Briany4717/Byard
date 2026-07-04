@@ -17,7 +17,7 @@ use byard_core::{ByardError, PlatformHost, PointerButton, PointerState, WindowSi
 use std::sync::Mutex;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -277,6 +277,15 @@ impl<H: PlatformHost> ApplicationHandler<FramePublished> for WinitApp<H> {
                 window.request_redraw();
             }
 
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (x, y) = self.cursor_pos;
+                match to_scroll_origin(delta, window.scale_factor()) {
+                    ScrollOrigin::Wheel(dx, dy) => self.host.on_wheel(dx, dy, x, y),
+                    ScrollOrigin::Scroll(dx, dy) => self.host.on_scroll(dx, dy, x, y),
+                }
+                window.request_redraw();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 let key_str = key_to_str(&event.logical_key);
@@ -352,6 +361,36 @@ fn to_pointer_state(state: ElementState) -> PointerState {
     match state {
         ElementState::Pressed => PointerState::Pressed,
         ElementState::Released => PointerState::Released,
+    }
+}
+
+/// Which [`PlatformHost`] callback a `winit` scroll delta maps to
+/// (RFC-0012 §A loose end): a physical mouse wheel reports discrete
+/// [`MouseScrollDelta::LineDelta`]s, a trackpad reports continuous
+/// [`MouseScrollDelta::PixelDelta`]s — `winit` doesn't otherwise
+/// distinguish the two input devices, so the delta's own shape is the only
+/// signal available for routing `wheel` vs `scroll`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScrollOrigin {
+    /// A physical mouse wheel — `on_wheel`.
+    Wheel(f32, f32),
+    /// A trackpad/touch scroll gesture — `on_scroll`.
+    Scroll(f32, f32),
+}
+
+/// Converts a `winit` [`MouseScrollDelta`] into a [`ScrollOrigin`], resolving
+/// `PixelDelta`'s physical coordinates to logical pixels via `scale_factor`.
+///
+/// Extracted as a pure function for the same reason as [`to_window_size`] —
+/// testable without a real event loop.
+fn to_scroll_origin(delta: MouseScrollDelta, scale_factor: f64) -> ScrollOrigin {
+    match delta {
+        MouseScrollDelta::LineDelta(dx, dy) => ScrollOrigin::Wheel(dx, dy),
+        MouseScrollDelta::PixelDelta(pos) => {
+            let logical = pos.to_logical::<f64>(scale_factor);
+            #[allow(clippy::cast_possible_truncation)]
+            ScrollOrigin::Scroll(logical.x as f32, logical.y as f32)
+        }
     }
 }
 
@@ -432,5 +471,31 @@ mod tests {
             to_pointer_state(ElementState::Released),
             PointerState::Released
         );
+    }
+
+    #[test]
+    fn to_scroll_origin_routes_line_delta_to_wheel() {
+        // A physical mouse wheel — line deltas are already logical units,
+        // `scale_factor` must not affect them.
+        assert_eq!(
+            to_scroll_origin(MouseScrollDelta::LineDelta(0.0, 1.0), 2.0),
+            ScrollOrigin::Wheel(0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn to_scroll_origin_routes_pixel_delta_to_scroll_and_converts_to_logical() {
+        // A trackpad — physical pixel deltas must be divided by the scale
+        // factor to land in the same logical-pixel space as everything else.
+        let physical = winit::dpi::PhysicalPosition::new(20.0, 40.0);
+        let origin = to_scroll_origin(MouseScrollDelta::PixelDelta(physical), 2.0);
+        assert_eq!(origin, ScrollOrigin::Scroll(10.0, 20.0));
+    }
+
+    #[test]
+    fn to_scroll_origin_pixel_delta_at_unit_scale_is_unchanged() {
+        let physical = winit::dpi::PhysicalPosition::new(5.0, -3.0);
+        let origin = to_scroll_origin(MouseScrollDelta::PixelDelta(physical), 1.0);
+        assert_eq!(origin, ScrollOrigin::Scroll(5.0, -3.0));
     }
 }

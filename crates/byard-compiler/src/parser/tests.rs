@@ -328,6 +328,133 @@ fn prop_vs_event_attributes() {
 }
 
 #[test]
+fn sub_property_axis_parses_and_carries_the_base_name_plus_axis() {
+    // RFC-0011 `translate.y: 2` — one axis of a two-axis prop, set inline
+    // without a tuple.
+    let view = one_view("View V() { Box #[translate.y: 2, gap: 12] }");
+    let el = as_element(&view.body[0]);
+    assert_eq!(el.attrs.len(), 2);
+    assert_eq!(el.attrs[0].name, sym("translate"));
+    assert_eq!(el.attrs[0].axis, Some(sym("y")));
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop {
+            value: Expr::IntLit(2, _)
+        }
+    ));
+
+    // An ordinary attribute (no dot) always has `axis: None`.
+    assert_eq!(el.attrs[1].name, sym("gap"));
+    assert_eq!(el.attrs[1].axis, None);
+}
+
+#[test]
+fn angle_literal_parses_as_an_angle_lit_expr() {
+    let view = one_view("View V() { Box #[rotate: 90deg] }");
+    let el = as_element(&view.body[0]);
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop { value: Expr::AngleLit(rad, _) }
+            if (*rad - std::f64::consts::FRAC_PI_2).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn negative_numeric_literals_parse() {
+    // Byld has no binary arithmetic; a leading `-` is the sign of a numeric
+    // literal. `translate: (-8, 4)` must parse, not raise a parse error.
+    let view = one_view("View V() { Box #[translate: (-8, 4)] }");
+    let el = as_element(&view.body[0]);
+    let AttrKind::Prop {
+        value: Expr::Tuple(args, _),
+    } = &el.attrs[0].kind
+    else {
+        panic!("expected a tuple value");
+    };
+    assert!(matches!(&args[0].value, Expr::IntLit(-8, _)));
+    assert!(matches!(&args[1].value, Expr::IntLit(4, _)));
+
+    // Negative float and negative angle literals too.
+    let view = one_view("View V() { Box #[scale: -1.5, rotate: -90deg] }");
+    let el = as_element(&view.body[0]);
+    assert!(matches!(
+        &el.attrs[0].kind,
+        AttrKind::Prop { value: Expr::FloatLit(f, _) } if (*f + 1.5).abs() < 1e-9
+    ));
+    assert!(matches!(
+        &el.attrs[1].kind,
+        AttrKind::Prop { value: Expr::AngleLit(rad, _) }
+            if (*rad + std::f64::consts::FRAC_PI_2).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn bare_minus_without_a_number_is_a_targeted_error() {
+    // `-` not followed by a number must report the specific diagnostic, not a
+    // silent drop or a generic "expected an expression".
+    let parsed = parse("View V() { Box #[translate: (-, 4)] }");
+    assert!(!parsed.errors.is_empty());
+}
+
+#[test]
+fn with_animation_binds_the_whole_ternary_as_the_value() {
+    // RFC-0010: `a ? b : c with k` groups as `(a ? b : c) with k` — the whole
+    // conditional is the animated value, not just the else-branch.
+    let view = one_view("View V() { Box #[radius: pressed ? 3 : 10 with anim.spring()] }");
+    let el = as_element(&view.body[0]);
+    let AttrKind::Prop {
+        value: Expr::Animated { value, anim, .. },
+    } = &el.attrs[0].kind
+    else {
+        panic!("expected an Animated value, got {:?}", el.attrs[0].kind);
+    };
+    assert!(
+        matches!(value.as_ref(), Expr::Ternary { .. }),
+        "the ternary must be the animated value"
+    );
+    assert!(
+        matches!(anim.as_ref(), Expr::Call { .. }),
+        "the anim side must be the `anim.spring()` call"
+    );
+}
+
+#[test]
+fn with_animation_optional_parens_and_named_args_parse() {
+    // Bare call, named-arg call, and a `200ms` duration literal all parse.
+    one_view("View V() { Box #[scale: hovered ? 1.05 : 1.0 with anim.spring()] }");
+    one_view(
+        "View V() { Box #[scale: hovered ? 1.05 : 1.0 with anim.spring(stiffness: 210, damping: 20)] }",
+    );
+    one_view("View V() { Box #[opacity: shown ? 1.0 : 0.0 with anim.linear(200ms)] }");
+}
+
+#[test]
+fn style_value_and_spread_parse() {
+    // RFC-0016: `let s = style { … }` binds a style value; `#[..s]` spreads it.
+    let view = one_view(
+        "View V() { let s = style { bg: 0x111111, radius: 4 } Box #[..s, color: 0xFFFFFF] }",
+    );
+    let Member::Let {
+        init: Expr::StyleValue { attrs, .. },
+        ..
+    } = &view.body[0]
+    else {
+        panic!("expected `let = style {{}}`, got {:?}", view.body[0]);
+    };
+    assert_eq!(attrs.len(), 2, "the style holds two attributes");
+
+    let el = as_element(&view.body[1]);
+    assert!(
+        matches!(&el.attrs[0].kind, AttrKind::Spread { .. }),
+        "the first element attribute is a `..` spread"
+    );
+    assert!(
+        matches!(&el.attrs[1].kind, AttrKind::Prop { .. }),
+        "the inline attribute follows the spread"
+    );
+}
+
+#[test]
 fn function_types_parse() {
     let view = one_view("View V(onPick: Fn(ChangeEvent<Str>), test: Fn(Int) -> Bool) {}");
     let Type::Function { params, ret, .. } = view.params[0].ty.as_ref().unwrap() else {
@@ -364,4 +491,23 @@ fn error_recovery_collects_multiple_diagnostics() {
     );
     assert_eq!(parsed.views.len(), 1);
     assert_eq!(parsed.views[0].body.len(), 2);
+}
+
+#[test]
+fn style_value_captures_base_attrs_and_state_blocks() {
+    // RFC-0016: `style { … on <state> { … } }` collects base attributes and
+    // interaction-state blocks into `Expr::StyleValue`.
+    let view = one_view(
+        "View V() {\n let b = style { bg: 1 on hover { bg: 2 } on pressed { scale: 0.97 } }\n}",
+    );
+    let Member::Let { init, .. } = &view.body[0] else {
+        panic!("expected a let binding, got {:?}", view.body[0]);
+    };
+    let Expr::StyleValue { attrs, states, .. } = init else {
+        panic!("expected a StyleValue, got {init:?}");
+    };
+    assert_eq!(attrs.len(), 1, "one base attribute");
+    assert_eq!(states.len(), 2, "two state blocks");
+    assert_eq!(states[0].state, StyleStateKind::Hover);
+    assert_eq!(states[1].state, StyleStateKind::Pressed);
 }

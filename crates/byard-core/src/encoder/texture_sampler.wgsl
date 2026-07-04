@@ -38,10 +38,12 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.local_pos = (vertex.quad_pos - 0.5) * vec2<f32>(w, h);
 
     let world_pos = instance.rect.xy + vertex.quad_pos * vec2<f32>(w, h);
+    // misc.y carries the draw-order depth (NDC-z), written per instance by the
+    // encoder so images honour global paint order against solids/decorated/text.
     out.position = vec4<f32>(
         (world_pos.x / viewport_size.x) * 2.0 - 1.0,
         1.0 - (world_pos.y / viewport_size.y) * 2.0,
-        0.0,
+        instance.misc.y,
         1.0
     );
 

@@ -239,6 +239,51 @@ pub enum CompileError {
         /// The cycle path, e.g. `A → B → A`.
         path: String,
     },
+    /// A `with` clause named a curve that is not `anim.linear`/`ease`/`spring`
+    /// (RFC-0010); `hint` carries a Levenshtein "did you mean …?".
+    UnknownAnimation {
+        /// Source range of the offending `anim.*` call.
+        span: Span,
+        /// The unknown curve name.
+        name: String,
+        /// The closest known curve name, if any.
+        hint: Option<String>,
+    },
+    /// A `with` clause attached an animation to a layout-affecting property
+    /// (`width`/`height`/`p`/`m`/`gap`/…), which cannot animate on the GPU
+    /// because it would require a per-frame relayout (RFC-0010 §"Layout
+    /// properties", INV-8).
+    LayoutPropNotAnimatable {
+        /// Source range of the animated attribute.
+        span: Span,
+        /// The offending layout property name.
+        prop: String,
+    },
+    /// A curve call had a malformed argument list (RFC-0010): a missing
+    /// duration, a non-numeric value, or an unknown parameter name.
+    InvalidAnimation {
+        /// Source range of the offending call or argument.
+        span: Span,
+        /// Human-readable description of the problem.
+        message: String,
+    },
+    /// A `..` spread's operand did not resolve to a `style { … }` value
+    /// (RFC-0016) — e.g. `..x` where `x` is not a `let`-bound style.
+    NotAStyle {
+        /// Source range of the offending spread.
+        span: Span,
+    },
+    /// An `on <state> { … }` block named a state that isn't one of the four
+    /// engine-owned interaction states (RFC-0016) — `hover`/`pressed`/
+    /// `focused`/`disabled`.
+    UnknownStyleState {
+        /// Source range of the offending state name.
+        span: Span,
+        /// The name as written.
+        name: String,
+        /// The closest known state, if one is near (D4-style suggestion).
+        hint: Option<String>,
+    },
 }
 
 impl CompileError {
@@ -268,7 +313,12 @@ impl CompileError {
             | Self::MissingParam { span, .. }
             | Self::DuplicateParam { span, .. }
             | Self::IntrinsicShadowed { span, .. }
-            | Self::RecursiveView { span, .. } => *span,
+            | Self::RecursiveView { span, .. }
+            | Self::UnknownAnimation { span, .. }
+            | Self::LayoutPropNotAnimatable { span, .. }
+            | Self::InvalidAnimation { span, .. }
+            | Self::NotAStyle { span }
+            | Self::UnknownStyleState { span, .. } => *span,
         }
     }
 
@@ -300,6 +350,11 @@ impl CompileError {
             Self::DuplicateParam { .. } => "DuplicateParam",
             Self::IntrinsicShadowed { .. } => "IntrinsicShadowed",
             Self::RecursiveView { .. } => "RecursiveView",
+            Self::UnknownAnimation { .. } => "UnknownAnimation",
+            Self::LayoutPropNotAnimatable { .. } => "LayoutPropNotAnimatable",
+            Self::InvalidAnimation { .. } => "InvalidAnimation",
+            Self::NotAStyle { .. } => "NotAStyle",
+            Self::UnknownStyleState { .. } => "UnknownStyleState",
         }
     }
 
@@ -360,7 +415,8 @@ impl CompileError {
             Self::DynamicStyleForbidden { .. } => {
                 "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()
             }
-            Self::ConflictingSpacingField { message, .. } => message.clone(),
+            Self::ConflictingSpacingField { message, .. }
+            | Self::InvalidAnimation { message, .. } => message.clone(),
             Self::ViewArityMismatch {
                 name,
                 expected,
@@ -387,6 +443,20 @@ impl CompileError {
             Self::RecursiveView { path, .. } => {
                 format!("recursive view cycle without a `when`/`for` guard: {path}")
             }
+            Self::UnknownAnimation { name, hint, .. } => {
+                with_hint(format!("unknown animation curve `{name}`"), hint.as_deref())
+            }
+            Self::LayoutPropNotAnimatable { prop, .. } => format!(
+                "`{prop}` is a layout property and cannot be animated with `with` \
+                 (it would relayout every frame); animate a `scale` transform instead"
+            ),
+            Self::NotAStyle { .. } => "`..` can only spread a `style { … }` value".to_string(),
+            Self::UnknownStyleState { name, hint, .. } => with_hint(
+                format!(
+                    "unknown interaction state `{name}` (expected hover/pressed/focused/disabled)"
+                ),
+                hint.as_deref(),
+            ),
         }
     }
 

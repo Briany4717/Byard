@@ -185,6 +185,10 @@ pub struct ElementNode {
 pub struct Attr {
     /// Attribute name.
     pub name: Symbol,
+    /// The sub-property axis, if written as `name.axis: value` (RFC-0011
+    /// §"Dual surface", e.g. `translate.y: 2`). `None` for the ordinary
+    /// `name: value` / `name(payload)? => action` forms.
+    pub axis: Option<Symbol>,
     /// Whether this is a property binding or an engine event.
     pub kind: AttrKind,
     /// Source span.
@@ -208,6 +212,76 @@ pub enum AttrKind {
         /// The action expression.
         action: Expr,
     },
+    /// `..expr` — a style spread (RFC-0016): splice the attributes of the
+    /// [`StyleValue`](Expr::StyleValue) `expr` resolves to into this list, in
+    /// written order, before any inline attributes override them. The owning
+    /// [`Attr`]'s `name` is empty for a spread.
+    Spread {
+        /// The style expression being spread (an identifier bound to a style,
+        /// or an inline `style { … }`).
+        value: Expr,
+    },
+}
+
+/// One of the four engine-owned interaction states an `on <state> { }` block
+/// (RFC-0016) can target. The engine reports these via `StyleState` (RFC-0012);
+/// when several are active at once the highest-priority block wins, in the fixed
+/// order `Disabled > Pressed > Focused > Hover` (RFC-0016 §"Resolution order").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleStateKind {
+    /// The pointer is over the element.
+    Hover,
+    /// The element is being pressed (pointer down inside it).
+    Pressed,
+    /// The element holds keyboard focus.
+    Focused,
+    /// The element is disabled (also gates event dispatch, RFC-0012 §S5).
+    Disabled,
+}
+
+impl StyleStateKind {
+    /// Parses a state name; `None` for anything not one of the four states (an
+    /// unknown name is a compile error, [`CompileError::UnknownStyleState`]).
+    ///
+    /// [`CompileError::UnknownStyleState`]: crate::diagnostics::CompileError::UnknownStyleState
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "hover" => Some(Self::Hover),
+            "pressed" => Some(Self::Pressed),
+            "focused" => Some(Self::Focused),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    /// The canonical spelling of this state, for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hover => "hover",
+            Self::Pressed => "pressed",
+            Self::Focused => "focused",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// The four state names, for `closest_match` suggestions.
+    pub const NAMES: [&'static str; 4] = ["hover", "pressed", "focused", "disabled"];
+}
+
+/// An `on <state> { attr* }` block inside a `style { }` value (RFC-0016): the
+/// attributes that apply only while the element is in the engine-owned `state`.
+/// Resolved at render time against the live `StyleState` mask — the *only*
+/// sanctioned dynamism in an otherwise-static style (D8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateBlock {
+    /// Which interaction state activates this block.
+    pub state: StyleStateKind,
+    /// The attributes overlaid onto the base while `state` is active.
+    pub attrs: Vec<Attr>,
+    /// Source span.
+    pub span: Span,
 }
 
 /// A style rule: `. IDENT #[ attrs ]` (D5).
@@ -266,6 +340,9 @@ pub enum Expr {
     IntLit(i64, Span),
     /// A float literal (`f64`; D9).
     FloatLit(f64, Span),
+    /// An angle literal (`360deg`/`1.5rad`, RFC-0011 T1), already
+    /// canonicalized to radians by the lexer.
+    AngleLit(f64, Span),
     /// A string literal, possibly interpolated.
     StrLit(Vec<StrPart>, Span),
     /// An identifier reference.
@@ -338,6 +415,41 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// An animated attribute value `value with anim.*(…)` (RFC-0010): `value`
+    /// is the (usually ternary) target and `anim` is the `anim.*` curve call,
+    /// resolved to a typed `Curve` at lowering. `with` binds below the ternary,
+    /// so `a ? b : c with k` parses as `(a ? b : c) with k`.
+    Animated {
+        /// The target value expression (scalar/ternary).
+        value: Box<Expr>,
+        /// The `anim.*` curve call, resolved to a typed `Curve` at lower time.
+        anim: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// A first-class style value `style { name: value, … }` (RFC-0016): an
+    /// ordered bundle of attributes, `let`-bound and applied to an element with
+    /// the `..` spread. Static and composable; no cascade.
+    StyleValue {
+        /// The style's base attributes, in written order.
+        attrs: Vec<Attr>,
+        /// `on <state> { … }` interaction-state blocks (RFC-0016), applied at
+        /// render time over the base when their state is active.
+        states: Vec<StateBlock>,
+        /// Source span.
+        span: Span,
+    },
+    /// `left merge right` (RFC-0016 M3): composes two style values into one; on
+    /// a conflicting attribute the right operand wins. Both operands resolve to
+    /// styles at lower time.
+    Merge {
+        /// The base style.
+        left: Box<Expr>,
+        /// The overriding style.
+        right: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// A parse-error placeholder, so recovery can continue and collect more
     /// diagnostics (RFC-0002 §"Parser").
     Error(Span),
@@ -350,6 +462,7 @@ impl Expr {
         match self {
             Self::IntLit(_, span)
             | Self::FloatLit(_, span)
+            | Self::AngleLit(_, span)
             | Self::StrLit(_, span)
             | Self::Ident(_, span)
             | Self::Array(_, span)
@@ -361,6 +474,9 @@ impl Expr {
             | Self::Assign { span, .. }
             | Self::Postfix { span, .. }
             | Self::Ternary { span, .. }
+            | Self::Animated { span, .. }
+            | Self::StyleValue { span, .. }
+            | Self::Merge { span, .. }
             | Self::Error(span) => *span,
         }
     }
@@ -398,6 +514,7 @@ mod tests {
             }],
             attrs: vec![Attr {
                 name: Symbol::intern("bg"),
+                axis: None,
                 kind: AttrKind::Prop {
                     value: Expr::IntLit(1, sp()),
                 },
@@ -438,6 +555,7 @@ mod tests {
     fn event_attr_carries_optional_payload() {
         let attr = Attr {
             name: Symbol::intern("pointer_move"),
+            axis: None,
             kind: AttrKind::Event {
                 payload: Some(Symbol::intern("e")),
                 action: Expr::Error(sp()),

@@ -180,7 +180,15 @@ impl TextGlyphPipeline {
         let glyph_cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &glyph_cache, format);
         let viewport = Viewport::new(device, &glyph_cache);
-        let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+        // Enable the same draw-order depth state as the box/texture pipelines so
+        // glyphon's text participates in cross-pass paint ordering (RFC-0011)
+        // instead of always drawing on top.
+        let renderer = TextRenderer::new(
+            &mut atlas,
+            device,
+            MultisampleState::default(),
+            Some(super::draw_depth_stencil()),
+        );
 
         if let Some(error) = scope.pop().await {
             return Err(ByardError::PipelineCompilation {
@@ -243,6 +251,7 @@ impl TextGlyphPipeline {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         text_lines: &[TextLine],
+        depths: &[f32],
         scale_factor: f32,
         viewport_dirty: bool,
     ) -> Result<(), ByardError> {
@@ -296,10 +305,14 @@ impl TextGlyphPipeline {
 
             // Color is applied per-TextArea in pass 2 (default_color field).
             // Here we only need to shape the text; color does not affect layout.
+            // Tag every glyph of this line with its line index as glyphon
+            // `metadata`, so pass 3's `metadata_to_depth` can look up this
+            // line's draw-order depth. Lines are re-shaped every tick (all
+            // dirty), so the metadata stays current with the line's index.
             entry.buffer.set_text(
                 &mut self.font_system,
                 &line.text,
-                &Attrs::new().family(Family::SansSerif),
+                &Attrs::new().family(Family::SansSerif).metadata(i),
                 glyphon::Shaping::Advanced,
                 None, // align: no paragraph-level override
             );
@@ -349,12 +362,18 @@ impl TextGlyphPipeline {
             })
             .collect();
 
-        // ── Pass 3: glyphon prepare ───────────────────────────────────────────
+        // ── Pass 3: glyphon prepare (with draw-order depth) ───────────────────
         //
         // Borrows: renderer, font_system, atlas, viewport, swash_cache.
         // These are all distinct fields from `cache` (borrowed by text_areas).
+        //
+        // `metadata_to_depth` maps each glyph's metadata (its line index, set in
+        // pass 1) to that line's draw-order NDC-z, so text is depth-sorted
+        // against solids/decorated/textures instead of always painting on top
+        // (RFC-0011 cross-pass paint order). A missing/out-of-range depth falls
+        // back to the far plane.
         self.renderer
-            .prepare(
+            .prepare_with_depth(
                 device,
                 queue,
                 &mut self.font_system,
@@ -362,6 +381,12 @@ impl TextGlyphPipeline {
                 &self.viewport,
                 text_areas,
                 &mut self.swash_cache,
+                |meta| {
+                    depths
+                        .get(meta)
+                        .copied()
+                        .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR)
+                },
             )
             .map_err(|e| ByardError::TextPrepare(e.to_string()))
     }

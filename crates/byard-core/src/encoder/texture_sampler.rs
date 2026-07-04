@@ -415,7 +415,7 @@ pub async fn build_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(super::draw_depth_stencil()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -442,6 +442,7 @@ pub fn draw(
     quad_buffer: &wgpu::Buffer,
     cache: &TextureCache,
     textures: &[TextureSampler],
+    depths: &[f32],
 ) {
     if textures.is_empty() {
         return;
@@ -450,16 +451,22 @@ pub fn draw(
     render_pass.set_bind_group(0, viewport_bind_group, &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
 
-    for t in textures {
+    for (i, t) in textures.iter().enumerate() {
         let Some(entry) = cache.get(&t.src) else {
             continue;
         };
         let uv_xform = uv_transform(t.fit, entry.width, entry.height, t.rect[2], t.rect[3]);
+        // misc.y carries this image's draw-order depth (NDC-z); the shader reads
+        // it as position.z. Missing depth falls back to the far plane.
+        let depth = depths
+            .get(i)
+            .copied()
+            .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR);
         let instance = TextureInstance {
             rect: t.rect,
             radii: t.radii,
             uv_xform,
-            misc: [t.opacity, 0.0, 0.0, 0.0],
+            misc: [t.opacity, depth, 0.0, 0.0],
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ByardCore - TextureSampler Instance Buffer"),

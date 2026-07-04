@@ -3,7 +3,10 @@
 // interpolation, ternaries, the full intrinsic catalog, two-way `bind:`,
 // keyboard focus + Tab, structural `for`/`when … else`, themed typography,
 // the four `Len` padding forms, decoration (radius/border/shadow/opacity),
-// and a textured `Image`. Run with: `byard dev` (or the example runner).
+// paint-time transforms, coherent paint order, and a textured `Image`.
+//
+// Laid out as two side-by-side columns in a ~16:9 landscape frame. Run with:
+//   cargo run -p byard-cli -- dev crates/byard-compiler/examples/hello_world.byd
 
 View Main() {
     // ── Reactive state (Int / Bool / Float / Str) ───────────────────────────
@@ -12,72 +15,235 @@ View Main() {
     var volume: Float = 0.5
     var name: String = ""
     var note: String = ""
+    var hovered: Bool = false
+    var eventFocused: Bool = false
+    var pokes: Int = 0
+    var wheelTicks: Int = 0
+    var scrollTicks: Int = 0
+    var cardHovered: Bool = false
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
     let summary = describe(count)
 
-    Column #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 20, width: 540] {
+    // A first-class style value (RFC-0016): a named, reusable bundle of
+    // attributes, spread onto elements below with `..chip`.
+    let chip = style { bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10) }
+    // Composed with `merge` — the accent chip is `chip` with its bg overridden.
+    let hotChip = chip merge style { bg: 0x964747 }
+    // Interaction states (RFC-0016): the `on <state>` blocks re-style the element
+    // straight from the engine's own hover/pressed/disabled truth — no `var`, no
+    // event handler, no ternary. Priority is disabled > pressed > focused > hover.
+    let pill = style {
+        bg: 0x34344A, radius: 10, p: (vertical: 12, horizontal: 20)
+        on hover    { bg: 0x6495ED }
+        on pressed  { scale: 0.96 }
+        on disabled { opacity: 0.4 }
+    }
+    // Group transform (RFC-0011): scaling a container carries its whole subtree —
+    // text and inner boxes scale with it, not just the background. Hover to zoom
+    // the entire card as one unit.
+    let zoomCard = style {
+        bg: 0x262636, radius: 16, p: 18, gap: 8, border: 0x3C3C52
+        on hover { scale: 1.08 }
+    }
 
-        // ── Header: textured Image + themed typography ───────────────────────
-        Row #[gap: 16, align: center] {
-            Image("logo.png") #[width: 56, height: 56, radius: 14, fit: cover]
-            Column #[gap: 2] {
-                Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
-                Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
-            }
-        }
+    // Two columns side by side → a landscape ~16:9 frame instead of one tall
+    // strip. `align: start` keeps both columns pinned to the top.
+    Row #[bg: 0x14141C, p: (vertical: 28, horizontal: 32), gap: 24, align: start] {
 
-        // ── Counter card: events (=>), ternary, fn + interpolation ───────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
-            Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
-            Row #[gap: 12, align: center] {
-                Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
-                Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
-                Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
-                Spacer
-                Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
-            }
-        }
+        // ══ LEFT COLUMN ═════════════════════════════════════════════════════
+        Column #[gap: 20, width: 560] {
 
-        // ── Interactive widgets bound two-way to the vars above ──────────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 16, border: 0x3C3C52] {
-            Row #[align: center, justify: between] {
-                Text("Favourite") #[color: 0x9AA0AC, size: 15]
-                Toggle #[bind: liked, width: 52, height: 30]
+            // ── Header: textured Image + themed typography ───────────────────
+            Row #[gap: 16, align: center] {
+                Image("logo.png") #[width: 56, height: 56, radius: 14, fit: cover]
+                Column #[gap: 2] {
+                    Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
+                    Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
+                }
             }
-            Row #[align: center, justify: between, gap: 16] {
-                Text("Volume {volume}") #[color: 0x9AA0AC, size: 15]
-                Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
-            }
-            // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
-            TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: 8, p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
-            Text("Hi {name}") #[color: 0x10B981, size: 14]
-        }
 
-        // ── Structural: when … else, and a for-loop over a list ──────────────
-        Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
-            when liked {
-                Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
-            } else {
-                Text("tap the toggle to favourite") #[color: 0xEF4444, weight: medium]
+            // ── Counter card: events (=>), ternary, fn + interpolation ───────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52, shadow: "md"] {
+                Text("{summary}") #[typo: "titleMedium", color: 0xE6E1E5]
+                Row #[gap: 12, align: center] {
+                    Button("-") #[bg: 0x964747, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count--
+                    Text("{count}") #[typo: "headlineMedium", color: 0x90CAF9, weight: bold, width: 64, align: center]
+                    Button("+") #[bg: 0x6495ED, radius: 10, p: (vertical: 10, horizontal: 18), color: 0xFFFFFF, weight: bold] => count++
+                    // Disabled (RFC-0012 S5): dimmed and inert — the router gates
+                    // its handler, so clicking it never resets the counter.
+                    Button("reset") #[bg: 0x3C3C52, radius: 10, p: (vertical: 10, horizontal: 14), color: 0xC9C9D4, size: 13, disabled: true, opacity: 0.4] => count = 0
+                    Spacer
+                    Text(liked ? "favourited" : "not a favourite") #[color: 0x9AA0AC]
+                }
             }
-            Row #[gap: 8] {
-                for tag in ["reactive", "typed", "native"] {
-                    Box #[bg: 0x3C3C52, radius: 6, p: (vertical: 4, horizontal: 10)] {
-                        Text("{tag}") #[color: 0xC9C9D4, size: 13]
+
+            // ── Interactive widgets bound two-way to the vars above ──────────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 16, border: 0x3C3C52] {
+                Row #[align: center, justify: between] {
+                    Text("Favourite") #[color: 0x9AA0AC, size: 15]
+                    Toggle #[bind: liked, width: 52, height: 30]
+                }
+                Row #[align: center, justify: between, gap: 16] {
+                    Text("Volume {volume}") #[color: 0x9AA0AC, size: 15]
+                    Slider #[bind: volume, min: 0.0, max: 1.0, step: 0.05, width: 220, height: 26]
+                }
+                // Two focusable fields → Tab / Shift+Tab cycle, click steals focus.
+                TextField #[bind: name, focused: liked, placeholder: "your name…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+                TextField #[bind: note, placeholder: "a quick note…", bg: 0x34344A, radius: (8,8,0,0), p: (horizontal: 12), width: 360, height: 40, color: 0xFFFFFF]
+                Text("Hi {name}") #[color: 0x10B981, size: 14]
+            }
+
+            // ── Structural: when … else, and a for-loop over a list ──────────
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
+                when liked {
+                    Text("♥ thanks for the love") #[color: 0x10B981, weight: medium]
+                } else {
+                    Text("tap the toggle to favourite") #[color: 0xEF4444, weight: medium]
+                }
+                Row #[gap: 8] {
+                    for tag in ["reactive", "typed", "native"] {
+                        // Each chip spreads the shared `chip` style (RFC-0016).
+                        Box #[..chip] {
+                            Text("{tag}") #[color: 0xC9C9D4, size: 13]
+                        }
+                    }
+                    // The accent chip spreads the `merge`d style.
+                    Box #[..hotChip] {
+                        Text("gpu") #[color: 0xFFFFFF, size: 13]
                     }
                 }
             }
         }
 
-        // ── Decoration showcase: radius / border / shadow / opacity ──────────
-        Row #[gap: 16] {
-            Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
-            Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
-            Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
-            Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
+        // ══ RIGHT COLUMN ════════════════════════════════════════════════════
+        Column #[gap: 20, width: 560] {
+
+            // ── Decoration showcase: radius / border / shadow / opacity ──────
+            Row #[gap: 16] {
+                Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
+                Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
+                Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
+                Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
+            }
+
+            // ── Paint-time transforms (RFC-0011): translate/scale/rotate/origin
+            // never re-run layout — the boxes below sit in a plain Row, and
+            // moving/rotating/scaling them doesn't reflow their siblings.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52] {
+                Text("Paint-time transforms") #[color: 0x9AA0AC, size: 15]
+                Row #[gap: 24, align: center] {
+                    // Hover to lift: scale up around the box's own center (the
+                    // default origin) — and now the scale *springs* there
+                    // (RFC-0010) instead of snapping. Hover on and off to see it
+                    // interruptible: reversing mid-flight starts from where it is.
+                    Box #[
+                        bg: cardHovered ? 0x6495ED : 0xFFFFFF with anim.spring(),
+                        radius: 12,
+                        width: 90,
+                        height: 56,
+                        scale: cardHovered ? 1.12 : 1.0 with anim.spring(),
+                        hover => cardHovered = true,
+                        pointer_exit => cardHovered = false,
+                    ]
+                    // Nudged 14px right and 10px down from its laid-out position.
+                    Box #[bg: 0x9C27B0, radius: 12, width: 90, height: 56, translate: (34, 10)]
+                    // Verbose named-tuple form (coherent with `p: (top:…, left:…)`):
+                    // negative x moves it left, positive y moves it down.
+                    Box #[bg: 0xEF4444, radius: 12, width: 90, height: 56, translate: (x: -18, y: 30)]
+                    // Sub-property axis form: only the y-axis translate is set.
+                    Box #[bg: 0xF97316, radius: 12, width: 90, height: 56, translate.y: 20]
+                    // Rotated 90deg around its own center (the default origin).
+                    Box #[bg: 0x10B981, radius: 12, width: 90, height: 56, rotate: 90deg]
+                    // Rotated around its top-left corner instead of its center —
+                    // visibly swings the whole box, not just its fill.
+                    Box #[bg: 0xFBC02D, radius: 12, width: 90, height: 56, rotate: 10deg, origin: top_right]
+                }
+            }
+
+            // ── Declarative interaction states (RFC-0016): spread `..pill` and
+            // the `on hover`/`on pressed`/`on disabled` blocks light up from the
+            // engine's live state — hover to tint blue, press to shrink. The
+            // third pill is `disabled: true`, so it dims and never presses.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 12, border: 0x3C3C52] {
+                Text("Interaction states — no vars, no handlers") #[color: 0x9AA0AC, size: 15]
+                Row #[gap: 16, align: center] {
+                    Box #[..pill] {
+                        Text("hover / press me") #[color: 0xFFFFFF, size: 14]
+                    }
+                    Box #[..pill] {
+                        Text("and me") #[color: 0xFFFFFF, size: 14]
+                    }
+                    Box #[..pill, disabled: true] {
+                        Text("disabled") #[color: 0xFFFFFF, size: 14]
+                    }
+                }
+            }
+
+            // ── Group transform (RFC-0011): a scaled container carries its whole
+            // subtree. Hover this card to zoom it as one unit — the heading, the
+            // body text, and the inner chip all scale together, not just the box.
+            Box #[..zoomCard, width: 300] {
+                Text("Group transform") #[color: 0xE6E1E5, size: 16, weight: bold]
+                Text("hover me — my text scales too") #[color: 0x9AA0AC, size: 13]
+                Box #[bg: 0x6495ED, radius: 6, p: (vertical: 4, horizontal: 10)] {
+                    Text("child chip") #[color: 0xFFFFFF, size: 12]
+                }
+            }
+
+            // ── Paint order (z-order): one rule — later-emitted paints on top.
+            // Text is depth-sorted like every box now, NOT forced to the front.
+            // Boxes are translated to overlap the labels (text can't transform,
+            // so the boxes move instead); the paint result follows source order.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 14, border: 0x3C3C52] {
+                Text("Paint order — text is depth-sorted, not always on top") #[color: 0x9AA0AC, size: 15]
+
+                // (a) label first, then an OPAQUE bar emitted after it and nudged
+                // up onto it → the bar paints OVER the label (text is not on top).
+                Text("this label is BEHIND the blue bar") #[color: 0xE6E1E5, size: 18]
+                Box #[bg: 0x6495ED, radius: 6, width: 320, height: 24, translate.y: -22]
+
+                // (b) a bar first, then a label emitted after it; the bar is
+                // nudged down onto the label → the label paints OVER the bar.
+                Box #[bg: 0x964747, radius: 6, width: 320, height: 24, translate.y: 30]
+                Text("this label is IN FRONT of the red bar") #[color: 0xFFFFFF, size: 18, weight: bold]
+            }
+
+            // ── Full event exposure (RFC-0012 §A): hover/enter/exit, long_press,
+            // double_tap, secondary (right-click), the `click` alias, and the
+            // `focus =>`/`blur =>` sugar — hover the box, left/right/double-click
+            // it, hold it, then Tab to move focus in and out.
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 8, border: 0x3C3C52] {
+                Text("Event exposure") #[color: 0x9AA0AC, size: 15]
+                Box #[
+                    bg: hovered ? 0x6495ED : 0x34344A with anim.linear(160ms),
+                    radius: 10,
+                    p: (vertical: 14, horizontal: 18),
+                    width: 320,
+                    hover => hovered = true,
+                    pointer_exit => hovered = false,
+                    click => pokes++,
+                    double_tap => pokes += 10,
+                    long_press => pokes += 100,
+                    secondary => pokes = 0,
+                    focused: eventFocused,
+                    focus => eventFocused = true,
+                    blur => eventFocused = false,
+                ] {
+                    Text(eventFocused ? "focused — click, right-click, hold, or double-click" : "click to focus me") #[color: 0xFFFFFF, size: 14]
+                }
+                Text("pokes: {pokes} (click +1, double-tap +10, long-press +100, right-click resets)") #[color: 0x9AA0AC, size: 13]
+
+                // Hardware wheel/scroll origin (RFC-0012 §A loose end): hover
+                // this area and use a physical mouse wheel (`wheelTicks`) or a
+                // trackpad scroll gesture (`scrollTicks`) over it. `scroll` is
+                // only in `ScrollView`'s accepted vocabulary today; `wheel` is
+                // universal.
+                ScrollView #[bg: 0x1E1E2A, radius: 10, p: (vertical: 14, horizontal: 18), width: 320, wheel => wheelTicks++, scroll => scrollTicks++] {
+                    Text("wheel: {wheelTicks}   scroll: {scrollTicks}") #[color: 0xFFFFFF, size: 14]
+                }
+            }
         }
     }
 }

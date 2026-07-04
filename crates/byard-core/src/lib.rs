@@ -28,6 +28,7 @@ pub mod evaluator;
 pub mod frame;
 pub mod platform;
 pub mod relay;
+pub mod telemetry;
 pub mod text;
 
 pub use encoder::BoxInstance;

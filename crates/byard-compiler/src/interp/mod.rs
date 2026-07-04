@@ -5,6 +5,7 @@
 //! environment + `inject`) lands first; the reactive core, eval driver,
 //! intrinsics, style, events, and hot-reload follow.
 
+pub mod anim;
 pub mod env;
 pub mod eval;
 pub mod events;

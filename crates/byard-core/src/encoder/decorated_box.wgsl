@@ -17,6 +17,12 @@ struct InstanceInput {
     @location(6) params: vec4<f32>,
     // (opacity, _, _, _)
     @location(7) misc: vec4<f32>,
+    // Paint-time transform (RFC-0011); identity is a free no-op below.
+    // `opacity` isn't part of this block — `misc.x` above stays authoritative.
+    @location(8) t_translate: vec2<f32>,
+    @location(9) t_scale: vec2<f32>,
+    @location(10) t_rotate: f32,
+    @location(11) t_origin: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -34,6 +40,24 @@ struct VertexOutput {
 @group(0) @binding(0) var<uniform> viewport_size: vec2<f32>;
 
 const QUAD_PADDING: f32 = 2.0;
+
+/// Applies a paint-time transform (RFC-0011) to a world-space (logical-pixel)
+/// position: rotate + scale about `origin`, then translate. Identity inputs
+/// collapse to `world` unchanged.
+fn apply_transform(
+    world: vec2<f32>,
+    translate: vec2<f32>,
+    scale: vec2<f32>,
+    rotate: f32,
+    origin: vec2<f32>,
+) -> vec2<f32> {
+    let p = world - origin;
+    let scaled = vec2<f32>(p.x * scale.x, p.y * scale.y);
+    let c = cos(rotate);
+    let s = sin(rotate);
+    let rotated = vec2<f32>(scaled.x * c - scaled.y * s, scaled.x * s + scaled.y * c);
+    return rotated + origin + translate;
+}
 
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
@@ -53,10 +77,20 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.local_pos = (vertex.quad_pos - 0.5) * padded;
     let world_pos = instance.rect.xy - margin + vertex.quad_pos * padded;
 
+    let transformed = apply_transform(
+        world_pos,
+        instance.t_translate,
+        instance.t_scale,
+        instance.t_rotate,
+        instance.t_origin,
+    );
+
+    // misc.y carries the draw-order depth (NDC-z); the encoder writes it per
+    // instance so decorated boxes honour global paint order against solids/text.
     out.position = vec4<f32>(
-        (world_pos.x / viewport_size.x) * 2.0 - 1.0,
-        1.0 - (world_pos.y / viewport_size.y) * 2.0,
-        0.0,
+        (transformed.x / viewport_size.x) * 2.0 - 1.0,
+        1.0 - (transformed.y / viewport_size.y) * 2.0,
+        instance.misc.y,
         1.0
     );
 

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod commands;
 mod manifest;
+mod telemetry_overlay;
 
 #[derive(Parser)]
 #[command(

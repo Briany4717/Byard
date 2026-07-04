@@ -53,7 +53,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
 
     // Poll mode: the event loop spins continuously so file-change frames
     // appear without waiting for the next mouse event (RFC-0006 §3.2).
-    let host = WinitHost::new(&title, 800, 600).with_poll();
+    let host = WinitHost::new(&title, 1280, 720).with_poll();
     host.run(App {
         engine: None,
         width_bits: None,
@@ -61,6 +61,8 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         entry_path,
         initial_views,
         initial_errors,
+        last_gpu_telemetry: byard_core::telemetry::SampleBlock::default(),
+        last_telemetry_print: std::time::Instant::now(),
     })
     .map_err(|e| format!("event loop error: {e}"))
 }
@@ -84,6 +86,9 @@ struct ByldRuntime {
     error_state: Option<Vec<CompileError>>,
     width_bits: Arc<AtomicU32>,
     height_bits: Arc<AtomicU32>,
+    /// Epoch for the animation clock (RFC-0010): `with` animations sample
+    /// against ms elapsed since the logic runtime started.
+    start: std::time::Instant,
 }
 
 impl ByldRuntime {
@@ -160,13 +165,21 @@ impl LogicRuntime for ByldRuntime {
         self.interp.tick();
 
         // ── Step 3: render ────────────────────────────────────────────────────
+        // Advance the animation clock (RFC-0010) before rendering so `with`
+        // curves sample against the current elapsed time.
+        let elapsed = u32::try_from(self.start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.interp.set_now_ms(elapsed);
         let w = f32::from_bits(self.width_bits.load(Ordering::Relaxed));
         let h = f32::from_bits(self.height_bits.load(Ordering::Relaxed));
 
         if let Some(errors) = &self.error_state {
-            // Render view first, then overlay on top (C4: overlay path is
-            // independent of the interpreter).
-            self.interp.render(&self.tree, frame, w, h);
+            // Render *only* the overlay — deliberately NOT the last-good view
+            // underneath it. Text is drawn in a single global pass after every
+            // box (the flat 4-pass encoder order), so any app text painted here
+            // would bleed *over* the overlay's scrim. Drawing the overlay alone
+            // on an opaque background sidesteps that and reads as a dedicated
+            // "fix your file" error screen (C4: overlay path is independent of
+            // the interpreter).
             render_error_overlay(frame, errors, w, h);
         } else {
             self.interp.render(&self.tree, frame, w, h);
@@ -185,11 +198,14 @@ const OVERLAY_MAX_HEADLINE_CHARS: usize = 60;
 /// Truncates to [`OVERLAY_MAX_ERRORS`] errors and [`OVERLAY_MAX_HEADLINE_CHARS`]
 /// chars per headline to keep the overlay bounded without needing Taffy layout.
 fn render_error_overlay(frame: &mut RenderFrame, errors: &[CompileError], w: f32, h: f32) {
-    // Dark semi-opaque background covering the full viewport.
+    // Opaque dark background covering the full viewport. Opaque (not a scrim)
+    // because the underlying view is intentionally not drawn while errors are
+    // shown — see the call site in `App::render`.
     frame.push_instance(BoxInstance {
         rect: [0.0, 0.0, w, h],
-        color: [0.0, 0.0, 0.0, 0.8],
+        color: [0.09, 0.09, 0.11, 1.0],
         radii: [0.0; 4],
+        transform: byard_core::frame::Transform::IDENTITY,
     });
 
     let padding = 32.0;
@@ -280,6 +296,46 @@ struct App {
     entry_path: std::path::PathBuf,
     initial_views: Vec<ViewDecl>,
     initial_errors: Vec<CompileError>,
+    /// This (render/main) thread's GPU telemetry ring, drained on **every**
+    /// redraw — not just when about to print — so it only ever holds
+    /// samples produced since the *previous redraw*. `byard dev`'s Poll-mode
+    /// loop redraws far more often than once a second; draining only at
+    /// print time would let a whole second's worth of `gpu.ui_pass` samples
+    /// pile up into one inflated, unreadable dump (RFC-0013's overlay is
+    /// meant to be a per-frame snapshot, not an accumulator).
+    last_gpu_telemetry: byard_core::telemetry::SampleBlock,
+    /// Last time the telemetry overlay was printed (RFC-0013 "Overlay
+    /// format"), throttled to roughly once a second so `byard dev` doesn't
+    /// spam a line for every redraw. Printing is throttled; draining
+    /// `last_gpu_telemetry` (above) is not.
+    last_telemetry_print: std::time::Instant,
+}
+
+impl App {
+    /// Prints the flat telemetry overlay (RFC-0013 "Overlay format") to
+    /// stderr, throttled to roughly once a second. Combines the last
+    /// published frame's CPU samples (drained on the logic thread at publish
+    /// time) with `gpu`, this thread's most recent single-redraw GPU
+    /// samples — see `telemetry_overlay`'s module docs for why the two live
+    /// on separate rings, and [`App::last_gpu_telemetry`]'s doc comment for
+    /// why `gpu` must be drained every redraw rather than only here.
+    fn print_telemetry_overlay(
+        engine: &Engine,
+        gpu: &byard_core::telemetry::SampleBlock,
+        last_print: &mut std::time::Instant,
+    ) {
+        if last_print.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        *last_print = std::time::Instant::now();
+        let cpu = engine.latest_cpu_telemetry().unwrap_or_default();
+        let overlay = crate::telemetry_overlay::format_telemetry_overlay(
+            &cpu,
+            gpu,
+            engine.gpu_timing_available(),
+        );
+        eprint!("{overlay}");
+    }
 }
 
 impl PlatformHost for App {
@@ -354,6 +410,7 @@ impl PlatformHost for App {
                 error_state: initial_errors,
                 width_bits: w_clone,
                 height_bits: h_clone,
+                start: std::time::Instant::now(),
             })
         })?;
 
@@ -382,21 +439,35 @@ impl PlatformHost for App {
     fn on_redraw(&mut self) -> Result<(), ByardError> {
         if let Some(e) = self.engine.as_mut() {
             e.render_latest()?;
+            // Drained every redraw (see `last_gpu_telemetry`'s doc comment),
+            // independent of the print throttle below.
+            self.last_gpu_telemetry = byard_core::telemetry::drain_samples();
+            App::print_telemetry_overlay(
+                e,
+                &self.last_gpu_telemetry,
+                &mut self.last_telemetry_print,
+            );
         }
         Ok(())
     }
 
-    fn on_pointer_input(&mut self, _button: PointerButton, state: PointerState, x: f32, y: f32) {
+    fn on_pointer_input(&mut self, button: PointerButton, state: PointerState, x: f32, y: f32) {
         if let Some(engine) = &self.engine {
             let kind = match state {
                 PointerState::Pressed => byard_core::platform::EventKind::PointerDown,
                 PointerState::Released => byard_core::platform::EventKind::PointerUp,
             };
+            // The router only consults this on `PointerDown` (RFC-0012
+            // `secondary`): a right-button press flags the whole down→up
+            // gesture as `secondary` instead of `tap`. Without it every
+            // button reports as a plain left-click.
+            let payload = (button == PointerButton::Right)
+                .then_some(byard_core::platform::InputPayload::Bool(true));
             engine.push_input(byard_core::platform::InputEvent {
                 kind,
                 pos: (x, y),
                 delta: (0.0, 0.0),
-                payload: None,
+                payload,
                 time_ms: now_ms(),
             });
         }
@@ -414,18 +485,21 @@ impl PlatformHost for App {
         }
     }
 
-    fn on_key(&mut self, _key: &str, pressed: bool) {
+    fn on_key(&mut self, key: &str, pressed: bool) {
         if let Some(engine) = &self.engine {
             let kind = if pressed {
                 byard_core::platform::EventKind::KeyDown
             } else {
                 byard_core::platform::EventKind::KeyUp
             };
+            // The router keys `Tab` traversal (M18) and `Backspace`/edit
+            // handling (M17) off this payload — dropping it here silently
+            // breaks both, since every key would otherwise look identical.
             engine.push_input(byard_core::platform::InputEvent {
                 kind,
                 pos: (0.0, 0.0),
                 delta: (0.0, 0.0),
-                payload: None,
+                payload: Some(byard_core::platform::InputPayload::Key(key.to_string())),
                 time_ms: now_ms(),
             });
         }
@@ -438,6 +512,30 @@ impl PlatformHost for App {
                 pos: (0.0, 0.0),
                 delta: (0.0, 0.0),
                 payload: Some(byard_core::platform::InputPayload::Key(text.to_string())),
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_scroll(&mut self, dx: f32, dy: f32, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Scroll,
+                pos: (x, y),
+                delta: (dx, dy),
+                payload: None,
+                time_ms: now_ms(),
+            });
+        }
+    }
+
+    fn on_wheel(&mut self, dx: f32, dy: f32, x: f32, y: f32) {
+        if let Some(engine) = &self.engine {
+            engine.push_input(byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (x, y),
+                delta: (dx, dy),
+                payload: None,
                 time_ms: now_ms(),
             });
         }

@@ -24,7 +24,8 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StrPart, ViewDecl,
+    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
+    StrPart, StyleStateKind, ViewDecl,
 };
 use crate::symbol::Symbol;
 use crate::util::closest_match;
@@ -56,10 +57,34 @@ fn step_decimals(step: f64) -> i32 {
     }
 }
 
+/// Settling thresholds for the CPU-sampled animation path (RFC-0010).
+///
+/// `eval_pure` animates opacity, scale, rotate, and translate through one
+/// generic path that doesn't carry the property's unit, so the epsilons must be
+/// tight enough to be correct for the *tightest* unit (ratios, ~0..1) — which is
+/// simply conservative (settles a hair later) for pixels and radians. Position
+/// is the final-value accuracy gate; a tight velocity gate keeps a spring's
+/// overshoot alive rather than freezing it at the first crossing of the target.
+const ANIM_SETTLE_EPS_POS: f32 = 0.002;
+const ANIM_SETTLE_EPS_VEL: f32 = 0.02;
+
 /// Rounds `val` to `decimals` decimal places (half-away-from-zero).
 fn round_to_decimals(val: f64, decimals: i32) -> f64 {
     let factor = 10f64.powi(decimals);
     (val * factor).round() / factor
+}
+
+/// A resolved first-class style value (RFC-0016): a flat base attribute set
+/// plus its `on <state> { … }` interaction-state blocks. Produced by
+/// [`Interpreter::resolve_style_expr`] from a `style { … }` value, a `let`-bound
+/// style name, or a `merge` of two styles. Static and view-scoped — no cascade.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyleDef {
+    /// The base attributes, last-write-wins in written order.
+    pub base: Vec<Attr>,
+    /// The state blocks, in written order (a later block of the same state
+    /// wins, which is how `merge` layers the right operand over the left).
+    pub states: Vec<StateBlock>,
 }
 
 /// A lowered render-tree node: the interpreter's plan for one element. Reactive
@@ -72,6 +97,9 @@ pub enum RenderNode {
         name: Symbol,
         /// Styling attributes.
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016), overlaid onto `attrs` at render
+        /// time when their engine state is active. Empty for the common case.
+        state_blocks: Vec<StateBlock>,
         /// Child render nodes.
         children: Vec<RenderNode>,
         /// Event shorthand action.
@@ -83,6 +111,8 @@ pub enum RenderNode {
     Text {
         /// Styling attributes.
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016) overlaid at render time.
+        state_blocks: Vec<StateBlock>,
         /// The reactive scope projecting the text content.
         content: ScopeId,
     },
@@ -92,6 +122,8 @@ pub enum RenderNode {
     Image {
         /// Styling attributes (width, height, fit, radii, opacity, …).
         attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016) overlaid at render time.
+        state_blocks: Vec<StateBlock>,
         /// The reactive scope that evaluates to the image source path/URL.
         src: ScopeId,
     },
@@ -174,6 +206,38 @@ pub struct Interpreter {
     /// pre-lowered in the *caller* scope so a `content` element reference inside
     /// the callee body splices nodes that capture the caller's environment.
     slot_stack: Vec<Vec<RenderNode>>,
+    /// Current engine time (ms since the runner's epoch), set once per frame by
+    /// the runner via [`set_now_ms`](Self::set_now_ms). Drives `with`
+    /// animations (RFC-0010).
+    now_ms: u32,
+    /// Whether a host has ever advanced the clock. Distinguishes a real
+    /// `set_now_ms(0)` start from "the clock was never set" — without it, a host
+    /// that never ticks the clock would pin an animation at `t = 0` (never
+    /// settling, `has_active_animations` latched true, an infinite redraw loop
+    /// on a wait-based runner). Unset ⇒ animations resolve to their target
+    /// instantly.
+    clock_set: bool,
+    /// Persisted per-property animation state (RFC-0010), keyed by the `with`
+    /// node's source span so it survives the whole-tree re-render each frame.
+    /// A mid-flight target change reseeds `from` to the current sampled value
+    /// (interruptible springs).
+    animations: std::collections::HashMap<Span, byard_core::frame::Motion>,
+    /// Persisted colour-animation state (RFC-0010 A3): one `Motion` per OKLab
+    /// channel (`L`, `a`, `b`), so a `bg`/`color`/`border` transition
+    /// interpolates in a perceptually-uniform space — no muddy mid-points — and
+    /// is interruptible like the scalar props. Keyed by the `with` node's span.
+    color_animations: std::collections::HashMap<Span, [byard_core::frame::Motion; 3]>,
+    /// Set true during a render whenever an animation sampled this frame has not
+    /// yet settled — the runner reads it (via [`has_active_animations`]) to keep
+    /// requesting frames until motion stops (idle → 0 frames).
+    ///
+    /// [`has_active_animations`]: Self::has_active_animations
+    any_active: bool,
+    /// First-class style values (RFC-0016): `let name = style { … }` registers
+    /// its base attributes and `on <state>` blocks here, and a `..name` spread
+    /// on an element splices them in at lower time. Static and view-scoped — no
+    /// cascade.
+    styles: std::collections::HashMap<Symbol, StyleDef>,
 }
 
 impl Interpreter {
@@ -228,6 +292,22 @@ impl Interpreter {
         self.ctx.pull(epoch);
     }
 
+    /// Sets the current engine time (ms since the runner's epoch) that `with`
+    /// animations sample against (RFC-0010). The runner calls this once per
+    /// frame, before [`render`](Self::render).
+    pub fn set_now_ms(&mut self, ms: u32) {
+        self.now_ms = ms;
+        self.clock_set = true;
+    }
+
+    /// Whether any `with` animation was still in flight as of the last
+    /// [`render`](Self::render). The runner keeps requesting frames while this
+    /// is true and lets the app idle (0 frames) once every animation settles.
+    #[must_use]
+    pub fn has_active_animations(&self) -> bool {
+        self.any_active
+    }
+
     /// The most recently projected value of a value binding (for tests).
     #[must_use]
     pub fn binding_value(&self, s: ScopeId) -> Option<Value> {
@@ -266,7 +346,21 @@ impl Interpreter {
                 self.define_var(name.clone(), init);
             }
             Member::Let { name, init, .. } => {
-                self.define_let(name.clone(), init);
+                // `let x = style { … }` / `let x = a merge b` (RFC-0016) register
+                // a style value in the view-scoped table rather than a reactive
+                // memo; a `..x` spread splices its attributes at lower time.
+                if matches!(init, Expr::StyleValue { .. } | Expr::Merge { .. }) {
+                    match self.resolve_style_expr(init) {
+                        Some(def) => {
+                            self.styles.insert(name.clone(), def);
+                        }
+                        None => self
+                            .errors
+                            .push(CompileError::NotAStyle { span: init.span() }),
+                    }
+                } else {
+                    self.define_let(name.clone(), init);
+                }
             }
             Member::Fn {
                 name, params, body, ..
@@ -578,7 +672,17 @@ impl Interpreter {
     /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
     /// `known_views` are user `ViewDecl` names in scope.
     pub fn lower_element(&mut self, el: &ElementNode, known_views: &[&str]) -> RenderNode {
-        self.errors.extend(validate_element(el, known_views));
+        // RFC-0016: expand `..style` spreads into a flat attribute set *before*
+        // validating or lowering, so everything downstream sees ordinary
+        // resolved attributes (and a spread can never leak into the checker).
+        let (attrs, state_blocks) = self.expand_style_spreads(&el.attrs);
+        // Validate the base *and* every state block's attributes against the
+        // intrinsic's contract (an `on hover { bg: … }` must obey the same §5
+        // rules as an inline `bg:`); the state attrs are validation-only and do
+        // not affect the emitted base set.
+        let to_validate = attrs_with_states(&attrs, &state_blocks);
+        self.errors
+            .extend(validate_element(el, &to_validate, known_views));
         match el.name.as_str() {
             "Text" | "Button" if !el.content.is_empty() => {
                 let content = self.bind_value(&el.content[0].value);
@@ -586,9 +690,11 @@ impl Interpreter {
                     // A Button is a decorated box wrapping its label.
                     RenderNode::Box {
                         name: Symbol::intern("Button"),
-                        attrs: el.attrs.clone(),
+                        attrs,
+                        state_blocks,
                         children: vec![RenderNode::Text {
                             attrs: Vec::new(),
+                            state_blocks: Vec::new(),
                             content,
                         }],
                         action: el.action.clone(),
@@ -596,7 +702,8 @@ impl Interpreter {
                     }
                 } else {
                     RenderNode::Text {
-                        attrs: el.attrs.clone(),
+                        attrs,
+                        state_blocks,
                         content,
                     }
                 }
@@ -611,7 +718,8 @@ impl Interpreter {
                 );
                 let src = self.bind_value(&src_expr);
                 RenderNode::Image {
-                    attrs: el.attrs.clone(),
+                    attrs,
+                    state_blocks,
                     src,
                 }
             }
@@ -630,10 +738,11 @@ impl Interpreter {
             }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
-                let bound_sig = self.resolve_bind_sig(&el.attrs);
+                let bound_sig = self.resolve_bind_sig(&attrs);
                 RenderNode::Box {
                     name: el.name.clone(),
-                    attrs: el.attrs.clone(),
+                    attrs,
+                    state_blocks,
                     children: Vec::new(),
                     action: el.action.clone(),
                     bound_sig,
@@ -644,7 +753,8 @@ impl Interpreter {
                 let children = self.lower_members(&el.children, known_views);
                 RenderNode::Box {
                     name: el.name.clone(),
-                    attrs: el.attrs.clone(),
+                    attrs,
+                    state_blocks,
                     children,
                     action: el.action.clone(),
                     bound_sig: None,
@@ -754,6 +864,72 @@ impl Interpreter {
         self.instance_depth -= 1;
     }
 
+    /// Expands `..style` spreads (RFC-0016) in an attribute list into a flat
+    /// set: each spread splices the referenced style's attributes in written
+    /// order (a later spread overrides an earlier one), then inline attributes
+    /// override every spread. The common, spread-free case returns a plain
+    /// clone with no work. A spread that doesn't resolve to a known style is a
+    /// [`CompileError::NotAStyle`].
+    fn expand_style_spreads(&mut self, attrs: &[Attr]) -> (Vec<Attr>, Vec<StateBlock>) {
+        if !attrs
+            .iter()
+            .any(|a| matches!(a.kind, AttrKind::Spread { .. }))
+        {
+            return (attrs.to_vec(), Vec::new());
+        }
+        let mut resolved: Vec<Attr> = Vec::new();
+        let mut states: Vec<StateBlock> = Vec::new();
+        // 1) Spreads first, in written order. Each spread contributes its base
+        //    attributes (last-write-wins) and appends its `on <state>` blocks
+        //    (a later spread's block of the same state wins at resolve time).
+        for a in attrs {
+            if let AttrKind::Spread { value } = &a.kind {
+                match self.resolve_style_expr(value) {
+                    Some(def) => {
+                        for sa in def.base {
+                            override_attr(&mut resolved, sa);
+                        }
+                        states.extend(def.states);
+                    }
+                    None => self.errors.push(CompileError::NotAStyle { span: a.span }),
+                }
+            }
+        }
+        // 2) Inline attributes win over the spreads.
+        for a in attrs {
+            if !matches!(a.kind, AttrKind::Spread { .. }) {
+                override_attr(&mut resolved, a.clone());
+            }
+        }
+        (resolved, states)
+    }
+
+    /// Resolves a style expression to a [`StyleDef`] (base attributes + state
+    /// blocks): a `let`-bound style name, an inline `style { … }` value, or a
+    /// `merge` of two styles.
+    fn resolve_style_expr(&self, value: &Expr) -> Option<StyleDef> {
+        match value {
+            Expr::Ident(name, _) => self.styles.get(name).cloned(),
+            Expr::StyleValue { attrs, states, .. } => Some(StyleDef {
+                base: attrs.clone(),
+                states: states.clone(),
+            }),
+            // `a merge b` (RFC-0016): the right style overrides the left — its
+            // base attributes overlay last-write-wins, and its state blocks are
+            // appended so a later block of the same state wins at resolve time.
+            Expr::Merge { left, right, .. } => {
+                let mut def = self.resolve_style_expr(left)?;
+                let over = self.resolve_style_expr(right)?;
+                for a in over.base {
+                    override_attr(&mut def.base, a);
+                }
+                def.states.extend(over.states);
+                Some(def)
+            }
+            _ => None,
+        }
+    }
+
     /// Lowers a slice of `Member`s into child `RenderNode`s, handling
     /// `Element`, `When`, and `For` (M20).
     fn lower_members(&mut self, members: &[Member], known_views: &[&str]) -> Vec<RenderNode> {
@@ -838,6 +1014,9 @@ impl Interpreter {
     ) {
         use byard_core::frame::Viewport;
 
+        // Recomputed every frame: an animation re-marks itself active below if it
+        // sampled without having settled this tick (RFC-0010).
+        self.any_active = false;
         self.atlas.clear();
         // Rebuild the handler set from the fresh layout, but keep the in-flight
         // gesture state (a pending `down`, the focused element) so a tap that
@@ -875,6 +1054,8 @@ impl Interpreter {
                         &flat_ids,
                         &mut flat_idx,
                         parent_rect,
+                        1.0,
+                        byard_core::frame::Transform::IDENTITY,
                     );
                 }
             }
@@ -908,7 +1089,7 @@ impl Interpreter {
                 flat_ids.push(id);
                 Ok(id)
             }
-            RenderNode::Text { attrs, content } => {
+            RenderNode::Text { attrs, content, .. } => {
                 let text = match self.binding_value(*content) {
                     Some(Value::Str(s)) => s,
                     other => other.map_or_else(String::new, |v| format!("{v:?}")),
@@ -974,6 +1155,7 @@ impl Interpreter {
     }
 
     #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_arguments)]
     fn render_node_with_atlas(
         &mut self,
         node: &RenderNode,
@@ -982,14 +1164,37 @@ impl Interpreter {
         flat_ids: &[byard_core::atlas::layout::AtlasNodeId],
         flat_idx: &mut usize,
         parent_rect: crate::interp::intrinsics::Rect,
+        // Opacity inherited from ancestors (RFC-0011 T4 approximation): folded
+        // into this element's own `opacity` and multiplied into the alpha of
+        // every primitive it emits, so a translucent parent dims its text and
+        // widgets too — not only its own background.
+        inherited_opacity: f32,
+        // Paint-time transform inherited from ancestors (RFC-0011 group
+        // transforms): composed with this element's own transform so a scaled or
+        // translated container carries its children, text, and widgets with it —
+        // not only its own background box. `IDENTITY` at the root.
+        inherited_transform: byard_core::frame::Transform,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
 
         match node {
             RenderNode::Spacer => {}
-            RenderNode::Text { attrs, content } => {
+            RenderNode::Text {
+                attrs,
+                state_blocks,
+                content,
+            } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // RFC-0016: overlay any active `on <state>` block against the
+                    // live engine mask before reading paint properties.
+                    let elem_idx = self.atlas.node_index(atlas_node);
+                    let state = elem_idx
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let attrs = resolve_state_attrs(attrs, state_blocks, state);
+                    let attrs = attrs.as_ref();
                     let text = match self.binding_value(*content) {
                         Some(Value::Str(s)) => s,
                         other => other.map_or_else(String::new, |v| format!("{v:?}")),
@@ -1007,12 +1212,22 @@ impl Interpreter {
                         self.eval_int_prop(attrs, "size")
                             .or(typo_size)
                             .unwrap_or(self.theme.font_size as i64) as f32;
+                    let mut rgba = super::intrinsics::color_to_rgba(color, false);
+                    rgba[3] *= inherited_opacity;
+                    // RFC-0011 group transforms: a `Text` carries no transform of
+                    // its own, so an ancestor's scale/translate is baked into the
+                    // baseline anchor and the font size (glyph extents scale from
+                    // the anchor, so this scales the run about the ancestor pivot).
+                    // Rotation can't be baked per-glyph and is left to box
+                    // primitives (shader-applied) — a documented limitation.
+                    let anchor = inherited_transform.apply_point([rect.x, rect.y]);
+                    let scaled_size = size * inherited_transform.uniform_scale();
                     frame.push_text(byard_core::TextLine {
-                        x: rect.x,
-                        y: rect.y,
+                        x: anchor[0],
+                        y: anchor[1],
                         text,
-                        font_size: size,
-                        color: super::intrinsics::color_to_rgba(color, false),
+                        font_size: scaled_size,
+                        color: rgba,
                         dirty: true,
                     });
 
@@ -1028,7 +1243,6 @@ impl Interpreter {
                         );
                         let hit_rect =
                             crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect);
-                        let elem_idx = self.atlas.node_index(atlas_node);
                         self.register_event_attrs(attrs, hit_rect, elem_idx);
                     }
                 }
@@ -1036,11 +1250,20 @@ impl Interpreter {
             RenderNode::Box {
                 name,
                 attrs,
+                state_blocks,
                 children,
                 action,
                 bound_sig,
             } => {
                 let mut current_rect = parent_rect;
+                // Opacity children inherit from this box: its effective opacity
+                // when it has a resolved rect (set below), else whatever it
+                // inherited unchanged.
+                let mut child_opacity = inherited_opacity;
+                // Likewise the composed paint transform children inherit (RFC-0011
+                // group transforms): this box's own transform ∘ its ancestors',
+                // set once the rect is known, else passed through unchanged.
+                let mut child_transform = inherited_transform;
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     current_rect = crate::interp::intrinsics::Rect::new(
                         rect.x,
@@ -1048,25 +1271,66 @@ impl Interpreter {
                         rect.width,
                         rect.height,
                     );
-                    let bg = self.eval_color_prop(attrs, "bg");
-                    let radii = self.resolve_radii(attrs, "radius");
+                    let elem_idx = self.atlas.node_index(atlas_node);
+                    // RFC-0012 S5: a `disabled:` element still lays out and paints,
+                    // but the router gates every handler it registers below and
+                    // reports the `DISABLED` interaction state. Marked here, before
+                    // resolving state styles, so an `on disabled { … }` block takes
+                    // effect on the very frame the element becomes disabled.
+                    if self.eval_bool_prop(attrs, "disabled") == Some(true) {
+                        if let Some(idx) = elem_idx {
+                            self.router.set_disabled(idx);
+                        }
+                    }
+                    // RFC-0016: overlay any active `on <state>` block over the
+                    // base attributes against the live engine `StyleState` mask
+                    // *before* reading paint properties. Stateless boxes borrow
+                    // `attrs` unchanged (no clone). The base `attrs` still drive
+                    // event/handler registration below so hit targets are stable.
+                    let paint_state = elem_idx
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let paint_attrs = resolve_state_attrs(attrs, state_blocks, paint_state);
+                    let paint_attrs = paint_attrs.as_ref();
+                    // Resolve the paint-time transform once, up front, so it can
+                    // be applied both to a plain container's `bg` fill *and* to
+                    // the self-owned visuals of `Toggle`/`Slider`/`TextField`
+                    // (their track/fill/thumb/underline/caret are the element's
+                    // own quads, so RFC-0011's element-local transform applies to
+                    // them exactly as it does to a `Box` fill).
+                    // The element's own transform, then composed with the one
+                    // inherited from its ancestors (RFC-0011 group transforms) so
+                    // this box's fill, its widget visuals, its children, and its
+                    // text all move/scale as a group. Passed on to children below.
+                    let own_transform = self.resolve_transform(paint_attrs, current_rect);
+                    let transform = inherited_transform.compose(&own_transform);
+                    child_transform = transform;
+                    let bg = self.eval_color_prop(paint_attrs, "bg");
+                    let radii = self.resolve_radii(paint_attrs, "radius");
                     // `border` is a Color (catalog DECORATION); a present border
                     // draws a 2px ring of that colour.
-                    let border_color = self.eval_color_prop(attrs, "border");
+                    let border_color = self.eval_color_prop(paint_attrs, "border");
                     let border_width = if border_color.is_some() { 2.0 } else { 0.0 };
                     // `shadow` is a token (`sm`/`md`/`lg`) → an offset+blur drop
                     // shadow; any other non-empty value falls back to `md`.
                     let (shadow_dy, shadow_blur, shadow_color) =
-                        match self.eval_str_prop(attrs, "shadow").as_deref() {
+                        match self.eval_str_prop(paint_attrs, "shadow").as_deref() {
                             Some("sm") => (1.0_f32, 3.0_f32, Some(0x4400_0000_i64)),
                             Some("lg") => (6.0, 16.0, Some(0x6600_0000)),
                             Some("none") | None => (0.0, 0.0, None),
                             Some(_) => (3.0, 8.0, Some(0x5500_0000)),
                         };
                     let shadow_dx = 0.0_f32;
-                    let opacity = self
-                        .eval_float_prop(attrs, "opacity")
-                        .map_or(1.0, |v| v as f32);
+                    // The element's *effective* opacity: its own `opacity` prop
+                    // folded with whatever it inherited (RFC-0011 T4). Used for
+                    // this box's own fill and passed down so children (a Button's
+                    // label, a widget's visuals) dim with it.
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(paint_attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
+                    child_opacity = opacity;
                     let is_decorated = border_width > 0.0
                         || shadow_blur > 0.0
                         || (opacity - 1.0).abs() > f32::EPSILON;
@@ -1079,6 +1343,7 @@ impl Interpreter {
                             rect: [rect.x, rect.y, rect.width, rect.height],
                             color: super::intrinsics::color_to_rgba(color, false),
                             radii,
+                            transform,
                         };
                         let border_rgba = border_color
                             .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
@@ -1133,7 +1398,17 @@ impl Interpreter {
                     let element_name = name.as_str();
                     let hit_rect =
                         crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
-                    let elem_idx = self.atlas.node_index(atlas_node);
+
+                    // RFC-0016: an element that styles `on hover`/`on pressed` but
+                    // registers no handler still needs the engine to track the
+                    // pointer over it, so register a bare hover/press hit region.
+                    if let Some(idx) = elem_idx {
+                        if state_blocks.iter().any(|sb| {
+                            matches!(sb.state, StyleStateKind::Hover | StyleStateKind::Pressed)
+                        }) {
+                            self.router.track_region(idx, hit_rect);
+                        }
+                    }
 
                     // ── Widget-specific visual lowering & handler registration (M16/M19) ──
                     match element_name {
@@ -1144,6 +1419,8 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -1154,6 +1431,8 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -1164,6 +1443,8 @@ impl Interpreter {
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
+                                transform,
+                                opacity,
                                 frame,
                             );
                         }
@@ -1212,22 +1493,47 @@ impl Interpreter {
                         flat_ids,
                         flat_idx,
                         current_rect,
+                        child_opacity,
+                        child_transform,
                     );
                 }
             }
-            RenderNode::Image { attrs, src } => {
+            RenderNode::Image {
+                attrs,
+                state_blocks,
+                src,
+            } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    // RFC-0016: overlay active `on <state>` blocks before reading
+                    // paint properties (fit/radius/opacity).
+                    let state = self
+                        .atlas
+                        .node_index(atlas_node)
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let attrs = resolve_state_attrs(attrs, state_blocks, state);
+                    let attrs = attrs.as_ref();
                     let src_val = self
                         .binding_value(*src)
                         .and_then(|v| if let Value::Str(s) = v { Some(s) } else { None })
                         .unwrap_or_default();
                     let fit = self.eval_fit_prop(attrs);
                     let radii = self.resolve_radii(attrs, "radius");
-                    let opacity = self
-                        .eval_float_prop(attrs, "opacity")
-                        .map_or(1.0, |v| v as f32);
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
+                    // RFC-0011 group transforms: an `Image` carries no transform
+                    // field, so an ancestor's scale/translate is baked into its
+                    // rect (top-left through the transform, extents scaled per
+                    // axis). Rotation isn't representable here and is left to box
+                    // primitives — same limitation as `Text`.
+                    let tl = inherited_transform.apply_point([rect.x, rect.y]);
+                    let tw = rect.width * inherited_transform.scale[0];
+                    let th = rect.height * inherited_transform.scale[1];
                     frame.push_texture(byard_core::frame::TextureSampler {
-                        rect: [rect.x, rect.y, rect.width, rect.height],
+                        rect: [tl[0], tl[1], tw, th],
                         src: src_val,
                         fit,
                         radii,
@@ -1275,6 +1581,8 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
@@ -1292,8 +1600,9 @@ impl Interpreter {
         let radius = rect.h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [rect.x, rect.y, rect.w, rect.h],
-            color: track_color,
+            color: dim_alpha(track_color, opacity),
             radii: [radius; 4],
+            transform,
         });
 
         // Thumb: a white circle inset from the track edges, sliding L↔R.
@@ -1307,8 +1616,9 @@ impl Interpreter {
         };
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
             radii: [thumb_size / 2.0; 4],
+            transform,
         });
 
         // Tap handler to flip the bool (M16).
@@ -1332,6 +1642,8 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         // Keep the authored `f64` values for the value-write path: computing the
@@ -1368,8 +1680,9 @@ impl Interpreter {
         let track_r = track_h / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [rect.x, track_y, rect.w, track_h],
-            color: [0.40, 0.42, 0.48, 1.0],
+            color: dim_alpha([0.40, 0.42, 0.48, 1.0], opacity),
             radii: [track_r; 4],
+            transform,
         });
 
         // Fill up to the thumb.
@@ -1377,8 +1690,9 @@ impl Interpreter {
         if fill_w > 0.0 {
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, track_y, fill_w, track_h],
-                color: accent_rgba,
+                color: dim_alpha(accent_rgba, opacity),
                 radii: [track_r; 4],
+                transform,
             });
         }
 
@@ -1389,14 +1703,16 @@ impl Interpreter {
         let thumb_y = rect.y + (rect.h - thumb_size) / 2.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x, thumb_y, thumb_size, thumb_size],
-            color: accent_rgba,
+            color: dim_alpha(accent_rgba, opacity),
             radii: [thumb_size / 2.0; 4],
+            transform,
         });
         let inner = thumb_size - 5.0;
         frame.push_instance(byard_core::BoxInstance {
             rect: [thumb_x + 2.5, thumb_y + 2.5, inner, inner],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
             radii: [inner / 2.0; 4],
+            transform,
         });
 
         // Handlers: PointerDown + PointerDrag (M16).
@@ -1447,6 +1763,8 @@ impl Interpreter {
         rect: crate::interp::intrinsics::Rect,
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
+        opacity: f32,
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         let placeholder = self.eval_str_prop(attrs, "placeholder").unwrap_or_default();
@@ -1477,21 +1795,29 @@ impl Interpreter {
             let bar_h = 2.0_f32;
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
-                color: super::intrinsics::color_to_rgba(self.theme.primary, false),
+                color: dim_alpha(
+                    super::intrinsics::color_to_rgba(self.theme.primary, false),
+                    opacity,
+                ),
                 radii: [0.0; 4],
+                transform,
             });
         }
 
         let pad_x = 10.0_f32;
         let text_x = rect.x + pad_x;
         let text_y = rect.y + (rect.h - font_size) / 2.0;
+        // NOTE: `TextLine` carries no `Transform` field (RFC-0011 engine slice:
+        // only box primitives were given one), so the field's *text* does not
+        // follow `translate`/`scale`/`rotate` — the box visuals below (underline,
+        // caret) and its `bg` fill do. Same limitation as the `Text` intrinsic.
         if !display_text.is_empty() {
             frame.push_text(byard_core::TextLine {
                 x: text_x,
                 y: text_y,
                 text: display_text.clone(),
                 font_size,
-                color: super::intrinsics::color_to_rgba(text_color, false),
+                color: dim_alpha(super::intrinsics::color_to_rgba(text_color, false), opacity),
                 dirty: true,
             });
         }
@@ -1505,8 +1831,9 @@ impl Interpreter {
             };
             frame.push_instance(byard_core::BoxInstance {
                 rect: [text_x + measured + 1.0, text_y, 1.5, font_size],
-                color: [1.0, 1.0, 1.0, 1.0],
+                color: dim_alpha([1.0, 1.0, 1.0, 1.0], opacity),
                 radii: [0.0; 4],
+                transform,
             });
         }
 
@@ -1597,7 +1924,7 @@ impl Interpreter {
         for attr in attrs {
             if let AttrKind::Event { payload, action } = &attr.kind {
                 let event_kind = match attr.name.as_str() {
-                    "tap" => super::events::EventKind::Tap,
+                    "tap" | "click" => super::events::EventKind::Tap, // "click" is an alias (RFC-0012 §A)
                     "pointer_down" => super::events::EventKind::PointerDown,
                     "pointer_up" => super::events::EventKind::PointerUp,
                     "pointer_move" => super::events::EventKind::PointerMove,
@@ -1607,6 +1934,18 @@ impl Interpreter {
                     "key_down" => super::events::EventKind::KeyDown,
                     "key_up" => super::events::EventKind::KeyUp,
                     "text_input" => super::events::EventKind::TextInput,
+                    // RFC-0012 §A: the six modeled-but-previously-unexposed events.
+                    "hover" => super::events::EventKind::Hover,
+                    "pointer_enter" => super::events::EventKind::PointerEnter,
+                    "pointer_exit" => super::events::EventKind::PointerExit,
+                    "long_press" => super::events::EventKind::LongPress,
+                    "double_tap" => super::events::EventKind::DoubleTap,
+                    "secondary" => super::events::EventKind::Secondary,
+                    // RFC-0012 S2: `focus =>`/`blur =>` sugar over `focused_sig`'s
+                    // edges — registered as ordinary handlers here; `steal_focus`
+                    // fires them directly (see `interp::events::EventKind::Focus`).
+                    "focus" => super::events::EventKind::Focus,
+                    "blur" => super::events::EventKind::Blur,
                     _ => continue,
                 };
                 if let Ok(closure) = self.lower_action(action, payload.clone()) {
@@ -1618,30 +1957,101 @@ impl Interpreter {
         }
     }
 
-    /// Registers an element as focusable if it has a `focused:` prop attr (M16/M18).
+    /// Registers an element as focusable if it has a `focused:` prop attr
+    /// (M16/M18), **or** a `focus =>`/`blur =>` handler (RFC-0012 S2) — the
+    /// sugar rides `focused_sig`'s edges, so an element that only wants the
+    /// one-shot event (no bound `var`) still needs a signal for
+    /// `steal_focus` to flip. That signal is a fresh internal one when
+    /// `focused:` wasn't given, mirroring `render_text_field`'s same
+    /// bind-or-create pattern for its own `focused_sig`.
     fn register_focusable(
         &mut self,
         attrs: &[Attr],
         hit_rect: crate::interp::intrinsics::Rect,
         elem_idx: Option<u32>,
     ) {
-        if let Some(sig) = self.resolve_focused_sig(attrs) {
-            if let Some(idx) = elem_idx {
-                self.router.focusable(idx, hit_rect, sig);
-            }
+        // Without an index there is nowhere to register the focusable, so a
+        // freshly created internal signal below would just be dropped —
+        // bail out first rather than allocate one for nothing.
+        let Some(idx) = elem_idx else {
+            return;
+        };
+        let has_focus_sugar = attrs.iter().any(|a| {
+            matches!(a.kind, AttrKind::Event { .. }) && matches!(a.name.as_str(), "focus" | "blur")
+        });
+        let sig = self
+            .resolve_focused_sig(attrs)
+            .or_else(|| has_focus_sugar.then(|| self.ctx.create_signal(Value::Bool(false))));
+        if let Some(sig) = sig {
+            self.router.focusable(idx, hit_rect, sig);
         }
     }
 
     fn eval_color_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
-        attrs.iter().find_map(|a| {
-            if a.name.as_str() == name {
-                if let AttrKind::Prop { value } = &a.kind {
-                    let val = self.eval_pure(value);
-                    return val.as_int();
-                }
+        // Resolve the matching attribute value; a `with` colour animation
+        // (RFC-0010 A3) is driven through the OKLab path rather than the scalar
+        // one, since a packed `0xRRGGBB` can't be interpolated component-wise.
+        let value = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == name => Some(value),
+            _ => None,
+        })?;
+        if let Expr::Animated {
+            value: target,
+            anim,
+            span,
+        } = value
+        {
+            return Some(self.eval_animated_color(target, anim, *span));
+        }
+        self.eval_pure(value).as_int()
+    }
+
+    /// Drives one colour `with` animation (RFC-0010 A3): interpolates from the
+    /// current colour to the target in OKLab (one [`Motion`] per channel), so
+    /// the transition is perceptually uniform and interruptible. Returns the
+    /// current colour packed as `0xRRGGBB`.
+    ///
+    /// [`Motion`]: byard_core::frame::Motion
+    fn eval_animated_color(&mut self, target: &Expr, anim: &Expr, key: Span) -> i64 {
+        let target_int = self.eval_pure(target).as_int().unwrap_or(0);
+        // Without an advancing clock, jump straight to the target (mirrors the
+        // scalar path — never latch `has_active_animations` on t=0).
+        if !self.clock_set {
+            return target_int;
+        }
+        let Ok(curve) = crate::interp::anim::resolve_curve(anim) else {
+            return target_int;
+        };
+        let packed = pack_curve(curve);
+        let now = self.now_ms;
+        let target_oklab = oklab_from_hex(target_int);
+        let motions = self.color_animations.entry(key).or_insert_with(|| {
+            [0, 1, 2].map(|i| byard_core::frame::Motion {
+                from: target_oklab[i],
+                to: target_oklab[i],
+                start_ms: now,
+                curve: packed,
+            })
+        });
+        let mut current = [0.0_f32; 3];
+        let mut all_settled = true;
+        for (i, m) in motions.iter_mut().enumerate() {
+            if (m.to - target_oklab[i]).abs() > 1e-5 {
+                let here = m.sample(now);
+                m.from = here;
+                m.to = target_oklab[i];
+                m.start_ms = now;
             }
-            None
-        })
+            m.curve = packed;
+            current[i] = m.sample(now);
+            if !m.is_settled_with_eps(now, ANIM_SETTLE_EPS_POS, ANIM_SETTLE_EPS_VEL) {
+                all_settled = false;
+            }
+        }
+        if !all_settled {
+            self.any_active = true;
+        }
+        hex_from_oklab(current)
     }
 
     fn eval_int_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
@@ -1666,6 +2076,19 @@ impl Interpreter {
                         Value::Int(n) => Some(n as f64),
                         _ => None,
                     };
+                }
+            }
+            None
+        })
+    }
+
+    fn eval_bool_prop(&mut self, attrs: &[Attr], name: &str) -> Option<bool> {
+        attrs.iter().find_map(|a| {
+            if a.name.as_str() == name {
+                if let AttrKind::Prop { value } = &a.kind {
+                    if let Value::Bool(b) = self.eval_pure(value) {
+                        return Some(b);
+                    }
                 }
             }
             None
@@ -2040,6 +2463,267 @@ impl Interpreter {
         }
     }
 
+    /// Resolves the paint-time transform attributes (RFC-0011:
+    /// `translate`/`scale`/`rotate`/`origin`; `opacity` stays on its own
+    /// existing path — see the doc comment on `DecoratedBox`/`Transform` in
+    /// `frame.rs` for why). `rect` is the element's own laid-out rect,
+    /// logical pixels, needed to resolve a token/fractional `origin` into an
+    /// absolute pivot.
+    fn resolve_transform(
+        &mut self,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+    ) -> byard_core::frame::Transform {
+        let translate = self.resolve_axis_pair(attrs, "translate", (0.0, 0.0));
+        let scale = self.resolve_axis_pair(attrs, "scale", (1.0, 1.0));
+        let rotate = self.resolve_rotate(attrs).unwrap_or(0.0);
+        let origin = self.resolve_origin(attrs, rect);
+        byard_core::frame::Transform {
+            translate: [translate.0, translate.1],
+            scale: [scale.0, scale.1],
+            rotate,
+            origin: [origin.0, origin.1],
+            opacity: 1.0,
+        }
+    }
+
+    /// Resolves a two-axis prop (`translate`/`scale`) to `(x, y)` — RFC-0011's
+    /// dual surface: a bare scalar fills both axes; `(a, b)` binds positionally;
+    /// `(x: a, y: b)` sets any subset, order-independent, leaving the rest at
+    /// `default`. The sub-property form (`name.x: v` / `name.y: v`, a separate
+    /// `Attr` with `axis: Some(_)`) then overrides individual axes on top of
+    /// whatever the base `name: value` attribute (if any) already resolved —
+    /// so `translate.y: 2` alone is exactly `translate: (y: 2)`.
+    fn resolve_axis_pair(&mut self, attrs: &[Attr], name: &str, default: (f32, f32)) -> (f32, f32) {
+        let mut result = default;
+        if let Some(attr) = attrs
+            .iter()
+            .find(|a| a.name.as_str() == name && a.axis.is_none())
+        {
+            if let AttrKind::Prop { value } = &attr.kind {
+                result = self.resolve_axis_pair_value(value, default);
+            }
+        }
+        for attr in attrs
+            .iter()
+            .filter(|a| a.name.as_str() == name && a.axis.is_some())
+        {
+            let AttrKind::Prop { value } = &attr.kind else {
+                continue;
+            };
+            let span = value.span();
+            let val = self.eval_pure(value);
+            let Some(v) = spacing_value(&val) else {
+                self.errors.push(CompileError::AttributeTypeMismatch {
+                    span,
+                    expected: "a number".to_string(),
+                });
+                continue;
+            };
+            let Some(axis) = attr.axis.as_ref() else {
+                continue;
+            };
+            match axis.as_str() {
+                "x" => result.0 = v,
+                "y" => result.1 = v,
+                unknown => {
+                    let hint = crate::util::closest_match(unknown, ["x", "y"]).map(String::from);
+                    self.errors.push(CompileError::UnknownAttribute {
+                        span: attr.span,
+                        name: format!("{name}.{unknown}"),
+                        hint: hint.map(|h| format!("{name}.{h}")),
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// Parses one `translate`/`scale`-shaped [`Expr`] (scalar, positional
+    /// tuple, or named tuple) into `(x, y)` — the value-shape half of
+    /// [`Self::resolve_axis_pair`], factored out so [`Self::resolve_origin`]
+    /// can reuse the exact same tuple grammar for its own fractional pair.
+    fn resolve_axis_pair_value(&mut self, value: &Expr, default: (f32, f32)) -> (f32, f32) {
+        match value {
+            Expr::Tuple(args, span) => {
+                let any_named = args.iter().any(|a| a.name.is_some());
+                let all_named = args.iter().all(|a| a.name.is_some());
+                if any_named && !all_named {
+                    self.errors.push(CompileError::ConflictingSpacingField {
+                        span: *span,
+                        message: "cannot mix named and positional fields".to_string(),
+                    });
+                    return default;
+                }
+                if all_named {
+                    let (mut x, mut y) = (None, None);
+                    for arg in args {
+                        let Some(name) = &arg.name else { continue };
+                        let span = arg.value.span();
+                        let val = self.eval_pure(&arg.value);
+                        let Some(v) = spacing_value(&val) else {
+                            self.errors.push(CompileError::AttributeTypeMismatch {
+                                span,
+                                expected: "a number".to_string(),
+                            });
+                            continue;
+                        };
+                        match name.as_str() {
+                            "x" => assign_side(&mut x, v, "x", span, &mut self.errors),
+                            "y" => assign_side(&mut y, v, "y", span, &mut self.errors),
+                            unknown => {
+                                let hint = crate::util::closest_match(unknown, ["x", "y"])
+                                    .map(String::from);
+                                self.errors.push(CompileError::UnknownAttribute {
+                                    span,
+                                    name: unknown.to_string(),
+                                    hint,
+                                });
+                            }
+                        }
+                    }
+                    (x.unwrap_or(default.0), y.unwrap_or(default.1))
+                } else if args.len() == 2 {
+                    let x = self.eval_pure(&args[0].value);
+                    let y = self.eval_pure(&args[1].value);
+                    let x = spacing_value(&x).unwrap_or_else(|| {
+                        self.errors.push(CompileError::AttributeTypeMismatch {
+                            span: args[0].value.span(),
+                            expected: "a number".to_string(),
+                        });
+                        default.0
+                    });
+                    let y = spacing_value(&y).unwrap_or_else(|| {
+                        self.errors.push(CompileError::AttributeTypeMismatch {
+                            span: args[1].value.span(),
+                            expected: "a number".to_string(),
+                        });
+                        default.1
+                    });
+                    (x, y)
+                } else {
+                    self.errors.push(CompileError::ArityMismatch {
+                        span: *span,
+                        name: "translate/scale/origin".to_string(),
+                        expected: 2,
+                        found: args.len(),
+                    });
+                    default
+                }
+            }
+            other => {
+                let val = self.eval_pure(other);
+                if let Some(v) = spacing_value(&val) {
+                    (v, v)
+                } else {
+                    self.errors.push(CompileError::AttributeTypeMismatch {
+                        span: other.span(),
+                        expected: "a number".to_string(),
+                    });
+                    default
+                }
+            }
+        }
+    }
+
+    /// Resolves `rotate` (RFC-0011): the terse `rotate: 90deg` form or the
+    /// verbose `rotate: (angle: 90deg)` single-field tuple — both already
+    /// canonicalized to radians by the lexer's `Expr::AngleLit`. Absent →
+    /// `None` (caller defaults to `0.0`, no rotation).
+    fn resolve_rotate(&mut self, attrs: &[Attr]) -> Option<f32> {
+        let attr = attrs
+            .iter()
+            .find(|a| a.name.as_str() == "rotate" && a.axis.is_none())?;
+        let AttrKind::Prop { value } = &attr.kind else {
+            return None;
+        };
+        let inner = match value {
+            Expr::Tuple(args, _)
+                if args.len() == 1
+                    && args[0].name.as_ref().map(Symbol::as_str) == Some("angle") =>
+            {
+                &args[0].value
+            }
+            other => other,
+        };
+        let val = self.eval_pure(inner);
+        let Some(rad) = spacing_value(&val) else {
+            // A non-numeric `rotate` (e.g. `rotate: center`, or a reactive var
+            // that didn't resolve to a number) is a real mistake, not a no-op —
+            // flag it the same way `translate`/`scale` flag theirs instead of
+            // silently painting with no rotation.
+            self.errors.push(CompileError::AttributeTypeMismatch {
+                span: inner.span(),
+                expected: "an angle (e.g. 90deg, 1.5rad)".to_string(),
+            });
+            return None;
+        };
+        Some(rad)
+    }
+
+    /// Resolves `origin` (RFC-0011 T2) to an absolute logical-pixel pivot in
+    /// the same coordinate space as `rect`: a named token (`center` and the
+    /// four corners/edges), or a fractional `(fx, fy)` tuple relative to
+    /// `rect` (positional or named, reusing [`Self::resolve_axis_pair_value`]'s
+    /// tuple grammar). Absent, or an unrecognized token, defaults to `center`
+    /// — RFC-0011's own stated default — rather than hard-failing.
+    ///
+    /// Deliberately out of scope for now: the `px` absolute-origin suffix
+    /// (T2's third form) needs a new lexer literal this slice doesn't add;
+    /// only the token and fractional forms are implemented.
+    fn resolve_origin(
+        &mut self,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+    ) -> (f32, f32) {
+        let center = (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        let Some(attr) = attrs
+            .iter()
+            .find(|a| a.name.as_str() == "origin" && a.axis.is_none())
+        else {
+            return center;
+        };
+        let AttrKind::Prop { value } = &attr.kind else {
+            return center;
+        };
+        if let Expr::Ident(sym, span) = value {
+            const TOKENS: &[&str] = &[
+                "center",
+                "top_left",
+                "top_right",
+                "bottom_left",
+                "bottom_right",
+                "top",
+                "bottom",
+                "left",
+                "right",
+            ];
+            return match sym.as_str() {
+                "center" => center,
+                "top_left" => (rect.x, rect.y),
+                "top_right" => (rect.x + rect.w, rect.y),
+                "bottom_left" => (rect.x, rect.y + rect.h),
+                "bottom_right" => (rect.x + rect.w, rect.y + rect.h),
+                "top" => (rect.x + rect.w * 0.5, rect.y),
+                "bottom" => (rect.x + rect.w * 0.5, rect.y + rect.h),
+                "left" => (rect.x, rect.y + rect.h * 0.5),
+                "right" => (rect.x + rect.w, rect.y + rect.h * 0.5),
+                unknown => {
+                    let hint = crate::util::closest_match(unknown, TOKENS.iter().copied())
+                        .map(String::from);
+                    self.errors.push(CompileError::UnknownAttribute {
+                        span: *span,
+                        name: format!("origin: {unknown}"),
+                        hint,
+                    });
+                    center
+                }
+            };
+        }
+        let (fx, fy) = self.resolve_axis_pair_value(value, (0.5, 0.5));
+        (rect.x + fx * rect.w, rect.y + fy * rect.h)
+    }
+
     /// Processes a whole `View`: its declarations first (so bindings can resolve
     /// names), then lowers its top-level elements into a render tree, handling
     /// `when`/`for` structural members (M20).
@@ -2060,6 +2744,12 @@ impl Interpreter {
             Expr::FloatLit(f, _) => {
                 let f = *f;
                 Box::new(move |_| Value::Float(f))
+            }
+            // Already canonicalized to radians by the lexer (RFC-0011 T1) —
+            // from here on an angle is just a plain `Float`.
+            Expr::AngleLit(rad, _) => {
+                let rad = *rad;
+                Box::new(move |_| Value::Float(rad))
             }
             Expr::StrLit(parts, _) => self.lower_strlit(parts, payload_name),
             Expr::Ident(name, _) => self.lower_ident(name, payload_name),
@@ -2147,6 +2837,18 @@ impl Interpreter {
                     Box::new(|_| Value::Unit)
                 }
             }
+            // A `style { … }` value (RFC-0016) is consumed structurally — bound
+            // via `let` into the style table and spliced by `..` at lower time
+            // (see `register_style`/`expand_style_spreads`) — never projected as
+            // a scalar. Reaching here means it was used where a value was
+            // expected, which has no meaning; yield Unit.
+            Expr::StyleValue { .. } | Expr::Merge { .. } => Box::new(|_| Value::Unit),
+            // `value with anim.*(…)` (RFC-0010): lower to the *target* value.
+            // The curve is validated by the checker; the `Motion` runtime that
+            // actually drives the on-screen transition lands in the follow-up
+            // slice, so for now the target resolves instantly (as it did before
+            // any `with` was written), which is a safe, correct fallback.
+            Expr::Animated { value, .. } => self.lower_expr(value, payload_name),
             // Member access needs controller metadata (not modeled in Phase 2);
             // lambdas/assignments are actions, not projected values.
             Expr::Member { .. } | Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
@@ -2305,8 +3007,73 @@ impl Interpreter {
     /// Evaluates `expr` once, immediately, with no scope active (so nothing
     /// subscribes). Used to seed `var`s and to evaluate action operands.
     fn eval_pure(&mut self, expr: &Expr) -> Value {
+        // A `with` animation (RFC-0010) is driven here, at the single evaluation
+        // chokepoint, so every animatable scalar prop (opacity/scale/translate/
+        // rotate — all of which resolve through `eval_pure`) animates without
+        // per-prop plumbing. A non-animated value takes the ordinary path.
+        if let Expr::Animated { value, anim, span } = expr {
+            return self.eval_animated(value, anim, *span);
+        }
         let mut compute = self.lower_expr(expr, None);
         compute(&mut self.ctx)
+    }
+
+    /// Drives one `with` animation (RFC-0010): resolves the target and curve,
+    /// advances (or seeds) the persisted [`Motion`](byard_core::frame::Motion)
+    /// keyed by `key`, and returns the value sampled at the current engine time.
+    /// A target change reseeds `from` to the current on-screen value so a
+    /// mid-flight reversal is continuous.
+    fn eval_animated(&mut self, target: &Expr, anim: &Expr, key: Span) -> Value {
+        let target_val = match self.eval_pure(target) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            // A non-numeric target can't be interpolated — pass it through
+            // untouched (the checker already restricts `with` to numeric props).
+            other => return other,
+        };
+        // No advancing clock (a host that never calls `set_now_ms`, e.g. a
+        // non-animating test path): resolve straight to the target so an
+        // animation can never latch `has_active_animations` on `t = 0` forever.
+        if !self.clock_set {
+            return Value::Float(f64::from(target_val));
+        }
+        let Ok(curve) = crate::interp::anim::resolve_curve(anim) else {
+            // The checker already reported this; render the target inertly.
+            return Value::Float(f64::from(target_val));
+        };
+        let packed = pack_curve(curve);
+        let now = self.now_ms;
+        let motion = self
+            .animations
+            .entry(key)
+            .or_insert_with(|| byard_core::frame::Motion {
+                from: target_val,
+                to: target_val,
+                start_ms: now,
+                curve: packed,
+            });
+        // Retarget on a goal change: reseed `from` to where the property
+        // actually is right now (interruptible spring), restart the clock.
+        if (motion.to - target_val).abs() > f32::EPSILON {
+            let current = motion.sample(now);
+            motion.from = current;
+            motion.to = target_val;
+            motion.start_ms = now;
+        }
+        // Keep the curve in sync (a hot-reload may have edited it).
+        motion.curve = packed;
+        let sampled = motion.sample(now);
+        // `Motion::DEFAULT_EPS_*` are pixel-scaled (0.5), far too loose for the
+        // ratio/opacity/radian props that also animate through this one generic
+        // path — with them an ease-out could read "settled" while still visibly
+        // short of the target. Use tight, unit-agnostic epsilons: position is
+        // the final-value accuracy gate; the velocity gate keeps a spring's
+        // overshoot alive instead of freezing it at the first target crossing.
+        let settled = motion.is_settled_with_eps(now, ANIM_SETTLE_EPS_POS, ANIM_SETTLE_EPS_VEL);
+        if !settled {
+            self.any_active = true;
+        }
+        Value::Float(f64::from(sampled))
     }
 
     fn resolve_var(&self, target: &Expr, span: Span) -> Result<SignalId, CompileError> {
@@ -2397,6 +3164,182 @@ fn spacing_value(v: &Value) -> Option<f32> {
         Value::Int(n) => Some(*n as f32),
         Value::Float(f) => Some(*f as f32),
         _ => None,
+    }
+}
+
+/// Inserts `attr` into a resolved style set, replacing any existing attribute
+/// with the same name and sub-property axis (last-wins) or appending it — so a
+/// spread/inline override cleanly supersedes an earlier value (RFC-0016).
+fn override_attr(set: &mut Vec<Attr>, attr: Attr) {
+    if let Some(existing) = set
+        .iter_mut()
+        .find(|a| a.name == attr.name && a.axis == attr.axis)
+    {
+        *existing = attr;
+    } else {
+        set.push(attr);
+    }
+}
+
+/// Builds a flat attribute list for *validation only* (RFC-0016): the base
+/// attributes followed by every `on <state>` block's attributes, so a state
+/// block's `bg:`/`scale:`/… is checked against the intrinsic's §5 contract just
+/// like an inline attribute. Never emitted — rendering keeps base and states
+/// separate so states resolve per-frame against the live mask.
+fn attrs_with_states(base: &[Attr], states: &[StateBlock]) -> Vec<Attr> {
+    if states.is_empty() {
+        return base.to_vec();
+    }
+    let mut all = base.to_vec();
+    for sb in states {
+        all.extend(sb.attrs.iter().cloned());
+    }
+    all
+}
+
+/// Resolves an element's effective attributes for the current interaction state
+/// (RFC-0016 §"Resolution order"): the base set overlaid, last-wins, with each
+/// active `on <state>` block in **ascending** priority so the highest-priority
+/// active state wins — `hover < focused < pressed < disabled`. Blocks of the
+/// same state apply in written order (this is how `merge`/spread layering wins).
+///
+/// The common stateless case (no blocks) borrows the base with no allocation.
+fn resolve_state_attrs<'a>(
+    base: &'a [Attr],
+    state_blocks: &[StateBlock],
+    active: crate::interp::events::StyleState,
+) -> std::borrow::Cow<'a, [Attr]> {
+    use crate::interp::events::StyleState;
+    // Fixed ascending-priority order: a later state in this list overrides an
+    // earlier one when both are active (RFC-0012 S3 / RFC-0016).
+    const ORDER: [(StyleStateKind, StyleState); 4] = [
+        (StyleStateKind::Hover, StyleState::HOVER),
+        (StyleStateKind::Focused, StyleState::FOCUSED),
+        (StyleStateKind::Pressed, StyleState::PRESSED),
+        (StyleStateKind::Disabled, StyleState::DISABLED),
+    ];
+    if state_blocks.is_empty() {
+        return std::borrow::Cow::Borrowed(base);
+    }
+    let mut resolved = base.to_vec();
+    let mut touched = false;
+    for (kind, bit) in ORDER {
+        if !active.contains(bit) {
+            continue;
+        }
+        for sb in state_blocks.iter().filter(|sb| sb.state == kind) {
+            for a in &sb.attrs {
+                override_attr(&mut resolved, a.clone());
+            }
+            touched = true;
+        }
+    }
+    if touched {
+        std::borrow::Cow::Owned(resolved)
+    } else {
+        // No active block matched — avoid handing back a needless clone.
+        std::borrow::Cow::Borrowed(base)
+    }
+}
+
+/// Multiplies a colour's alpha by `opacity` — folds an element's effective
+/// opacity into the widget/text primitives it emits so a translucent control
+/// dims as a whole, not just its background (RFC-0011 T4 approximation).
+fn dim_alpha(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
+    color[3] *= opacity;
+    color
+}
+
+/// Converts a packed `0xRRGGBB` colour to OKLab `[L, a, b]` for perceptually
+/// uniform interpolation (RFC-0010 A3).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)] // standard colour-space notation
+fn oklab_from_hex(hex: i64) -> [f32; 3] {
+    let r = srgb_to_linear(((hex >> 16) & 0xFF) as f32 / 255.0);
+    let g = srgb_to_linear(((hex >> 8) & 0xFF) as f32 / 255.0);
+    let b = srgb_to_linear((hex & 0xFF) as f32 / 255.0);
+    // Björn Ottosson's linear-sRGB → OKLab.
+    let l = 0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b;
+    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
+    let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+    let (l_, m_, s_) = (l.cbrt(), m.cbrt(), s.cbrt());
+    [
+        0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_,
+        1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_,
+        0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_,
+    ]
+}
+
+/// Converts OKLab `[L, a, b]` back to a packed `0xRRGGBB` colour, clamping any
+/// out-of-gamut result (a spring can overshoot a channel).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names
+)] // standard colour-space notation
+fn hex_from_oklab(lab: [f32; 3]) -> i64 {
+    let [big_l, a, b] = lab;
+    let l_ = big_l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = big_l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = big_l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let r = 4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s;
+    let g = -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s;
+    let bl = -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s;
+    let to_byte = |c: f32| -> i64 { (linear_to_srgb(c).clamp(0.0, 1.0) * 255.0).round() as i64 };
+    (to_byte(r) << 16) | (to_byte(g) << 8) | to_byte(bl)
+}
+
+/// sRGB gamma → linear (per channel).
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear → sRGB gamma (per channel).
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Packs the compiler's typed [`Curve`](crate::interp::anim::Curve) into the
+/// engine's POD [`MotionCurve`](byard_core::frame::MotionCurve) (RFC-0010), so
+/// a resolved curve crosses the frame boundary as plain data.
+fn pack_curve(curve: crate::interp::anim::Curve) -> byard_core::frame::MotionCurve {
+    use crate::interp::anim::{Curve, EaseKind};
+    use byard_core::frame::MotionCurve;
+    #[allow(clippy::cast_precision_loss)]
+    match curve {
+        Curve::Linear { ms } => MotionCurve {
+            kind: MotionCurve::LINEAR,
+            params: [ms as f32, 0.0, 0.0],
+        },
+        Curve::Ease { ms, kind } => MotionCurve {
+            kind: match kind {
+                EaseKind::In => MotionCurve::EASE_IN,
+                EaseKind::Out => MotionCurve::EASE_OUT,
+                EaseKind::InOut => MotionCurve::EASE_IN_OUT,
+            },
+            params: [ms as f32, 0.0, 0.0],
+        },
+        Curve::Spring {
+            stiffness,
+            damping,
+            v0,
+        } => MotionCurve {
+            kind: MotionCurve::SPRING,
+            params: [stiffness, damping, v0],
+        },
     }
 }
 
@@ -3504,6 +4447,537 @@ mod tests {
         let instances = frame.instances();
         assert_eq!(instances.len(), 1, "expected exactly one BoxInstance");
         assert_eq!(instances[0].radii, [4.0, 8.0, 12.0, 16.0]);
+    }
+
+    // ── RFC-0011: paint-time transform attribute surface ─────────────────
+
+    #[test]
+    fn transform_attrs_reach_the_box_instance() {
+        let parsed = parse(
+            "View C() { Box #[bg: 0xFF0000, width: 50, height: 50, \
+             translate: (5, 10), scale: 1.5, rotate: 90deg] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let instances = frame.instances();
+        assert_eq!(instances.len(), 1);
+        let t = instances[0].transform;
+        assert_eq!(t.translate, [5.0, 10.0]);
+        assert_eq!(t.scale, [1.5, 1.5]);
+        assert!((t.rotate - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        // Unset `origin` defaults to the element's own center, not (0,0).
+        assert_eq!(t.origin, [25.0, 25.0]);
+    }
+
+    #[test]
+    fn with_animation_interpolates_toward_the_target_and_settles() {
+        // A linear ramp gives deterministic sample points to assert on.
+        let parsed = parse(
+            "View V() { var on: Bool = false \
+             Box #[bg: 0x808080, width: 10, height: 10, \
+             scale: on ? 2.0 : 1.0 with anim.linear(1000)] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+
+        let render_scale = |interp: &mut Interpreter, now: u32| -> f32 {
+            interp.set_now_ms(now);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame.instances()[0].transform.scale[0]
+        };
+
+        // At rest: target is 1.0, nothing is animating.
+        assert!((render_scale(&mut interp, 0) - 1.0).abs() < 1e-3);
+        assert!(!interp.has_active_animations());
+
+        // Flip the target to 2.0 at t=0 — the motion retargets from the current
+        // value (~1.0) and is now active.
+        let sig = interp.var_signal(&Symbol::intern("on")).unwrap();
+        interp.write_var(sig, Value::Bool(true));
+        interp.tick();
+        assert!(
+            (render_scale(&mut interp, 0) - 1.0).abs() < 1e-2,
+            "starts where it was"
+        );
+        assert!(
+            interp.has_active_animations(),
+            "a just-retargeted motion is active"
+        );
+
+        // Halfway through the 1000 ms ramp → ~1.5.
+        assert!((render_scale(&mut interp, 500) - 1.5).abs() < 5e-2);
+
+        // Past the end → arrived at 2.0 and settled (idle again).
+        assert!((render_scale(&mut interp, 1000) - 2.0).abs() < 1e-3);
+        assert!(
+            !interp.has_active_animations(),
+            "settles once the ramp completes"
+        );
+    }
+
+    #[test]
+    fn oklab_hex_round_trips_within_one_lsb() {
+        for hex in [
+            0x00_0000_i64,
+            0xFF_FFFF,
+            0x64_95ED,
+            0xEF_4444,
+            0x10_B981,
+            0x80_8080,
+        ] {
+            let back = hex_from_oklab(oklab_from_hex(hex));
+            for shift in [16, 8, 0] {
+                let a = (hex >> shift) & 0xFF;
+                let b = (back >> shift) & 0xFF;
+                assert!(
+                    (a - b).abs() <= 1,
+                    "channel drift for {hex:#08x}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_animation_lerps_color_in_oklab_and_settles() {
+        let parsed = parse(
+            "View V() { var on: Bool = false \
+             Box #[width: 10, height: 10, \
+             bg: on ? 0x000000 : 0xFFFFFF with anim.linear(1000)] }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+
+        let render_r = |interp: &mut Interpreter, now: u32| -> f32 {
+            interp.set_now_ms(now);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame.instances()[0].color[0]
+        };
+
+        // At rest the target is white; nothing is animating.
+        assert!((render_r(&mut interp, 0) - 1.0).abs() < 1e-2);
+        assert!(!interp.has_active_animations());
+
+        // Flip toward black: starts near white and is active.
+        let sig = interp.var_signal(&Symbol::intern("on")).unwrap();
+        interp.write_var(sig, Value::Bool(true));
+        interp.tick();
+        let start = render_r(&mut interp, 0);
+        assert!(start > 0.9, "starts near white, got {start}");
+        assert!(interp.has_active_animations());
+
+        // Mid-flight it's a grey between the endpoints, still moving.
+        let mid = render_r(&mut interp, 500);
+        assert!((0.05..0.95).contains(&mid), "mid-flight grey, got {mid}");
+
+        // Arrives at black and settles (idle again).
+        assert!(render_r(&mut interp, 1000) < 1e-2, "arrives black");
+        assert!(!interp.has_active_animations());
+    }
+
+    #[test]
+    fn animation_is_inert_until_the_clock_is_advanced() {
+        // A host that never advances the clock must resolve the value to its
+        // target and never mark it active — otherwise a wait-based runner would
+        // spin forever redrawing a motion pinned at t=0.
+        let parsed = parse(
+            "View V() { var on: Bool = true \
+             Box #[bg: 0x808080, width: 10, height: 10, \
+             scale: on ? 2.0 : 1.0 with anim.spring()] }",
+        );
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (frame.instances()[0].transform.scale[0] - 2.0).abs() < 1e-6,
+            "with no clock the value jumps straight to its target"
+        );
+        assert!(
+            !interp.has_active_animations(),
+            "an un-advanced clock must never leave an animation active"
+        );
+    }
+
+    #[test]
+    fn opacity_dims_descendant_text_not_only_the_background() {
+        // Regression: a translucent Button dims its *label* too, not just its
+        // background — `opacity` folds into the alpha of every primitive the
+        // element and its descendants emit.
+        let parsed = parse(
+            "View V() { var c: Int = 0 \
+             Button(\"x\") #[bg: 0x6495ED, opacity: 0.4, width: 100, height: 44] => c++ }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let label = frame
+            .texts()
+            .iter()
+            .find(|t| t.text == "x")
+            .expect("the button's label was emitted");
+        assert!(
+            (label.color[3] - 0.4).abs() < 1e-3,
+            "label alpha should inherit the 0.4 opacity, got {}",
+            label.color[3]
+        );
+    }
+
+    #[test]
+    fn style_value_spreads_onto_an_element_and_inline_overrides() {
+        // RFC-0016: a `let`-bound style is spliced by `..`, and inline attrs win.
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x112233, radius: 8 } \
+             Box #[..btn, width: 10, height: 10] {} \
+             Box #[..btn, bg: 0x445566, width: 10, height: 10] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let insts = frame.instances();
+        // First box takes `bg` from the spread (0x11 red channel).
+        assert!(
+            (insts[0].color[0] - f32::from(0x11u8) / 255.0).abs() < 1e-3,
+            "spread bg reaches the box, got {:?}",
+            insts[0].color
+        );
+        // Second box: inline `bg` overrides the spread (0x44 red channel).
+        assert!(
+            (insts[1].color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "inline bg overrides the spread, got {:?}",
+            insts[1].color
+        );
+    }
+
+    #[test]
+    fn merge_composes_two_styles_right_wins() {
+        // RFC-0016: `base merge overrides` — the right style wins on conflicts,
+        // the left's non-conflicting attributes survive.
+        let parsed = parse(
+            "View V() { \
+             let base = style { bg: 0x111111, radius: 8 } \
+             let hot = base merge style { bg: 0x445566 } \
+             Box #[..hot, width: 10, height: 10] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let inst = frame.instances()[0];
+        // `bg` comes from the right side of the merge (0x44 red channel)…
+        assert!(
+            (inst.color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "right style's bg wins, got {:?}",
+            inst.color
+        );
+        // …while `radius` (only on the base) survives (radii != 0).
+        assert!(inst.radii[0] > 0.0, "base radius survives the merge");
+    }
+
+    #[test]
+    fn parent_scale_is_inherited_by_child_text_and_boxes() {
+        // RFC-0011 group transforms: a scaled container carries its descendants —
+        // the reported bug was that a scaled parent's *text* stayed the same size.
+        let parsed = parse(
+            "View V() {\n Column #[scale: 2.0, width: 100, height: 100, bg: 0x111111] {\n \
+             Text(\"hi\") #[size: 10]\n Box #[bg: 0x222222, width: 20, height: 20]\n }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // The child text's font size doubled with the parent scale (the fix).
+        let line = frame
+            .texts()
+            .iter()
+            .find(|t| t.text == "hi")
+            .expect("the child text line is emitted");
+        assert!(
+            (line.font_size - 20.0).abs() < 1e-3,
+            "child text scaled 2× with its parent (10 → 20), got {}",
+            line.font_size
+        );
+
+        // Both boxes carry a 2× scale: the parent's own, and the child's inherited.
+        for inst in frame.instances() {
+            assert!(
+                (inst.transform.scale[0] - 2.0).abs() < 1e-3
+                    && (inst.transform.scale[1] - 2.0).abs() < 1e-3,
+                "every box in the group inherits the 2× scale, got {:?}",
+                inst.transform.scale
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_state_attrs_applies_priority_disabled_wins() {
+        // RFC-0016 resolution order: `disabled > pressed > focused > hover`.
+        use crate::interp::events::StyleState;
+        let sp = crate::diagnostics::Span::new(0, 0);
+        let prop = |name: &str, v: i64| Attr {
+            name: Symbol::intern(name),
+            axis: None,
+            kind: AttrKind::Prop {
+                value: Expr::IntLit(v, sp),
+            },
+            span: sp,
+        };
+        let base = vec![prop("bg", 1)];
+        let blocks = vec![
+            StateBlock {
+                state: StyleStateKind::Hover,
+                attrs: vec![prop("bg", 2)],
+                span: sp,
+            },
+            StateBlock {
+                state: StyleStateKind::Disabled,
+                attrs: vec![prop("bg", 3)],
+                span: sp,
+            },
+        ];
+
+        // No state active → base survives, and the borrow is cheap (no clone).
+        let none = resolve_state_attrs(&base, &blocks, StyleState::empty());
+        assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(find_int(&none, "bg"), Some(1));
+
+        // Hover alone → the hover block overlays.
+        let hov = resolve_state_attrs(&base, &blocks, StyleState::HOVER);
+        assert_eq!(find_int(&hov, "bg"), Some(2));
+
+        // Hover *and* disabled → disabled wins (highest priority).
+        let both = resolve_state_attrs(
+            &base,
+            &blocks,
+            StyleState::HOVER.union(StyleState::DISABLED),
+        );
+        assert_eq!(find_int(&both, "bg"), Some(3));
+    }
+
+    fn find_int(attrs: &[Attr], name: &str) -> Option<i64> {
+        attrs
+            .iter()
+            .find(|a| a.name == Symbol::intern(name))
+            .and_then(|a| match &a.kind {
+                AttrKind::Prop {
+                    value: Expr::IntLit(n, _),
+                } => Some(*n),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn disabled_state_block_recolours_in_the_same_frame() {
+        // A `disabled:` box with an `on disabled { bg }` block resolves the
+        // DISABLED state on the very frame it renders (the router is marked
+        // before state styles resolve), so the disabled bg wins immediately.
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x111111 on disabled { bg: 0x445566 } } \
+             Box #[..btn, disabled: true, width: 40, height: 20] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let inst = frame.instances()[0];
+        assert!(
+            (inst.color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "disabled bg overlays the base, got {:?}",
+            inst.color
+        );
+    }
+
+    #[test]
+    fn hover_state_block_recolours_after_pointer_enters() {
+        // RFC-0016: an `on hover { bg }` block lights up once the pointer moves
+        // over the element — even though the element registers no handler of its
+        // own (it is tracked as a bare hover region).
+        let parsed = parse(
+            "View V() { \
+             let btn = style { bg: 0x111111 on hover { bg: 0x445566 } } \
+             Box #[..btn, width: 40, height: 20] {} }",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+        // First frame: pointer hasn't entered, base bg (0x11 red channel).
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (frame.instances()[0].color[0] - f32::from(0x11u8) / 255.0).abs() < 1e-3,
+            "base bg before hover, got {:?}",
+            frame.instances()[0].color
+        );
+
+        // Move the pointer inside the box, then re-render.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerMove,
+            pos: (10.0, 10.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+        let mut frame2 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame2, 400.0, 300.0);
+        assert!(
+            (frame2.instances()[0].color[0] - f32::from(0x44u8) / 255.0).abs() < 1e-3,
+            "hover bg overlays after the pointer enters, got {:?}",
+            frame2.instances()[0].color
+        );
+    }
+
+    #[test]
+    fn unknown_state_name_is_an_error_with_a_hint() {
+        let parsed =
+            parse("View V() { let s = style { bg: 1 on hoover { bg: 2 } } Box #[..s] {} }");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownStyleState { .. })),
+            "an unknown state name must be an UnknownStyleState error, got {:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn spreading_a_non_style_is_an_error() {
+        let parsed = parse("View V() { let x = 5 Box #[..x, width: 10, height: 10] {} }");
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let _ = interp.lower_view(view, &[]);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::NotAStyle { .. })),
+            "spreading a non-style must be a NotAStyle error, got {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn no_transform_attrs_produces_identity() {
+        let parsed = parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50] }");
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // `origin` alone isn't checked against `Transform::IDENTITY`'s [0,0]:
+        // the compiler defaults an unset `origin` to the element's own
+        // center (RFC-0011's stated default), which is a real but *inert*
+        // difference from the engine's raw identity — pivot is irrelevant
+        // when scale = 1 and rotate = 0, so the render is pixel-identical.
+        let t = frame.instances()[0].transform;
+        assert_eq!(t.translate, [0.0, 0.0]);
+        assert_eq!(t.scale, [1.0, 1.0]);
+        assert_eq!(t.rotate, 0.0);
+        assert_eq!(t.opacity, 1.0);
+    }
+
+    #[test]
+    fn sub_property_axis_sets_one_axis_and_leaves_the_other_default() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, translate.y: 7] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(frame.instances()[0].transform.translate, [0.0, 7.0]);
+    }
+
+    #[test]
+    fn named_tuple_scale_sets_one_axis_and_leaves_the_other_at_one() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, scale: (y: 2.0)] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        assert_eq!(frame.instances()[0].transform.scale, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn origin_token_resolves_relative_to_the_laid_out_rect() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 40, height: 20, origin: top_left] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        // The Box lays out at the view's origin (0,0) by default.
+        assert_eq!(frame.instances()[0].transform.origin, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn unknown_origin_token_is_a_compile_error_with_a_hint() {
+        let parsed =
+            parse("View C() { Box #[bg: 0xFF0000, width: 50, height: 50, origin: centre] }");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let view = &parsed.views[0];
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(view, &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(matches!(
+            &interp.errors()[0],
+            CompileError::UnknownAttribute { hint: Some(h), .. } if h.contains("center")
+        ));
     }
 
     // ── M16: Toggle/Slider/TextField write-back ──────────────────────────

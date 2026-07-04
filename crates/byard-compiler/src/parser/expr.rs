@@ -46,6 +46,16 @@ impl Parser<'_> {
                 self.advance();
                 Expr::FloatLit(f, span)
             }
+            Some(Token::AngleLit(rad)) => {
+                self.advance();
+                Expr::AngleLit(rad, span)
+            }
+            // A `200ms` duration folds to a plain integer count of milliseconds
+            // (RFC-0010) — only read inside an `anim.*` curve call, as ms.
+            Some(Token::DurationLit(ms)) => {
+                self.advance();
+                Expr::IntLit(i64::from(ms), span)
+            }
             Some(Token::StrLit) => {
                 self.advance();
                 let parts = self.parse_string_literal(span);
@@ -55,6 +65,8 @@ impl Parser<'_> {
                 self.advance();
                 Expr::Ident(sym, span)
             }
+            Some(Token::Minus) => self.parse_negative(),
+            Some(Token::Style) => self.parse_style_value(),
             Some(Token::LBrack) => self.parse_array(),
             Some(Token::LParen) => self.parse_paren_or_lambda(),
             Some(Token::Pipe) => self.parse_pipe_lambda(),
@@ -63,6 +75,119 @@ impl Parser<'_> {
                 self.error("an expression");
                 // Do not consume: let the caller's recovery decide.
                 Expr::Error(span)
+            }
+        }
+    }
+
+    /// A first-class style value `style { name: value, … }` (RFC-0016) in
+    /// expression position (e.g. `let btn = style { … }`). Attributes are the
+    /// same `name: value` / `..spread` forms as an element's `#[…]`, separated
+    /// by commas or newlines. (The member-level `style { .class … }` rules
+    /// block is a separate, statement-level form.)
+    fn parse_style_value(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // `style`
+        self.expect(&Token::LBrace, "'{' after `style`");
+        let mut attrs = Vec::new();
+        let mut states = Vec::new();
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            if self.at_state_block() {
+                if let Some(sb) = self.parse_state_block() {
+                    states.push(sb);
+                }
+            } else if let Some(a) = self.parse_attr() {
+                attrs.push(a);
+            }
+            if self.pos == before {
+                self.advance(); // guarantee progress on a malformed attr
+            }
+            // Commas are optional (newlines separate too, but aren't tokens).
+            self.eat(&Token::Comma);
+        }
+        self.expect(&Token::RBrace, "'}' to close the style");
+        Expr::StyleValue {
+            attrs,
+            states,
+            span: self.span_from(start),
+        }
+    }
+
+    /// True when the cursor is on an `on <state> { … }` interaction-state block
+    /// (RFC-0016). `on` is a *contextual* keyword: it opens a state block only
+    /// here (followed by an identifier), so nothing else that spells `on` breaks.
+    fn at_state_block(&self) -> bool {
+        matches!(self.cur(), Some(Token::Ident(s)) if s.as_str() == "on")
+            && matches!(self.peek2(), Some(Token::Ident(_)))
+    }
+
+    /// Parses `on <state> { attr* }` (RFC-0016). An unknown state name records
+    /// an [`UnknownStyleState`](crate::diagnostics::CompileError::UnknownStyleState)
+    /// but the block body is still consumed so parsing recovers cleanly.
+    fn parse_state_block(&mut self) -> Option<super::ast::StateBlock> {
+        use super::ast::StyleStateKind;
+        let start = self.cur_span();
+        self.advance(); // `on`
+        let name_span = self.cur_span();
+        let name = self.expect_ident("an interaction state (hover/pressed/focused/disabled)")?;
+        let kind = StyleStateKind::from_name(name.as_str());
+        if kind.is_none() {
+            let hint =
+                crate::util::closest_match(name.as_str(), StyleStateKind::NAMES.iter().copied())
+                    .map(str::to_string);
+            self.errors
+                .push(crate::diagnostics::CompileError::UnknownStyleState {
+                    span: name_span,
+                    name: name.as_str().to_string(),
+                    hint,
+                });
+        }
+        self.expect(&Token::LBrace, "'{' after the interaction state");
+        let mut attrs = Vec::new();
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            if let Some(a) = self.parse_attr() {
+                attrs.push(a);
+            }
+            if self.pos == before {
+                self.advance();
+            }
+            self.eat(&Token::Comma);
+        }
+        self.expect(&Token::RBrace, "'}' to close the state block");
+        // Only yield a block for a known state — an unknown one is dropped (the
+        // error is already recorded) rather than silently mis-applied.
+        Some(super::ast::StateBlock {
+            state: kind?,
+            attrs,
+            span: self.span_from(start),
+        })
+    }
+
+    /// A negative numeric literal `-<number>`. Byld has no binary arithmetic
+    /// operators, so a leading `-` is only meaningful as the sign of a numeric
+    /// literal (e.g. `translate: (-8, 0)`, `rotate: -90deg`). Anything else
+    /// gets a targeted "a number after `-`" diagnostic instead of the generic
+    /// "expected an expression", so the dev-overlay message is actionable.
+    fn parse_negative(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // '-'
+        match self.cur().cloned() {
+            Some(Token::IntLit(n)) => {
+                self.advance();
+                Expr::IntLit(-n, self.span_from(start))
+            }
+            Some(Token::FloatLit(f)) => {
+                self.advance();
+                Expr::FloatLit(-f, self.span_from(start))
+            }
+            Some(Token::AngleLit(rad)) => {
+                self.advance();
+                Expr::AngleLit(-rad, self.span_from(start))
+            }
+            _ => {
+                self.error("a number after `-`");
+                Expr::Error(self.span_from(start))
             }
         }
     }
@@ -84,8 +209,19 @@ impl Parser<'_> {
                 left: 18,
                 right: 19,
             }),
-            // Ternary (right-assoc).
-            Token::Question => Some(Bp { left: 4, right: 3 }),
+            // Ternary (right-assoc). `right: 4` (not 3) so the else-branch is
+            // parsed one power *above* the `with` operator (left: 3) below — this
+            // is what makes `a ? b : c with k` group as `(a ? b : c) with k`
+            // (RFC-0010): the whole conditional is the animated value, not just
+            // the else-branch. Nothing else has left bp 3, so this is invisible
+            // to every other expression.
+            Token::Question => Some(Bp { left: 4, right: 4 }),
+            // `with` animation operator (RFC-0010): below the ternary, above
+            // assignment, so `(cond ? a : b) with anim.spring()` is the value.
+            Token::With => Some(Bp { left: 3, right: 3 }),
+            // `merge` style composition (RFC-0016): binds tighter than the
+            // ternary so `a merge b` is a single composed style; right-assoc.
+            Token::Merge => Some(Bp { left: 5, right: 6 }),
             // Assignment (right-assoc), lowest.
             Token::Eq | Token::PlusEq | Token::MinusEq => Some(Bp { left: 2, right: 1 }),
             _ => None,
@@ -140,6 +276,28 @@ impl Parser<'_> {
                     cond: Box::new(lhs),
                     then,
                     els,
+                    span: self.span_from(start),
+                }
+            }
+            // `value with anim.*(…)` (RFC-0010): `lhs` is the target value; the
+            // RHS is the `anim.*` curve call, resolved to a typed `Curve` at
+            // lowering. Parsed at `right_bp` (3) so it stops before an assignment.
+            Some(Token::With) => {
+                self.advance();
+                let anim = Box::new(self.parse_expr(right_bp));
+                Expr::Animated {
+                    value: Box::new(lhs),
+                    anim,
+                    span: self.span_from(start),
+                }
+            }
+            // `left merge right` (RFC-0016): compose two styles, right wins.
+            Some(Token::Merge) => {
+                self.advance();
+                let right = Box::new(self.parse_expr(right_bp));
+                Expr::Merge {
+                    left: Box::new(lhs),
+                    right,
                     span: self.span_from(start),
                 }
             }

@@ -42,8 +42,8 @@ fn demo_boxes_are_actually_painted_on_screen() {
     };
 
     // ── Logic side: render the real demo into a RenderFrame ───────────────
-    let logical_w = 600.0_f32;
-    let logical_h = 1000.0_f32;
+    let logical_w = 1280.0_f32;
+    let logical_h = 720.0_f32;
     let parsed = parse(SRC);
     assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
     let mut interp = Interpreter::new();
@@ -179,8 +179,8 @@ fn widget_inside_bordered_card_is_not_occluded() {
         return;
     };
 
-    let logical_w = 600.0_f32;
-    let logical_h = 1000.0_f32;
+    let logical_w = 1280.0_f32;
+    let logical_h = 720.0_f32;
     let parsed = parse(SRC);
     assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
     let mut interp = Interpreter::new();
