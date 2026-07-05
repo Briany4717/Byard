@@ -21,7 +21,9 @@ fn main() {
     let svg_path = args.next().unwrap_or_else(|| {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/svg/gear.svg").to_string()
     });
-    let out_path = args.next().unwrap_or_else(|| "msdf_preview.png".to_string());
+    let out_path = args
+        .next()
+        .unwrap_or_else(|| "msdf_preview.png".to_string());
 
     let svg_bytes = std::fs::read(&svg_path).unwrap_or_else(|e| {
         eprintln!("failed to read {svg_path}: {e}");
@@ -47,5 +49,8 @@ fn main() {
 }
 
 fn print_error(err: &CompileError, svg_path: &str) {
-    eprintln!("could not generate an MSDF field for {svg_path}: {}", err.headline());
+    eprintln!(
+        "could not generate an MSDF field for {svg_path}: {}",
+        err.headline()
+    );
 }
