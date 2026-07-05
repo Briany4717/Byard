@@ -22,6 +22,29 @@ use crate::frame::{AtlasUpload, VectorInstance};
 /// cells; the dev allocator (M48) grows layers on top of this.
 pub const ATLAS_SIZE: u32 = 2048;
 
+/// Array-layer count the dev atlas is created with (and, until layer-growth
+/// M48 lands, its hard cap — the JIT allocator must not exceed it).
+///
+/// **Must be ≥ 2.** The shader samples this atlas as a `texture_2d_array` (a
+/// `D2Array` view). On the GL backend, wgpu-hal maps a `D2` texture created with
+/// a *single* array layer to `GL_TEXTURE_2D`, not `GL_TEXTURE_2D_ARRAY`; binding
+/// that to a `sampler2DArray` then samples all-zero — every glyph reads as
+/// "fully outside" the field and paints nothing (`alpha 0`). Metal and DX12
+/// reinterpret a 1-layer texture as an array freely, which is why a 1-layer
+/// atlas only ever broke on Linux/GL (the Ubuntu CI, which has no Vulkan ICD and
+/// falls back to Mesa GL). Two layers is the minimum that forces a real array
+/// texture on every backend.
+pub const ATLAS_LAYERS: u32 = 2;
+
+// Compile-time guard for the invariant the doc comment above depends on: a
+// single-layer atlas is a `GL_TEXTURE_2D` on the GL backend, which the shader's
+// `sampler2DArray` binding samples as all-zero (invisible glyphs on Linux/GL).
+// Never drop below two without also changing the texture-array binding.
+const _: () = assert!(
+    ATLAS_LAYERS >= 2,
+    "the MSDF atlas must be a true array texture for the GL backend"
+);
+
 /// Vertex buffer layout for [`VectorInstance`] (locations 1..=5; the static quad
 /// occupies location 0). Matches `vector_msdf.wgsl`'s `InstanceInput`.
 #[must_use]

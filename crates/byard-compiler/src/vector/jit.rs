@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use byard_core::encoder::vector_msdf::ATLAS_SIZE;
+use byard_core::encoder::vector_msdf::{ATLAS_LAYERS, ATLAS_SIZE};
 use byard_core::frame::{AtlasUpload, Rect};
 use crossbeam_channel::{Receiver, Sender};
 
@@ -59,9 +59,12 @@ struct JitMessage {
 
 const CELLS_PER_ROW: u32 = ATLAS_SIZE / GRID_SIZE;
 const CELLS_PER_LAYER: u32 = CELLS_PER_ROW * CELLS_PER_ROW;
-/// Fixed layer cap for this minimal allocator; the shelf/skyline + LRU
-/// allocator replaces this with growth + eviction.
-const MAX_LAYERS: u32 = 4;
+/// Fixed layer cap for this minimal allocator. Tied to the atlas the render
+/// thread actually creates ([`ATLAS_LAYERS`]) so the allocator can never hand
+/// out a layer the atlas doesn't have — an upload to a nonexistent layer is
+/// dropped by `VectorAtlas::apply_uploads`. The shelf/skyline + LRU allocator
+/// (M48) replaces this with growth + eviction.
+const MAX_LAYERS: u32 = ATLAS_LAYERS;
 
 /// Cache + dispatcher for dev-mode MSDF generation, owned by the interpreter.
 pub struct VectorJit {

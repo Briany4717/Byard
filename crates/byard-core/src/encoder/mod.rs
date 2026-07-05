@@ -462,13 +462,16 @@ impl EncoderSubsystem {
             surface_format,
         )
         .await?;
-        // One layer to start; the dev allocator (M48) grows this on demand.
+        // The atlas is an *array* texture (`vector_msdf::ATLAS_LAYERS` layers):
+        // it must be a real `GL_TEXTURE_2D_ARRAY` on the GL backend, so a single
+        // layer is not an option — see `ATLAS_LAYERS`. The dev allocator (M48)
+        // grows layers on top of this on demand.
         let vector_atlas = VectorAtlas::new(
             &device,
             &vector_atlas_layout,
             &vector_sampler,
             vector_msdf::ATLAS_SIZE,
-            1,
+            vector_msdf::ATLAS_LAYERS,
         );
 
         let (persistent_color, persistent_view) =
