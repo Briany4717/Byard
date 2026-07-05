@@ -357,9 +357,9 @@ const APP_ID: &str = "dev.byard.Byard";
     target_os = "dragonfly"
 ))]
 fn with_app_id(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
-    use winit::platform::wayland::WindowAttributesExtWayland as _;
-    use winit::platform::x11::WindowAttributesExtX11 as _;
-    // Fully-qualified: both traits are in scope and both expose `with_name`.
+    // Fully-qualified rather than `use`d as a trait: both extension traits
+    // expose `with_name`, so bringing them into scope would be ambiguous (and
+    // an unused import on the call that doesn't resolve through it).
     let attrs =
         winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, APP_ID, "byard");
     winit::platform::x11::WindowAttributesExtX11::with_name(attrs, APP_ID, "byard")
