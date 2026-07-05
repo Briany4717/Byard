@@ -243,6 +243,18 @@ impl Engine {
             .await
             .map_err(|_| ByardError::UnsupportedBackend)?;
 
+        // Surfaced unconditionally (not gated behind a verbose/debug flag):
+        // which adapter and backend actually got picked is exactly the
+        // information needed to diagnose "nothing renders, no error" reports —
+        // a software/CPU adapter (`DeviceType::Cpu`) or an unexpected backend
+        // (e.g. GL instead of Vulkan) explains a great deal that would
+        // otherwise look like a silent failure.
+        let info = adapter.get_info();
+        eprintln!(
+            "  GPU adapter: {} ({:?}, {:?} backend, driver: {})",
+            info.name, info.device_type, info.backend, info.driver
+        );
+
         // --- Logical device ---
         // wgpu 29: request_device takes only &DeviceDescriptor (trace path moved
         // into DeviceDescriptor::trace); use ..Default::default() to zero-fill
