@@ -174,11 +174,12 @@ impl<H: PlatformHost> ApplicationHandler<FramePublished> for WinitApp<H> {
             return;
         }
 
-        let window = match event_loop.create_window(
+        let attributes = with_app_id(
             Window::default_attributes()
                 .with_title(&self.title)
                 .with_inner_size(LogicalSize::new(self.width, self.height)),
-        ) {
+        );
+        let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 self.fail(event_loop, ByardError::Platform(e.to_string()));
@@ -324,6 +325,57 @@ impl<H: PlatformHost> ApplicationHandler<FramePublished> for WinitApp<H> {
             }
         }
     }
+}
+
+/// Stable free-desktop application id (Wayland `app_id` / X11 `WM_CLASS`).
+///
+/// Set so a running Byard window is attributed to a real application by the
+/// desktop shell instead of the generic "Unknown"/"Desconocido" label a
+/// Wayland toplevel with no `app_id` gets, and so a future
+/// `dev.byard.Byard.desktop` can supply the taskbar icon and name.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const APP_ID: &str = "dev.byard.Byard";
+
+/// Applies the free-desktop application id to `attrs` on Wayland and X11.
+///
+/// winit exposes the app id only through its per-backend attribute extension
+/// traits. Both are available on free-desktop targets and applying both is
+/// correct: a Wayland session ignores the X11 `WM_CLASS` and vice versa. On
+/// macOS/Windows/mobile there is no such concept, so the other definition below
+/// is the identity.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn with_app_id(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    // Fully-qualified rather than `use`d as a trait: both extension traits
+    // expose `with_name`, so bringing them into scope would be ambiguous (and
+    // an unused import on the call that doesn't resolve through it).
+    let attrs =
+        winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, APP_ID, "byard");
+    winit::platform::x11::WindowAttributesExtX11::with_name(attrs, APP_ID, "byard")
+}
+
+/// No-op on platforms without a free-desktop application id (macOS, Windows,
+/// mobile): the window title is the only identifier those shells use.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn with_app_id(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    attrs
 }
 
 /// Converts a `winit` physical size + DPI scale factor into a

@@ -243,6 +243,18 @@ impl Engine {
             .await
             .map_err(|_| ByardError::UnsupportedBackend)?;
 
+        // Surfaced unconditionally (not gated behind a verbose/debug flag):
+        // which adapter and backend actually got picked is exactly the
+        // information needed to diagnose "nothing renders, no error" reports —
+        // a software/CPU adapter (`DeviceType::Cpu`) or an unexpected backend
+        // (e.g. GL instead of Vulkan) explains a great deal that would
+        // otherwise look like a silent failure.
+        let info = adapter.get_info();
+        eprintln!(
+            "  GPU adapter: {} ({:?}, {:?} backend, driver: {})",
+            info.name, info.device_type, info.backend, info.driver
+        );
+
         // --- Logical device ---
         // wgpu 29: request_device takes only &DeviceDescriptor (trace path moved
         // into DeviceDescriptor::trace); use ..Default::default() to zero-fill
@@ -276,6 +288,26 @@ impl Engine {
             .copied()
             .unwrap_or(caps.formats[0]);
 
+        // --- Composite alpha negotiation ---
+        // The UI clears its target to `Color::TRANSPARENT` (an incremental
+        // frame needs a genuinely empty background to blend onto), so the
+        // presented image carries a zero alpha in its cleared regions. Under a
+        // *non-opaque* composite mode the window manager then blends the whole
+        // window against the desktop and the app looks fully transparent — a
+        // frozen, see-through window on X11, and on Wayland a toplevel the
+        // compositor may not visibly map at all. macOS/Metal and Windows/DX12
+        // happen to report `Opaque` first so `alpha_modes[0]` was invisibly
+        // "correct" there; most Linux drivers report a transparent mode first,
+        // which is the real cause of the "window never appears" report. Pick
+        // `Opaque` explicitly whenever the surface offers it, so the alpha
+        // channel is ignored at composite time and the cleared background reads
+        // as solid on every platform.
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+
         // --- Surface configuration (physical pixels — wgpu requirement) ---
         //
         // COPY_DST is required in addition to RENDER_ATTACHMENT: per RFC §3.3's
@@ -291,7 +323,7 @@ impl Engine {
             width,
             height,
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -371,6 +403,13 @@ impl Engine {
     /// need it. See [`Relay::set_frame_waker`](crate::relay::Relay::set_frame_waker).
     pub fn set_frame_waker(&self, waker: crate::relay::FrameWaker) {
         self.relay.set_frame_waker(waker);
+    }
+
+    /// Installs the channel this engine reports applied vector-atlas-upload
+    /// ids through (RFC-0009 §2-C) — see
+    /// [`EncoderSubsystem::set_vector_ack_sender`](crate::encoder::EncoderSubsystem::set_vector_ack_sender).
+    pub fn set_vector_ack_sender(&mut self, tx: crossbeam_channel::Sender<u64>) {
+        self.encoder.set_vector_ack_sender(tx);
     }
 
     /// Notifies the engine that the window surface has been resized.
@@ -536,6 +575,16 @@ impl Engine {
     /// Returns [`ByardError::RenderSurface`] only on unrecoverable surface
     /// errors such as out-of-memory or GPU timeout.
     pub fn render_latest(&mut self) -> Result<(), ByardError> {
+        // Nothing published yet (the logic thread hasn't produced its first
+        // frame): skip *before* touching the surface. Acquiring a surface
+        // texture and dropping it without `present()` is an anti-pattern — on
+        // Wayland/FIFO it churns the swapchain acquire without ever committing a
+        // buffer, so the window can sit unmapped ("loading", no error) until the
+        // first real frame instead of drawing as soon as one lands.
+        let Some(relay_frame) = self.relay.current() else {
+            return Ok(());
+        };
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -567,10 +616,6 @@ impl Engine {
                 Err(_other) => {}
             }
         }
-
-        let Some(relay_frame) = self.relay.current() else {
-            return Ok(());
-        };
 
         let cmd = self
             .encoder

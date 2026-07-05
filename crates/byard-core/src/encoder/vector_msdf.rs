@@ -22,6 +22,29 @@ use crate::frame::{AtlasUpload, VectorInstance};
 /// cells; the dev allocator (M48) grows layers on top of this.
 pub const ATLAS_SIZE: u32 = 2048;
 
+/// Array-layer count the dev atlas is created with (and, until layer-growth
+/// M48 lands, its hard cap — the JIT allocator must not exceed it).
+///
+/// **Must be ≥ 2.** The shader samples this atlas as a `texture_2d_array` (a
+/// `D2Array` view). On the GL backend, wgpu-hal maps a `D2` texture created with
+/// a *single* array layer to `GL_TEXTURE_2D`, not `GL_TEXTURE_2D_ARRAY`; binding
+/// that to a `sampler2DArray` then samples all-zero — every glyph reads as
+/// "fully outside" the field and paints nothing (`alpha 0`). Metal and DX12
+/// reinterpret a 1-layer texture as an array freely, which is why a 1-layer
+/// atlas only ever broke on Linux/GL (the Ubuntu CI, which has no Vulkan ICD and
+/// falls back to Mesa GL). Two layers is the minimum that forces a real array
+/// texture on every backend.
+pub const ATLAS_LAYERS: u32 = 2;
+
+// Compile-time guard for the invariant the doc comment above depends on: a
+// single-layer atlas is a `GL_TEXTURE_2D` on the GL backend, which the shader's
+// `sampler2DArray` binding samples as all-zero (invisible glyphs on Linux/GL).
+// Never drop below two without also changing the texture-array binding.
+const _: () = assert!(
+    ATLAS_LAYERS >= 2,
+    "the MSDF atlas must be a true array texture for the GL backend"
+);
+
 /// Vertex buffer layout for [`VectorInstance`] (locations 1..=5; the static quad
 /// occupies location 0). Matches `vector_msdf.wgsl`'s `InstanceInput`.
 #[must_use]
@@ -32,6 +55,7 @@ pub fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
         3 => Float32x4, // color
         4 => Float32,   // px_range
         5 => Uint32,    // atlas_layer
+        6 => Float32,   // depth (RFC-0011 cross-pass paint order)
     ];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<VectorInstance>() as wgpu::BufferAddress,
@@ -166,13 +190,25 @@ impl VectorAtlas {
     /// Applies pending MSDF-field uploads to the atlas (RFC-0009 §2-C / INV-8).
     /// **Render thread only** — this is the single place a `Queue::write_texture`
     /// for the atlas is issued. Out-of-bounds uploads are skipped defensively.
-    pub fn apply_uploads(&self, queue: &wgpu::Queue, uploads: &[AtlasUpload]) {
+    /// Returns the `id` of every upload actually applied, so the caller can
+    /// acknowledge them back to whoever is resending unconfirmed uploads.
+    #[must_use]
+    pub fn apply_uploads(&self, queue: &wgpu::Queue, uploads: &[AtlasUpload]) -> Vec<u64> {
+        let mut applied = Vec::with_capacity(uploads.len());
         for up in uploads {
             if up.layer >= self.layers || up.width == 0 || up.height == 0 {
+                eprintln!(
+                    "vector: dropping out-of-bounds atlas upload (layer {} of {}, {}x{})",
+                    up.layer, self.layers, up.width, up.height
+                );
                 continue;
             }
             let expected = (up.width as usize) * (up.height as usize) * 4;
             if up.bytes.len() < expected {
+                eprintln!(
+                    "vector: dropping undersized atlas upload ({} bytes, expected {expected})",
+                    up.bytes.len()
+                );
                 continue;
             }
             queue.write_texture(
@@ -198,7 +234,9 @@ impl VectorAtlas {
                     depth_or_array_layers: 1,
                 },
             );
+            applied.push(up.id);
         }
+        applied
     }
 }
 
@@ -262,7 +300,10 @@ pub async fn build_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        // Shares the pass's draw-order depth buffer with the other pipelines
+        // (RFC-0011 cross-pass paint order) — required for pipeline/pass
+        // compatibility even where a caller doesn't care about ordering.
+        depth_stencil: Some(crate::encoder::draw_depth_stencil()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,

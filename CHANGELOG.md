@@ -12,6 +12,13 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0009 `VectorIcon` renders live in `byard dev`.** The `VectorMSDF`
+  pipeline is now actually wired into the render loop (atlas + pipeline built
+  at startup, drawn every frame) and participates in cross-pipeline paint
+  order like every other primitive. A background dev-mode dispatcher generates
+  each icon's field on its own worker thread the first time it's referenced;
+  the call site paints a zero-opacity placeholder until the field lands, then
+  the icon appears — no stall, no re-render trigger needed from the caller.
 - **RFC-0009 vector/icon MSDF generator.** `byard_compiler::vector` turns an
   SVG icon into a multi-channel signed distance field: a structural complexity
   guardrail (rejects gradients, patterns, filters, and oversized path sets),
