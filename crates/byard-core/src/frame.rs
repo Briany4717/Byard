@@ -726,6 +726,11 @@ pub struct AtlasUpload {
     pub height: u32,
     /// The RGBA8 MSDF field bytes (`width * height * 4`), owned (INV-3).
     pub bytes: Vec<u8>,
+    /// Caller-assigned identity for this upload (monotonic per-generator),
+    /// echoed back through an acknowledgment channel once the render thread
+    /// actually applies it — lets the caller resend an upload indefinitely
+    /// until confirmed, rather than guessing a fixed retry window.
+    pub id: u64,
 }
 
 /// A single line of text to be rendered in a frame.
@@ -1198,6 +1203,7 @@ mod tests {
             y: 0,
             width: 2,
             height: 2,
+            id: 0,
             bytes: vec![0u8; 2 * 2 * 4],
         });
         assert_eq!(frame.vector_instances().len(), 1);

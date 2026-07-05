@@ -443,8 +443,14 @@ impl PlatformHost for App {
         // and makes input-driven redraws prompt if the mode ever changes.
         engine.set_frame_waker(waker);
 
+        // RFC-0009 §2-C: the render thread reports which vector-atlas
+        // uploads it actually applied through this channel, so the dev JIT
+        // cache (on the logic thread) knows when to stop re-sending one.
+        let (vector_ack_tx, vector_ack_rx) = crossbeam_channel::unbounded();
+        engine.set_vector_ack_sender(vector_ack_tx);
+
         engine.start_logic_from_view(move |_arena| {
-            let (interp, tree, current_views) = if initial_views.is_empty() {
+            let (mut interp, tree, current_views) = if initial_views.is_empty() {
                 (Interpreter::new(), vec![], vec![])
             } else {
                 let mut interp = Interpreter::new();
@@ -454,6 +460,7 @@ impl PlatformHost for App {
                 interp.tick();
                 (interp, tree, initial_views)
             };
+            interp.set_vector_ack_receiver(vector_ack_rx);
 
             Box::new(ByldRuntime {
                 interp,

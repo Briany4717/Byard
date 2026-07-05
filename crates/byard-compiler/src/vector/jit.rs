@@ -37,27 +37,20 @@ enum CacheEntry {
     Resident {
         glyph: ResidentGlyph,
         /// Owned field bytes, kept around so the upload can be **re-emitted**
-        /// on the next few ticks (see [`RESEND_TICKS`]) — not just this one.
+        /// on every tick until [`ack_receiver`](VectorJit) confirms the render
+        /// thread actually applied it.
         bytes: std::sync::Arc<[u8]>,
         width: u32,
         height: u32,
-        /// Remaining ticks this upload will still be attached to the frame.
-        resend_remaining: u8,
+        /// This upload's identity, echoed back through the ack channel.
+        upload_id: u64,
+        /// Set once the render thread confirms it applied `upload_id`.
+        acked: bool,
     },
     /// Generation failed; stays a permanent placeholder until a hot-reload
     /// invalidates the entry.
     Failed,
 }
-
-/// How many ticks after a glyph becomes resident its `AtlasUpload` keeps
-/// being re-attached to the frame. `RenderFrame`s are read on a latest-wins
-/// basis by the render thread (RFC-0001 §5.2 double buffering) — a one-shot
-/// upload can land in a tick the render thread happens to skip and be lost
-/// forever (the cache would believe the cell is resident while the real GPU
-/// texture never received its bytes). Resending for a short window makes
-/// that essentially impossible without needing a render-thread acknowledgement
-/// channel.
-const RESEND_TICKS: u8 = 12;
 
 struct JitMessage {
     handle: String,
@@ -76,6 +69,12 @@ pub struct VectorJit {
     sender: Sender<JitMessage>,
     receiver: Receiver<JitMessage>,
     next_cell: u32,
+    next_upload_id: u64,
+    /// Receives the ids of uploads the render thread has actually applied
+    /// (wired in by the host via [`VectorJit::set_ack_receiver`]; `None` in
+    /// contexts with no render thread, e.g. most unit tests — an upload then
+    /// simply keeps resending forever, which is harmless there).
+    ack_receiver: Option<Receiver<u64>>,
 }
 
 impl Default for VectorJit {
@@ -86,6 +85,8 @@ impl Default for VectorJit {
             sender,
             receiver,
             next_cell: 0,
+            next_upload_id: 0,
+            ack_receiver: None,
         }
     }
 }
@@ -95,6 +96,15 @@ impl VectorJit {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wires in the channel the render thread reports applied-upload ids
+    /// through (see [`byard_core::encoder::EncoderSubsystem::set_vector_ack_sender`]).
+    /// Without this, a resident glyph's upload is re-attached to every tick's
+    /// frame forever rather than only until acknowledged — correct but
+    /// wasteful, so callers with a real render thread should always wire it.
+    pub fn set_ack_receiver(&mut self, rx: Receiver<u64>) {
+        self.ack_receiver = Some(rx);
     }
 
     /// Looks up `handle` (an SVG file path). Returns its resident atlas
@@ -117,6 +127,7 @@ impl VectorJit {
     }
 
     fn dispatch(&self, handle: String) {
+        eprintln!("vector: dispatching generation for {handle:?}");
         let tx = self.sender.clone();
         std::thread::spawn(move || {
             let result = std::fs::read(&handle)
@@ -130,13 +141,34 @@ impl VectorJit {
 
     /// Drains every generation that completed since the last call, allocates
     /// each a fresh atlas cell, marks it resident, and returns the
-    /// [`AtlasUpload`]s to attach to this tick's frame — plus a re-send of any
-    /// still-fresh resident upload (see [`RESEND_TICKS`]), so a `RenderFrame`
-    /// the render thread happens to skip never permanently loses an upload.
-    /// **Logic thread only** (INV-2) — call once per tick, before building
-    /// the frame.
+    /// [`AtlasUpload`]s to attach to this tick's frame — plus a re-send of
+    /// every still-unacknowledged resident upload, so a `RenderFrame` the
+    /// render thread happens to skip never permanently loses one. **Logic
+    /// thread only** (INV-2) — call once per tick, before building the frame.
     pub fn drain_ready(&mut self) -> Vec<AtlasUpload> {
         let mut uploads = Vec::new();
+
+        // Mark acknowledged uploads first, so the resend pass below doesn't
+        // re-attach one the render thread already confirmed this same tick.
+        if let Some(rx) = &self.ack_receiver {
+            let mut acked_ids = std::collections::HashSet::new();
+            while let Ok(id) = rx.try_recv() {
+                acked_ids.insert(id);
+            }
+            if !acked_ids.is_empty() {
+                for entry in self.entries.values_mut() {
+                    if let CacheEntry::Resident {
+                        upload_id, acked, ..
+                    } = entry
+                    {
+                        if acked_ids.contains(upload_id) {
+                            *acked = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Handles that just became resident this call already have their one
         // upload pushed below; skip them in the resend pass so they aren't
         // double-uploaded on their very first tick.
@@ -156,6 +188,8 @@ impl VectorJit {
                             cell_size / atlas_size,
                             cell_size / atlas_size,
                         );
+                        let upload_id = self.next_upload_id;
+                        self.next_upload_id += 1;
                         let bytes: std::sync::Arc<[u8]> = glyph.bitmap.into();
                         uploads.push(AtlasUpload {
                             layer,
@@ -164,7 +198,12 @@ impl VectorJit {
                             width: glyph.width,
                             height: glyph.height,
                             bytes: bytes.to_vec(),
+                            id: upload_id,
                         });
+                        eprintln!(
+                            "vector: {:?} is now resident (layer {layer}, cell {x},{y}, {}x{} px)",
+                            msg.handle, glyph.width, glyph.height
+                        );
                         just_completed.insert(msg.handle.clone());
                         self.entries.insert(
                             msg.handle,
@@ -177,9 +216,8 @@ impl VectorJit {
                                 bytes,
                                 width: glyph.width,
                                 height: glyph.height,
-                                // Already pushed one upload above; resend the
-                                // remaining budget on subsequent ticks.
-                                resend_remaining: RESEND_TICKS - 1,
+                                upload_id,
+                                acked: false,
                             },
                         );
                     } else {
@@ -199,8 +237,10 @@ impl VectorJit {
                 }
             }
         }
-        // Re-attach any still-fresh resident upload so a skipped RenderFrame
-        // never loses it permanently.
+        // Re-attach every still-unacknowledged resident upload so a skipped
+        // RenderFrame never loses it permanently — no arbitrary time or tick
+        // limit, since generation/render pacing can't be bounded in general;
+        // this simply stops once the render thread confirms receipt.
         for (handle, entry) in &mut self.entries {
             if just_completed.contains(handle) {
                 continue;
@@ -210,10 +250,11 @@ impl VectorJit {
                 bytes,
                 width,
                 height,
-                resend_remaining,
+                upload_id,
+                acked,
             } = entry
             {
-                if *resend_remaining > 0 {
+                if !*acked {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let x = (glyph.uv_rect.x * ATLAS_SIZE as f32).round() as u32;
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -225,8 +266,8 @@ impl VectorJit {
                         width: *width,
                         height: *height,
                         bytes: bytes.to_vec(),
+                        id: *upload_id,
                     });
-                    *resend_remaining -= 1;
                 }
             }
         }
@@ -295,12 +336,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_upload_is_resent_on_subsequent_ticks() {
+    fn an_unacknowledged_upload_is_resent_on_subsequent_ticks() {
         // Regression: `RenderFrame`s are read latest-wins by the render
         // thread (RFC-0001 §5.2). A one-shot upload attached to exactly the
         // tick it completed on can land in a skipped frame and be lost
         // forever, even though the cache believes the glyph is resident. The
-        // fix re-attaches the same upload for a few ticks after the fact.
+        // fix re-attaches the same upload every tick until acknowledged.
         let path = write_gear_fixture();
         let mut jit = VectorJit::new();
         assert!(jit.lookup_or_dispatch(&path).is_none());
@@ -317,10 +358,56 @@ mod tests {
             1,
             "the very next tick must resend the same upload, not drop it"
         );
+        assert_eq!(second[0].id, first[0].id);
         assert_eq!(second[0].layer, first[0].layer);
         assert_eq!(second[0].x, first[0].x);
         assert_eq!(second[0].y, first[0].y);
         assert_eq!(second[0].bytes, first[0].bytes);
+    }
+
+    #[test]
+    fn resend_survives_a_burst_of_ticks_before_any_render_read() {
+        // Regression (found via manual testing): a real dev session can burst
+        // through hundreds of logic ticks before the render thread's very
+        // first draw (e.g. a flurry of startup/resize input keeps the logic
+        // thread off the idle-park path, RFC-0001 §5.1). Since there is no
+        // time or tick limit — only "has it been acknowledged?" — no burst,
+        // however large, can exhaust the resend.
+        let path = write_gear_fixture();
+        let mut jit = VectorJit::new();
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let first = wait_for_drain(&mut jit);
+        assert_eq!(first.len(), 1);
+
+        for _ in 0..500 {
+            jit.drain_ready();
+        }
+
+        let after_burst = jit.drain_ready();
+        assert_eq!(
+            after_burst.len(),
+            1,
+            "an unacknowledged upload must still be attached after hundreds of ticks"
+        );
+    }
+
+    #[test]
+    fn acknowledging_an_upload_stops_the_resend() {
+        let path = write_gear_fixture();
+        let mut jit = VectorJit::new();
+        let (ack_tx, ack_rx) = crossbeam_channel::unbounded();
+        jit.set_ack_receiver(ack_rx);
+
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let first = wait_for_drain(&mut jit);
+        assert_eq!(first.len(), 1);
+
+        ack_tx.send(first[0].id).unwrap();
+        let after_ack = jit.drain_ready();
+        assert!(
+            after_ack.is_empty(),
+            "an acknowledged upload must not be resent"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ toml_edit      = "0.22"
 sha2           = "0.10"
 pollster       = "0.3"
 wgpu           = "29.0"
+crossbeam-channel = "0.5"
 
 [lints]
 workspace = true

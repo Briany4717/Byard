@@ -373,6 +373,13 @@ impl Engine {
         self.relay.set_frame_waker(waker);
     }
 
+    /// Installs the channel this engine reports applied vector-atlas-upload
+    /// ids through (RFC-0009 §2-C) — see
+    /// [`EncoderSubsystem::set_vector_ack_sender`](crate::encoder::EncoderSubsystem::set_vector_ack_sender).
+    pub fn set_vector_ack_sender(&mut self, tx: crossbeam_channel::Sender<u64>) {
+        self.encoder.set_vector_ack_sender(tx);
+    }
+
     /// Notifies the engine that the window surface has been resized.
     ///
     /// `width` and `height` are the new dimensions in **physical pixels**

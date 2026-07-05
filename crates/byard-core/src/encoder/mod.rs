@@ -191,6 +191,11 @@ pub struct EncoderSubsystem {
     /// [`RenderFrame::atlas_uploads`] (RFC-0009 §2-C, INV-8 — this is the only
     /// place `Queue::write_texture` is called for it).
     vector_atlas: VectorAtlas,
+    /// Reports applied-upload ids back to whoever is re-sending unconfirmed
+    /// `AtlasUpload`s (the dev JIT cache), installed via
+    /// [`set_vector_ack_sender`](Self::set_vector_ack_sender). `None` skips
+    /// acknowledgment (e.g. a bare encoder with no JIT wired at all).
+    vector_ack_tx: Option<crossbeam_channel::Sender<u64>>,
     /// Async-decode plumbing (M29): the relay's I/O runtime handle and the
     /// type-erased result sender, installed by the engine via
     /// [`set_io_context`](Self::set_io_context). `None` for a bare encoder
@@ -488,6 +493,7 @@ impl EncoderSubsystem {
             texture_cache: texture_sampler::TextureCache::default(),
             vector_pipeline,
             vector_atlas,
+            vector_ack_tx: None,
             io: None,
             scale_factor,
             viewport_dirty: false,
@@ -691,7 +697,15 @@ impl EncoderSubsystem {
         // RFC-0009 §2-C / INV-8: the single place this atlas is ever written
         // to. Applied unconditionally (not gated on `should_draw` below) so a
         // pending upload is never silently dropped on a skip-frame.
-        self.vector_atlas.apply_uploads(&self.queue, atlas_uploads);
+        let applied = self.vector_atlas.apply_uploads(&self.queue, atlas_uploads);
+        if let Some(tx) = &self.vector_ack_tx {
+            for id in applied {
+                // The dev JIT cache may have already dropped this entry (a
+                // hot-reload invalidated it); a disconnected/full receiver is
+                // not this encoder's problem, so ignore the send result.
+                let _ = tx.send(id);
+            }
+        }
 
         self.request_textures(textures);
 
@@ -951,6 +965,13 @@ impl EncoderSubsystem {
         tx: texture_sampler::IoResultSender,
     ) {
         self.io = Some(IoContext { handle, tx });
+    }
+
+    /// Installs the channel this encoder reports applied vector-atlas-upload
+    /// ids through (RFC-0009 §2-C), so the dev JIT cache stops re-sending an
+    /// upload once it knows the render thread actually applied it.
+    pub fn set_vector_ack_sender(&mut self, tx: crossbeam_channel::Sender<u64>) {
+        self.vector_ack_tx = Some(tx);
     }
 
     /// Uploads one async decode result on the render thread (M29). Called by

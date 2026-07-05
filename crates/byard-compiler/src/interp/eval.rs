@@ -304,6 +304,14 @@ impl Interpreter {
         self.clock_set = true;
     }
 
+    /// Wires in the channel the render thread reports applied vector-atlas
+    /// upload ids through (RFC-0009 §2-C), so the dev JIT cache stops
+    /// re-sending an upload once it knows the GPU actually received it. Call
+    /// once, right after construction, before the first [`render`](Self::render).
+    pub fn set_vector_ack_receiver(&mut self, rx: crossbeam_channel::Receiver<u64>) {
+        self.vector_jit.set_ack_receiver(rx);
+    }
+
     /// Whether any `with` animation was still in flight as of the last
     /// [`render`](Self::render). The runner keeps requesting frames while this
     /// is true and lets the app idle (0 frames) once every animation settles.
