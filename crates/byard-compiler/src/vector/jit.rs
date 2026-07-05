@@ -34,11 +34,30 @@ pub struct ResidentGlyph {
 
 enum CacheEntry {
     Pending,
-    Resident(ResidentGlyph),
+    Resident {
+        glyph: ResidentGlyph,
+        /// Owned field bytes, kept around so the upload can be **re-emitted**
+        /// on the next few ticks (see [`RESEND_TICKS`]) — not just this one.
+        bytes: std::sync::Arc<[u8]>,
+        width: u32,
+        height: u32,
+        /// Remaining ticks this upload will still be attached to the frame.
+        resend_remaining: u8,
+    },
     /// Generation failed; stays a permanent placeholder until a hot-reload
     /// invalidates the entry.
     Failed,
 }
+
+/// How many ticks after a glyph becomes resident its `AtlasUpload` keeps
+/// being re-attached to the frame. `RenderFrame`s are read on a latest-wins
+/// basis by the render thread (RFC-0001 §5.2 double buffering) — a one-shot
+/// upload can land in a tick the render thread happens to skip and be lost
+/// forever (the cache would believe the cell is resident while the real GPU
+/// texture never received its bytes). Resending for a short window makes
+/// that essentially impossible without needing a render-thread acknowledgement
+/// channel.
+const RESEND_TICKS: u8 = 12;
 
 struct JitMessage {
     handle: String,
@@ -88,7 +107,7 @@ impl VectorJit {
             return None;
         }
         match self.entries.get(handle) {
-            Some(CacheEntry::Resident(glyph)) => return Some(*glyph),
+            Some(CacheEntry::Resident { glyph, .. }) => return Some(*glyph),
             Some(CacheEntry::Pending | CacheEntry::Failed) => return None,
             None => {}
         }
@@ -111,10 +130,18 @@ impl VectorJit {
 
     /// Drains every generation that completed since the last call, allocates
     /// each a fresh atlas cell, marks it resident, and returns the
-    /// [`AtlasUpload`]s to attach to this tick's frame. **Logic thread only**
-    /// (INV-2) — call once per tick, before building the frame.
+    /// [`AtlasUpload`]s to attach to this tick's frame — plus a re-send of any
+    /// still-fresh resident upload (see [`RESEND_TICKS`]), so a `RenderFrame`
+    /// the render thread happens to skip never permanently loses an upload.
+    /// **Logic thread only** (INV-2) — call once per tick, before building
+    /// the frame.
     pub fn drain_ready(&mut self) -> Vec<AtlasUpload> {
         let mut uploads = Vec::new();
+        // Handles that just became resident this call already have their one
+        // upload pushed below; skip them in the resend pass so they aren't
+        // double-uploaded on their very first tick.
+        let mut just_completed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         while let Ok(msg) = self.receiver.try_recv() {
             match msg.result {
                 Ok(glyph) => {
@@ -129,22 +156,32 @@ impl VectorJit {
                             cell_size / atlas_size,
                             cell_size / atlas_size,
                         );
-                        self.entries.insert(
-                            msg.handle,
-                            CacheEntry::Resident(ResidentGlyph {
-                                uv_rect,
-                                layer,
-                                px_range: glyph.px_range,
-                            }),
-                        );
+                        let bytes: std::sync::Arc<[u8]> = glyph.bitmap.into();
                         uploads.push(AtlasUpload {
                             layer,
                             x,
                             y,
                             width: glyph.width,
                             height: glyph.height,
-                            bytes: glyph.bitmap,
+                            bytes: bytes.to_vec(),
                         });
+                        just_completed.insert(msg.handle.clone());
+                        self.entries.insert(
+                            msg.handle,
+                            CacheEntry::Resident {
+                                glyph: ResidentGlyph {
+                                    uv_rect,
+                                    layer,
+                                    px_range: glyph.px_range,
+                                },
+                                bytes,
+                                width: glyph.width,
+                                height: glyph.height,
+                                // Already pushed one upload above; resend the
+                                // remaining budget on subsequent ticks.
+                                resend_remaining: RESEND_TICKS - 1,
+                            },
+                        );
                     } else {
                         eprintln!(
                             "vector atlas is full; {} could not be placed (eviction is not yet implemented)",
@@ -159,6 +196,37 @@ impl VectorJit {
                         msg.handle
                     );
                     self.entries.insert(msg.handle, CacheEntry::Failed);
+                }
+            }
+        }
+        // Re-attach any still-fresh resident upload so a skipped RenderFrame
+        // never loses it permanently.
+        for (handle, entry) in &mut self.entries {
+            if just_completed.contains(handle) {
+                continue;
+            }
+            if let CacheEntry::Resident {
+                glyph,
+                bytes,
+                width,
+                height,
+                resend_remaining,
+            } = entry
+            {
+                if *resend_remaining > 0 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let x = (glyph.uv_rect.x * ATLAS_SIZE as f32).round() as u32;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let y = (glyph.uv_rect.y * ATLAS_SIZE as f32).round() as u32;
+                    uploads.push(AtlasUpload {
+                        layer: glyph.layer,
+                        x,
+                        y,
+                        width: *width,
+                        height: *height,
+                        bytes: bytes.to_vec(),
+                    });
+                    *resend_remaining -= 1;
                 }
             }
         }
@@ -224,6 +292,35 @@ mod tests {
             .lookup_or_dispatch(&path)
             .expect("the handle must be resident after draining");
         assert_eq!(resident.layer, 0);
+    }
+
+    #[test]
+    fn a_fresh_upload_is_resent_on_subsequent_ticks() {
+        // Regression: `RenderFrame`s are read latest-wins by the render
+        // thread (RFC-0001 §5.2). A one-shot upload attached to exactly the
+        // tick it completed on can land in a skipped frame and be lost
+        // forever, even though the cache believes the glyph is resident. The
+        // fix re-attaches the same upload for a few ticks after the fact.
+        let path = write_gear_fixture();
+        let mut jit = VectorJit::new();
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let first = wait_for_drain(&mut jit);
+        assert_eq!(
+            first.len(),
+            1,
+            "the completing tick emits exactly one upload"
+        );
+
+        let second = jit.drain_ready();
+        assert_eq!(
+            second.len(),
+            1,
+            "the very next tick must resend the same upload, not drop it"
+        );
+        assert_eq!(second[0].layer, first[0].layer);
+        assert_eq!(second[0].x, first[0].x);
+        assert_eq!(second[0].y, first[0].y);
+        assert_eq!(second[0].bytes, first[0].bytes);
     }
 
     #[test]
