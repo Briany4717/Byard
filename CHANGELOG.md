@@ -12,6 +12,12 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0009 vector/icon MSDF generator.** `byard_compiler::vector` turns an
+  SVG icon into a multi-channel signed distance field: a structural complexity
+  guardrail (rejects gradients, patterns, filters, and oversized path sets),
+  and a generator that parses/normalizes with `usvg` and produces the field
+  with a pure-Rust generator, deterministically and with sharp corners
+  preserved at any scale.
 - **RFC-0008 package ecosystem.** The `use` import surface with explicit
   namespacing (`use material as m` → `m.Card`, `use material.{Card}`); a
   module resolver in `byard_compiler::resolve` with package-cycle detection

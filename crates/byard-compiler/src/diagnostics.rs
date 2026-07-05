@@ -357,6 +357,20 @@ pub enum CompileError {
         /// The failure, human-readable.
         message: String,
     },
+    /// A `VectorIcon`'s SVG paints with a gradient, pattern, or filter — the
+    /// MSDF pipeline supports flat monochrome fills only (RFC-0009 §2).
+    SvgUnsupportedFeatures {
+        /// Anchor span of the `VectorIcon` content argument.
+        span: Span,
+    },
+    /// A `VectorIcon`'s SVG exceeds the path-segment complexity budget for MSDF
+    /// generation (RFC-0009 §2; default 500 segments).
+    SvgTooComplexForMssdf {
+        /// Anchor span of the `VectorIcon` content argument.
+        span: Span,
+        /// The number of path segments actually found.
+        found_nodes: usize,
+    },
 }
 
 impl CompileError {
@@ -398,7 +412,9 @@ impl CompileError {
             | Self::NameCollision { span, .. }
             | Self::PackageCycle { span, .. }
             | Self::DuplicateViewName { span, .. }
-            | Self::Project { span, .. } => *span,
+            | Self::Project { span, .. }
+            | Self::SvgUnsupportedFeatures { span }
+            | Self::SvgTooComplexForMssdf { span, .. } => *span,
         }
     }
 
@@ -442,7 +458,9 @@ impl CompileError {
             | Self::NameCollision { span, .. }
             | Self::PackageCycle { span, .. }
             | Self::DuplicateViewName { span, .. }
-            | Self::Project { span, .. } => {
+            | Self::Project { span, .. }
+            | Self::SvgUnsupportedFeatures { span }
+            | Self::SvgTooComplexForMssdf { span, .. } => {
                 span.start = (i64::from(span.start) + delta).max(0) as u32;
                 span.end = (i64::from(span.end) + delta).max(0) as u32;
             }
@@ -489,6 +507,8 @@ impl CompileError {
             Self::PackageCycle { .. } => "PackageCycle",
             Self::DuplicateViewName { .. } => "DuplicateViewName",
             Self::Project { .. } => "Project",
+            Self::SvgUnsupportedFeatures { .. } => "SvgUnsupportedFeatures",
+            Self::SvgTooComplexForMssdf { .. } => "SvgTooComplexForMssdf",
         }
     }
 
@@ -622,6 +642,15 @@ impl CompileError {
             Self::DuplicateViewName { name, package, .. } => {
                 format!("view `{name}` is declared more than once in {package}")
             }
+            Self::SvgUnsupportedFeatures { .. } => {
+                "SVG uses a gradient, pattern, or filter; the MSDF vector pipeline only \
+                 supports flat monochrome fills — use `Image` instead"
+                    .to_string()
+            }
+            Self::SvgTooComplexForMssdf { found_nodes, .. } => format!(
+                "SVG has {found_nodes} path segments, exceeding the MSDF complexity budget \
+                 (500) — simplify the artwork or use `Image` instead"
+            ),
         }
     }
 
