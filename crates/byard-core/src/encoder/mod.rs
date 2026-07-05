@@ -46,8 +46,9 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::ByardError;
-use crate::frame::{Rect, RenderFrame, Transform, Viewport};
+use crate::frame::{AtlasUpload, Rect, RenderFrame, Transform, VectorInstance, Viewport};
 use text_glyph::{TextGlyphPipeline, TextLine};
+use vector_msdf::VectorAtlas;
 
 /// Re-exported from [`crate::frame`] — the canonical definition now lives
 /// there so the Logic thread can populate [`RenderFrame::instances`] without
@@ -183,6 +184,13 @@ pub struct EncoderSubsystem {
     image_sampler: wgpu::Sampler,
     /// Path-keyed cache of decoded image textures (M21).
     texture_cache: texture_sampler::TextureCache,
+    /// `VectorMSDF` pipeline (RFC-0009 §1, the fifth pipeline) — samples
+    /// [`vector_atlas`](Self::vector_atlas) to draw crisp monochrome icons.
+    vector_pipeline: wgpu::RenderPipeline,
+    /// The MSDF atlas: an array texture uploaded to by the JIT/AOT paths via
+    /// [`RenderFrame::atlas_uploads`] (RFC-0009 §2-C, INV-8 — this is the only
+    /// place `Queue::write_texture` is called for it).
+    vector_atlas: VectorAtlas,
     /// Async-decode plumbing (M29): the relay's I/O runtime handle and the
     /// type-erased result sender, installed by the engine via
     /// [`set_io_context`](Self::set_io_context). `None` for a bare encoder
@@ -430,6 +438,34 @@ impl EncoderSubsystem {
         let (decorated_pipeline, texture_pipeline, texture_bind_group_layout, image_sampler) =
             build_m21_pipelines(&device, &bind_group_layout, surface_format).await?;
 
+        // `VectorMSDF` pipeline (RFC-0009 §1, the fifth pipeline).
+        let vector_atlas_layout = vector_msdf::bind_group_layout(&device);
+        let vector_sampler = vector_msdf::sampler(&device);
+        let vector_pipeline = vector_msdf::build_pipeline(
+            &device,
+            &bind_group_layout,
+            &vector_atlas_layout,
+            wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            surface_format,
+        )
+        .await?;
+        // One layer to start; the dev allocator (M48) grows this on demand.
+        let vector_atlas = VectorAtlas::new(
+            &device,
+            &vector_atlas_layout,
+            &vector_sampler,
+            vector_msdf::ATLAS_SIZE,
+            1,
+        );
+
         let (persistent_color, persistent_view) =
             create_persistent_target(&device, surface_format, width, height);
         let persistent_depth_view = create_depth_target(&device, width, height);
@@ -450,6 +486,8 @@ impl EncoderSubsystem {
             texture_bind_group_layout,
             image_sampler,
             texture_cache: texture_sampler::TextureCache::default(),
+            vector_pipeline,
+            vector_atlas,
             io: None,
             scale_factor,
             viewport_dirty: false,
@@ -629,6 +667,8 @@ impl EncoderSubsystem {
             texts,
             &[],
             &[],
+            &[],
+            &[],
             DrawDepths::default(),
         )
     }
@@ -644,8 +684,15 @@ impl EncoderSubsystem {
         texts: &[TextLine],
         decorated: &[crate::frame::DecoratedBox],
         textures: &[crate::frame::TextureSampler],
+        vectors: &[VectorInstance],
+        atlas_uploads: &[AtlasUpload],
         depths: DrawDepths<'_>,
     ) -> Result<wgpu::CommandBuffer, ByardError> {
+        // RFC-0009 §2-C / INV-8: the single place this atlas is ever written
+        // to. Applied unconditionally (not gated on `should_draw` below) so a
+        // pending upload is never silently dropped on a skip-frame.
+        self.vector_atlas.apply_uploads(&self.queue, atlas_uploads);
+
         self.request_textures(textures);
 
         self.drain_gpu_samples_into_telemetry();
@@ -695,10 +742,13 @@ impl EncoderSubsystem {
         };
 
         // Nothing to (re)draw into `persistent_color` this frame: not a full
-        // redraw, and no `TextLine` is dirty. The swapchain still gets a
-        // fresh copy of `persistent_color` below — just unchanged from last
-        // frame.
-        let should_draw = full_redraw || scissor.is_some();
+        // redraw, no `TextLine` is dirty, and no vector glyph just landed. The
+        // swapchain still gets a fresh copy of `persistent_color` below — just
+        // unchanged from last frame. A fresh `atlas_uploads` entry forces a
+        // draw even with an empty scissor, since a placeholder→resident
+        // transition changes a `VectorInstance`'s content but not its rect —
+        // the scissor union (rect-based) would otherwise miss it entirely.
+        let should_draw = full_redraw || scissor.is_some() || !atlas_uploads.is_empty();
 
         // ── Text prepare (before the render pass) ─────────────────────────────
         if should_draw {
@@ -732,6 +782,7 @@ impl EncoderSubsystem {
                     clear: &self.clear_pipeline,
                     decorated: &self.decorated_pipeline,
                     texture: &self.texture_pipeline,
+                    vector: &self.vector_pipeline,
                 },
                 &self.viewport_bind_group,
                 &self.quad_buffer,
@@ -744,6 +795,8 @@ impl EncoderSubsystem {
                     decorated,
                     textures,
                     texture_cache: &self.texture_cache,
+                    vectors,
+                    vector_atlas: &self.vector_atlas,
                     solid_depths: depths.solid,
                     decorated_depths: depths.decorated,
                     texture_depths: depths.texture,
@@ -835,6 +888,8 @@ impl EncoderSubsystem {
                 &texts_dirty,
                 frame.decorated(),
                 frame.textures(),
+                frame.vector_instances(),
+                frame.atlas_uploads(),
                 frame_draw_depths(frame),
             )?;
             self.last_relay_version = frame.version();
@@ -846,6 +901,8 @@ impl EncoderSubsystem {
             frame.texts(),
             frame.decorated(),
             frame.textures(),
+            frame.vector_instances(),
+            frame.atlas_uploads(),
             frame_draw_depths(frame),
         )?;
         self.last_relay_version = frame.version();
@@ -958,6 +1015,7 @@ struct DrawPipelines<'a> {
     clear: &'a wgpu::RenderPipeline,
     decorated: &'a wgpu::RenderPipeline,
     texture: &'a wgpu::RenderPipeline,
+    vector: &'a wgpu::RenderPipeline,
 }
 
 /// Draw-order depth slices for one frame (RFC-0011 cross-pass paint order),
@@ -994,9 +1052,15 @@ struct DrawPrimitives<'a> {
     decorated: &'a [crate::frame::DecoratedBox],
     textures: &'a [crate::frame::TextureSampler],
     texture_cache: &'a texture_sampler::TextureCache,
+    /// MSDF vector-glyph instances (RFC-0009 §1).
+    vectors: &'a [VectorInstance],
+    /// The MSDF atlas these `vectors` sample; not drawn without one.
+    vector_atlas: &'a VectorAtlas,
     /// Draw-order depths, parallel to `instances`/`decorated`/`textures`
     /// respectively (RFC-0011 cross-pass paint order). `texts` depth is applied
-    /// inside `TextGlyphPipeline::prepare` via glyphon's per-glyph metadata.
+    /// inside `TextGlyphPipeline::prepare` via glyphon's per-glyph metadata;
+    /// `vectors`' depth is a field on `VectorInstance` itself (stamped by
+    /// `RenderFrame::push_vector`), not a parallel slice like these three.
     solid_depths: &'a [f32],
     decorated_depths: &'a [f32],
     texture_depths: &'a [f32],
@@ -1022,6 +1086,7 @@ fn draw_ui_pass(
         clear: clear_pipeline,
         decorated: decorated_pipeline,
         texture: texture_pipeline,
+        vector: vector_pipeline,
     } = *pipelines;
     let DrawPrimitives {
         instances,
@@ -1029,6 +1094,8 @@ fn draw_ui_pass(
         decorated,
         textures,
         texture_cache,
+        vectors,
+        vector_atlas,
         solid_depths,
         decorated_depths,
         texture_depths,
@@ -1129,6 +1196,18 @@ fn draw_ui_pass(
         texture_cache,
         textures,
         texture_depths,
+    );
+    // RFC-0009 §1: crisp monochrome icons, sampled from the same MSDF atlas
+    // the JIT/AOT paths upload to. Each instance carries its own draw-order
+    // depth (RFC-0011), so paint order across pipelines is honoured here too.
+    vector_msdf::draw(
+        &mut render_pass,
+        device,
+        vector_pipeline,
+        viewport_bind_group,
+        quad_buffer,
+        vector_atlas,
+        vectors,
     );
 
     // Always the full, unfiltered `texts` slice (the `prepare` call before
@@ -1534,10 +1613,11 @@ async fn build_m21_pipelines(
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Depth-stencil state for the *drawing* pipelines (solid/decorated/texture/
-/// text): write each primitive's draw-order z and keep the nearest — i.e. the
-/// later-emitted — fragment (`LessEqual`, since later = smaller z, buffer
-/// cleared to the far plane).
-fn draw_depth_stencil() -> wgpu::DepthStencilState {
+/// vector/text): write each primitive's draw-order z and keep the nearest —
+/// i.e. the later-emitted — fragment (`LessEqual`, since later = smaller z,
+/// buffer cleared to the far plane). `pub(crate)` so `vector_msdf` (a sibling
+/// submodule) shares it instead of duplicating the state.
+pub(crate) fn draw_depth_stencil() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),

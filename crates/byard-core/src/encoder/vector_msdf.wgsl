@@ -22,6 +22,8 @@ struct InstanceInput {
     @location(3) color: vec4<f32>,
     @location(4) px_range: f32,
     @location(5) atlas_layer: u32,
+    // Draw-order NDC-z (RFC-0011 cross-pass paint order).
+    @location(6) depth: f32,
 };
 
 struct VertexOutput {
@@ -45,7 +47,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.position = vec4<f32>(
         (world_pos.x / viewport_size.x) * 2.0 - 1.0,
         1.0 - (world_pos.y / viewport_size.y) * 2.0,
-        0.0,
+        instance.depth,
         1.0
     );
 

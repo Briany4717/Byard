@@ -62,6 +62,11 @@ View Main() {
                     Text("Byard Engine Demo") #[typo: "headlineSmall", color: 0xFFFFFF, weight: bold]
                     Text("every capability, one screen") #[typo: "bodySmall", color: 0x9AA0AC]
                 }
+                // Crisp, resolution-independent MSDF icon (RFC-0009). The dev
+                // JIT generates its field on a background thread the first
+                // time this line runs, so it may pop in a frame or two after
+                // a cold start or a save of icon.svg.
+                VectorIcon("icon.svg") #[size: 40, color: 0x90CAF9]
             }
 
             // ── Counter card: events (=>), ternary, fn + interpolation ───────

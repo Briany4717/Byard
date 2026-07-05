@@ -6,7 +6,9 @@
 //! delegated to the vendored `bymsdfgen-core` generator.
 
 pub mod generate;
+pub mod jit;
 pub mod validate;
 
 pub use generate::{EDGE_ANGLE_DEGREES, GRID_SIZE, MsdfGlyph, PX_RANGE, generate};
+pub use jit::{ResidentGlyph, VectorJit};
 pub use validate::{MAX_NODES, validate_vector_complexity};

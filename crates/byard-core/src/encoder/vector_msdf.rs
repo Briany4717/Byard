@@ -32,6 +32,7 @@ pub fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
         3 => Float32x4, // color
         4 => Float32,   // px_range
         5 => Uint32,    // atlas_layer
+        6 => Float32,   // depth (RFC-0011 cross-pass paint order)
     ];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<VectorInstance>() as wgpu::BufferAddress,
@@ -262,7 +263,10 @@ pub async fn build_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        // Shares the pass's draw-order depth buffer with the other pipelines
+        // (RFC-0011 cross-pass paint order) — required for pipeline/pass
+        // compatibility even where a caller doesn't care about ordering.
+        depth_stencil: Some(crate::encoder::draw_depth_stencil()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,

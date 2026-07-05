@@ -238,6 +238,10 @@ pub struct Interpreter {
     /// on an element splices them in at lower time. Static and view-scoped — no
     /// cascade.
     styles: std::collections::HashMap<Symbol, StyleDef>,
+    /// Dev-mode MSDF generation cache/dispatcher for `VectorIcon` (RFC-0009
+    /// §2). Drained once per [`render`](Self::render) call, before the tree
+    /// walk, so a freshly-resident glyph is visible the same tick it lands.
+    vector_jit: crate::vector::VectorJit,
 }
 
 impl Interpreter {
@@ -1022,6 +1026,13 @@ impl Interpreter {
         // gesture state (a pending `down`, the focused element) so a tap that
         // spans this re-render is still recognized (RFC-0003 E4).
         self.router.clear_handlers();
+
+        // Drain any MSDF generations that finished since the last tick,
+        // before the tree walk below, so a freshly-resident glyph is visible
+        // the same tick it lands (RFC-0009 §2, INV-2: logic-thread only).
+        for upload in self.vector_jit.drain_ready() {
+            frame.push_atlas_upload(upload);
+        }
         let mut flat_ids = Vec::new();
 
         let mut root_children = Vec::new();
@@ -1544,25 +1555,49 @@ impl Interpreter {
                     });
                 }
             }
-            RenderNode::Vector { attrs, src: _ } => {
+            RenderNode::Vector { attrs, src } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
-                    // Until the dev JIT atlas resolves the asset handle to a UV
-                    // slot (M46), emit a zero-opacity placeholder so the frame
-                    // ships without stalling (INV-9). The `color` rgb is resolved
-                    // now so a resident glyph tints correctly once M46 lands.
-                    let rgb =
-                        self.eval_color_prop(attrs, "color")
-                            .map_or([1.0, 1.0, 1.0, 0.0], |c| {
-                                let mut c = super::intrinsics::color_to_rgba(c, false);
-                                c[3] = 0.0; // placeholder: not yet resident
-                                c
-                            });
+                    let handle = self
+                        .binding_value(*src)
+                        .and_then(|v| if let Value::Str(s) = v { Some(s) } else { None })
+                        .unwrap_or_default();
+                    let base_rgb = self
+                        .eval_color_prop(attrs, "color")
+                        .map_or([1.0, 1.0, 1.0, 1.0], |c| {
+                            super::intrinsics::color_to_rgba(c, false)
+                        });
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
+
+                    // Cache hit: a resident glyph, tinted and opacity-applied.
+                    // Cache miss: a zero-opacity placeholder so the frame ships
+                    // without stalling (INV-9); the dispatch itself happened
+                    // inside `lookup_or_dispatch`.
+                    let (uv_rect, layer, px_range, alpha) =
+                        match self.vector_jit.lookup_or_dispatch(&handle) {
+                            Some(glyph) => (
+                                glyph.uv_rect,
+                                glyph.layer,
+                                glyph.px_range,
+                                base_rgb[3] * opacity,
+                            ),
+                            None => (
+                                byard_core::frame::Rect::new(0.0, 0.0, 0.0, 0.0),
+                                0,
+                                super::intrinsics::VECTOR_DEFAULT_PX_RANGE,
+                                0.0,
+                            ),
+                        };
+                    let rgb = [base_rgb[0], base_rgb[1], base_rgb[2], alpha];
+
                     frame.push_vector(byard_core::frame::VectorInstance::new(
                         byard_core::frame::Rect::new(rect.x, rect.y, rect.width, rect.height),
-                        byard_core::frame::Rect::new(0.0, 0.0, 0.0, 0.0),
+                        uv_rect,
                         rgb,
-                        super::intrinsics::VECTOR_DEFAULT_PX_RANGE,
-                        0,
+                        px_range,
+                        layer,
                     ));
                 }
             }
@@ -3433,6 +3468,49 @@ mod tests {
             matches!(&tree[0], RenderNode::Vector { .. }),
             "VectorIcon lowers to RenderNode::Vector, got {:?}",
             tree[0]
+        );
+    }
+
+    #[test]
+    fn vector_icon_starts_as_a_placeholder_then_becomes_resident() {
+        // Uses the real gear fixture from the M45 generator PR so this proves
+        // the JIT dispatch end to end, not just the cache bookkeeping.
+        let svg_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/svg/gear.svg");
+        let src =
+            format!("View App() {{ VectorIcon(\"{svg_path}\") #[size: 24, color: 0xFFFFFF] }}");
+        let (mut interp, tree) = lower_named(&src, "App");
+
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let first = frame.vector_instances()[0];
+        assert!(
+            first.color[3] < f32::EPSILON,
+            "first tick must be a zero-opacity placeholder (INV-9), got alpha {}",
+            first.color[3]
+        );
+
+        // Poll subsequent ticks until the background generation lands.
+        let mut resident = None;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let inst = frame.vector_instances()[0];
+            if inst.color[3] > 0.0 {
+                resident = Some(inst);
+                break;
+            }
+        }
+        let inst = resident.expect("the glyph must become resident within the poll window");
+        assert!(
+            (inst.color[3] - 1.0).abs() < f32::EPSILON,
+            "full opacity once resident"
+        );
+        assert!(
+            (inst.color[0] - 1.0).abs() < f32::EPSILON,
+            "color: 0xFFFFFF tints white"
         );
     }
 

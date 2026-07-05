@@ -675,12 +675,19 @@ pub struct VectorInstance {
     pub px_range: f32,
     /// Array-texture layer holding this glyph's cell.
     pub atlas_layer: u32,
+    /// Draw-order depth (NDC-z, RFC-0011 cross-pass paint order — see
+    /// [`draw_depth`]). Set by [`RenderFrame::push_vector`], not by
+    /// [`VectorInstance::new`] (which defaults it to the far plane); a bare
+    /// `VectorInstance` built outside a `RenderFrame` therefore always loses
+    /// the depth test to one that went through `push_vector`.
+    pub depth: f32,
 }
 
 impl VectorInstance {
     /// Builds an instance from logical-pixel screen geometry and an atlas UV
     /// rect (both as [`Rect`]), a colour, the baked `px_range`, and the atlas
-    /// layer.
+    /// layer. `depth` defaults to the far plane; [`RenderFrame::push_vector`]
+    /// stamps the real draw-order value on push.
     #[must_use]
     pub fn new(screen: Rect, atlas_uv: Rect, color: [f32; 4], px_range: f32, layer: u32) -> Self {
         Self {
@@ -694,6 +701,7 @@ impl VectorInstance {
             color,
             px_range,
             atlas_layer: layer,
+            depth: DRAW_DEPTH_CLEAR,
         }
     }
 }
@@ -955,7 +963,8 @@ impl RenderFrame {
     }
 
     /// Appends a [`VectorInstance`] (MSDF glyph) to the frame (RFC-0009 §1).
-    pub fn push_vector(&mut self, v: VectorInstance) {
+    pub fn push_vector(&mut self, mut v: VectorInstance) {
+        v.depth = self.next_depth();
         self.vector_instances.push(v);
     }
 
@@ -1177,8 +1186,8 @@ mod tests {
         let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
         assert!(close(v.atlas_uv_rect, [0.0, 0.0, 0.25, 0.25]));
         assert!(close(v.screen_rect, [10.0, 20.0, 16.0, 16.0]));
-        // Pod: 14 × 4-byte fields, no padding (so it uploads zero-copy).
-        assert_eq!(std::mem::size_of::<VectorInstance>(), 56);
+        // Pod: 15 × 4-byte fields, no padding (so it uploads zero-copy).
+        assert_eq!(std::mem::size_of::<VectorInstance>(), 60);
         let _bytes: &[u8] = bytemuck::bytes_of(&v);
 
         let mut frame = RenderFrame::new();

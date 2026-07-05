@@ -165,6 +165,151 @@ fn demo_boxes_are_actually_painted_on_screen() {
     );
 }
 
+/// End-to-end proof of the RFC-0009 dev JIT pipeline: a `VectorIcon` starts as
+/// a zero-opacity placeholder, the background generation lands within a few
+/// ticks, and the resulting `AtlasUpload` actually reaches the GPU texture and
+/// paints an opaque pixel — the whole chain from `.byd` source to a real
+/// screen pixel, not just unit-level cache bookkeeping.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn vector_icon_paints_after_generation_lands() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping readback");
+        return;
+    };
+
+    // A guaranteed fully-opaque icon (no holes) so any interior pixel is
+    // unambiguously "inside" the shape, regardless of MSDF channel mixing.
+    let svg_path = std::env::temp_dir().join("byard_vector_readback_solid_square.svg");
+    std::fs::write(
+        &svg_path,
+        br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+              <path d="M2 2 L22 2 L22 22 L2 22 Z" fill="#000000"/>
+            </svg>"##,
+    )
+    .unwrap();
+    let svg_path = svg_path.to_str().unwrap();
+
+    let logical_w = 400.0_f32;
+    let logical_h = 400.0_f32;
+    let src = format!(r#"View App() {{ VectorIcon("{svg_path}") #[size: 200, color: 0xFFFFFF] }}"#);
+    let parsed = parse(&src);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let mut interp = Interpreter::new();
+    let tree = interp.lower_view(&parsed.views[0], &[]);
+    assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+
+    // Poll ticks until the background generation lands (first tick dispatches
+    // it and only ever emits the INV-9 placeholder).
+    let mut frame = RenderFrame::new();
+    let mut resident_rect = None;
+    for _ in 0..200 {
+        interp.tick();
+        frame = RenderFrame::new();
+        interp.render(&tree, &mut frame, logical_w, logical_h);
+        let inst = frame.vector_instances()[0];
+        if inst.color[3] > 0.0 {
+            resident_rect = Some(inst.screen_rect);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let rect = resident_rect.expect("the icon must become resident within the poll window");
+    let cx = rect[0] + rect[2] / 2.0;
+    let cy = rect[1] + rect[3] / 2.0;
+
+    let scale = 1.0_f32;
+    let phys_w = logical_w as u32;
+    let phys_h = logical_h as u32;
+    let fmt = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let mut enc = pollster::block_on(EncoderSubsystem::init(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        fmt,
+        scale,
+        phys_w,
+        phys_h,
+    ))
+    .unwrap();
+    enc.update_viewport(
+        Viewport {
+            width: logical_w,
+            height: logical_h,
+        },
+        phys_w,
+        phys_h,
+        scale,
+    );
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("target"),
+        size: wgpu::Extent3d {
+            width: phys_w,
+            height: phys_h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: fmt,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let cmd = enc.encode_frame_from_relay(&target, &frame).unwrap();
+    queue.submit(std::iter::once(cmd));
+
+    let px = cx as u32;
+    let py = cy as u32;
+    let bpr = 256 * (phys_w * 4).div_ceil(256);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(bpr) * u64::from(phys_h),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut ce = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    ce.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(phys_h),
+            },
+        },
+        wgpu::Extent3d {
+            width: phys_w,
+            height: phys_h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(ce.finish()));
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range();
+    let idx = (py * bpr + px * 4) as usize;
+    let (b, g, r, a) = (data[idx], data[idx + 1], data[idx + 2], data[idx + 3]);
+
+    let _ = std::fs::remove_file(svg_path);
+
+    assert!(
+        a > 200,
+        "the generated icon's interior must be opaque, got alpha {a}"
+    );
+    assert!(
+        b > 200 && g > 200 && r > 200,
+        "color: 0xFFFFFF must tint the field white, got BGR=({b},{g},{r})"
+    );
+}
+
 /// Regression: a widget that sits *inside* an opaque, bordered card
 /// (here the `Toggle`, whose ON track is painted in the theme accent) must
 /// remain visible on screen. Before the fix the card became an opaque
