@@ -22,6 +22,11 @@ fn try_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .ok()?;
+    let info = adapter.get_info();
+    eprintln!(
+        "  GPU adapter: {} ({:?}, {:?} backend, driver: {})",
+        info.name, info.device_type, info.backend, info.driver
+    );
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("readback device"),
         required_features: wgpu::Features::empty(),
