@@ -41,8 +41,11 @@ enum Command {
         /// Path to a `.byd` file. Defaults to `entry` in `byard.toml`.
         file: Option<PathBuf>,
     },
-    /// (Phase 3+) Compile to a production binary.
-    Build,
+    /// Bake the AOT vector atlas for the project (RFC-0009 §4).
+    Build {
+        /// Path to a `.byd` file or project dir. Defaults to `byard.toml`.
+        file: Option<PathBuf>,
+    },
     /// Add a dependency to byard.toml, then fetch and lock it (RFC-0008).
     #[command(alias = "install")]
     Add {
@@ -71,7 +74,7 @@ fn main() {
         Command::New { name } => commands::new::run(&name),
         Command::Dev { file } => commands::dev::run(file.as_deref()),
         Command::Check { file } => commands::check::run(file.as_deref()),
-        Command::Build => commands::build::run(),
+        Command::Build { file } => commands::build::run(file.as_deref()),
         Command::Add {
             name,
             path,

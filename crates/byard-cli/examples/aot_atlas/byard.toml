@@ -1,0 +1,3 @@
+[project]
+name = "aot_atlas"
+entry = "src/main.byd"

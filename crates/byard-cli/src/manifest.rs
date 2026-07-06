@@ -54,7 +54,6 @@ pub struct Dependency {
 
 /// Parsed project manifest (or a synthetic one for bare-file usage).
 pub struct Manifest {
-    #[allow(dead_code)]
     pub project_root: PathBuf,
     /// Absolute path to the `.byd` entry file.
     pub entry: PathBuf,
@@ -65,6 +64,10 @@ pub struct Manifest {
     /// project: only the entry file is compiled, sibling `.byd`s are ignored.
     /// A real project (a `byard.toml`) treats every sibling as one namespace.
     pub single_file: bool,
+    /// `[assets.vectors] include` — the RFC-0009 §4 escape hatch: handles the
+    /// AOT packer must bake even though no `VectorIcon("literal")` names them
+    /// (e.g. a `VectorIcon(someVar)` resolved at runtime). Empty by default.
+    pub vector_includes: Vec<String>,
 }
 
 impl Manifest {
@@ -125,6 +128,7 @@ impl Manifest {
                 name,
                 dependencies: Vec::new(),
                 single_file: false,
+                vector_includes: Vec::new(),
             });
         }
 
@@ -149,6 +153,7 @@ impl Manifest {
             name,
             dependencies: Vec::new(),
             single_file: true,
+            vector_includes: Vec::new(),
         }
     }
 
@@ -161,13 +166,29 @@ impl Manifest {
         let project = table.get("project");
 
         // Warn on unknown top-level keys (C2: forward-compatible) — except
-        // `[dependencies]`, which is parsed strictly below, and `[package]`,
-        // reserved for package manifests.
+        // `[dependencies]`, which is parsed strictly below, `[package]`,
+        // reserved for package manifests, and `[assets]` (RFC-0009 §4).
         for key in table.keys() {
-            if !matches!(key.as_str(), "project" | "dependencies" | "package") {
+            if !matches!(
+                key.as_str(),
+                "project" | "dependencies" | "package" | "assets"
+            ) {
                 eprintln!("byard.toml: warning: unknown key `{key}` (ignored)");
             }
         }
+
+        // `[assets.vectors] include = ["a.svg", ...]` — the AOT escape hatch.
+        let vector_includes = table
+            .get("assets")
+            .and_then(|a| a.get("vectors"))
+            .and_then(|v| v.get("include"))
+            .and_then(toml::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let name = project
             .and_then(|p| p.get("name"))
@@ -207,6 +228,7 @@ impl Manifest {
             name,
             dependencies,
             single_file: false,
+            vector_includes,
         })
     }
 }

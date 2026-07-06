@@ -2,6 +2,10 @@
 /dist
 Cargo.lock
 /support/
+# Per-project build/cache dir (RFC-0006 §"`.byard/`"): dev caches and the
+# `byard build` AOT vector-atlas artifact (`.byard/generated/`) are generated,
+# never committed.
+.byard/
 **/*.rs.bk
 *.pdb
 .env
