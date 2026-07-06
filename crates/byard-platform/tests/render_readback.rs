@@ -453,3 +453,172 @@ fn widget_inside_bordered_card_is_not_occluded() {
         "toggle track must show the accent over the card, got BGR=({b},{g},{r})"
     );
 }
+
+/// RFC-0005 `ScrollView` content clip: a box (and text) emitted inside
+/// `begin_clip` is scissored to the clip rect — visible inside it, gone outside.
+/// Set `BYARD_DUMP_PNG=1` to also write the frame to a PNG for eyeballing.
+#[test]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn content_clip_scissors_overflow_to_the_viewport() {
+    use byard_core::BoxInstance;
+    use byard_core::frame::{Rect, TextLine, Transform};
+
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping readback");
+        return;
+    };
+
+    let (lw, lh) = (400.0_f32, 300.0_f32);
+    let scale = 1.0_f32;
+    let (pw, ph) = (lw as u32, lh as u32);
+
+    let solid = |x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| BoxInstance {
+        rect: [x, y, w, h],
+        color: c,
+        radii: [0.0; 4],
+        transform: Transform::IDENTITY,
+    };
+
+    // Scene: a dark full-frame background, then a 200×140 "scroll window" clip
+    // at (100,80) holding a bright box + text that overflow it on every side.
+    let mut frame = RenderFrame::new();
+    frame.set_version(1);
+    frame.push_instance(solid(0.0, 0.0, lw, lh, [0.07, 0.08, 0.11, 1.0]));
+    let window = Rect::new(100.0, 80.0, 200.0, 140.0);
+    frame.begin_clip(window);
+    frame.push_instance(solid(60.0, 40.0, 280.0, 240.0, [0.39, 0.58, 0.93, 1.0]));
+    for (i, s) in ["clipped to the", "scroll viewport", "— overflow hidden"]
+        .iter()
+        .enumerate()
+    {
+        frame.push_text(TextLine {
+            x: 70.0,
+            y: 110.0 + i as f32 * 28.0,
+            text: (*s).to_string(),
+            font_size: 18.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            dirty: true,
+        });
+    }
+    frame.end_clip();
+
+    let fmt = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let mut enc = pollster::block_on(EncoderSubsystem::init(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        fmt,
+        scale,
+        pw,
+        ph,
+    ))
+    .unwrap();
+    enc.update_viewport(
+        Viewport {
+            width: lw,
+            height: lh,
+        },
+        pw,
+        ph,
+        scale,
+    );
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("clip target"),
+        size: wgpu::Extent3d {
+            width: pw,
+            height: ph,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: fmt,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let cmd = enc.encode_frame_from_relay(&target, &frame).unwrap();
+    queue.submit(std::iter::once(cmd));
+
+    // Read the whole frame back.
+    let bpr = 256 * (pw * 4).div_ceil(256);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(bpr) * u64::from(ph),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut ce = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    ce.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(ph),
+            },
+        },
+        wgpu::Extent3d {
+            width: pw,
+            height: ph,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(ce.finish()));
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range();
+
+    // BGRA sample at a physical pixel.
+    let px = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+        let i = (y * bpr + x * 4) as usize;
+        (data[i], data[i + 1], data[i + 2], data[i + 3])
+    };
+
+    // Inside the window, on the blue content → blue-dominant.
+    let (b_in, _g, r_in, _a) = px(160, 130);
+    assert!(
+        b_in > 150 && b_in > r_in + 40,
+        "content inside the clip must paint blue, got B={b_in} R={r_in}"
+    );
+
+    // Inside the blue content's rect but OUTSIDE the window (top-left of it):
+    // must be clipped away → the dark background, not the blue content. (The bg
+    // is `[0.07,0.08,0.11]` linear, which sRGB-encodes to ~BGR(93,80,75) in the
+    // sRGB target — dark and near-neutral, unlike the strongly-blue content.)
+    let (b_out, _g_out, r_out, _a) = px(70, 50);
+    assert!(
+        b_out < 120 && b_out < r_out + 40,
+        "content outside the clip must be scissored away (dark bg, not blue), got B={b_out} R={r_out}"
+    );
+
+    // Optional visual dump (BGRA → RGBA), for eyeballing the clip.
+    if std::env::var("BYARD_DUMP_PNG").is_ok() {
+        let mut rgba = vec![0u8; (pw * ph * 4) as usize];
+        for y in 0..ph {
+            for x in 0..pw {
+                let (b, g, r, a) = px(x, y);
+                let o = ((y * pw + x) * 4) as usize;
+                rgba[o] = r;
+                rgba[o + 1] = g;
+                rgba[o + 2] = b;
+                rgba[o + 3] = a;
+            }
+        }
+        let out = std::env::var("BYARD_PNG_PATH").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("byard_clip.png")
+                .display()
+                .to_string()
+        });
+        image::save_buffer(&out, &rgba, pw, ph, image::ColorType::Rgba8).unwrap();
+        eprintln!("wrote clip readback PNG to {out}");
+    }
+}

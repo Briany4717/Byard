@@ -679,6 +679,7 @@ impl EncoderSubsystem {
             &[],
             &[],
             DrawDepths::default(),
+            FrameClips::default(),
         )
     }
 
@@ -696,6 +697,7 @@ impl EncoderSubsystem {
         vectors: &[VectorInstance],
         atlas_uploads: &[AtlasUpload],
         depths: DrawDepths<'_>,
+        clips: FrameClips<'_>,
     ) -> Result<wgpu::CommandBuffer, ByardError> {
         // RFC-0009 §2-C / INV-8: the single place this atlas is ever written
         // to. Applied unconditionally (not gated on `should_draw` below) so a
@@ -777,6 +779,8 @@ impl EncoderSubsystem {
                 depths.text,
                 self.scale_factor,
                 viewport_dirty,
+                clips.table,
+                clips.text,
             )?;
         }
         self.viewport_dirty = false;
@@ -806,6 +810,7 @@ impl EncoderSubsystem {
                 &mut self.text_pipeline,
                 full_redraw,
                 scissor,
+                (self.scale_factor, self.phys_w, self.phys_h),
                 &DrawPrimitives {
                     instances,
                     texts,
@@ -817,6 +822,7 @@ impl EncoderSubsystem {
                     solid_depths: depths.solid,
                     decorated_depths: depths.decorated,
                     texture_depths: depths.texture,
+                    clips,
                 },
                 self.gpu_timer.as_ref(),
             )?;
@@ -908,6 +914,7 @@ impl EncoderSubsystem {
                 frame.vector_instances(),
                 frame.atlas_uploads(),
                 frame_draw_depths(frame),
+                frame_clips(frame),
             )?;
             self.last_relay_version = frame.version();
             return Ok(cmd);
@@ -921,6 +928,7 @@ impl EncoderSubsystem {
             frame.vector_instances(),
             frame.atlas_uploads(),
             frame_draw_depths(frame),
+            frame_clips(frame),
         )?;
         self.last_relay_version = frame.version();
         Ok(cmd)
@@ -1058,6 +1066,36 @@ pub struct DrawDepths<'a> {
     pub text: &'a [f32],
 }
 
+/// A frame's content-clip table plus the parallel per-pool clip slices
+/// (RFC-0005 `ScrollView`) — the [`DrawDepths`] analogue for clips.
+#[derive(Clone, Copy, Default)]
+pub struct FrameClips<'a> {
+    /// The clip-rect table; a pool's `Option<u16>` indexes into this.
+    pub table: &'a [crate::frame::ClipRect],
+    /// Parallel to solid `BoxInstance`s.
+    pub solid: &'a [Option<u16>],
+    /// Parallel to `DecoratedBox`es.
+    pub decorated: &'a [Option<u16>],
+    /// Parallel to `TextureSampler`s.
+    pub texture: &'a [Option<u16>],
+    /// Parallel to `TextLine`s (applied via glyphon `TextBounds`).
+    pub text: &'a [Option<u16>],
+    /// Parallel to `VectorInstance`s.
+    pub vector: &'a [Option<u16>],
+}
+
+/// Bundles a frame's clip table and per-pool clip slices into a [`FrameClips`].
+fn frame_clips(frame: &RenderFrame) -> FrameClips<'_> {
+    FrameClips {
+        table: frame.clips(),
+        solid: frame.solid_clips(),
+        decorated: frame.decorated_clips(),
+        texture: frame.texture_clips(),
+        text: frame.text_clips(),
+        vector: frame.vector_clips(),
+    }
+}
+
 /// Bundles a frame's parallel draw-order depth slices into a [`DrawDepths`].
 fn frame_draw_depths(frame: &RenderFrame) -> DrawDepths<'_> {
     DrawDepths {
@@ -1088,9 +1126,11 @@ struct DrawPrimitives<'a> {
     solid_depths: &'a [f32],
     decorated_depths: &'a [f32],
     texture_depths: &'a [f32],
+    /// Content-clip table + per-pool clip slices (RFC-0005 `ScrollView`).
+    clips: FrameClips<'a>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn draw_ui_pass(
     encoder: &mut wgpu::CommandEncoder,
     persistent_view: &wgpu::TextureView,
@@ -1102,6 +1142,8 @@ fn draw_ui_pass(
     text_pipeline: &mut TextGlyphPipeline,
     full_redraw: bool,
     scissor: Option<(Rect, u32, u32, u32, u32)>,
+    // (scale_factor, physical width, physical height) — for clip→scissor math.
+    dims: (f32, u32, u32),
     primitives: &DrawPrimitives<'_>,
     gpu_timer: Option<&GpuTimer>,
 ) -> Result<(), ByardError> {
@@ -1123,7 +1165,22 @@ fn draw_ui_pass(
         solid_depths,
         decorated_depths,
         texture_depths,
+        clips,
     } = *primitives;
+    // The base scissor every clipped draw intersects with: the dirty region on
+    // an incremental frame, or the whole physical target on a full redraw.
+    let (scale, phys_w, phys_h) = dims;
+    let base_scissor: Scissor = match scissor {
+        Some((_, x, y, w, h)) => (x, y, w, h),
+        None => (0, 0, phys_w, phys_h),
+    };
+    let clip_ctx = ClipCtx {
+        clips: clips.table,
+        base: base_scissor,
+        scale,
+        phys_w,
+        phys_h,
+    };
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("ByardCore - UI Render Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1194,6 +1251,8 @@ fn draw_ui_pass(
             quad_buffer,
             instances,
             solid_depths,
+            clips.solid,
+            clip_ctx,
         );
     }
 
@@ -1210,6 +1269,8 @@ fn draw_ui_pass(
         quad_buffer,
         decorated,
         decorated_depths,
+        clips.decorated,
+        clip_ctx,
     );
     texture_sampler::draw(
         &mut render_pass,
@@ -1220,6 +1281,8 @@ fn draw_ui_pass(
         texture_cache,
         textures,
         texture_depths,
+        clips.texture,
+        clip_ctx,
     );
     // RFC-0009 §1: crisp monochrome icons, sampled from the same MSDF atlas
     // the JIT/AOT paths upload to. Each instance carries its own draw-order
@@ -1232,7 +1295,20 @@ fn draw_ui_pass(
         quad_buffer,
         vector_atlas,
         vectors,
+        clips.vector,
+        clip_ctx,
     );
+
+    // Restore the base scissor before text: the pool draws above left the GPU
+    // scissor at their last clip run, but text is clipped per-line via glyphon's
+    // own `TextBounds` (set in `prepare`), so its render must run under the full
+    // base region, not a stale ScrollView run.
+    {
+        let (x, y, w, h) = base_scissor;
+        if w > 0 && h > 0 {
+            render_pass.set_scissor_rect(x, y, w, h);
+        }
+    }
 
     // Always the full, unfiltered `texts` slice (the `prepare` call before
     // this pass began did too) — `TextGlyphPipeline`'s internal cache is
@@ -1475,6 +1551,79 @@ impl<'a> ScissorInputs<'a> {
             textures: &[],
             prev_textures: &[],
         }
+    }
+}
+
+/// A physical-pixel scissor tuple `(x, y, w, h)` as
+/// `wgpu::RenderPass::set_scissor_rect` expects.
+type Scissor = (u32, u32, u32, u32);
+
+/// The per-frame context a clipped draw needs (RFC-0005 `ScrollView`): the clip
+/// table, the frame's base scissor (the dirty region on an incremental frame,
+/// or the whole target on a full one), and the physical-pixel conversion. Small
+/// and `Copy` so it threads cheaply into every pool draw.
+#[derive(Clone, Copy)]
+pub struct ClipCtx<'a> {
+    clips: &'a [crate::frame::ClipRect],
+    base: Scissor,
+    scale: f32,
+    phys_w: u32,
+    phys_h: u32,
+}
+
+/// Axis-aligned intersection of two physical scissor rects; `None` if empty
+/// (wgpu rejects a zero-size scissor).
+fn intersect_scissor(a: Scissor, b: Scissor) -> Option<Scissor> {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// The physical scissor for a primitive with clip index `clip`: the frame's
+/// base scissor when unclipped, else that base intersected with the clip's
+/// viewport. `None` means fully clipped away (draw nothing).
+pub(crate) fn clip_scissor(ctx: ClipCtx<'_>, clip: Option<u16>) -> Option<Scissor> {
+    match clip {
+        None => Some(ctx.base),
+        Some(idx) => ctx.clips.get(idx as usize).and_then(|c| {
+            let cr = logical_rect_to_physical_scissor(c.rect, ctx.scale, ctx.phys_w, ctx.phys_h);
+            intersect_scissor(ctx.base, cr)
+        }),
+    }
+}
+
+/// Draws `count` instances grouped by content clip (RFC-0005 `ScrollView`).
+/// Walks maximal runs of equal clip in `clip_slice` — which is contiguous
+/// because emission is tree-order — and for each run sets the scissor to
+/// `clip ∩ base` (physical) and invokes `draw_range(pass, start, end)`. A run
+/// whose effective scissor is empty is skipped entirely: an off-screen scroll
+/// row costs zero fragments (a bonus cull on top of emission culling). Callers
+/// bind the pipeline/buffers once, before this.
+pub(crate) fn for_each_clip_run(
+    pass: &mut wgpu::RenderPass<'_>,
+    count: usize,
+    clip_slice: &[Option<u16>],
+    ctx: ClipCtx<'_>,
+    mut draw_range: impl FnMut(&mut wgpu::RenderPass<'_>, u32, u32),
+) {
+    let clip_at = |i: usize| clip_slice.get(i).copied().flatten();
+    let mut i = 0;
+    while i < count {
+        let cur = clip_at(i);
+        let mut j = i + 1;
+        while j < count && clip_at(j) == cur {
+            j += 1;
+        }
+        if let Some((x, y, w, h)) = clip_scissor(ctx, cur) {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                pass.set_scissor_rect(x, y, w, h);
+                draw_range(pass, i as u32, j as u32);
+            }
+        }
+        i = j;
     }
 }
 
@@ -1794,6 +1943,7 @@ fn draw_clear_quad(
 /// pixels touched here, so calling this unconditionally on every
 /// `should_draw` frame is still proportional to the dirty region's
 /// bandwidth, not the full instance list's.
+#[allow(clippy::too_many_arguments)]
 fn draw_solid_box_instances(
     render_pass: &mut wgpu::RenderPass<'_>,
     device: &wgpu::Device,
@@ -1802,6 +1952,8 @@ fn draw_solid_box_instances(
     quad_buffer: &wgpu::Buffer,
     instances: &[BoxInstance],
     depths: &[f32],
+    clip_slice: &[Option<u16>],
+    ctx: ClipCtx<'_>,
 ) {
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ByardCore - SolidBox Instance Buffer"),
@@ -1825,11 +1977,10 @@ fn draw_solid_box_instances(
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
     render_pass.set_vertex_buffer(2, depth_buffer.slice(..));
-    // Safety: no UI frame will ever hold 2^32 instances. The cast is
-    // bounded by system memory (each BoxInstance is 80 bytes, so 2^32
-    // would require 320 GiB of RAM before reaching this code).
-    #[allow(clippy::cast_possible_truncation)]
-    render_pass.draw(0..4, 0..instances.len() as u32);
+    // Draw in content-clip runs (RFC-0005), each scissored to its viewport.
+    for_each_clip_run(render_pass, instances.len(), clip_slice, ctx, |p, s, e| {
+        p.draw(0..4, s..e);
+    });
 }
 
 /// Vertex buffer layout for the `SolidBox` pipeline's parallel draw-order depth

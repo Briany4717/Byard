@@ -162,8 +162,9 @@ pub async fn build_pipeline(
     Ok(pipeline)
 }
 
-/// Draws every [`DecoratedBox`] using the pipeline. The active GPU scissor (if
-/// any) bounds which pixels are actually touched.
+/// Draws every [`DecoratedBox`], scissored to its content clip (RFC-0005). The
+/// active GPU scissor bounds which pixels are actually touched.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     render_pass: &mut wgpu::RenderPass<'_>,
     device: &wgpu::Device,
@@ -172,6 +173,8 @@ pub fn draw(
     quad_buffer: &wgpu::Buffer,
     boxes: &[DecoratedBox],
     depths: &[f32],
+    clip_slice: &[Option<u16>],
+    ctx: super::ClipCtx<'_>,
 ) {
     if boxes.is_empty() {
         return;
@@ -201,6 +204,8 @@ pub fn draw(
     render_pass.set_bind_group(0, bind_group, &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
-    #[allow(clippy::cast_possible_truncation)]
-    render_pass.draw(0..4, 0..instances.len() as u32);
+    // Content-clip runs (RFC-0005): scissor each run to its ScrollView viewport.
+    super::for_each_clip_run(render_pass, instances.len(), clip_slice, ctx, |p, s, e| {
+        p.draw(0..4, s..e);
+    });
 }
