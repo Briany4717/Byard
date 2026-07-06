@@ -177,12 +177,9 @@ fn later_child_paints_over_container_border() {
         base: solid([50.0, 50.0, 200.0, 150.0], [0.0, 0.0, 0.0, 0.0]),
         border_width: 10.0,
         border_color: [1.0, 0.0, 0.0, 1.0],
-        shadow_dx: 0.0,
-        shadow_dy: 0.0,
-        shadow_blur: 0.0,
-        shadow_color: [0.0; 4],
         opacity: 1.0,
         dirty: true,
+        ..Default::default()
     });
     // 3. Child box (solid, green), emitted LAST, straddling the top border ring
     //    at y≈50 (covers y 40..90, x 100..200).

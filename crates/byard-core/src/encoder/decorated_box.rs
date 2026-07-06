@@ -53,7 +53,9 @@ impl From<&DecoratedBox> for DecoratedInstance {
             border_color: d.border_color,
             shadow_color: d.shadow_color,
             params: [d.border_width, d.shadow_dx, d.shadow_dy, d.shadow_blur],
-            misc: [d.opacity, 0.0, 0.0, 0.0],
+            // misc.y (depth) is stamped per-instance in `draw`; misc.z carries
+            // the shadow spread (RFC-0011).
+            misc: [d.opacity, 0.0, d.shadow_spread, 0.0],
             t_translate: d.base.transform.translate,
             t_scale: d.base.transform.scale,
             t_rotate: d.base.transform.rotate,

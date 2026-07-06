@@ -591,6 +591,9 @@ pub struct DecoratedBox {
     pub shadow_dy: f32,
     /// Drop-shadow blur radius in logical pixels.
     pub shadow_blur: f32,
+    /// Drop-shadow spread in logical pixels (RFC-0011): grows (`> 0`) or shrinks
+    /// (`< 0`) the shadow shape before blurring, like CSS `box-shadow` spread.
+    pub shadow_spread: f32,
     /// Drop-shadow colour `[r, g, b, a]`.
     pub shadow_color: [f32; 4],
     /// Element opacity `0.0–1.0`.
@@ -620,6 +623,7 @@ impl Default for DecoratedBox {
             shadow_dx: 0.0,
             shadow_dy: 0.0,
             shadow_blur: 0.0,
+            shadow_spread: 0.0,
             shadow_color: [0.0; 4],
             opacity: 1.0,
             dirty: false,
