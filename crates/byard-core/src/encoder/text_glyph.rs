@@ -35,6 +35,20 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, SwashCache, TextArea,
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+
+/// Converts a logical-pixel content clip ([`crate::frame::ClipRect`]) into
+/// glyphon's physical-pixel [`TextBounds`] (RFC-0005 `ScrollView`), so a text
+/// line inside a scroll viewport is clipped to it per-area rather than via a
+/// render-pass scissor.
+#[allow(clippy::cast_possible_truncation)]
+fn clip_to_text_bounds(rect: crate::frame::Rect, scale: f32) -> TextBounds {
+    TextBounds {
+        left: (rect.x * scale).floor() as i32,
+        top: (rect.y * scale).floor() as i32,
+        right: ((rect.x + rect.width) * scale).ceil() as i32,
+        bottom: ((rect.y + rect.height) * scale).ceil() as i32,
+    }
+}
 #[cfg(debug_assertions)]
 use rustc_hash::FxHasher;
 use wgpu::MultisampleState;
@@ -246,6 +260,7 @@ impl TextGlyphPipeline {
     /// # Errors
     ///
     /// Returns [`ByardError::TextPrepare`] if glyphon's `prepare` fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -254,6 +269,8 @@ impl TextGlyphPipeline {
         depths: &[f32],
         scale_factor: f32,
         viewport_dirty: bool,
+        clips: &[crate::frame::ClipRect],
+        text_clips: &[Option<u16>],
     ) -> Result<(), ByardError> {
         // ── Pass 1: grow cache and re-shape dirty lines ───────────────────────
         //
@@ -348,14 +365,24 @@ impl TextGlyphPipeline {
                     left: line.x * scale_factor,
                     top: line.y * scale_factor,
                     scale: scale_factor,
-                    // Unbounded clip region: text is visible anywhere on screen.
-                    // A real layout system would tighten this to the widget's rect.
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: i32::MAX,
-                        bottom: i32::MAX,
-                    },
+                    // Content clip (RFC-0005 `ScrollView`): a line inside a scroll
+                    // viewport is clipped to it via glyphon's own `TextBounds`
+                    // (physical px) — the clean, per-area way to clip text without
+                    // a render-pass scissor. Unclipped lines stay unbounded.
+                    bounds: text_clips
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .and_then(|idx| clips.get(idx as usize))
+                        .map_or(
+                            TextBounds {
+                                left: 0,
+                                top: 0,
+                                right: i32::MAX,
+                                bottom: i32::MAX,
+                            },
+                            |c| clip_to_text_bounds(c.rect, scale_factor),
+                        ),
                     default_color,
                     custom_glyphs: &[],
                 }

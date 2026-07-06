@@ -24,6 +24,9 @@ winit = "0.30"
 pollster = "0.3"
 # hello_world_byd example: drives the byld interpreter in a real winit window.
 byard-compiler = { path = "../byard-compiler" }
+# Dumps readback frames to PNG for visual verification (gated behind
+# BYARD_DUMP_PNG); dev-only, never in the shipped engine.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints]
 workspace = true

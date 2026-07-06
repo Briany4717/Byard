@@ -322,6 +322,7 @@ pub async fn build_pipeline(
 /// Draws every [`VectorInstance`], batched against the atlas bind group. Group 0
 /// (viewport) must already be bound by the caller. A no-op on an empty list, so
 /// the render path is unchanged when no vector glyphs are present.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     render_pass: &mut wgpu::RenderPass<'_>,
     device: &wgpu::Device,
@@ -330,6 +331,8 @@ pub fn draw(
     quad_buffer: &wgpu::Buffer,
     atlas: &VectorAtlas,
     instances: &[VectorInstance],
+    clip_slice: &[Option<u16>],
+    ctx: super::ClipCtx<'_>,
 ) {
     if instances.is_empty() {
         return;
@@ -344,8 +347,11 @@ pub fn draw(
     render_pass.set_bind_group(1, atlas.bind_group(), &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
     render_pass.set_vertex_buffer(1, buffer.slice(..));
-    let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
-    render_pass.draw(0..4, 0..count);
+    // Content-clip runs (RFC-0005): an icon scrolled out of its viewport is
+    // scissored away (a zero-area run is skipped entirely).
+    super::for_each_clip_run(render_pass, instances.len(), clip_slice, ctx, |p, s, e| {
+        p.draw(0..4, s..e);
+    });
 }
 
 /// Median of three channels — the MSDF reconstruction of the true signed

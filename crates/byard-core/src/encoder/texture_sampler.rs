@@ -443,6 +443,8 @@ pub fn draw(
     cache: &TextureCache,
     textures: &[TextureSampler],
     depths: &[f32],
+    clip_slice: &[Option<u16>],
+    ctx: super::ClipCtx<'_>,
 ) {
     if textures.is_empty() {
         return;
@@ -455,6 +457,13 @@ pub fn draw(
         let Some(entry) = cache.get(&t.src) else {
             continue;
         };
+        // Content clip (RFC-0005): scissor this image to its ScrollView
+        // viewport; skip it entirely if scrolled fully out of view.
+        let Some((sx, sy, sw, sh)) = super::clip_scissor(ctx, clip_slice.get(i).copied().flatten())
+        else {
+            continue;
+        };
+        render_pass.set_scissor_rect(sx, sy, sw, sh);
         let uv_xform = uv_transform(t.fit, entry.width, entry.height, t.rect[2], t.rect[3]);
         // misc.y carries this image's draw-order depth (NDC-z); the shader reads
         // it as position.z. Missing depth falls back to the far plane.
