@@ -93,6 +93,7 @@ const DECORATION: &[(&str, PropType)] = &[
     ("radius", PropType::Len),
     ("opacity", PropType::Float),
     ("border", PropType::Color),
+    ("border_width", PropType::Int),
     ("shadow", PropType::Str),
 ];
 /// Paint-time transform props (RFC-0011). `opacity` is deliberately **not**

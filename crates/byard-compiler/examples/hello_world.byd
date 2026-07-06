@@ -23,6 +23,7 @@ View Main() {
     var wheelTicks: Int = 0
     var scrollTicks: Int = 0
     var cardHovered: Bool = false
+    var raised: Bool = false
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
@@ -152,6 +153,18 @@ View Main() {
                     Box #[bg: 0xFFFFFF, radius: 10, width: 72, height: 48,
                           shadow: [(y: 1, blur: 2, color: 0x30000000),
                                    (y: 12, blur: 26, spread: -4, color: 0x26000000)]]
+                }
+                // Animated Material elevation (RFC-0010): hover to lift — the
+                // shadow's offset & blur AND the border width both spring on the
+                // GPU (every paint prop animates through the same `with` path).
+                Box #[bg: 0xFFFFFF, radius: 12, width: 260, height: 52,
+                      border: 0x6495ED,
+                      border_width: raised ? 3 : 1 with anim.spring(),
+                      shadow: (y: (raised ? 14 : 3) with anim.spring(),
+                               blur: (raised ? 30 : 8) with anim.spring(),
+                               color: 0x33000000),
+                      hover => raised = true, pointer_exit => raised = false] {
+                    Text("hover me — animated elevation + border") #[color: 0x1A1A22, size: 12]
                 }
             }
 
