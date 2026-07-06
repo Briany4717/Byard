@@ -1,11 +1,14 @@
 //! AOT vector-atlas baking (RFC-0009 §4, M49).
 //!
 //! `byard build` closes the set of icons an app actually instantiates, bakes
-//! only those into one immutable atlas, and emits a fixed coordinate table — so
-//! a shipped binary uploads one texture and indexes a `[BakedGlyph; N]` with no
-//! runtime SVG parsing or coordinate math (the dev/prod parity invariant INV-7:
-//! the baked UV rect is byte-for-byte what the dev JIT produces for the same
-//! cell).
+//! only those into one **tightest-fit** immutable atlas, and emits a fixed
+//! coordinate table — so a shipped binary uploads one small texture and indexes
+//! a `[BakedGlyph; N]` with no runtime SVG parsing or coordinate math. The atlas
+//! is sized to the packing (theoretical-minimum VRAM), not to a fixed sheet.
+//! Dev/prod render parity (INV-7) holds because the baked **field bytes** are
+//! identical to dev's — the UV only addresses them, and a self-describing atlas
+//! `size` travels with the table, so a smaller sheet changes addressing, never
+//! the sampled texels.
 //!
 //! Three stages, each independently testable:
 //!
@@ -26,7 +29,7 @@ use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{ElementNode, Expr, Member, StrPart, ViewDecl};
 
 use super::generate::{GRID_SIZE, PX_RANGE};
-use super::pack::{Size, pack_layers};
+use super::pack::{Placement, Size, pack_layers};
 
 /// A statically resolved `VectorIcon` reference: the literal handle string as
 /// written in source, plus the call-site span for diagnostics.
@@ -44,8 +47,9 @@ pub struct StaticVectorRef {
 pub struct BakedGlyph {
     /// The source handle this entry resolves (the runtime lookup key).
     pub handle: String,
-    /// Normalized UV rect `(u0, v0, u1, v1)` — identical to the corners a dev
-    /// [`byard_core::frame::VectorInstance`] carries for the same atlas cell.
+    /// Normalized UV rect `(u0, v0, u1, v1)` within this atlas ([`BakedVectorAtlas::size`]).
+    /// Addresses the same field bytes the dev path samples, so the render matches
+    /// (INV-7) even though the corners differ from dev's larger sheet.
     pub uv_rect: [f32; 4],
     /// Array-texture layer.
     pub layer: u32,
@@ -169,7 +173,14 @@ pub fn bake_atlas(
         return Err(errors);
     }
 
-    // Pack (all fields are GRID_SIZE² today, but the packer is size-general).
+    // Pack into the *tightest* square atlas (the north star: theoretical-minimum
+    // VRAM). Unlike the dev atlas, the AOT set is fully known, so we size the
+    // texture to the packing instead of always allocating `ATLAS_SIZE`² — a
+    // 5-icon app ships a 64² atlas (~16 KB), not a 2048² one (~16 MB). The baked
+    // atlas is self-describing (`size` travels with the table), so a smaller
+    // atlas changes the UV *addressing*, never the sampled texels: dev/prod
+    // render parity (INV-7) is preserved by the identical field bytes, not by a
+    // byte-identical UV.
     let sizes: Vec<Size> = glyphs
         .iter()
         .map(|(_, g)| Size {
@@ -177,25 +188,25 @@ pub fn bake_atlas(
             h: g.height,
         })
         .collect();
-    let Some((placements, layers)) = pack_layers(&sizes, ATLAS_SIZE, ATLAS_SIZE) else {
+    let Some((atlas_size, placements, layers)) = pack_minimal(&sizes) else {
         return Err(vec![CompileError::Project {
             span: Span::new(0, 0),
             message: format!(
-                "vector atlas packing failed: an icon exceeds the {ATLAS_SIZE}px atlas"
+                "vector atlas packing failed: an icon exceeds the {ATLAS_SIZE}px atlas cap"
             ),
         }]);
     };
 
     // Blit each field into its cell and record its table entry.
-    let plane = (ATLAS_SIZE as usize) * (ATLAS_SIZE as usize) * 4;
+    let plane = (atlas_size as usize) * (atlas_size as usize) * 4;
     let mut atlas = vec![0u8; plane * layers as usize];
     let mut table = Vec::with_capacity(glyphs.len());
     for p in &placements {
         let (handle, glyph) = &glyphs[p.index];
-        blit(&mut atlas, glyph, p.x, p.y, p.layer);
+        blit(&mut atlas, atlas_size, glyph, p.x, p.y, p.layer);
         table.push(BakedGlyph {
             handle: handle.clone(),
-            uv_rect: cell_uv(p.x, p.y, glyph.width, glyph.height),
+            uv_rect: cell_uv(atlas_size, p.x, p.y, glyph.width, glyph.height),
             layer: p.layer,
             px_range: glyph.px_range,
         });
@@ -203,28 +214,60 @@ pub fn bake_atlas(
     table.sort_by(|a, b| a.handle.cmp(&b.handle));
 
     Ok(BakedVectorAtlas {
-        size: ATLAS_SIZE,
+        size: atlas_size,
         layers,
         atlas,
         table,
     })
 }
 
+/// Smallest power-of-two square atlas that packs `sizes` at minimum total VRAM
+/// (`edge² · layers`). Grows the bin by powers of two up to the [`ATLAS_SIZE`]
+/// cap and keeps whichever edge minimises the allocated texels — a small icon
+/// set collapses to a tiny sheet instead of always paying for `ATLAS_SIZE`².
+/// Returns `(edge, placements, layers)`, or `None` if a glyph exceeds the cap.
+fn pack_minimal(sizes: &[Size]) -> Option<(u32, Vec<Placement>, u32)> {
+    /// Floor edge: below a full-HD-ish sheet there's no reason to go smaller
+    /// than one grid cell, but a 64² floor keeps tiny atlases GPU-friendly.
+    const MIN_EDGE: u32 = 64;
+    let mut best: Option<(u64, u32, Vec<Placement>, u32)> = None;
+    let mut edge = MIN_EDGE;
+    while edge <= ATLAS_SIZE {
+        if let Some((placements, layers)) = pack_layers(sizes, edge, edge) {
+            let vram = u64::from(edge) * u64::from(edge) * u64::from(layers);
+            if best.as_ref().is_none_or(|b| vram < b.0) {
+                best = Some((vram, edge, placements, layers));
+            }
+        }
+        edge = edge.saturating_mul(2);
+    }
+    best.map(|(_, edge, placements, layers)| (edge, placements, layers))
+}
+
 /// The normalized `(u0, v0, u1, v1)` corners of a cell at pixel `(x, y)` sized
-/// `w × h` — the exact corners a dev `VectorInstance` carries (INV-7 parity).
+/// `w × h` within an `atlas_size`² sheet. Self-consistent with the baked atlas
+/// (the runtime uploads `atlas_size` and indexes these UVs together), so the
+/// sampled texels — and thus the render — match dev regardless of the size.
 #[must_use]
 #[allow(clippy::many_single_char_names)] // x/y/w/h/s are the natural rect names
-fn cell_uv(x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
+fn cell_uv(atlas_size: u32, x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
     #[allow(clippy::cast_precision_loss)]
-    let s = ATLAS_SIZE as f32;
+    let s = atlas_size as f32;
     #[allow(clippy::cast_precision_loss)]
     let (x, y, w, h) = (x as f32, y as f32, w as f32, h as f32);
     [x / s, y / s, (x + w) / s, (y + h) / s]
 }
 
-/// Copies a glyph's RGBA rows into the atlas at `(x, y, layer)`.
-fn blit(atlas: &mut [u8], glyph: &super::generate::MsdfGlyph, x: u32, y: u32, layer: u32) {
-    let size = ATLAS_SIZE as usize;
+/// Copies a glyph's RGBA rows into the `atlas_size`² atlas at `(x, y, layer)`.
+fn blit(
+    atlas: &mut [u8],
+    atlas_size: u32,
+    glyph: &super::generate::MsdfGlyph,
+    x: u32,
+    y: u32,
+    layer: u32,
+) {
+    let size = atlas_size as usize;
     let plane = size * size * 4;
     let (gw, gh) = (glyph.width as usize, glyph.height as usize);
     let (x, y, layer) = (x as usize, y as usize, layer as usize);
@@ -377,10 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn baked_uv_rect_matches_the_dev_vector_instance_for_the_same_cell() {
-        // INV-7 (dev/prod render parity): the AOT table's UV corners must be
-        // byte-identical to what the dev JIT → `VectorInstance` produces for a
-        // glyph in the same atlas cell.
+    fn baked_field_bytes_match_dev_and_uv_is_self_consistent() {
+        // INV-7 (dev/prod render parity) after the tightest-fit change: the baked
+        // UV corners are relative to the *baked* atlas size (not dev's 2048²), so
+        // they no longer equal dev's corners. Parity now rests on two facts,
+        // both asserted here: (a) the baked field texels are byte-identical to
+        // what the generator produces for the dev path, and (b) the UV addresses
+        // exactly that field's cell within the baked atlas — so the sampled
+        // texels, and thus the render, are identical.
         let dir = std::env::temp_dir().join(format!("byard_aot_parity_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("square.svg"), SQUARE).unwrap();
@@ -393,25 +440,68 @@ mod tests {
         assert_eq!(baked.table.len(), 1);
         let entry = &baked.table[0];
 
-        // Reproduce the dev path's cell → UV corners for the same cell (0,0).
+        // (a) Field parity: the atlas region at the glyph's cell equals the raw
+        // generated field bytes (the dev path uploads exactly these).
+        let dev_field = crate::vector::generate::generate(
+            SQUARE.as_bytes(),
+            GRID_SIZE,
+            PX_RANGE,
+            Span::new(0, 0),
+        )
+        .unwrap()
+        .bitmap;
+        let size = baked.size as usize;
+        let (cx, cy) = (0usize, 0usize); // first packed cell
+        for row in 0..GRID_SIZE as usize {
+            let dst = ((cy + row) * size + cx) * 4;
+            let src = row * GRID_SIZE as usize * 4;
+            let n = GRID_SIZE as usize * 4;
+            assert_eq!(
+                &baked.atlas[dst..dst + n],
+                &dev_field[src..src + n],
+                "baked texels must equal the dev-generated field"
+            );
+        }
+
+        // (b) UV self-consistency: corners = cell / baked-atlas-size.
         #[allow(clippy::cast_precision_loss)]
         let s = baked.size as f32;
         #[allow(clippy::cast_precision_loss)]
-        let cell = GRID_SIZE as f32;
-        let dev_uv = byard_core::frame::Rect::new(0.0, 0.0, cell / s, cell / s);
-        let dev_instance = byard_core::frame::VectorInstance::new(
-            byard_core::frame::Rect::new(0.0, 0.0, 24.0, 24.0),
-            dev_uv,
-            [1.0, 1.0, 1.0, 1.0],
-            entry.px_range,
-            entry.layer,
-        );
-        // Bit-exact comparison: the two paths compute the corners with identical
-        // integer→f32 math, so they must be byte-for-byte equal, not merely close.
+        let c = GRID_SIZE as f32;
         assert_eq!(
             entry.uv_rect.map(f32::to_bits),
-            dev_instance.atlas_uv_rect.map(f32::to_bits),
-            "AOT and dev must agree on the UV corners for the same cell"
+            [0.0, 0.0, c / s, c / s].map(f32::to_bits),
+            "UV must address the glyph's cell within the baked atlas"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_small_icon_set_bakes_a_tiny_atlas_not_the_full_sheet() {
+        // The north star: theoretical-minimum VRAM. Two 32px icons must not ship
+        // a 2048² (~16 MB) sheet — they collapse to a 64² one (~16 KB).
+        let dir = std::env::temp_dir().join(format!("byard_aot_vram_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("square.svg"), SQUARE).unwrap();
+        std::fs::write(dir.join("ring.svg"), RING).unwrap();
+
+        let refs = vec![
+            StaticVectorRef {
+                handle: "square.svg".into(),
+                span: Span::new(0, 0),
+            },
+            StaticVectorRef {
+                handle: "ring.svg".into(),
+                span: Span::new(0, 0),
+            },
+        ];
+        let baked = bake_atlas(&refs, &dir, None).unwrap();
+        assert_eq!(baked.size, 64, "two 32px cells fit a 64² atlas");
+        assert_eq!(baked.layers, 1);
+        assert!(
+            baked.atlas.len() <= 64 * 64 * 4,
+            "atlas bytes track the tight size, not ATLAS_SIZE²"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
