@@ -76,6 +76,11 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
 
     let initial_views = program.views;
     let initial_errors = program.errors;
+    let vector_cache_dir = manifest
+        .project_root
+        .join(".byard")
+        .join("cache")
+        .join("vectors");
 
     // Poll mode: the event loop spins continuously so file-change frames
     // appear without waiting for the next mouse event (RFC-0006 §3.2).
@@ -86,6 +91,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         height_bits: None,
         file_override: file.map(Path::to_path_buf),
         watch_paths,
+        vector_cache_dir,
         initial_views,
         initial_errors,
         last_gpu_telemetry: byard_core::telemetry::SampleBlock::default(),
@@ -356,6 +362,9 @@ struct App {
     file_override: Option<PathBuf>,
     /// Directories the watcher covers: project sources + `path` deps (D-J).
     watch_paths: Vec<PathBuf>,
+    /// Persistent MSDF field cache (`.byard/cache/vectors/`, RFC-0009 §5, M52),
+    /// installed on the interpreter so cold starts skip regeneration.
+    vector_cache_dir: PathBuf,
     initial_views: Vec<ViewDecl>,
     initial_errors: Vec<CompileError>,
     /// This (render/main) thread's GPU telemetry ring, drained on **every**
@@ -463,6 +472,7 @@ impl PlatformHost for App {
         // cache (on the logic thread) knows when to stop re-sending one.
         let (vector_ack_tx, vector_ack_rx) = crossbeam_channel::unbounded();
         engine.set_vector_ack_sender(vector_ack_tx);
+        let vector_cache_dir = self.vector_cache_dir.clone();
 
         engine.start_logic_from_view(move |_arena| {
             let (mut interp, tree, current_views) = if initial_views.is_empty() {
@@ -476,6 +486,7 @@ impl PlatformHost for App {
                 (interp, tree, initial_views)
             };
             interp.set_vector_ack_receiver(vector_ack_rx);
+            interp.set_vector_cache_dir(vector_cache_dir);
 
             Box::new(ByldRuntime {
                 interp,

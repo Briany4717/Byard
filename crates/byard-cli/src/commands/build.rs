@@ -47,8 +47,15 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         ));
     }
 
-    // Stages 2–3: generate + dedup + pack.
-    let baked = bake_atlas(&refs, &manifest.project_root).map_err(|errs| {
+    // Stages 2–3: generate + dedup + pack. Fields are read through the shared
+    // on-disk cache (RFC-0009 §5, M52), so an unchanged icon is not regenerated
+    // on a rebuild.
+    let cache_dir = manifest
+        .project_root
+        .join(".byard")
+        .join("cache")
+        .join("vectors");
+    let baked = bake_atlas(&refs, &manifest.project_root, Some(&cache_dir)).map_err(|errs| {
         for err in &errs {
             eprintln!("{}", program.source_map.render_line(err));
         }

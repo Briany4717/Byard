@@ -66,6 +66,11 @@ enum Command {
     },
     /// Fetch dependencies and write byard.lock (the only lock writer).
     Get,
+    /// Remove generated artifacts and caches under `.byard/` (RFC-0009 §5).
+    Clean {
+        /// Path to a `.byd` file or project dir. Defaults to `byard.toml`.
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -75,6 +80,7 @@ fn main() {
         Command::Dev { file } => commands::dev::run(file.as_deref()),
         Command::Check { file } => commands::check::run(file.as_deref()),
         Command::Build { file } => commands::build::run(file.as_deref()),
+        Command::Clean { file } => commands::clean::run(file.as_deref()),
         Command::Add {
             name,
             path,

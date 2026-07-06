@@ -25,7 +25,7 @@ use byard_core::encoder::vector_msdf::ATLAS_SIZE;
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{ElementNode, Expr, Member, StrPart, ViewDecl};
 
-use super::generate::{GRID_SIZE, PX_RANGE, generate};
+use super::generate::{GRID_SIZE, PX_RANGE};
 use super::pack::{Size, pack_layers};
 
 /// A statically resolved `VectorIcon` reference: the literal handle string as
@@ -132,6 +132,7 @@ pub fn collect_static_vector_refs(
 pub fn bake_atlas(
     refs: &[StaticVectorRef],
     base: &Path,
+    cache_dir: Option<&Path>,
 ) -> Result<BakedVectorAtlas, Vec<CompileError>> {
     // Dedup identical handles (RFC-0009 §4) while keeping a stable order.
     let mut seen = BTreeSet::new();
@@ -149,10 +150,15 @@ pub fn bake_atlas(
     for r in &unique {
         let path = base.join(&r.handle);
         match std::fs::read(&path) {
-            Ok(bytes) => match generate(&bytes, GRID_SIZE, PX_RANGE, r.span) {
-                Ok(glyph) => glyphs.push((r.handle.clone(), glyph)),
-                Err(e) => errors.push(e),
-            },
+            // RFC-0009 §5 (M52): a build reuses the same on-disk field cache as
+            // the dev JIT, so an unchanged icon is not re-generated on rebuild.
+            Ok(bytes) => {
+                match super::cache::generate_cached(&bytes, GRID_SIZE, PX_RANGE, r.span, cache_dir)
+                {
+                    Ok(glyph) => glyphs.push((r.handle.clone(), glyph)),
+                    Err(e) => errors.push(e),
+                }
+            }
             Err(e) => errors.push(CompileError::Project {
                 span: r.span,
                 message: format!("cannot read vector asset {}: {e}", r.handle),
@@ -353,7 +359,7 @@ mod tests {
                 span: Span::new(0, 0),
             },
         ];
-        let baked = bake_atlas(&refs, &dir).expect("bake must succeed");
+        let baked = bake_atlas(&refs, &dir, None).expect("bake must succeed");
 
         assert_eq!(baked.table.len(), 2, "identical handles must dedup");
         assert_eq!(baked.layers, 1, "two 32px cells fit one layer");
@@ -383,7 +389,7 @@ mod tests {
             handle: "square.svg".into(),
             span: Span::new(0, 0),
         }];
-        let baked = bake_atlas(&refs, &dir).unwrap();
+        let baked = bake_atlas(&refs, &dir, None).unwrap();
         assert_eq!(baked.table.len(), 1);
         let entry = &baked.table[0];
 
