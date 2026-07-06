@@ -853,6 +853,28 @@ pub struct RenderFrame {
     texture_depths: Vec<f32>,
     text_depths: Vec<f32>,
 
+    /// Content-clip rectangles (RFC-0005 `ScrollView`, §3.3 scissor). A
+    /// [`ScrollView`] wraps its children in [`begin_clip`](Self::begin_clip) /
+    /// [`end_clip`](Self::end_clip); every drawable emitted inside carries the
+    /// index of the active clip in the parallel `*_clips` slices below, and the
+    /// Encoder sets the GPU scissor to that rect (intersected with the dirty
+    /// region) while drawing it. Distinct from the *dirty-region* scissor, which
+    /// is a per-frame redraw optimisation — this is a semantic content clip.
+    clips: Vec<ClipRect>,
+    /// Stack of active clip indices during emission (not serialized). The top is
+    /// stamped onto each `push_*`; nested clips store their **intersection** with
+    /// the parent, so the Encoder only ever sets one rect. Empty after a frame.
+    clip_stack: Vec<u16>,
+
+    /// Per-primitive clip index, parallel to each drawable pool (like the
+    /// `*_depths` vecs — kept off the `Pod` instance types so vertex layouts stay
+    /// byte-for-byte unchanged). `None` = unclipped (the whole viewport).
+    solid_clips: Vec<Option<u16>>,
+    decorated_clips: Vec<Option<u16>>,
+    texture_clips: Vec<Option<u16>>,
+    text_clips: Vec<Option<u16>>,
+    vector_clips: Vec<Option<u16>>,
+
     /// Running global emission counter, mapped to a depth by [`draw_depth`].
     /// Reset each [`clear`](Self::clear); advanced by every `push_*` drawable.
     draw_seq: u32,
@@ -869,6 +891,27 @@ pub struct RenderFrame {
     /// the existing atomic frame swap instead of a dedicated channel. Empty
     /// when the `telemetry` feature is off or nothing was profiled this tick.
     telemetry: crate::telemetry::SampleBlock,
+}
+
+/// A content-clip rectangle (RFC-0005 `ScrollView`). `rect` is in logical
+/// pixels, like every other [`RenderFrame`] geometry; the Encoder scales it to
+/// physical pixels and intersects it with the dirty-region scissor before the
+/// draw. A [`ScrollView`]'s clip is the intersection of its own viewport with
+/// any ancestor scroll viewport, so nested scrolling needs no per-draw math.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ClipRect {
+    /// The clip region in logical pixels.
+    pub rect: Rect,
+}
+
+/// Axis-aligned intersection of two logical-pixel rects (empty if disjoint).
+#[must_use]
+fn intersect_rect(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
 /// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
@@ -917,6 +960,13 @@ impl RenderFrame {
         self.decorated_depths.clear();
         self.texture_depths.clear();
         self.text_depths.clear();
+        self.clips.clear();
+        self.clip_stack.clear();
+        self.solid_clips.clear();
+        self.decorated_clips.clear();
+        self.texture_clips.clear();
+        self.text_clips.clear();
+        self.vector_clips.clear();
         self.draw_seq = 0;
         self.version = 0;
         // `Vec::clear` only, not `SampleBlock::default()` — the latter would
@@ -943,38 +993,74 @@ impl RenderFrame {
         d
     }
 
+    /// The clip index stamped onto the next `push_*` (the top of the clip
+    /// stack), or `None` when nothing is being clipped.
+    fn active_clip(&self) -> Option<u16> {
+        self.clip_stack.last().copied()
+    }
+
+    /// Opens a content clip (RFC-0005 `ScrollView`): every drawable pushed until
+    /// the matching [`end_clip`](Self::end_clip) is clipped to `rect`. A nested
+    /// clip is stored as its **intersection** with the enclosing clip, so the
+    /// Encoder only ever sets one scissor rect. Returns the clip's index.
+    pub fn begin_clip(&mut self, rect: Rect) -> u16 {
+        let clipped = match self.clip_stack.last() {
+            Some(&parent) => intersect_rect(self.clips[parent as usize].rect, rect),
+            None => rect,
+        };
+        let id = u16::try_from(self.clips.len()).unwrap_or(u16::MAX);
+        self.clips.push(ClipRect { rect: clipped });
+        self.clip_stack.push(id);
+        id
+    }
+
+    /// Closes the most recently opened content clip.
+    pub fn end_clip(&mut self) {
+        self.clip_stack.pop();
+    }
+
     /// Appends a [`BoxInstance`] to the frame.
     pub fn push_instance(&mut self, instance: BoxInstance) {
         let d = self.next_depth();
+        let c = self.active_clip();
         self.instances.push(instance);
         self.solid_depths.push(d);
+        self.solid_clips.push(c);
     }
 
     /// Appends a [`DecoratedBox`] (border/shadow/opacity) to the frame (M21).
     pub fn push_decorated(&mut self, d: DecoratedBox) {
         let depth = self.next_depth();
+        let c = self.active_clip();
         self.decorated.push(d);
         self.decorated_depths.push(depth);
+        self.decorated_clips.push(c);
     }
 
     /// Appends a [`TextureSampler`] (image) to the frame (M21).
     pub fn push_texture(&mut self, t: TextureSampler) {
         let d = self.next_depth();
+        let c = self.active_clip();
         self.textures.push(t);
         self.texture_depths.push(d);
+        self.texture_clips.push(c);
     }
 
     /// Appends a [`TextLine`] to the frame.
     pub fn push_text(&mut self, text: TextLine) {
         let d = self.next_depth();
+        let c = self.active_clip();
         self.texts.push(text);
         self.text_depths.push(d);
+        self.text_clips.push(c);
     }
 
     /// Appends a [`VectorInstance`] (MSDF glyph) to the frame (RFC-0009 §1).
     pub fn push_vector(&mut self, mut v: VectorInstance) {
         v.depth = self.next_depth();
+        let c = self.active_clip();
         self.vector_instances.push(v);
+        self.vector_clips.push(c);
     }
 
     /// Records a pending [`AtlasUpload`] for the render thread to apply before
@@ -1058,6 +1144,38 @@ impl RenderFrame {
     #[must_use]
     pub fn text_depths(&self) -> &[f32] {
         &self.text_depths
+    }
+
+    /// The content-clip table (RFC-0005 `ScrollView`); a primitive's
+    /// `*_clips` entry indexes into this.
+    #[must_use]
+    pub fn clips(&self) -> &[ClipRect] {
+        &self.clips
+    }
+    /// Per-`BoxInstance` clip index (parallel to [`instances`](Self::instances)).
+    #[must_use]
+    pub fn solid_clips(&self) -> &[Option<u16>] {
+        &self.solid_clips
+    }
+    /// Per-`DecoratedBox` clip index (parallel to [`decorated`](Self::decorated)).
+    #[must_use]
+    pub fn decorated_clips(&self) -> &[Option<u16>] {
+        &self.decorated_clips
+    }
+    /// Per-`TextureSampler` clip index (parallel to [`textures`](Self::textures)).
+    #[must_use]
+    pub fn texture_clips(&self) -> &[Option<u16>] {
+        &self.texture_clips
+    }
+    /// Per-`TextLine` clip index (parallel to [`texts`](Self::texts)).
+    #[must_use]
+    pub fn text_clips(&self) -> &[Option<u16>] {
+        &self.text_clips
+    }
+    /// Per-`VectorInstance` clip index (parallel to [`vector_instances`](Self::vector_instances)).
+    #[must_use]
+    pub fn vector_clips(&self) -> &[Option<u16>] {
+        &self.vector_clips
     }
 
     /// Returns the monotonic version counter for this frame.
@@ -1577,5 +1695,93 @@ mod motion_tests {
                 "clamped damping stays bounded"
             );
         }
+    }
+
+    // ── ScrollView content clip (RFC-0005) ───────────────────────────────
+
+    fn box_at(x: f32, y: f32) -> BoxInstance {
+        BoxInstance {
+            rect: [x, y, 10.0, 10.0],
+            color: [1.0; 4],
+            radii: [0.0; 4],
+            transform: Transform::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn drawables_are_stamped_with_the_active_clip_and_none_outside() {
+        let mut f = RenderFrame::new();
+        f.push_instance(box_at(0.0, 0.0)); // unclipped
+        let c = f.begin_clip(Rect::new(20.0, 20.0, 100.0, 80.0));
+        f.push_instance(box_at(30.0, 30.0)); // inside the clip
+        f.end_clip();
+        f.push_instance(box_at(5.0, 5.0)); // unclipped again
+
+        assert_eq!(f.solid_clips(), &[None, Some(c), None]);
+        assert_eq!(f.clips().len(), 1);
+        assert_eq!(f.clips()[0].rect, Rect::new(20.0, 20.0, 100.0, 80.0));
+    }
+
+    #[test]
+    fn a_nested_clip_stores_its_intersection_with_the_parent() {
+        let mut f = RenderFrame::new();
+        let outer = f.begin_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let inner = f.begin_clip(Rect::new(50.0, 50.0, 100.0, 100.0));
+        f.push_instance(box_at(60.0, 60.0));
+        f.end_clip();
+        f.end_clip();
+
+        // Inner clip is the intersection: (50,50) .. (100,100) → 50×50.
+        assert_eq!(
+            f.clips()[inner as usize].rect,
+            Rect::new(50.0, 50.0, 50.0, 50.0)
+        );
+        assert_eq!(
+            f.clips()[outer as usize].rect,
+            Rect::new(0.0, 0.0, 100.0, 100.0)
+        );
+        assert_eq!(f.solid_clips(), &[Some(inner)]);
+    }
+
+    #[test]
+    fn disjoint_nested_clips_intersect_to_an_empty_rect() {
+        let mut f = RenderFrame::new();
+        f.begin_clip(Rect::new(0.0, 0.0, 40.0, 40.0));
+        let inner = f.begin_clip(Rect::new(100.0, 100.0, 40.0, 40.0)); // no overlap
+        f.end_clip();
+        f.end_clip();
+        let r = f.clips()[inner as usize].rect;
+        assert!(r.width == 0.0 || r.height == 0.0, "empty: {r:?}");
+    }
+
+    #[test]
+    fn every_pool_carries_a_clip_slice_parallel_to_it() {
+        let mut f = RenderFrame::new();
+        let c = f.begin_clip(Rect::new(0.0, 0.0, 50.0, 50.0));
+        f.push_instance(box_at(1.0, 1.0));
+        f.push_vector(VectorInstance::new(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(0.0, 0.0, 1.0, 1.0),
+            [1.0; 4],
+            4.0,
+            0,
+        ));
+        f.end_clip();
+        assert_eq!(f.solid_clips(), &[Some(c)]);
+        assert_eq!(f.vector_clips(), &[Some(c)]);
+    }
+
+    #[test]
+    fn clear_resets_the_clip_table_stack_and_slices() {
+        let mut f = RenderFrame::new();
+        f.begin_clip(Rect::new(0.0, 0.0, 10.0, 10.0));
+        f.push_instance(box_at(0.0, 0.0));
+        // Deliberately leave the clip open, then clear.
+        f.clear();
+        assert!(f.clips().is_empty());
+        assert!(f.solid_clips().is_empty());
+        // The stack is empty, so a fresh push is unclipped.
+        f.push_instance(box_at(0.0, 0.0));
+        assert_eq!(f.solid_clips(), &[None]);
     }
 }
