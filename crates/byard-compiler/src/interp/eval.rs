@@ -1387,7 +1387,16 @@ impl Interpreter {
                     // `border` is a Color (catalog DECORATION); a present border
                     // draws a 2px ring of that colour.
                     let border_color = self.eval_color_prop(paint_attrs, "border");
-                    let border_width = if border_color.is_some() { 2.0 } else { 0.0 };
+                    // `border_width` is an animatable paint prop (RFC-0010): it
+                    // resolves through `eval_pure`, so `border_width: n with
+                    // anim.*` interpolates like any other scalar. Defaults to 2px
+                    // when a border colour is present, 0 when there is no border.
+                    let border_width = if border_color.is_some() {
+                        self.eval_float_prop(paint_attrs, "border_width")
+                            .map_or(2.0, |v| v as f32)
+                    } else {
+                        0.0
+                    };
                     // `shadow` is a token (`sm`/`md`/`lg`) → an offset+blur drop
                     // shadow; any other non-empty value falls back to `md`.
                     // `shadow` (RFC-0011 custom shadows): a preset token, a
@@ -4784,6 +4793,90 @@ mod tests {
             !interp.has_active_animations(),
             "settles once the ramp completes"
         );
+    }
+
+    /// Drives a `on ? … : …` paint prop through a 1000 ms linear ramp and
+    /// returns the value `sample` reads from the rendered frame at t = 0 (just
+    /// after the flip), 500, and 1000 ms — the shared body of the coverage tests
+    /// below, which each assert a different paint prop interpolates.
+    fn ramp_paint_prop(
+        src: &str,
+        sample: impl Fn(&byard_core::frame::RenderFrame) -> f32,
+    ) -> [f32; 3] {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        // Seed at rest, then flip the target on at t = 0 so the motion retargets.
+        interp.set_now_ms(0);
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let sig = interp.var_signal(&Symbol::intern("on")).unwrap();
+        interp.write_var(sig, Value::Bool(true));
+        interp.tick();
+        let at = |interp: &mut Interpreter, now: u32| {
+            interp.set_now_ms(now);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            sample(&frame)
+        };
+        [
+            at(&mut interp, 0),
+            at(&mut interp, 500),
+            at(&mut interp, 1000),
+        ]
+    }
+
+    #[test]
+    fn radius_animates_as_a_paint_prop() {
+        let [a, b, c] = ramp_paint_prop(
+            "View V() { var on: Bool = false \
+             Box #[bg: 0x808080, width: 40, height: 40, radius: on ? 20 : 4 with anim.linear(1000)] }",
+            |f| f.instances()[0].radii[0],
+        );
+        assert!((a - 4.0).abs() < 0.5, "starts near 4, got {a}");
+        assert!((b - 12.0).abs() < 1.5, "~halfway, got {b}");
+        assert!((c - 20.0).abs() < 0.5, "arrives at 20, got {c}");
+    }
+
+    #[test]
+    fn border_width_animates_as_a_paint_prop() {
+        let sample = |f: &byard_core::frame::RenderFrame| {
+            f.decorated()
+                .iter()
+                .map(|d| d.border_width)
+                .fold(0.0_f32, f32::max)
+        };
+        let [a, b, c] = ramp_paint_prop(
+            "View V() { var on: Bool = false \
+             Box #[bg: 0x808080, border: 0xFFFFFF, width: 40, height: 40, \
+             border_width: on ? 8 : 2 with anim.linear(1000)] }",
+            sample,
+        );
+        assert!((a - 2.0).abs() < 0.5, "starts near 2, got {a}");
+        assert!((b - 5.0).abs() < 1.0, "~halfway, got {b}");
+        assert!((c - 8.0).abs() < 0.5, "arrives at 8, got {c}");
+    }
+
+    #[test]
+    fn a_shadow_field_animates() {
+        let sample = |f: &byard_core::frame::RenderFrame| {
+            f.decorated()
+                .iter()
+                .map(|d| d.shadow_dy)
+                .fold(0.0_f32, f32::max)
+        };
+        let [a, b, c] = ramp_paint_prop(
+            "View V() { var on: Bool = false \
+             Box #[bg: 0x808080, width: 40, height: 40, \
+             shadow: (y: (on ? 12 : 2) with anim.linear(1000), blur: 8, color: 0x80000000)] }",
+            sample,
+        );
+        assert!((a - 2.0).abs() < 0.6, "starts near 2, got {a}");
+        assert!((b - 7.0).abs() < 1.5, "~halfway, got {b}");
+        assert!((c - 12.0).abs() < 0.6, "arrives at 12, got {c}");
     }
 
     #[test]
