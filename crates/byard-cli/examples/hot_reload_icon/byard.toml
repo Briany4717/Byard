@@ -1,0 +1,3 @@
+[project]
+name = "hot_reload_icon"
+entry = "src/main.byd"

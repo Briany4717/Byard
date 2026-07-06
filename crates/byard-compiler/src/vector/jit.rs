@@ -47,6 +47,14 @@ enum CacheEntry {
         /// Set once the render thread confirms it applied `upload_id`.
         acked: bool,
     },
+    /// A hot-reload (RFC-0009 §3, M47) is regenerating this asset. The previous
+    /// field's atlas cell is retained in `glyph` so the freshly generated field
+    /// lands in the **same UV slot** — the consuming `View` does not remount and
+    /// an in-flight size animation stays crisp — and a `lookup` keeps returning
+    /// that old glyph so the old texels stay on screen until the new ones land.
+    Regenerating {
+        glyph: ResidentGlyph,
+    },
     /// Generation failed; stays a permanent placeholder until a hot-reload
     /// invalidates the entry.
     Failed,
@@ -120,13 +128,68 @@ impl VectorJit {
             return None;
         }
         match self.entries.get(handle) {
-            Some(CacheEntry::Resident { glyph, .. }) => return Some(*glyph),
+            // While regenerating, keep returning the *old* resident glyph so the
+            // previous field stays on screen until the new one lands (M47).
+            Some(CacheEntry::Resident { glyph, .. } | CacheEntry::Regenerating { glyph }) => {
+                return Some(*glyph);
+            }
             Some(CacheEntry::Pending | CacheEntry::Failed) => return None,
             None => {}
         }
         self.entries.insert(handle.to_string(), CacheEntry::Pending);
         self.dispatch(handle.to_string());
         None
+    }
+
+    /// Invalidates one asset by handle (its source path string) on hot-reload
+    /// (RFC-0009 §3, M47). A resident asset re-dispatches generation while
+    /// keeping its atlas cell — [`drain_ready`](Self::drain_ready) then reuses
+    /// that slot so existing `VectorInstance`s are untouched. A failed asset is
+    /// cleared so the next lookup regenerates it fresh. Returns `true` if the
+    /// handle was known and a regeneration was (re)started.
+    ///
+    /// Handles already `Pending`/`Regenerating` are left alone: a worker is
+    /// already in flight and re-dispatching would race two writers on one cell;
+    /// the freshest bytes are picked up by the *next* invalidation after it
+    /// lands. **Logic thread only** (INV-2), like every other cache mutation.
+    pub fn invalidate(&mut self, handle: &str) -> bool {
+        match self.entries.get(handle) {
+            Some(CacheEntry::Resident { glyph, .. }) => {
+                let glyph = *glyph;
+                self.entries
+                    .insert(handle.to_string(), CacheEntry::Regenerating { glyph });
+                self.dispatch(handle.to_string());
+                true
+            }
+            Some(CacheEntry::Failed) => {
+                // Drop it; the next `lookup_or_dispatch` dispatches a fresh
+                // generation into a newly allocated cell.
+                self.entries.remove(handle);
+                true
+            }
+            Some(CacheEntry::Pending | CacheEntry::Regenerating { .. }) | None => false,
+        }
+    }
+
+    /// Invalidates whichever cached asset(s) resolve to the file at `changed`
+    /// (RFC-0009 §3, M47). The file watcher reports absolute paths while a
+    /// handle is the (possibly relative) string from source, so both sides are
+    /// canonicalized before comparison. Returns `true` if any entry matched.
+    pub fn invalidate_path(&mut self, changed: &std::path::Path) -> bool {
+        let Ok(target) = std::fs::canonicalize(changed) else {
+            return false;
+        };
+        let matches: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|h| std::fs::canonicalize(h).is_ok_and(|c| c == target))
+            .cloned()
+            .collect();
+        let mut any = false;
+        for handle in matches {
+            any |= self.invalidate(&handle);
+        }
+        any
     }
 
     fn dispatch(&self, handle: String) {
@@ -180,49 +243,15 @@ impl VectorJit {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg.result {
                 Ok(glyph) => {
-                    if let Some((x, y, layer)) = self.alloc_cell() {
-                        #[allow(clippy::cast_precision_loss)]
-                        let atlas_size = ATLAS_SIZE as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let cell_size = GRID_SIZE as f32;
-                        let uv_rect = Rect::new(
-                            x as f32 / atlas_size,
-                            y as f32 / atlas_size,
-                            cell_size / atlas_size,
-                            cell_size / atlas_size,
-                        );
-                        let upload_id = self.next_upload_id;
-                        self.next_upload_id += 1;
-                        let bytes: std::sync::Arc<[u8]> = glyph.bitmap.into();
-                        uploads.push(AtlasUpload {
-                            layer,
-                            x,
-                            y,
-                            width: glyph.width,
-                            height: glyph.height,
-                            bytes: bytes.to_vec(),
-                            id: upload_id,
-                        });
-                        eprintln!(
-                            "vector: {:?} is now resident (layer {layer}, cell {x},{y}, {}x{} px)",
-                            msg.handle, glyph.width, glyph.height
-                        );
+                    // A hot-reload regeneration reuses the retained cell so the
+                    // UV slot is stable (M47); a first-time miss allocates one.
+                    let cell = match self.entries.get(&msg.handle) {
+                        Some(CacheEntry::Regenerating { glyph }) => Some(cell_of(glyph)),
+                        _ => self.alloc_cell(),
+                    };
+                    if let Some((x, y, layer)) = cell {
                         just_completed.insert(msg.handle.clone());
-                        self.entries.insert(
-                            msg.handle,
-                            CacheEntry::Resident {
-                                glyph: ResidentGlyph {
-                                    uv_rect,
-                                    layer,
-                                    px_range: glyph.px_range,
-                                },
-                                bytes,
-                                width: glyph.width,
-                                height: glyph.height,
-                                upload_id,
-                                acked: false,
-                            },
-                        );
+                        self.place_glyph(msg.handle, &glyph, x, y, layer, &mut uploads);
                     } else {
                         eprintln!(
                             "vector atlas is full; {} could not be placed (eviction is not yet implemented)",
@@ -258,12 +287,9 @@ impl VectorJit {
             } = entry
             {
                 if !*acked {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let x = (glyph.uv_rect.x * ATLAS_SIZE as f32).round() as u32;
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let y = (glyph.uv_rect.y * ATLAS_SIZE as f32).round() as u32;
+                    let (x, y, layer) = cell_of(glyph);
                     uploads.push(AtlasUpload {
-                        layer: glyph.layer,
+                        layer,
                         x,
                         y,
                         width: *width,
@@ -275,6 +301,62 @@ impl VectorJit {
             }
         }
         uploads
+    }
+
+    /// Records a freshly generated `glyph` as resident in the cell at
+    /// (`x`, `y`, `layer`) and appends its [`AtlasUpload`] to `uploads`. Used
+    /// for both a first-time placement (a newly allocated cell) and a hot-reload
+    /// regeneration (the retained cell), so the two paths can't drift.
+    fn place_glyph(
+        &mut self,
+        handle: String,
+        glyph: &super::generate::MsdfGlyph,
+        x: u32,
+        y: u32,
+        layer: u32,
+        uploads: &mut Vec<AtlasUpload>,
+    ) {
+        #[allow(clippy::cast_precision_loss)]
+        let atlas_size = ATLAS_SIZE as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let cell_size = GRID_SIZE as f32;
+        let uv_rect = Rect::new(
+            x as f32 / atlas_size,
+            y as f32 / atlas_size,
+            cell_size / atlas_size,
+            cell_size / atlas_size,
+        );
+        let upload_id = self.next_upload_id;
+        self.next_upload_id += 1;
+        let bytes: std::sync::Arc<[u8]> = glyph.bitmap.clone().into();
+        uploads.push(AtlasUpload {
+            layer,
+            x,
+            y,
+            width: glyph.width,
+            height: glyph.height,
+            bytes: bytes.to_vec(),
+            id: upload_id,
+        });
+        eprintln!(
+            "vector: {handle:?} is now resident (layer {layer}, cell {x},{y}, {}x{} px)",
+            glyph.width, glyph.height
+        );
+        self.entries.insert(
+            handle,
+            CacheEntry::Resident {
+                glyph: ResidentGlyph {
+                    uv_rect,
+                    layer,
+                    px_range: glyph.px_range,
+                },
+                bytes,
+                width: glyph.width,
+                height: glyph.height,
+                upload_id,
+                acked: false,
+            },
+        );
     }
 
     fn alloc_cell(&mut self) -> Option<(u32, u32, u32)> {
@@ -289,6 +371,18 @@ impl VectorJit {
         self.next_cell += 1;
         Some((cx * GRID_SIZE, cy * GRID_SIZE, layer))
     }
+}
+
+/// The atlas cell (pixel `x`, pixel `y`, `layer`) a resident glyph occupies,
+/// recovered from its normalized UV rect — the inverse of the placement math in
+/// [`VectorJit::place_glyph`]. Used to reuse a cell on regeneration and to
+/// re-address an unacknowledged upload.
+fn cell_of(glyph: &ResidentGlyph) -> (u32, u32, u32) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let x = (glyph.uv_rect.x * ATLAS_SIZE as f32).round() as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let y = (glyph.uv_rect.y * ATLAS_SIZE as f32).round() as u32;
+    (x, y, glyph.layer)
 }
 
 #[cfg(test)]
@@ -439,5 +533,123 @@ mod tests {
         }
         // A second lookup on the now-`Failed` handle must stay `None`, not panic.
         assert!(jit.lookup_or_dispatch("/nonexistent/icon.svg").is_none());
+    }
+
+    // ── M47: hot-reload invalidation ──────────────────────────────────────
+
+    /// Writes `content` to a fresh, uniquely named temp `.svg` and returns its
+    /// path. Each test gets its own file so overwrites never race a sibling.
+    fn temp_svg(tag: &str, content: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("byard_jit_{tag}_{nanos}.svg"));
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    const SQUARE_SMALL: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        <path d="M8 8 L16 8 L16 16 L8 16 Z" fill="#000000"/></svg>"##;
+    const SQUARE_LARGE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        <path d="M2 2 L22 2 L22 22 L2 22 Z" fill="#000000"/></svg>"##;
+
+    /// Poll `drain_ready` until an upload whose id differs from `known` appears
+    /// (i.e. a *new* generation landed, not a resend of the old one).
+    fn wait_for_new_upload(jit: &mut VectorJit, known: u64) -> Option<AtlasUpload> {
+        for _ in 0..200 {
+            for up in jit.drain_ready() {
+                if up.id != known {
+                    return Some(up);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    fn invalidate_regenerates_the_field_into_the_same_atlas_cell() {
+        let path = temp_svg("reuse", SQUARE_SMALL);
+        let mut jit = VectorJit::new();
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let first = wait_for_drain(&mut jit);
+        assert_eq!(first.len(), 1, "one glyph should have been generated");
+        let resident1 = jit.lookup_or_dispatch(&path).expect("must be resident");
+
+        // Edit the asset on disk and invalidate it, as a hot-reload would.
+        std::fs::write(&path, SQUARE_LARGE).unwrap();
+        assert!(jit.invalidate(&path), "a resident asset must invalidate");
+
+        let regen = wait_for_new_upload(&mut jit, first[0].id)
+            .expect("the regenerated field must produce a fresh upload");
+
+        // Same cell (stable UV slot) so in-flight instances stay valid...
+        assert_eq!(
+            (regen.x, regen.y, regen.layer),
+            (first[0].x, first[0].y, first[0].layer),
+            "the regenerated field must reuse the original atlas cell"
+        );
+        // ...but genuinely new texels and a new upload id.
+        assert_ne!(
+            regen.bytes, first[0].bytes,
+            "a changed SVG must produce a different field"
+        );
+        assert_ne!(regen.id, first[0].id);
+
+        // The resident glyph the call site samples is unchanged (same UV rect).
+        let resident2 = jit.lookup_or_dispatch(&path).expect("still resident");
+        assert_eq!(resident2.uv_rect, resident1.uv_rect);
+        assert_eq!(resident2.layer, resident1.layer);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lookup_during_regeneration_keeps_returning_the_old_glyph() {
+        let path = temp_svg("regen_lookup", SQUARE_SMALL);
+        let mut jit = VectorJit::new();
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let _ = wait_for_drain(&mut jit);
+        let old = jit.lookup_or_dispatch(&path).expect("resident");
+
+        std::fs::write(&path, SQUARE_LARGE).unwrap();
+        assert!(jit.invalidate(&path));
+
+        // Before the new field lands, the call site must still get the old
+        // glyph — never a `None` placeholder that would blink the icon out.
+        assert_eq!(
+            jit.lookup_or_dispatch(&path),
+            Some(old),
+            "regenerating must not drop the previous field"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidate_is_a_noop_for_an_unknown_handle() {
+        let mut jit = VectorJit::new();
+        assert!(!jit.invalidate("/never/looked/up.svg"));
+    }
+
+    #[test]
+    fn invalidate_path_matches_a_resident_asset_by_canonical_path() {
+        let path = temp_svg("bypath", SQUARE_SMALL);
+        let mut jit = VectorJit::new();
+        assert!(jit.lookup_or_dispatch(&path).is_none());
+        let _ = wait_for_drain(&mut jit);
+
+        assert!(
+            jit.invalidate_path(std::path::Path::new(&path)),
+            "an absolute path to a resident asset must invalidate it"
+        );
+        assert!(
+            !jit.invalidate_path(std::path::Path::new("/no/such/file.svg")),
+            "an unrelated path must not invalidate anything"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

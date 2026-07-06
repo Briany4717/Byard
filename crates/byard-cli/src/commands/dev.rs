@@ -127,6 +127,9 @@ struct ByldRuntime {
     tree: Vec<RenderNode>,
     current_views: Vec<ViewDecl>,
     reload_channel: Arc<LatestWins<ParsedFile>>,
+    /// Changed `.svg` paths from the file watcher: each is invalidated in the
+    /// vector JIT so the field regenerates live (RFC-0009 §3, M47).
+    asset_changes: crossbeam_channel::Receiver<std::path::PathBuf>,
     /// A structure-incompatible reload held during an in-flight gesture (E5).
     pending_reload: Option<(Vec<ViewDecl>, ReloadKind)>,
     /// Parse errors from the last file save (drives error overlay, RFC-0006 §3.4).
@@ -203,6 +206,14 @@ impl LogicRuntime for ByldRuntime {
             } else {
                 self.apply_reload(&new_views, kind);
             }
+        }
+
+        // ── Step 0c: invalidate hot-reloaded vector assets (RFC-0009 §3) ──────
+        // Drain every `.svg` change the watcher reported since the last tick and
+        // invalidate its MSDF field; the regenerated field reuses the same atlas
+        // cell, so the icon updates in place without remounting its `View`.
+        while let Ok(path) = self.asset_changes.try_recv() {
+            self.interp.invalidate_vector_asset(&path);
         }
 
         // ── Step 1: dispatch input events ─────────────────────────────────────
@@ -414,8 +425,12 @@ impl PlatformHost for App {
         // we drop the watcher when the engine drops. We keep it in a Box::leak
         // for now so the OS thread stays alive for the session.
         // TODO: store in App struct properly once Engine exposes a cleanup hook.
+        // Vector-asset (`.svg`) change channel: the watcher forwards changed
+        // paths, the logic thread drains them each tick and invalidates the
+        // matching MSDF field so it regenerates live (RFC-0009 §3, M47).
+        let (asset_tx, asset_rx) = crossbeam_channel::unbounded::<std::path::PathBuf>();
         let file_override = self.file_override.clone();
-        let watcher = start_watcher(&self.watch_paths, watcher_channel, move || {
+        let watcher = start_watcher(&self.watch_paths, watcher_channel, asset_tx, move || {
             reresolve(file_override.as_deref())
         })
         .map_err(|e| ByardError::RenderSurface(format!("file watcher error: {e}")))?;
@@ -467,6 +482,7 @@ impl PlatformHost for App {
                 tree,
                 current_views,
                 reload_channel,
+                asset_changes: asset_rx,
                 pending_reload: None,
                 error_state: initial_errors,
                 width_bits: w_clone,
