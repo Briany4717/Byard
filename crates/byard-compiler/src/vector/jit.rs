@@ -17,7 +17,7 @@ use byard_core::encoder::vector_msdf::{ATLAS_LAYERS, ATLAS_SIZE};
 use byard_core::frame::{AtlasUpload, Rect};
 use crossbeam_channel::{Receiver, Sender};
 
-use super::generate::{GRID_SIZE, PX_RANGE, generate};
+use super::generate::{GRID_SIZE, PX_RANGE};
 use crate::diagnostics::Span;
 
 /// A resident glyph's location in the atlas — everything a `VectorInstance`
@@ -86,6 +86,10 @@ pub struct VectorJit {
     /// contexts with no render thread, e.g. most unit tests — an upload then
     /// simply keeps resending forever, which is harmless there).
     ack_receiver: Option<Receiver<u64>>,
+    /// Persistent field-cache directory (RFC-0009 §5, M52). `None` disables the
+    /// disk cache (every generation runs); the dev runner points it at
+    /// `.byard/cache/vectors/` so cold starts skip regeneration.
+    cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for VectorJit {
@@ -98,6 +102,7 @@ impl Default for VectorJit {
             next_cell: 0,
             next_upload_id: 0,
             ack_receiver: None,
+            cache_dir: None,
         }
     }
 }
@@ -116,6 +121,13 @@ impl VectorJit {
     /// wasteful, so callers with a real render thread should always wire it.
     pub fn set_ack_receiver(&mut self, rx: Receiver<u64>) {
         self.ack_receiver = Some(rx);
+    }
+
+    /// Points the JIT at a persistent field-cache directory (RFC-0009 §5, M52),
+    /// so generation consults `.byard/cache/vectors/` before running the field
+    /// math. Call once at setup; `None` (the default) disables the disk cache.
+    pub fn set_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.cache_dir = Some(dir);
     }
 
     /// Looks up `handle` (an SVG file path). Returns its resident atlas
@@ -195,11 +207,20 @@ impl VectorJit {
     fn dispatch(&self, handle: String) {
         eprintln!("vector: dispatching generation for {handle:?}");
         let tx = self.sender.clone();
+        let cache_dir = self.cache_dir.clone();
         std::thread::spawn(move || {
             let result = std::fs::read(&handle)
                 .map_err(|e| format!("failed to read {handle}: {e}"))
                 .and_then(|bytes| {
-                    generate(&bytes, GRID_SIZE, PX_RANGE, Span::new(0, 0)).map_err(|e| e.headline())
+                    // RFC-0009 §5 (M52): a disk hit skips the field math entirely.
+                    super::cache::generate_cached(
+                        &bytes,
+                        GRID_SIZE,
+                        PX_RANGE,
+                        Span::new(0, 0),
+                        cache_dir.as_deref(),
+                    )
+                    .map_err(|e| e.headline())
                 });
             let _ = tx.send(JitMessage { handle, result });
         });
