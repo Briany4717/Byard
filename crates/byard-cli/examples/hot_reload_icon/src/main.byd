@@ -1,0 +1,16 @@
+// RFC-0009 §3 (M47) — live hot-reload of a vector icon.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/hot_reload_icon
+//   cargo run -p byard-cli -- dev
+//
+// Then edit `src/icon.svg` — change the path data or the fill — and save.
+// The icon re-generates and repaints in place: no restart, no flicker, and
+// the atlas cell is reused so an in-flight size animation would stay crisp.
+View Main() {
+    Column #[bg: 0x14141C, p: 32, gap: 20, width: 420] {
+        Text("Hot-reload me") #[color: 0xFFFFFF, size: 22, weight: bold]
+        VectorIcon("src/icon.svg") #[size: 128, color: 0x8AB4F8]
+        Text("Edit src/icon.svg and save — I update live.") #[color: 0x9AA0AA, size: 14]
+    }
+}

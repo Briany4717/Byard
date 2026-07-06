@@ -221,9 +221,13 @@ pub struct ParsedFile {
 /// `reparse` re-derives the *whole program* — for a single-file project that
 /// is one `parse`, for a multi-file/package project the CLI passes a closure
 /// that re-runs the module resolver. Directories are watched recursively
-/// (project sources and cooperative-dev `path` dependencies, D-J); events for
-/// anything other than `.byd` sources or `byard.toml` are ignored. Fetched,
+/// (project sources and cooperative-dev `path` dependencies, D-J). Fetched,
 /// lock-pinned cache packages are immutable and must not be in `paths`.
+///
+/// Two event classes are routed: `.byd`/`byard.toml` edits trigger `reparse()`
+/// into `channel` (structural reload); `.svg` edits send the changed path to
+/// `assets` so the runtime can invalidate that vector field and regenerate it
+/// live (RFC-0009 §3, M47). Any other change is ignored.
 ///
 /// A parse error keeps `views` empty so the caller retains the last-good view.
 /// Returns the watcher handle — drop it to stop watching.
@@ -235,6 +239,7 @@ pub struct ParsedFile {
 pub fn start_watcher<F>(
     paths: &[std::path::PathBuf],
     channel: std::sync::Arc<LatestWins<ParsedFile>>,
+    assets: crossbeam_channel::Sender<std::path::PathBuf>,
     reparse: F,
 ) -> Result<notify::RecommendedWatcher, notify::Error>
 where
@@ -245,12 +250,23 @@ where
     let mut watcher = notify::RecommendedWatcher::new(
         move |result: notify::Result<notify::Event>| {
             if let Ok(event) = result {
-                let relevant = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-                    && event.paths.iter().any(|p| {
-                        p.extension().is_some_and(|e| e == "byd")
-                            || p.file_name().is_some_and(|f| f == "byard.toml")
-                    });
-                if relevant {
+                if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    return;
+                }
+                let mut source_changed = false;
+                for p in &event.paths {
+                    if p.extension().is_some_and(|e| e == "byd")
+                        || p.file_name().is_some_and(|f| f == "byard.toml")
+                    {
+                        source_changed = true;
+                    } else if p.extension().is_some_and(|e| e == "svg") {
+                        // A vector asset changed — hand its path to the runtime
+                        // for live regeneration (M47). A disconnected receiver
+                        // (runtime torn down) is not the watcher's problem.
+                        let _ = assets.send(p.clone());
+                    }
+                }
+                if source_changed {
                     channel.publish(reparse());
                 }
             }
