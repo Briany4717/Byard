@@ -140,6 +140,47 @@ pub enum RenderNode {
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
 
+/// One resolved drop shadow (RFC-0011 custom shadows): offset, blur, spread, and
+/// resolved RGBA colour. A box may carry several — CSS-style layered shadows —
+/// each emitted as its own shadow-only `DecoratedBox` beneath the surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowSpec {
+    dx: f32,
+    dy: f32,
+    blur: f32,
+    spread: f32,
+    color: [f32; 4],
+}
+
+/// Default drop-shadow colour (`0xAARRGGBB`, ~33% black) when a shadow omits its
+/// own `color`.
+const DEFAULT_SHADOW_COLOR: i64 = 0x5500_0000;
+
+/// A shadow-only [`DecoratedBox`](byard_core::frame::DecoratedBox): the box's
+/// geometry (rect/radii/transform) with a transparent fill and no border, so it
+/// casts `sh` beneath the surface. Emitted per shadow (RFC-0011 layered shadows).
+fn shadow_decorated(
+    base: byard_core::BoxInstance,
+    opacity: f32,
+    sh: &ShadowSpec,
+) -> byard_core::frame::DecoratedBox {
+    byard_core::frame::DecoratedBox {
+        base: byard_core::BoxInstance {
+            color: [0.0; 4],
+            ..base
+        },
+        border_width: 0.0,
+        border_color: [0.0; 4],
+        shadow_dx: sh.dx,
+        shadow_dy: sh.dy,
+        shadow_blur: sh.blur,
+        shadow_spread: sh.spread,
+        shadow_color: sh.color,
+        opacity,
+        dirty: true,
+    }
+}
+
 /// The per-instance parameter bindings produced by binding a user-view call's
 /// arguments to the callee's declared parameters (RFC-0007 §3). Each entry
 /// is a reactive memo projecting the argument expression over the *parent*
@@ -1349,14 +1390,11 @@ impl Interpreter {
                     let border_width = if border_color.is_some() { 2.0 } else { 0.0 };
                     // `shadow` is a token (`sm`/`md`/`lg`) → an offset+blur drop
                     // shadow; any other non-empty value falls back to `md`.
-                    let (shadow_dy, shadow_blur, shadow_color) =
-                        match self.eval_str_prop(paint_attrs, "shadow").as_deref() {
-                            Some("sm") => (1.0_f32, 3.0_f32, Some(0x4400_0000_i64)),
-                            Some("lg") => (6.0, 16.0, Some(0x6600_0000)),
-                            Some("none") | None => (0.0, 0.0, None),
-                            Some(_) => (3.0, 8.0, Some(0x5500_0000)),
-                        };
-                    let shadow_dx = 0.0_f32;
+                    // `shadow` (RFC-0011 custom shadows): a preset token, a
+                    // single (named/positional) tuple, or an array of tuples for
+                    // CSS-style layered shadows. Each becomes its own shadow-only
+                    // decorated box beneath the surface.
+                    let shadows = self.resolve_shadows(paint_attrs);
                     // The element's *effective* opacity: its own `opacity` prop
                     // folded with whatever it inherited (RFC-0011 T4). Used for
                     // this box's own fill and passed down so children (a Button's
@@ -1366,9 +1404,7 @@ impl Interpreter {
                             .eval_float_prop(paint_attrs, "opacity")
                             .map_or(1.0, |v| v as f32);
                     child_opacity = opacity;
-                    let is_decorated = border_width > 0.0
-                        || shadow_blur > 0.0
-                        || (opacity - 1.0).abs() > f32::EPSILON;
+                    let translucent = (opacity - 1.0).abs() > f32::EPSILON;
                     // `Toggle`/`Slider` own their visuals (track/fill/thumb) and
                     // treat `bg` as the *accent* colour, not a full-rect fill —
                     // painting the rect here would draw a slab behind the control.
@@ -1382,9 +1418,13 @@ impl Interpreter {
                         };
                         let border_rgba = border_color
                             .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, false));
-                        let shadow_rgba = shadow_color
-                            .map_or([0.0; 4], |c| super::intrinsics::color_to_rgba(c, true));
-                        let translucent = (opacity - 1.0).abs() > f32::EPSILON;
+                        // Cast the shadows first so they sit *beneath* the fill.
+                        // Reversed: first-listed is pushed last → nearest z → on
+                        // top of later shadows (CSS box-shadow order), all still
+                        // behind the surface pushed after them.
+                        for sh in shadows.iter().rev() {
+                            frame.push_decorated(shadow_decorated(base, opacity, sh));
+                        }
                         if translucent {
                             // A translucent box blends its fill as one unit on the
                             // decorated pipeline (leaf showcase boxes); keep it whole.
@@ -1392,24 +1432,21 @@ impl Interpreter {
                                 base,
                                 border_width,
                                 border_color: border_rgba,
-                                shadow_dx,
-                                shadow_dy,
-                                shadow_blur,
-                                shadow_color: shadow_rgba,
                                 opacity,
                                 // Re-walked and re-emitted every tick;
                                 // mirror Text's always-dirty lowering.
                                 dirty: true,
+                                ..Default::default()
                             });
-                        } else if is_decorated || border_color.is_some() {
+                        } else if border_color.is_some() {
                             // Paint the opaque fill on the SolidBox pass so it stays
                             // *behind* this container's children (they also paint as
                             // solids, pushed after it — and the decorated pass runs
-                            // after every solid). Then add the border/shadow as a
-                            // decorated overlay whose interior is transparent: it only
-                            // strokes the edge and casts the shadow, so it can never
-                            // occlude the children drawn beneath it (fixes the
-                            // parent-card-over-child-widget z-order bug).
+                            // after every solid). Then add the border as a decorated
+                            // overlay whose interior is transparent: it only strokes
+                            // the edge, so it can never occlude the children drawn
+                            // beneath it (fixes the parent-card-over-child-widget
+                            // z-order bug).
                             frame.push_instance(base);
                             frame.push_decorated(byard_core::frame::DecoratedBox {
                                 base: byard_core::BoxInstance {
@@ -1418,12 +1455,9 @@ impl Interpreter {
                                 },
                                 border_width,
                                 border_color: border_rgba,
-                                shadow_dx,
-                                shadow_dy,
-                                shadow_blur,
-                                shadow_color: shadow_rgba,
                                 opacity: 1.0,
                                 dirty: true,
+                                ..Default::default()
                             });
                         } else {
                             frame.push_instance(base);
@@ -2464,6 +2498,113 @@ impl Interpreter {
     /// arity is a `CompileError::ArityMismatch`; a non-numeric corner is an
     /// `AttributeTypeMismatch`; a named field is a `ConflictingSpacingField`
     /// (reusing the existing diagnostic — the message states the real cause).
+    /// Resolves the `shadow` attribute into zero or more drop shadows
+    /// (RFC-0011 custom shadows). Accepts a preset token (`sm`/`md`/`lg`/`none`),
+    /// a single tuple — named `(y: 4, blur: 8, spread: 0, color: 0x…)` or
+    /// positional `(x, y, blur, spread, color)` — or an array of tuples for
+    /// CSS-style layered shadows.
+    fn resolve_shadows(&mut self, attrs: &[Attr]) -> Vec<ShadowSpec> {
+        let Some(value) = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == "shadow" => Some(value),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        match value {
+            // Layered shadows: first-listed paints on top (CSS order), so the
+            // caller emits them reversed to sit nearest.
+            Expr::Array(items, _) => items
+                .iter()
+                .filter_map(|e| self.shadow_from_expr(e))
+                .collect(),
+            other => self.shadow_from_expr(other).into_iter().collect(),
+        }
+    }
+
+    /// One shadow from a tuple, or a preset token; `None` for `none`/unknown.
+    fn shadow_from_expr(&mut self, value: &Expr) -> Option<ShadowSpec> {
+        if let Expr::Tuple(args, _) = value {
+            return Some(self.shadow_from_tuple(args));
+        }
+        // A preset token (`sm`/`md`/`lg`); `none`/anything else → no shadow.
+        let (dy, blur) = match self.eval_pure(value) {
+            Value::Str(t) => match t.as_str() {
+                "sm" => (1.0, 3.0),
+                "md" => (3.0, 8.0),
+                "lg" => (6.0, 16.0),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // Preset alpha scales gently with size (sm 0x44 → lg 0x66).
+        #[allow(clippy::cast_possible_truncation)]
+        let alpha = (0x44 + (blur as i64 - 3) * 2).clamp(0x44, 0x66);
+        Some(ShadowSpec {
+            dx: 0.0,
+            dy,
+            blur,
+            spread: 0.0,
+            color: super::intrinsics::color_to_rgba(alpha << 24, true),
+        })
+    }
+
+    /// Builds a [`ShadowSpec`] from a `shadow` tuple. Named fields (`x`/`dx`,
+    /// `y`/`dy`, `blur`, `spread`, `color`) take any order; a positional tuple
+    /// maps by slot `(x, y, blur, spread, color)`, each optional (later slots
+    /// default), with `color` always the fifth slot so it is unambiguous.
+    fn shadow_from_tuple(&mut self, args: &[Arg]) -> ShadowSpec {
+        let mut s = ShadowSpec {
+            dx: 0.0,
+            dy: 0.0,
+            blur: 0.0,
+            spread: 0.0,
+            color: super::intrinsics::color_to_rgba(DEFAULT_SHADOW_COLOR, true),
+        };
+        if args.iter().any(|a| a.name.is_some()) {
+            for a in args {
+                let Some(field) = a.name.as_ref().map(crate::Symbol::as_str) else {
+                    continue;
+                };
+                match field {
+                    "x" | "dx" => s.dx = self.eval_num(&a.value),
+                    "y" | "dy" => s.dy = self.eval_num(&a.value),
+                    "blur" => s.blur = self.eval_num(&a.value),
+                    "spread" => s.spread = self.eval_num(&a.value),
+                    "color" => s.color = self.eval_shadow_color(&a.value),
+                    _ => {}
+                }
+            }
+        } else {
+            for (i, a) in args.iter().enumerate() {
+                match i {
+                    0 => s.dx = self.eval_num(&a.value),
+                    1 => s.dy = self.eval_num(&a.value),
+                    2 => s.blur = self.eval_num(&a.value),
+                    3 => s.spread = self.eval_num(&a.value),
+                    4 => s.color = self.eval_shadow_color(&a.value),
+                    _ => {}
+                }
+            }
+        }
+        s
+    }
+
+    /// Evaluates a numeric shadow field (offset/blur/spread) to `f32`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn eval_num(&mut self, e: &Expr) -> f32 {
+        match self.eval_pure(e) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Evaluates a shadow `color` field (a `0xAARRGGBB` literal) to RGBA.
+    fn eval_shadow_color(&mut self, e: &Expr) -> [f32; 4] {
+        let packed = self.eval_pure(e).as_int().unwrap_or(DEFAULT_SHADOW_COLOR);
+        super::intrinsics::color_to_rgba(packed, true)
+    }
+
     fn resolve_radii(&mut self, attrs: &[Attr], name: &str) -> [f32; 4] {
         let Some(attr) = attrs.iter().find(|a| a.name.as_str() == name) else {
             return [0.0; 4];
@@ -5771,6 +5912,64 @@ mod tests {
             frame.decorated()[0].shadow_color[3] > 0.0,
             "shadow is translucent"
         );
+    }
+
+    /// Renders `src`'s first view and returns the frame's decorated boxes'
+    /// shadow triples `(dy, blur, spread)`, for the custom-shadow tests below.
+    fn shadow_params(src: &str) -> Vec<(f32, f32, f32)> {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        frame
+            .decorated()
+            .iter()
+            .map(|d| (d.shadow_dy, d.shadow_blur, d.shadow_spread))
+            .collect()
+    }
+
+    #[test]
+    fn named_custom_shadow_sets_offset_blur_and_spread() {
+        let got = shadow_params(
+            "View C() { Box #[bg: 0x222222, shadow: (y: 6, blur: 12, spread: 3, color: 0x80000000)] {} }",
+        );
+        assert_eq!(got.len(), 1, "one shadow instance beneath the fill");
+        let (dy, blur, spread) = got[0];
+        assert!((dy - 6.0).abs() < 0.01, "dy={dy}");
+        assert!((blur - 12.0).abs() < 0.01, "blur={blur}");
+        assert!((spread - 3.0).abs() < 0.01, "spread={spread}");
+    }
+
+    #[test]
+    fn positional_shadow_maps_x_y_blur_spread_color_by_slot() {
+        let got =
+            shadow_params("View C() { Box #[bg: 0x222222, shadow: (0, 4, 8, 2, 0x80000000)] {} }");
+        assert_eq!(got.len(), 1);
+        let (dy, blur, spread) = got[0];
+        assert!(
+            (dy - 4.0).abs() < 0.01 && (blur - 8.0).abs() < 0.01 && (spread - 2.0).abs() < 0.01
+        );
+    }
+
+    #[test]
+    fn layered_shadows_emit_one_instance_each() {
+        let got = shadow_params(
+            "View C() { Box #[bg: 0x222222, shadow: [(y: 2, blur: 4), (y: 8, blur: 16)]] {} }",
+        );
+        assert_eq!(got.len(), 2, "two layered shadows → two instances");
+        let mut blurs: Vec<f32> = got.iter().map(|s| s.1).collect();
+        blurs.sort_by(f32::total_cmp);
+        assert!((blurs[0] - 4.0).abs() < 0.01 && (blurs[1] - 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn shadow_none_and_absent_emit_no_shadow() {
+        assert!(shadow_params("View C() { Box #[bg: 0x222222] {} }").is_empty());
+        assert!(shadow_params("View C() { Box #[bg: 0x222222, shadow: \"none\"] {} }").is_empty());
     }
 
     // ── M22: Theme system ────────────────────────────────────────────────

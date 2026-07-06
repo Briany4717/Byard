@@ -68,9 +68,11 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.half_size = vec2<f32>(w, h) * 0.5;
 
     // Inflate the quad to cover the shape, its anti-alias fringe, and the full
-    // shadow extent (offset + blur), so no shadow fragment is clipped away.
+    // shadow extent (offset + blur + positive spread), so no shadow fragment is
+    // clipped away. `misc.z` is the shadow spread.
     let shadow_margin = abs(vec2<f32>(instance.params.y, instance.params.z))
-        + vec2<f32>(instance.params.w);
+        + vec2<f32>(instance.params.w)
+        + vec2<f32>(max(instance.misc.z, 0.0));
     let margin = vec2<f32>(QUAD_PADDING) + shadow_margin;
     let padded = vec2<f32>(w, h) + margin * 2.0;
 
@@ -118,13 +120,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let border_width = in.params.x;
     let shadow_offset = vec2<f32>(in.params.y, in.params.z);
     let shadow_blur = in.params.w;
+    let shadow_spread = in.misc.z;
     let opacity = in.misc.x;
 
     // ── Drop shadow (drawn beneath the surface) ───────────────────────────
+    // `spread` grows/shrinks the shadow shape (and its corner radii) before the
+    // blur, matching CSS `box-shadow` spread; clamp to non-negative extents.
     var shadow_a = 0.0;
-    if (in.shadow_color.a > 0.0 && (shadow_blur > 0.0
+    if (in.shadow_color.a > 0.0 && (shadow_blur > 0.0 || shadow_spread != 0.0
         || abs(shadow_offset.x) > 0.0 || abs(shadow_offset.y) > 0.0)) {
-        let sdist = sd_rounded_box(in.local_pos - shadow_offset, in.half_size, in.radii);
+        let s_half = max(in.half_size + vec2<f32>(shadow_spread), vec2<f32>(0.0));
+        let s_radii = max(in.radii + vec4<f32>(shadow_spread), vec4<f32>(0.0));
+        let sdist = sd_rounded_box(in.local_pos - shadow_offset, s_half, s_radii);
         let soft = max(shadow_blur, 0.5);
         shadow_a = (1.0 - smoothstep(0.0, soft, sdist)) * in.shadow_color.a;
     }

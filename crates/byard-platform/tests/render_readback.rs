@@ -64,7 +64,18 @@ fn demo_boxes_are_actually_painted_on_screen() {
         .instances()
         .iter()
         .copied()
-        .filter(|b| b.color[3] > 0.9 && b.color[2] > 0.8 && b.color[2] - b.color[0] > 0.4)
+        .filter(|b| {
+            // Opaque, strongly blue-dominant …
+            let blue = b.color[3] > 0.9 && b.color[2] > 0.8 && b.color[2] - b.color[0] > 0.4;
+            // … and fully on-screen, so the sampled centre lands inside the
+            // readback buffer no matter how tall the demo grows: it extends past
+            // the 720px frame (there is no ScrollView yet), and an off-screen
+            // box's centre would index out of bounds.
+            let cx = b.rect[0] + b.rect[2] / 2.0;
+            let cy = b.rect[1] + b.rect[3] / 2.0;
+            let on_screen = cx >= 0.0 && cx < logical_w && cy >= 0.0 && cy < logical_h;
+            blue && on_screen
+        })
         .max_by(|a, b| {
             (a.rect[2] * a.rect[3])
                 .partial_cmp(&(b.rect[2] * b.rect[3]))

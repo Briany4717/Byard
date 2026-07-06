@@ -1,0 +1,29 @@
+// RFC-0011 — custom + layered drop shadows.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/shadows
+//   cargo run -p byard-cli -- dev
+//
+// `shadow` accepts a preset token, a named tuple, a positional tuple, or an
+// array of tuples for CSS-style layered shadows. `spread` grows/shrinks the
+// shadow shape before the blur.
+View Main() {
+    Column #[bg: 0xF2F3F5, p: 40, gap: 32, width: 520] {
+        // Preset token (unchanged sugar).
+        Box #[bg: 0xFFFFFF, radius: 12, width: 440, height: 72, shadow: "md"] {}
+
+        // Named custom shadow — self-describing, any field order.
+        Box #[bg: 0xFFFFFF, radius: 12, width: 440, height: 72,
+              shadow: (y: 10, blur: 24, spread: -2, color: 0x33000000)] {}
+
+        // Positional (x, y, blur, spread, color) — terse.
+        Box #[bg: 0xFFFFFF, radius: 12, width: 440, height: 72,
+              shadow: (0, 4, 8, 0, 0x40000000)] {}
+
+        // Layered: a tight contact shadow plus a soft ambient one (Material-like
+        // elevation). First-listed paints on top.
+        Box #[bg: 0xFFFFFF, radius: 12, width: 440, height: 72,
+              shadow: [(y: 1, blur: 2, color: 0x30000000),
+                       (y: 12, blur: 28, spread: -4, color: 0x28000000)]] {}
+    }
+}
