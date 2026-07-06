@@ -622,3 +622,166 @@ fn content_clip_scissors_overflow_to_the_viewport() {
         eprintln!("wrote clip readback PNG to {out}");
     }
 }
+
+/// RFC-0005 `ScrollView` end-to-end: a `.byd` list taller than its viewport,
+/// scrolled by `offset`, renders through the real interpreter → encoder and the
+/// overflow is clipped. `BYARD_DUMP_PNG=1` writes the frame to a PNG.
+#[test]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn scrollview_scrolls_and_clips_end_to_end() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping readback");
+        return;
+    };
+
+    let (lw, lh) = (400.0_f32, 340.0_f32);
+    let scale = 1.0_f32;
+    let (pw, ph) = (lw as u32, lh as u32);
+
+    // A scroll viewport at a fixed offset of 90px: the list is 12 rows tall and
+    // overflows the 200px viewport, so the top rows are scrolled out of view.
+    let src = r#"View Main() {
+        Column #[bg: 0x101018, p: 20, gap: 12, width: 340] {
+            ScrollView #[width: 300, height: 200, offset: (0, 90), bg: 0x1E1E2A, radius: 10] {
+                Column #[p: 10, gap: 8] {
+                    for label in ["A","B","C","D","E","F","G","H","I","J","K","L"] {
+                        Row #[bg: 0x2C6BD8, radius: 6, p: (vertical: 10, horizontal: 12), width: 268] {
+                            Text("row {label}") #[color: 0xFFFFFF, size: 15]
+                        }
+                    }
+                }
+            }
+            Text("below the scroll area") #[color: 0x9AA0AA, size: 13]
+        }
+    }"#;
+    let parsed = parse(src);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let mut interp = Interpreter::new();
+    let tree = interp.lower_view(&parsed.views[0], &[]);
+    assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+    interp.tick();
+    let mut frame = RenderFrame::new();
+    interp.render(&tree, &mut frame, lw, lh);
+    assert!(
+        !frame.clips().is_empty(),
+        "the ScrollView must emit a content clip"
+    );
+
+    let fmt = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let mut enc = pollster::block_on(EncoderSubsystem::init(
+        Arc::clone(&device),
+        Arc::clone(&queue),
+        fmt,
+        scale,
+        pw,
+        ph,
+    ))
+    .unwrap();
+    enc.update_viewport(
+        Viewport {
+            width: lw,
+            height: lh,
+        },
+        pw,
+        ph,
+        scale,
+    );
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scroll target"),
+        size: wgpu::Extent3d {
+            width: pw,
+            height: ph,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: fmt,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let cmd = enc.encode_frame_from_relay(&target, &frame).unwrap();
+    queue.submit(std::iter::once(cmd));
+
+    let bpr = 256 * (pw * 4).div_ceil(256);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(bpr) * u64::from(ph),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut ce = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    ce.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(ph),
+            },
+        },
+        wgpu::Extent3d {
+            width: pw,
+            height: ph,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(ce.finish()));
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range();
+    let px = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+        let i = (y * bpr + x * 4) as usize;
+        (data[i], data[i + 1], data[i + 2], data[i + 3])
+    };
+
+    // Is there a strongly-blue row pixel in a horizontal band at row `y`?
+    let has_blue_row = |y: u32| -> bool {
+        (30..300).step_by(3).any(|x| {
+            let (b, _g, r, _a) = px(x, y);
+            b > 140 && b > u32::from(r).saturating_add(30) as u8
+        })
+    };
+    // Inside the viewport (y in 20..220) at least one scan line shows a row.
+    assert!(
+        (30..215).step_by(4).any(has_blue_row),
+        "the scrolled list must paint rows inside the viewport"
+    );
+    // Below the viewport (the outer column, y > 230) the clipped list must not
+    // bleed — no blue rows there.
+    assert!(
+        !(232..300).step_by(4).any(has_blue_row),
+        "the list must be clipped to the viewport (no bleed below it)"
+    );
+
+    if std::env::var("BYARD_DUMP_PNG").is_ok() {
+        let mut rgba = vec![0u8; (pw * ph * 4) as usize];
+        for y in 0..ph {
+            for x in 0..pw {
+                let (b, g, r, a) = px(x, y);
+                let o = ((y * pw + x) * 4) as usize;
+                rgba[o] = r;
+                rgba[o + 1] = g;
+                rgba[o + 2] = b;
+                rgba[o + 3] = a;
+            }
+        }
+        let out = std::env::var("BYARD_PNG_PATH").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("byard_scroll.png")
+                .display()
+                .to_string()
+        });
+        image::save_buffer(&out, &rgba, pw, ph, image::ColorType::Rgba8).unwrap();
+        eprintln!("wrote scroll readback PNG to {out}");
+    }
+}

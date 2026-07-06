@@ -1562,6 +1562,29 @@ impl Interpreter {
                         self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
+                // RFC-0005 `ScrollView`: clip children to this viewport and
+                // translate the content by `−offset`. The overflow is scissored
+                // by the encoder (an off-viewport child costs no fragments), and
+                // the content was measured unbounded (layout `scroll`). `offset`
+                // is a two-way `Vec2` the app can read or drive; wheel/drag land
+                // next. Rotation of a scroll viewport is out of scope (the clip
+                // is an axis-aligned screen rect).
+                let scroll_open = if name.as_str() == "ScrollView" {
+                    let (ox, oy) = self.resolve_axis_pair(attrs, "offset", (0.0, 0.0));
+                    let tl = inherited_transform.apply_point([current_rect.x, current_rect.y]);
+                    let clip = byard_core::frame::Rect::new(
+                        tl[0],
+                        tl[1],
+                        current_rect.w * inherited_transform.scale[0],
+                        current_rect.h * inherited_transform.scale[1],
+                    );
+                    frame.begin_clip(clip);
+                    child_transform.translate[0] -= ox * inherited_transform.scale[0];
+                    child_transform.translate[1] -= oy * inherited_transform.scale[1];
+                    true
+                } else {
+                    false
+                };
                 for child in children {
                     let child_id = flat_ids[*flat_idx];
                     self.render_node_with_atlas(
@@ -1574,6 +1597,9 @@ impl Interpreter {
                         child_opacity,
                         child_transform,
                     );
+                }
+                if scroll_open {
+                    frame.end_clip();
                 }
             }
             RenderNode::Image {
@@ -2241,6 +2267,10 @@ impl Interpreter {
             "Row" => FlexDir::Row,
             _ => FlexDir::Column,
         };
+        // RFC-0005 `ScrollView`: a vertical scroll container — content is
+        // measured at natural size and overflows the fixed viewport (clipped +
+        // scrolled by the renderer), rather than flex-shrunk to fit.
+        style.scroll = element_name == "ScrollView";
         for attr in attrs {
             if let AttrKind::Prop { value } = &attr.kind {
                 let val = self.eval_pure(value);
@@ -4877,6 +4907,59 @@ mod tests {
         assert!((a - 2.0).abs() < 0.6, "starts near 2, got {a}");
         assert!((b - 7.0).abs() < 1.5, "~halfway, got {b}");
         assert!((c - 12.0).abs() < 0.6, "arrives at 12, got {c}");
+    }
+
+    /// RFC-0005 `ScrollView`: content is clipped to the viewport and translated
+    /// by `−offset`, so scrolling moves the content up without relayout.
+    #[test]
+    fn scrollview_clips_and_translates_content_by_offset() {
+        let src = "View V() { var off: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // The red content box's paint-time translate.y (where the scroll offset
+        // lives — the shader applies it, so the layout rect is untouched, i.e.
+        // no relayout on scroll), plus whether a content clip was emitted.
+        let sample = |interp: &mut Interpreter| -> (f32, f32, usize) {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let red = *frame
+                .instances()
+                .iter()
+                .find(|b| b.color[0] > 0.8 && b.color[1] < 0.3 && b.color[2] < 0.3)
+                .expect("the red content box is emitted");
+            (red.rect[1], red.transform.translate[1], frame.clips().len())
+        };
+
+        let (rect_y0, tx0, clips0) = sample(&mut interp);
+        assert!(clips0 >= 1, "the ScrollView must emit a content clip");
+
+        // Scroll down by 40 logical px → the content's paint translate moves up
+        // by 40, while its layout rect is unchanged (INV-8: no relayout).
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        interp.write_var(off, Value::Int(40));
+        interp.tick();
+        let (rect_y1, tx1, clips1) = sample(&mut interp);
+        assert!(clips1 >= 1);
+        assert!(
+            (rect_y0 - rect_y1).abs() < 0.01,
+            "layout rect must not move on scroll (no relayout): {rect_y0} vs {rect_y1}"
+        );
+        assert!(
+            (tx0 - tx1 - 40.0).abs() < 0.5,
+            "content must translate up by the offset: tx0={tx0} tx1={tx1}"
+        );
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
 use taffy::{
     AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, NodeId, Rect as TaffyRect, Size, Style, TaffyError, TaffyTree,
+    LengthPercentageAuto, NodeId, Overflow, Point, Rect as TaffyRect, Size, Style, TaffyError,
+    TaffyTree,
 };
 
 use super::spatial::SpatialGrid;
@@ -169,6 +170,11 @@ pub struct ContainerStyle {
     /// Flex-grow factor (how much this node expands to fill its parent's main
     /// axis).
     pub grow: f32,
+    /// Whether this is a **vertical scroll container** (RFC-0005 `ScrollView`):
+    /// its content is measured at natural size on the block axis and overflows
+    /// the fixed viewport (Taffy `overflow.y = Scroll`), rather than being
+    /// shrunk to fit. The overflow is clipped and scrolled by the renderer.
+    pub scroll: bool,
 }
 
 impl ContainerStyle {
@@ -232,6 +238,13 @@ impl ContainerStyle {
         self
     }
 
+    /// Marks this as a vertical scroll container (RFC-0005 `ScrollView`).
+    #[must_use]
+    pub fn with_scroll(mut self, scroll: bool) -> Self {
+        self.scroll = scroll;
+        self
+    }
+
     /// Builds the Taffy `Style` this container maps to.
     fn to_taffy(self) -> Style {
         Style {
@@ -276,6 +289,18 @@ impl ContainerStyle {
                 Justify::Evenly => JustifyContent::SpaceEvenly,
             }),
             flex_grow: self.grow,
+            // RFC-0005 `ScrollView`: a vertical scroll container measures its
+            // content at natural size and lets it overflow the fixed viewport,
+            // instead of flex-shrinking children to fit. The renderer clips and
+            // scrolls the overflow.
+            overflow: Point {
+                x: Overflow::Visible,
+                y: if self.scroll {
+                    Overflow::Scroll
+                } else {
+                    Overflow::Visible
+                },
+            },
             ..Default::default()
         }
     }
