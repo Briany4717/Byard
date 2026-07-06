@@ -1,0 +1,22 @@
+// RFC-0009 §4 (M49) — AOT vector-atlas bake.
+//
+// Bake it (from the repo root):
+//   cd crates/byard-cli/examples/aot_atlas
+//   cargo run -p byard-cli -- build
+//
+// `byard build` statically closes the icon set actually instantiated below
+// (`check.svg` is used twice → deduped to one cell; `unused.svg` sits in `src/`
+// but is never referenced → tree-shaken out), generates + MaxRects-packs them,
+// and writes `.byard/generated/vector_atlas.rs` (the `[BakedGlyph; N]` table)
+// and `vector_atlas.bin` (the packed texels). Inspect the emitted table:
+//   cat .byard/generated/vector_atlas.rs
+View Main() {
+    Column #[bg: 0x14141C, p: 32, gap: 16, width: 420] {
+        Text("Baked with byard build") #[color: 0xFFFFFF, size: 20, weight: bold]
+        Row #[gap: 16] {
+            VectorIcon("src/check.svg") #[size: 48, color: 0x8AB4F8]
+            VectorIcon("src/plus.svg")  #[size: 48, color: 0x81C995]
+            VectorIcon("src/check.svg") #[size: 32, color: 0xF28B82]
+        }
+    }
+}

@@ -561,6 +561,7 @@ mod tests {
                 source: DepSource::Path(PathBuf::from("../kit")),
             }],
             single_file: false,
+            vector_includes: Vec::new(),
         };
         let (program, provider) = resolve_project(&manifest).unwrap();
         assert!(program.errors.is_empty(), "{:?}", program.errors);

@@ -371,6 +371,15 @@ pub enum CompileError {
         /// The number of path segments actually found.
         found_nodes: usize,
     },
+    /// A `VectorIcon`'s asset argument is not a compile-time-constant handle, so
+    /// the AOT (`byard build`) packer cannot close the icon set statically
+    /// (RFC-0009 §4). The fix is to make the handle a string literal, or to
+    /// declare an explicit `[assets.vectors] include = [...]` list in
+    /// `byard.toml`. A partial atlas is never shipped silently.
+    VectorAssetNotStatic {
+        /// Anchor span of the `VectorIcon` call site.
+        span: Span,
+    },
 }
 
 impl CompileError {
@@ -414,7 +423,8 @@ impl CompileError {
             | Self::DuplicateViewName { span, .. }
             | Self::Project { span, .. }
             | Self::SvgUnsupportedFeatures { span }
-            | Self::SvgTooComplexForMssdf { span, .. } => *span,
+            | Self::SvgTooComplexForMssdf { span, .. }
+            | Self::VectorAssetNotStatic { span } => *span,
         }
     }
 
@@ -460,7 +470,8 @@ impl CompileError {
             | Self::DuplicateViewName { span, .. }
             | Self::Project { span, .. }
             | Self::SvgUnsupportedFeatures { span }
-            | Self::SvgTooComplexForMssdf { span, .. } => {
+            | Self::SvgTooComplexForMssdf { span, .. }
+            | Self::VectorAssetNotStatic { span } => {
                 span.start = (i64::from(span.start) + delta).max(0) as u32;
                 span.end = (i64::from(span.end) + delta).max(0) as u32;
             }
@@ -509,6 +520,7 @@ impl CompileError {
             Self::Project { .. } => "Project",
             Self::SvgUnsupportedFeatures { .. } => "SvgUnsupportedFeatures",
             Self::SvgTooComplexForMssdf { .. } => "SvgTooComplexForMssdf",
+            Self::VectorAssetNotStatic { .. } => "VectorAssetNotStatic",
         }
     }
 
@@ -651,6 +663,12 @@ impl CompileError {
                 "SVG has {found_nodes} path segments, exceeding the MSDF complexity budget \
                  (500) — simplify the artwork or use `Image` instead"
             ),
+            Self::VectorAssetNotStatic { .. } => {
+                "VectorIcon asset is not a compile-time-constant path; `byard build` cannot \
+                 statically close the icon set — use a string literal, or list the assets in \
+                 `byard.toml` under `[assets.vectors] include`"
+                    .to_string()
+            }
         }
     }
 
