@@ -2,8 +2,10 @@
 // available so far: reactive `var`/`let`, parameterized `fn`, string
 // interpolation, ternaries, the full intrinsic catalog, two-way `bind:`,
 // keyboard focus + Tab, structural `for`/`when … else`, themed typography,
-// the four `Len` padding forms, decoration (radius/border/shadow/opacity),
-// paint-time transforms, coherent paint order, and a textured `Image`.
+// the four `Len` padding forms, decoration (radius/border/opacity), custom &
+// layered drop shadows (named/positional/array, with spread), an MSDF
+// `VectorIcon`, paint-time transforms, coherent paint order, and a textured
+// `Image`.
 //
 // Laid out as two side-by-side columns in a ~16:9 landscape frame. Run with:
 //   cargo run -p byard-cli -- dev crates/byard-compiler/examples/hello_world.byd
@@ -125,12 +127,32 @@ View Main() {
         // ══ RIGHT COLUMN ════════════════════════════════════════════════════
         Column #[gap: 20, width: 560] {
 
-            // ── Decoration showcase: radius / border / shadow / opacity ──────
+            // ── Decoration showcase: radius / border / preset shadow / opacity
             Row #[gap: 16] {
                 Box #[bg: 0x6495ED, radius: 12, width: 96, height: 56]
                 Box #[bg: 0x1E1E2A, radius: 12, border: 0x6495ED, width: 96, height: 56]
                 Box #[bg: 0x9C27B0, radius: 12, shadow: "lg", width: 96, height: 56]
                 Box #[bg: 0xEF4444, radius: 12, opacity: 0.45, width: 96, height: 56]
+            }
+
+            // ── Custom & layered shadows (RFC-0011): full control over
+            // offset / blur / spread / colour, plus CSS-style layering. Drawn
+            // on a LIGHT panel so the shadows read clearly (they're near-
+            // invisible on the dark theme above). Left→right: a named tuple
+            // (any field order, negative spread), a positional tuple
+            // (x, y, blur, spread, colour), and a Material-like layered pair
+            // (tight contact + soft ambient).
+            Column #[bg: 0xF2F3F5, radius: 16, p: 20, gap: 12, width: 300] {
+                Text("Custom & layered shadows") #[color: 0x1A1A22, size: 15, weight: bold]
+                Row #[gap: 18, align: center] {
+                    Box #[bg: 0xFFFFFF, radius: 10, width: 72, height: 48,
+                          shadow: (y: 8, blur: 18, spread: -2, color: 0x33000000)]
+                    Box #[bg: 0xFFFFFF, radius: 10, width: 72, height: 48,
+                          shadow: (0, 3, 6, 0, 0x40000000)]
+                    Box #[bg: 0xFFFFFF, radius: 10, width: 72, height: 48,
+                          shadow: [(y: 1, blur: 2, color: 0x30000000),
+                                   (y: 12, blur: 26, spread: -4, color: 0x26000000)]]
+                }
             }
 
             // ── Paint-time transforms (RFC-0011): translate/scale/rotate/origin
