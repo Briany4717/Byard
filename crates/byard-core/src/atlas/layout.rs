@@ -741,6 +741,26 @@ impl LayoutAtlas {
         Ok(self.resolved_rect_internal(node))
     }
 
+    /// The `(width, height)` of a node's **content** — the extent of its
+    /// children, which for a `ScrollView` (Taffy `overflow: Scroll`) exceeds the
+    /// node's own box. Subtracting the viewport size gives the maximum scroll
+    /// distance (RFC-0005). `None` if the node is unknown or not yet computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::ForeignNode`] if `node` belongs to another atlas.
+    pub fn content_size(&self, node: AtlasNodeId) -> Result<Option<(f32, f32)>, AtlasError> {
+        self.validate_node(node)?;
+        if self.state != AtlasState::Computed {
+            return Ok(None);
+        }
+        Ok(self
+            .tree
+            .layout(node.node_id)
+            .ok()
+            .map(|l| (l.content_size.width, l.content_size.height)))
+    }
+
     /// Writes the resolved geometry of every node into `frame`, marking each
     /// entry dirty if its `TargetId` appears in `dirty_targets`.
     ///

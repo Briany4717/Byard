@@ -4,11 +4,12 @@
 //   cd crates/byard-cli/examples/scrollview
 //   cargo run -p byard-cli -- dev
 //
-// Drag the slider to scroll the list. `offset` is a two-way Vec2 — here the y
-// component is driven by `scrollY`. The content is measured at its natural
-// height and *overflows* the 220px viewport; the overflow is clipped (GPU
-// scissor) and the whole content is translated by −offset at paint time, so
-// scrolling never re-runs layout (INV-8). (Wheel + drag land next.)
+// Scroll with the **mouse wheel** over the list, or drag the slider — both
+// drive the same `scrollY` (the y of the two-way `offset` Vec2), clamped to the
+// content extent. The content is measured at its natural height and *overflows*
+// the 220px viewport; the overflow is clipped (GPU scissor) and the whole
+// content is translated by −offset at paint time, so scrolling never re-runs
+// layout (INV-8). (Drag-to-scroll — D-2 — lands next.)
 View Main() {
     var scrollY: Float = 0.0
 

@@ -140,6 +140,19 @@ pub enum RenderNode {
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
 
+/// A wheel-scrollable region recorded during render (RFC-0005 `ScrollView`).
+/// `dispatch_events` turns a wheel over `rect` into a clamped write to `sig`
+/// (the signal backing the view's `offset.y`), so the mouse wheel scrolls.
+#[derive(Clone, Copy)]
+struct ScrollTarget {
+    /// Viewport rect in logical screen px (the wheel hit region).
+    rect: crate::interp::intrinsics::Rect,
+    /// The signal backing `offset.y`; the wheel writes it.
+    sig: SignalId,
+    /// Maximum scroll distance (content height − viewport height), clamped ≥ 0.
+    max: f32,
+}
+
 /// One resolved drop shadow (RFC-0011 custom shadows): offset, blur, spread, and
 /// resolved RGBA colour. A box may carry several — CSS-style layered shadows —
 /// each emitted as its own shadow-only `DecoratedBox` beneath the surface.
@@ -283,6 +296,11 @@ pub struct Interpreter {
     /// §2). Drained once per [`render`](Self::render) call, before the tree
     /// walk, so a freshly-resident glyph is visible the same tick it lands.
     vector_jit: crate::vector::VectorJit,
+    /// Wheel-scroll targets recorded during the last render (RFC-0005): one per
+    /// `ScrollView` whose `offset.y` is a writable signal. `dispatch_events`
+    /// reads this to convert a wheel into a clamped scroll — the same
+    /// render-then-dispatch handshake the router's hit rects use.
+    scroll_targets: Vec<ScrollTarget>,
 }
 
 impl Interpreter {
@@ -737,6 +755,27 @@ impl Interpreter {
         None
     }
 
+    /// The signal backing a `ScrollView`'s `offset.y` (RFC-0005), if it is a
+    /// writable `var` — e.g. `offset: (0, scrollY)` yields `scrollY`'s signal, so
+    /// the wheel can scroll by writing it. `None` for a literal or computed
+    /// offset (then the wheel is inert and the app drives `offset` itself).
+    fn resolve_offset_sig(&self, attrs: &[Attr]) -> Option<super::env::SignalId> {
+        use crate::parser::ast::Expr;
+        let value = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == "offset" => Some(value),
+            _ => None,
+        })?;
+        // `offset: (x, y)` — the y component is the second tuple element.
+        if let Expr::Tuple(args, _) = value {
+            if let Some(Expr::Ident(name, _)) = args.get(1).map(|a| &a.value) {
+                if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
+                    return Some(*sig);
+                }
+            }
+        }
+        None
+    }
+
     /// Lowers an element to a [`RenderNode`], validating it against the §5
     /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
     /// `known_views` are user `ViewDecl` names in scope.
@@ -1091,6 +1130,9 @@ impl Interpreter {
         // gesture state (a pending `down`, the focused element) so a tap that
         // spans this re-render is still recognized (RFC-0003 E4).
         self.router.clear_handlers();
+        // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
+        // router's hit rects.
+        self.scroll_targets.clear();
 
         // Drain any MSDF generations that finished since the last tick,
         // before the tree walk below, so a freshly-resident glyph is visible
@@ -1581,6 +1623,28 @@ impl Interpreter {
                     frame.begin_clip(clip);
                     child_transform.translate[0] -= ox * inherited_transform.scale[0];
                     child_transform.translate[1] -= oy * inherited_transform.scale[1];
+                    // Record a wheel-scroll target when `offset.y` is a writable
+                    // signal (e.g. `offset: (0, scrollY)`): the wheel scrolls by
+                    // writing it, clamped to the content extent. `dispatch_events`
+                    // consumes these next tick (render-then-dispatch handshake).
+                    if let Some(sig) = self.resolve_offset_sig(attrs) {
+                        let content_h = self
+                            .atlas
+                            .content_size(atlas_node)
+                            .ok()
+                            .flatten()
+                            .map_or(current_rect.h, |(_, h)| h);
+                        self.scroll_targets.push(ScrollTarget {
+                            rect: crate::interp::intrinsics::Rect::new(
+                                clip.x,
+                                clip.y,
+                                clip.width,
+                                clip.height,
+                            ),
+                            sig,
+                            max: (content_h - current_rect.h).max(0.0),
+                        });
+                    }
                     true
                 } else {
                     false
@@ -3370,6 +3434,9 @@ impl Interpreter {
         use crate::interp::events::{EventKind as CompKind, InputEvent as CompEvent};
         use byard_core::platform::{EventKind as CoreKind, InputPayload};
 
+        /// Logical pixels a `ScrollView` scrolls per wheel line (RFC-0005).
+        const WHEEL_LINE_PX: f32 = 40.0;
+
         let comp_events: Vec<CompEvent> = events
             .iter()
             .map(|ev| {
@@ -3406,6 +3473,47 @@ impl Interpreter {
                 }
             })
             .collect();
+
+        // RFC-0005 `ScrollView` wheel: a wheel/scroll over a recorded scroll
+        // target writes its `offset.y` signal, clamped to `[0, content −
+        // viewport]`. Wheel deltas are line-based (× a per-line step); trackpad
+        // `Scroll` deltas are already pixels. Done here, before the render, so
+        // the same tick paints the new offset (paint-time translate, no
+        // relayout — INV-8).
+        for ev in events {
+            let step = match ev.kind {
+                CoreKind::Wheel => WHEEL_LINE_PX,
+                CoreKind::Scroll => 1.0,
+                _ => continue,
+            };
+            let (px, py) = ev.pos;
+            let Some(t) = self
+                .scroll_targets
+                .iter()
+                .rev()
+                .find(|t| {
+                    px >= t.rect.x
+                        && px < t.rect.x + t.rect.w
+                        && py >= t.rect.y
+                        && py < t.rect.y + t.rect.h
+                })
+                .copied()
+            else {
+                continue;
+            };
+            let cur = match self.peek(t.sig) {
+                Value::Int(n) => n as f32,
+                Value::Float(f) => f as f32,
+                _ => 0.0,
+            };
+            // Wheel forward (delta.y > 0) reveals earlier content → offset down.
+            let next = (cur - ev.delta.1 * step).clamp(0.0, t.max);
+            let value = match self.peek(t.sig) {
+                Value::Int(_) => Value::Int(next.round() as i64),
+                _ => Value::Float(f64::from(next)),
+            };
+            self.write_var(t.sig, value);
+        }
 
         self.router
             .dispatch_tick(&mut self.ctx, Some(&self.atlas), comp_events);
@@ -4960,6 +5068,74 @@ mod tests {
             (tx0 - tx1 - 40.0).abs() < 0.5,
             "content must translate up by the offset: tx0={tx0} tx1={tx1}"
         );
+    }
+
+    /// RFC-0005: the mouse wheel over a `ScrollView` scrolls it by writing the
+    /// signal behind `offset.y`, clamped to `[0, content − viewport]`.
+    #[test]
+    fn wheel_over_a_scrollview_scrolls_and_clamps_the_offset() {
+        // Content = 4 × 60px = 240 tall in a 100px viewport → max scroll 140.
+        let src = "View V() { var off: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // Render once to record the scroll target (viewport at the top-left).
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let peek_f = |interp: &Interpreter| -> f32 {
+            match interp.peek(off) {
+                Value::Float(f) => f as f32,
+                Value::Int(n) => n as f32,
+                _ => panic!("offset must be numeric"),
+            }
+        };
+        let wheel = |interp: &mut Interpreter, dy: f32| {
+            interp.dispatch_events(&[byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (100.0, 50.0), // inside the 200×100 viewport
+                delta: (0.0, dy),
+                payload: None,
+                time_ms: 0,
+            }]);
+            interp.tick();
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 400.0, 300.0);
+        };
+
+        // Wheel forward by 2 lines (× 40px) → scroll down by 80.
+        wheel(&mut interp, -2.0);
+        let after_one = peek_f(&interp);
+        assert!(
+            (after_one - 80.0).abs() < 1.0,
+            "one wheel notch scrolls by lines×40, got {after_one}"
+        );
+
+        // A big wheel clamps to the content extent (max = 240 − 100 = 140).
+        wheel(&mut interp, -20.0);
+        let clamped = peek_f(&interp);
+        assert!(
+            (clamped - 140.0).abs() < 1.0,
+            "scroll must clamp to content−viewport, got {clamped}"
+        );
+
+        // Wheel back up past the top clamps at 0.
+        wheel(&mut interp, 20.0);
+        let top = peek_f(&interp);
+        assert!(top.abs() < 1.0, "scroll must clamp at 0, got {top}");
     }
 
     #[test]
