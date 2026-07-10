@@ -116,7 +116,7 @@ table on the interpreter, built once per program load from `ParsedFile::views`:
 ```text
 ViewTable {
     by_name: HashMap<Symbol, ViewId>,   // Symbol → dense id
-    decls:   Vec<ViewDecl>,             // owned, Send (INV-3/INV-6)
+    decls:   Vec<ViewDecl>,             // owned, Send
 }
 ```
 
@@ -163,7 +163,7 @@ into a `Box` anymore; their handling is governed by the slot decision (D-A).
 - Arity, unknown-parameter, duplicate-parameter, and missing-required-parameter
   errors are diagnostics (§6), not panics.
 
-> **Signals stay on the logic thread (INV-2 / RFC-0001 §5.1).** Binding creates
+> **Signals stay on the logic thread (RFC-0001 §5.1).** Binding creates
 > memos and arena entries only on the logic thread; nothing here crosses a thread
 > boundary.
 
@@ -226,16 +226,16 @@ that would force runtime-only semantics must be flagged before merge.
 
 ---
 
-## Open decisions (to be logged in `DESICIONS.md`, continuing IMPL-46+)
+## Open decisions
 
-Use the existing `### IMPL-NN — Title` template (Context / Decision / Why /
-Consequences). **Never decide silently.**
+Each decision below is recorded with Context / Decision / Why / Consequences.
+**Never decide silently.**
 
 - **D-A — Slot / child-block model.** Does `Callee { ... }` pass a child block to
   the callee, and how does the callee receive it? *Recommendation:* introduce an
   explicit content parameter (a `View`-typed or `slot` param) rather than magic
   trailing-block capture; keep first implementation to named params only and log
-  slots as a follow-up sub-decision. Resolve before M35.
+  slots as a follow-up sub-decision. Resolve before the package ecosystem (RFC-0008).
 - **D-B — Parameter defaults.** Allow `View Card(elevated: Bool = false)`?
   *Recommendation:* yes, since it sharply reduces call-site noise and is trivial
   to transpile; defaults evaluate in the callee scope. Affects `MissingParam`.
@@ -244,8 +244,8 @@ Consequences). **Never decide silently.**
   diagnostic.
 - **D-D — Per-instance arena granularity.** One `ViewArena` per instance
   (RFC-0001 §2.1, recommended) vs. a pooled region. Measure before optimizing
-  (project ethos): start with per-instance, record allocation cost like
-  IMPL-40/IMPL-42 did for the render path.
+  (project ethos): start with per-instance, record allocation cost as was
+  done for the render path.
 - **D-E — Intrinsic precedence.** Confirm intrinsics (RFC-0005) always win over a
   same-named user `View` and that the collision is a hard error, not shadowing.
 

@@ -1,9 +1,9 @@
 # RFC-0008: Package Ecosystem — Multi-File Modules, Dependencies, and Distribution
 
-- **Status:** Active — implemented 2026-07-04 (M35). Pillars A/B/C/E landed;
+- **Status:** Active — implemented 2026-07-04. Pillars A/B/C/E landed;
   Pillar D (asset distribution) remains a design proposal. Open decisions
-  D-F…D-K are closed in `DESICIONS.md` IMPL-84…IMPL-89; the first out-of-tree
-  package (`byard-material`, IMPL-90) exercises the pipeline end to end.
+  D-F…D-K are resolved; the first out-of-tree package (`byard-material`)
+  exercises the pipeline end to end.
 - **Author(s):** Briany4717
 - **Created:** 2026-06-24
 - **Last updated:** 2026-07-04
@@ -21,21 +21,21 @@
 
 ---
 
-## Implementation status (2026-07-04, M35)
+## Implementation status (2026-07-04)
 
 | Pillar | State | Where |
 | --- | --- | --- |
 | A — `use` + module resolver | **Landed** | `Token::Use`, `UseDecl`, `byard_compiler::resolve` (graph, cycle detection, span-rebasing `SourceMap`, flatten into RFC-0007's `ViewTable`) |
 | B — Explicit namespacing | **Landed** | Alias/selective forms, canonical `pkg.View` names, `NameCollision`/`UnknownImportSymbol`/`DuplicateViewName` diagnostics |
 | C — Dependency manager | **Landed** | Strict `[dependencies]` parsing, `byard add`/`install`/`get`, `byard.lock` (commit + `sha256:` content hash), `~/.byard/cache`, transitive path/git deps |
-| D — Asset distribution | Design proposal | Unchanged below — fonts/icons/themes wait on RFC-0009 + IMPL-31/43 integration |
+| D — Asset distribution | Design proposal | Unchanged below — fonts/icons/themes wait on RFC-0009 + asset-loading integration |
 | E — Multi-file hot-reload | **Landed** | Watcher covers project dir + `path` deps (D-J: yes); any change re-runs the resolver; cache packages not watched |
 
-Two deliberate deviations from the text below, argued in `DESICIONS.md`:
-sibling files of one package share a **flat namespace** (no relative imports
-at all — IMPL-85), and `byard add <bare-name>` resolves through a small
-built-in index that writes an explicit pinned source into the manifest
-(IMPL-88), as the honest stopgap for the deferred registry.
+Two deliberate deviations from the text below: sibling files of one package
+share a **flat namespace** (no relative imports at all), and
+`byard add <bare-name>` resolves through a small built-in index that writes an
+explicit pinned source into the manifest, as the honest stopgap for the deferred
+registry.
 
 ---
 
@@ -48,8 +48,9 @@ namespacing** so two packages may both define `Button`; (C) a **dependency
 manager** in `byard-cli` (`byard add` / `byard get`, `[dependencies]` in
 `byard.toml`, and a content-hashed **`byard.lock`** for reproducible builds);
 and (D) **asset distribution** (fonts, icons, themes) handled as *engine policy*,
-not as `.byd`-author file I/O — consistent with RFC-0001 §1 and the IMPL-43
-precedent. Git-first acquisition; a central registry is explicitly deferred.
+not as `.byd`-author file I/O — consistent with RFC-0001 §1 and its
+asset-loading-as-engine-policy precedent. Git-first acquisition; a central
+registry is explicitly deferred.
 
 ---
 
@@ -72,8 +73,8 @@ from day one) and the **two-layer rule** (`.byd` never does I/O).
 The intuitive syntax `import "pkg:material/buttons/raised_button.byd"` encodes a
 *filesystem path and a resolution strategy as a string literal inside surface
 `byld`*. That sits uneasily with RFC-0001 §1 ("`.byd` files … contain no network
-calls, no file I/O") and with IMPL-43 (asset loading is engine policy, not an
-author choice). Two coherent directions:
+calls, no file I/O") and with the principle that asset loading is engine policy,
+not an author choice. Two coherent directions:
 
 - **Path-string imports** (Dart-like): familiar, but bakes path/resolution
   semantics into the language surface and invites authors to think in files.
@@ -158,8 +159,8 @@ Extend RFC-0006's CLI and `manifest.rs`:
 ### Pillar D — Asset distribution as engine policy
 
 Component libraries ship fonts, icons, and theme tokens. RFC-0001 §1 forbids
-`.byd` I/O, and IMPL-43 already established that loading is **engine policy, not
-a `byld`-author choice**. Therefore:
+`.byd` I/O, and the engine already establishes that loading is **engine policy,
+not a `byld`-author choice**. Therefore:
 
 - A package declares its assets in *its* manifest; the resolver registers them
   into an **asset table** keyed by package-qualified virtual id (e.g.
@@ -167,7 +168,7 @@ a `byld`-author choice**. Therefore:
 - The engine's text/texture subsystems (glyphon / cosmic-text, the
   `TextureSampler` pipeline, RFC-0001 §3.1) consume assets through that table.
   The `.byd` author references a token (`typo: m.titleLarge`), never a path.
-- Theme tokens extend the existing theme provenance model (IMPL-31), namespaced
+- Theme tokens extend the existing theme provenance model, namespaced
   per package so two themes coexist.
 
 ### Pillar E — Multi-file hot-reload
@@ -185,7 +186,7 @@ generalizes the watcher to the **module graph**:
 
 ---
 
-## Open decisions (log in `DESICIONS.md`, continuing after RFC-0007's IMPL-46+)
+## Open decisions
 
 - **D-F — Import surface.** Package-qualified symbol imports (`use`) vs.
   path-string imports. *Recommendation:* `use`, keeping I/O out of `byld`.
@@ -201,7 +202,7 @@ generalizes the watcher to the **module graph**:
   now, or pin exact refs and defer a solver to the registry phase?
   *Recommendation:* defer the solver; exact refs + lock first.
 - **D-L — Asset manifest schema.** How a package declares fonts/icons/themes and
-  how the resolver validates them against IMPL-31/IMPL-32/IMPL-43.
+  how the resolver validates them against the engine's asset-loading model.
 
 ---
 

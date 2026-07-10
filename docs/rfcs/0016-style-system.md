@@ -4,7 +4,7 @@
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
-- **Depends on:** RFC-0002 (D5 resolution, D8 static styles, Pratt parser, `inject`), RFC-0005 (§6 theme tokens / M22), RFC-0010 (`with` animation), RFC-0011 (transform), RFC-0012 (engine state source + event exposure).
+- **Depends on:** RFC-0002 (D5 resolution, D8 static styles, Pratt parser, `inject`), RFC-0005 (§6 theme tokens), RFC-0010 (`with` animation), RFC-0011 (transform), RFC-0012 (engine state source + event exposure).
 - **Supersedes:** RFC-0012's **§B declarative pseudo-state layer** (this RFC owns the declarative style/state surface). RFC-0012's **§A event exposure** and the engine `StyleState` mask **remain** and are consumed here.
 - **Relation to the existing `style { .class }`:** kept as desugaring sugar (§7 Migration) — no existing `.byd` breaks.
 
@@ -175,7 +175,7 @@ token_mod    := "." IDENT ( "(" arg_list ")" )?   // .surface / .round(md) / .to
 - `..expr` spread is parsed in the attribute list (`register_event_attrs` sibling)
   and requires an `expr` of type `Style` (checked).
 - `token_mod` is the **single-dot** `.name` form (a new `Expr::TokenMod`); the
-  **double-dot** `..name` is the `Style`-value spread (decision **M2**). The two
+  **double-dot** `..name` is the `Style`-value spread (decision **D2**). The two
   sigils are distinct, so there is no symbol-table disambiguation: `.` = token,
   `..` = whole style. Legacy `.class` references desugar to `..class` (§7).
 
@@ -183,7 +183,7 @@ token_mod    := "." IDENT ( "(" arg_list ")" )?   // .surface / .round(md) / .to
 
 At lower time, an element's effective attrs resolve last-wins in this order:
 
-1. **theme defaults** (RFC-0005 §6 / M22, D5 layer 1),
+1. **theme defaults** (RFC-0005 §6 theme tokens, D5 layer 1),
 2. **spread/merged styles** in written order (`..a, ..b` → b overrides a),
 3. **active interaction-state blocks**, in fixed priority
    `disabled > pressed > focused > hover` (RFC-0012 **S3**),
@@ -273,26 +273,26 @@ central theming, which Byard's token layer fixes), Jetpack Compose Material3 the
 - **State set / priority / dispatch gating:** inherit RFC-0012 **S1/S3/S5**.
 - **Composition:** `merge` + `..` spread only; last-wins; inline overrides.
 - **Backward compat:** `style { .class }` and `#[style: .class]` desugar (§7).
-- **M1 — recipe naming:** a recipe is a **free name** applied via
+- **D1 — recipe naming:** a recipe is a **free name** applied via
   `#[variant: (…)]`, **not** bound to an intrinsic name. Rationale: keeps recipes
   reusable/composable and decouples the style system from the intrinsic catalog; an
   intrinsic-bound default (all `Button`s adopt a `Button` recipe) is deferred sugar,
   not load-bearing.
-- **M2 — token vs style disambiguation → distinct sigils.** Single-dot **`.token`**
+- **D2 — token vs style disambiguation → distinct sigils.** Single-dot **`.token`**
   = semantic token modifier (resolved against the theme); double-dot **`..style`** =
   spread a `Style` *value*. Legacy `.class` references desugar to `..class`.
   Rationale: eliminates any symbol-table collision, is visually unambiguous
   (`.` = token, `..` = whole style), and matches the §7 migration.
-- **M3 — composition operator → keyword `merge`.** Infix `merge` for building named
+- **D3 — composition operator → keyword `merge`.** Infix `merge` for building named
   composed styles; `..` spread stays for inline. Rejected `+`/`&`: reads worse and
   overloads arithmetic with style semantics. `merge` is prose, consistent with
   `with`/`on`. A recipe may be `merge`d (it collapses to a plain `Style` first).
 
 ## Unresolved questions (deferred to implementation)
 
-- [ ] `AttrSet` inline capacity before spilling (mirror IMPL-01's `SmallVec<[_;4]>`).
+- [ ] `AttrSet` inline capacity before spilling (mirror the `SmallVec<[_;4]>` inline-capacity pattern used elsewhere on the hot path).
 - [ ] Lint/codemod to auto-migrate `.class` → `..style` spreads.
-- [ ] Exact theme-token vocabulary shared with RFC-0005 §6 / M22.
+- [ ] Exact theme-token vocabulary shared with RFC-0005 §6.
 
 ## Future possibilities
 

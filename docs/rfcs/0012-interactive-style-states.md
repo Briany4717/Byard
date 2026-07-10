@@ -24,8 +24,8 @@ without holding a widget reference and without hand-writing state `var`s and
    `pointer_enter`, `pointer_exit`, `long_press`, `double_tap`, `secondary`),
    plus optional `focus`/`blur` sugar and a `click`→`tap` alias.
 
-The audit (`support/AUDIT_events_and_interactive_styles.md`) established that the
-router and `byard_core` already recognize all these gestures with passing tests;
+An audit of the current event/style plumbing established that the router and
+`byard_core` already recognize all these gestures with passing tests;
 the only gap is the six-line `match` in `register_event_attrs` and the missing
 declarative state layer. This RFC closes both.
 
@@ -232,7 +232,7 @@ booleans resolved reference-free, and transitions ride RFC-0010's GPU springs.
 ## Resolved decisions (2026-07-01)
 
 - **S1 — Phase-1 state set:** the **four** (`hover/pressed/focused/disabled`);
-  `checked/selected/invalid` deferred to Phase 2 (they need M16 value write-back).
+  `checked/selected/invalid` deferred to Phase 2 (they need form value write-back).
 - **S2 — focus API:** **both** — keep `focused:` (bound state) *and* add `focus =>`/
   `blur =>` event sugar (one-shot side effects); both ride the same `focused_sig`.
 - **S3 — priority:** **`disabled > pressed > focused > hover`** (disabled always

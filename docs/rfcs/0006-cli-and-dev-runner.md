@@ -13,7 +13,7 @@
 - **Implements:**
   - RFC-0001 §7.3 "Dev mode" end-to-end (currently exercised only through an internal example, not a shipped tool)
   - RFC-0002 D10's open wire: `start_watcher` + `LatestWins<ParsedFile>` channel exists in `byard-compiler/src/interp/reload.rs` but is not connected to any live runner
-  - The "IMPL-23" item from the implementation log: notify file watcher concrete binding
+  - The concrete `notify` file-watcher binding
 
 ---
 

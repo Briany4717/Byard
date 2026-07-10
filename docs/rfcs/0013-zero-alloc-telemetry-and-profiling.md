@@ -107,8 +107,9 @@ no formatting on the hot path.
 At end-of-tick, the logic thread packs the tick's samples into a flat POD block
 and ships it on **the same atomic frame swap** already used to hand `RenderFrame`
 to the renderer (RFC-0001 §5.1). No new channel, no `Mutex`, no contention — the
-telemetry rides the frame it describes. Only `Send` PODs cross the boundary
-(INV-2). The renderer/overlay consumer reads the block after presenting.
+telemetry rides the frame it describes. Only `Send` PODs cross the boundary,
+per the RFC-0001 §5 concurrency model. The renderer/overlay consumer reads the
+block after presenting.
 
 ### GPU timing — async timestamp queries, never blocking
 
@@ -145,8 +146,8 @@ bottleneck worth a JIT?* You cannot answer that honestly without this bucket.
 ### Threading & invariants
 
 Ring buffers are `!Send` and thread-local; only packed POD sample blocks cross
-threads, on the existing frame channel. No back-dependency (INV-1), no shared
-mutable state, no lock on the hot path. Compiled out in release → the profiler
+threads, on the existing frame channel. No back-dependency (per the RFC-0001 §5
+concurrency model), no shared mutable state, no lock on the hot path. Compiled out in release → the profiler
 cannot affect shipped performance.
 
 ## Drawbacks

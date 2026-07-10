@@ -25,9 +25,7 @@
 > with RFC-0001 (§5.1 pool semantics, §9 `frame.rs` boundary, §3.1 TBDR
 > targeting). This revision adopts the corrected design: the standard term
 > **MSDF**, generation on a **CPU pool**, atlas uploads that **cross `frame.rs`**,
-> and a **`discard`-free** mobile fragment path. The corrections and their
-> rationale are tracked as IMPL-58..61 in `support/DESICIONS.md` and specified for
-> implementation in `support/IMPLEMENTATION_5.md` §2.
+> and a **`discard`-free** mobile fragment path.
 
 ---
 
@@ -55,8 +53,8 @@ Existing vector and icon pipelines carry structural overheads Byard rejects:
 **Redundant CPU rasterisation.** Drawing raw SVG at runtime forces the CPU to
 interpret Bézier paths and fill rules every frame, destroying the frame budget.
 Baking PNGs at a target size instead produces blurry, aliased edges during fluid
-scale or rotation (the M3-Expressive motion language depends on exactly these
-transitions).
+scale or rotation (the Material 3 Expressive motion language depends on exactly
+these transitions).
 
 **VRAM density explosion.** Storing distinct bitmaps per display density or per
 dynamic scale value bloats video memory and saturates the PCIe bus with constant
@@ -250,7 +248,7 @@ fn validate_vector_complexity(svg: &usvg::Tree) -> Result<(), CompileError> {
             }
         }
     }
-    if total_nodes > MAX_NODES {              // default 500 (IMPL-62)
+    if total_nodes > MAX_NODES {              // default 500 (tunable)
         return Err(CompileError::SvgTooComplexForMssdf { found_nodes: total_nodes });
     }
     Ok(())
@@ -276,7 +274,7 @@ When the atlas fills, the allocator adds an array layer up to a cap; past the ca
 it **LRU-evicts** the least-recently-sampled glyph and reuses its cell. An evicted
 handle falls back to the placeholder + regenerate-on-next-use path, so eviction is
 never visible beyond a one-frame placeholder. (This closes a gap in the original
-draft, which specified the blit but not the full-atlas behaviour — IMPL-64.)
+draft, which specified the blit but not the full-atlas behaviour.)
 
 On hot-reload, a saved `.svg` invalidates its cache entry; if the new field fits
 the same cell the UV slot is reused and only the texels change — existing
@@ -293,7 +291,7 @@ consuming `View` does not remount.
    set cannot be statically closed → `CompileError::VectorAssetNotStatic { span }`
    with a fix-it: make it literal, or declare an explicit inclusion list in
    `byard.toml` (`[assets.vectors] include = [...]`). A partial atlas is never
-   shipped silently. (Gap in the original draft — IMPL-65.)
+   shipped silently. (Gap in the original draft.)
 3. Dormant assets in the local package cache (`.byard/packages/`) without a live
    reference are stripped entirely.
 4. The closed set is generated (reusing the §2 generator), deduplicated, and packed
@@ -309,12 +307,11 @@ The default generation grid is **32×32** with a baked `px_range` of **4** (the
 `px_range` flows into `VectorInstance` for the §1 AA formula); high-PPI targets may
 opt into 64×64. Edge-coloring uses an angular threshold of **48°** to separate
 channels at sharp joints without wobble under extreme magnification. These defaults
-are tunable (IMPL-62) and validated by determinism and sharp-corner tests
-(`IMPLEMENTATION_5.md` M45).
+are tunable and validated by determinism and sharp-corner tests.
 
 A generated field is content-addressed and may be persisted to
 `.byard/cache/vectors/` keyed by `hash(svg ‖ grid ‖ px_range ‖ generator-version)`,
-so subsequent cold `byard dev` starts skip regeneration entirely (IMPL-68). The key
+so subsequent cold `byard dev` starts skip regeneration entirely. The key
 includes the generator version, so a toolchain bump invalidates the cache safely.
 
 ## Drawbacks
@@ -332,8 +329,8 @@ includes the generator version, so a toolchain bump invalidates the cache safely
 - **Generator mathematical complexity.** Transforming arbitrary cubic Bézier paths
   into continuous multi-channel distance fields — with correct channel coloring at
   sharp joints — is a steep, well-isolated maintenance burden on the compiler crate.
-  It is mitigated by leaning on an existing generator (the `msdf` crate, IMPL-63)
-  and a strict determinism test harness.
+  It is mitigated by leaning on an existing generator (the `msdf` crate) and a
+  strict determinism test harness.
 
 ## Rationale and alternatives
 
@@ -386,18 +383,18 @@ arm branch-free.
 
 - **Before merge:**
   - [ ] **Generation grid size.** Ratify the 32×32 default vs. 64×64 for high-PPI
-    (8K) precision against dev-mode memory (IMPL-62).
+    (8K) precision against dev-mode memory.
   - [ ] **Edge-coloring threshold.** Confirm 48° for the channel-separation angle
-    so sharp joints never wobble under extreme scaling (IMPL-62).
+    so sharp joints never wobble under extreme scaling.
   - [ ] **Generator dependency.** `msdf` crate vs. a vendored generator, pending a
-    licence/quality review (IMPL-63).
+    licence/quality review.
 - **During implementation:**
   - [ ] **Dev-atlas cap and eviction tuning.** Layer count and LRU threshold
-    before eviction visibly churns on a large icon set (IMPL-64).
+    before eviction visibly churns on a large icon set.
   - [ ] **Inclusion-list ergonomics.** Final `byard.toml` `[assets.vectors]` shape
-    for the dynamic-reference escape hatch (IMPL-65).
+    for the dynamic-reference escape hatch.
   - [ ] **Persistent cache pruning.** On-disk size bound and prune policy for
-    `.byard/cache/vectors/` (IMPL-68).
+    `.byard/cache/vectors/`.
 
 ## Future possibilities
 
