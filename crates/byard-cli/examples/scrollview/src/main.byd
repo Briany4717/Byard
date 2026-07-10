@@ -14,6 +14,11 @@
 //
 // The bottom strip is a **horizontal** ScrollView (`axis: horizontal`): wheel or
 // drag sideways to pan `panX`. `axis: both` would pan in 2-D from one drag.
+//
+// The vertical list is **windowed** (`windowed: true, row_height: 54`): only the
+// rows in view (± a little overscan) are laid out and drawn, so the list stays
+// O(visible) no matter how long it grows. Rows must be uniform height; the
+// `row_height` folds in the 44px row + 10px gap.
 View Main() {
     var scrollY: Float = 0.0
     var panX: Float = 0.0
@@ -21,12 +26,12 @@ View Main() {
     Column #[bg: 0x14141C, p: 28, gap: 16, width: 380] {
         Text("Scrollable list") #[color: 0xFFFFFF, size: 20, weight: bold]
 
-        ScrollView #[width: 320, height: 220, offset: (0, scrollY), bg: 0x1E1E2A, radius: 12] {
-            Column #[p: 12, gap: 10] {
+        ScrollView #[width: 320, height: 220, windowed: true, row_height: 54, offset: (0, scrollY), bg: 0x1E1E2A, radius: 12] {
+            Column #[p: 12] {
                 for label in ["Inbox", "Starred", "Sent", "Drafts", "Archive",
                               "Spam", "Trash", "Important", "Chats", "Scheduled",
                               "All Mail", "Snoozed"] {
-                    Row #[bg: 0x262636, radius: 8, p: (vertical: 12, horizontal: 14), gap: 10, width: 288] {
+                    Row #[bg: 0x262636, radius: 8, p: (vertical: 12, horizontal: 14), gap: 10, width: 288, height: 44] {
                         Box #[bg: 0x6495ED, radius: 5, width: 10, height: 10]
                         Text("{label}") #[color: 0xE6E1E5, size: 15]
                     }
@@ -49,6 +54,6 @@ View Main() {
             }
         }
 
-        Text("wheel or drag · vertical list + horizontal strip, both clipped") #[color: 0x9AA0AA, size: 13]
+        Text("windowed vertical list + horizontal strip · wheel or drag") #[color: 0x9AA0AA, size: 13]
     }
 }
