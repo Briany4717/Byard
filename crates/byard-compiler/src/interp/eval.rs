@@ -6002,6 +6002,52 @@ mod tests {
         );
     }
 
+    /// RFC-0005 windowed layout regression: with uniform rows whose stride equals
+    /// `row_height`, the materialised rows must stay on an exact `row_height` grid
+    /// at every offset — including across a window-slide boundary. A spacer sized
+    /// off-grid would shift the whole content when `start` ticks (the "small
+    /// jumps" bug), so this pins the invariant that a scroll of 1px moves the
+    /// content by exactly 1px, never a row.
+    #[test]
+    fn windowed_rows_stay_on_an_exact_grid_across_slides() {
+        // 500 rows laid out at exactly row_height (height 20, no gap → stride 20).
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, windowed: true, row_height: 20, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+
+        // Sweep offsets straddling several window-slide boundaries (start ticks
+        // every 20px). At each, the emitted rows must be exactly 20px apart.
+        for off in [0.0, 19.0, 20.0, 21.0, 79.0, 80.0, 81.0, 200.0, 205.0] {
+            interp.write_var(y, Value::Float(off));
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let mut ys: Vec<f32> = frame.instances().iter().map(|b| b.rect[1]).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for w in ys.windows(2) {
+                let stride = w[1] - w[0];
+                assert!(
+                    (stride - 20.0).abs() < 0.01,
+                    "rows must stay on the 20px grid at offset {off}, got stride {stride} in {ys:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn oklab_hex_round_trips_within_one_lsb() {
         for hex in [

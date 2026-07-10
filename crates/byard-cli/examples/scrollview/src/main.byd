@@ -17,8 +17,10 @@
 //
 // The vertical list is **windowed** (`windowed: true, row_height: 54`): only the
 // rows in view (± a little overscan) are laid out and drawn, so the list stays
-// O(visible) no matter how long it grows. Rows must be uniform height; the
-// `row_height` folds in the 44px row + 10px gap.
+// O(visible) no matter how long it grows. Windowing lays the list out gap-free,
+// so `row_height` must equal each row's real stride and spacing goes *in the
+// row*: here 44px tall + a 10px bottom margin = a 54px stride. (A `row_height`
+// that disagrees with the stride makes the content jump as rows scroll off.)
 View Main() {
     var scrollY: Float = 0.0
     var panX: Float = 0.0
@@ -31,7 +33,7 @@ View Main() {
                 for label in ["Inbox", "Starred", "Sent", "Drafts", "Archive",
                               "Spam", "Trash", "Important", "Chats", "Scheduled",
                               "All Mail", "Snoozed"] {
-                    Row #[bg: 0x262636, radius: 8, p: (vertical: 12, horizontal: 14), gap: 10, width: 288, height: 44] {
+                    Row #[bg: 0x262636, radius: 8, p: (vertical: 12, horizontal: 14), gap: 10, width: 288, height: 44, mb: 10] {
                         Box #[bg: 0x6495ED, radius: 5, width: 10, height: 10]
                         Text("{label}") #[color: 0xE6E1E5, size: 15]
                     }
