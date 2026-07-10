@@ -170,11 +170,16 @@ pub struct ContainerStyle {
     /// Flex-grow factor (how much this node expands to fill its parent's main
     /// axis).
     pub grow: f32,
-    /// Whether this is a **vertical scroll container** (RFC-0005 `ScrollView`):
-    /// its content is measured at natural size on the block axis and overflows
-    /// the fixed viewport (Taffy `overflow.y = Scroll`), rather than being
-    /// shrunk to fit. The overflow is clipped and scrolled by the renderer.
-    pub scroll: bool,
+    /// Whether this is a **horizontal scroll container** (RFC-0005 `ScrollView`
+    /// `axis: horizontal|both`): content is measured at natural width and
+    /// overflows the fixed viewport on the inline axis (Taffy `overflow.x =
+    /// Scroll`), rather than being shrunk to fit. The renderer clips and scrolls
+    /// the overflow.
+    pub scroll_x: bool,
+    /// Whether this is a **vertical scroll container** (RFC-0005 `ScrollView`,
+    /// the default `axis: vertical`): content overflows on the block axis
+    /// (Taffy `overflow.y = Scroll`). Clipped and scrolled by the renderer.
+    pub scroll_y: bool,
 }
 
 impl ContainerStyle {
@@ -238,10 +243,12 @@ impl ContainerStyle {
         self
     }
 
-    /// Marks this as a vertical scroll container (RFC-0005 `ScrollView`).
+    /// Marks this a scroll container on the given axes (RFC-0005 `ScrollView`):
+    /// content overflows the viewport where enabled instead of shrinking to fit.
     #[must_use]
-    pub fn with_scroll(mut self, scroll: bool) -> Self {
-        self.scroll = scroll;
+    pub fn with_scroll_axes(mut self, scroll_x: bool, scroll_y: bool) -> Self {
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
         self
     }
 
@@ -289,13 +296,17 @@ impl ContainerStyle {
                 Justify::Evenly => JustifyContent::SpaceEvenly,
             }),
             flex_grow: self.grow,
-            // RFC-0005 `ScrollView`: a vertical scroll container measures its
-            // content at natural size and lets it overflow the fixed viewport,
-            // instead of flex-shrinking children to fit. The renderer clips and
-            // scrolls the overflow.
+            // RFC-0005 `ScrollView`: a scroll container measures its content at
+            // natural size and lets it overflow the fixed viewport on the
+            // scrolling axes, instead of flex-shrinking children to fit. The
+            // renderer clips and scrolls the overflow.
             overflow: Point {
-                x: Overflow::Visible,
-                y: if self.scroll {
+                x: if self.scroll_x {
+                    Overflow::Scroll
+                } else {
+                    Overflow::Visible
+                },
+                y: if self.scroll_y {
                     Overflow::Scroll
                 } else {
                     Overflow::Visible

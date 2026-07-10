@@ -140,17 +140,27 @@ pub enum RenderNode {
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
 
-/// A wheel-scrollable region recorded during render (RFC-0005 `ScrollView`).
-/// `dispatch_events` turns a wheel over `rect` into a clamped write to `sig`
-/// (the signal backing the view's `offset.y`), so the mouse wheel scrolls.
+/// One scrollable axis of a [`ScrollTarget`]: the `var` behind `offset.x` or
+/// `offset.y` and how far it may travel (content extent − viewport, ≥ 0).
+#[derive(Clone, Copy)]
+struct ScrollAxis {
+    /// The signal backing this axis's offset component; the wheel/drag writes it.
+    sig: SignalId,
+    /// Maximum scroll distance on this axis (content − viewport), clamped ≥ 0.
+    max: f32,
+}
+
+/// A wheel/drag-scrollable region recorded during render (RFC-0005
+/// `ScrollView`). `dispatch_events` turns a wheel or a drag over `rect` into a
+/// clamped write to whichever of `offset.x`/`offset.y` is a writable `var`.
 #[derive(Clone, Copy)]
 struct ScrollTarget {
-    /// Viewport rect in logical screen px (the wheel hit region).
+    /// Viewport rect in logical screen px (the wheel/drag hit region).
     rect: crate::interp::intrinsics::Rect,
-    /// The signal backing `offset.y`; the wheel writes it.
-    sig: SignalId,
-    /// Maximum scroll distance (content height − viewport height), clamped ≥ 0.
-    max: f32,
+    /// Horizontal axis, present when `offset.x` is a writable `var`.
+    x: Option<ScrollAxis>,
+    /// Vertical axis, present when `offset.y` is a writable `var`.
+    y: Option<ScrollAxis>,
 }
 
 /// One resolved drop shadow (RFC-0011 custom shadows): offset, blur, spread, and
@@ -307,21 +317,31 @@ pub struct Interpreter {
     scroll_drag: Option<ScrollDrag>,
 }
 
+/// One axis of a live [`ScrollDrag`]: the signal to write and its value at the
+/// press, so the live offset is a pure function of the pointer travel.
+#[derive(Clone, Copy)]
+struct ScrollDragAxis {
+    /// The signal backing this axis's offset component, written as it moves.
+    sig: SignalId,
+    /// The offset at the press; the live offset is this minus the pointer travel.
+    start_offset: f32,
+    /// Maximum scroll distance on this axis (content − viewport), clamped ≥ 0.
+    max: f32,
+    /// Whether `sig` holds an `Int` (write back rounded) or a `Float`.
+    is_int: bool,
+}
+
 /// A live drag-to-scroll gesture (RFC-0005 `ScrollView`): the content follows
 /// the pointer between press and release. Captured at press so the offset is a
 /// pure function of the pointer travel — no accumulated drift (IMPL-10).
 #[derive(Clone, Copy)]
 struct ScrollDrag {
-    /// The signal backing `offset.y`, written as the pointer moves.
-    sig: SignalId,
-    /// Pointer Y at the press, in logical screen px.
-    start_y: f32,
-    /// The offset at the press; the live offset is this minus the pointer travel.
-    start_offset: f32,
-    /// Maximum scroll distance (content height − viewport height), clamped ≥ 0.
-    max: f32,
-    /// Whether `sig` holds an `Int` (write back rounded) or a `Float`.
-    is_int: bool,
+    /// Pointer position at the press, in logical screen px.
+    start_pos: (f32, f32),
+    /// Horizontal axis, present when `offset.x` is a writable `var`.
+    x: Option<ScrollDragAxis>,
+    /// Vertical axis, present when `offset.y` is a writable `var`.
+    y: Option<ScrollDragAxis>,
 }
 
 impl Interpreter {
@@ -776,25 +796,36 @@ impl Interpreter {
         None
     }
 
-    /// The signal backing a `ScrollView`'s `offset.y` (RFC-0005), if it is a
-    /// writable `var` — e.g. `offset: (0, scrollY)` yields `scrollY`'s signal, so
-    /// the wheel can scroll by writing it. `None` for a literal or computed
-    /// offset (then the wheel is inert and the app drives `offset` itself).
-    fn resolve_offset_sig(&self, attrs: &[Attr]) -> Option<super::env::SignalId> {
+    /// The signals backing a `ScrollView`'s `offset.x` and `offset.y` (RFC-0005),
+    /// each present when that tuple component is a writable `var` — e.g.
+    /// `offset: (panX, scrollY)` yields both, `offset: (0, scrollY)` only the y.
+    /// A component that is a literal or computed value yields `None` (that axis
+    /// is inert to wheel/drag; the app drives it). Returned as `(x, y)`.
+    fn resolve_offset_sigs(
+        &self,
+        attrs: &[Attr],
+    ) -> (Option<super::env::SignalId>, Option<super::env::SignalId>) {
         use crate::parser::ast::Expr;
-        let value = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+        let Some(value) = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
             (n, AttrKind::Prop { value }) if n.as_str() == "offset" => Some(value),
             _ => None,
-        })?;
-        // `offset: (x, y)` — the y component is the second tuple element.
-        if let Expr::Tuple(args, _) = value {
-            if let Some(Expr::Ident(name, _)) = args.get(1).map(|a| &a.value) {
-                if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
-                    return Some(*sig);
-                }
+        }) else {
+            return (None, None);
+        };
+        // `offset: (x, y)` — a component is scrollable iff it names a `var`.
+        let sig_at = |i: usize| -> Option<super::env::SignalId> {
+            let Expr::Tuple(args, _) = value else {
+                return None;
+            };
+            let Some(Expr::Ident(name, _)) = args.get(i).map(|a| &a.value) else {
+                return None;
+            };
+            match self.env.lookup(name) {
+                Some(super::env::Value::Signal(sig)) => Some(*sig),
+                _ => None,
             }
-        }
-        None
+        };
+        (sig_at(0), sig_at(1))
     }
 
     /// Whether a `ScrollView` child's laid-out rectangle, mapped through the
@@ -1671,9 +1702,9 @@ impl Interpreter {
                 // translate the content by `−offset`. The overflow is scissored
                 // by the encoder (an off-viewport child costs no fragments), and
                 // the content was measured unbounded (layout `scroll`). `offset`
-                // is a two-way `Vec2` the app can read or drive; wheel/drag land
-                // next. Rotation of a scroll viewport is out of scope (the clip
-                // is an axis-aligned screen rect).
+                // is a two-way `Vec2` the app can read or drive on either axis;
+                // wheel and drag write it below. Rotation of a scroll viewport is
+                // out of scope (the clip is an axis-aligned screen rect).
                 let scroll_clip = if name.as_str() == "ScrollView" {
                     let (ox, oy) = self.resolve_axis_pair(attrs, "offset", (0.0, 0.0));
                     let tl = inherited_transform.apply_point([current_rect.x, current_rect.y]);
@@ -1686,17 +1717,19 @@ impl Interpreter {
                     frame.begin_clip(clip);
                     child_transform.translate[0] -= ox * inherited_transform.scale[0];
                     child_transform.translate[1] -= oy * inherited_transform.scale[1];
-                    // Record a wheel-scroll target when `offset.y` is a writable
-                    // signal (e.g. `offset: (0, scrollY)`): the wheel scrolls by
-                    // writing it, clamped to the content extent. `dispatch_events`
-                    // consumes these next tick (render-then-dispatch handshake).
-                    if let Some(sig) = self.resolve_offset_sig(attrs) {
-                        let content_h = self
+                    // Record a wheel/drag scroll target for whichever of
+                    // `offset.x`/`offset.y` is a writable signal (e.g.
+                    // `offset: (panX, scrollY)`): the input scrolls by writing it,
+                    // clamped to the content extent. `dispatch_events` consumes
+                    // these next tick (render-then-dispatch handshake).
+                    let (sig_x, sig_y) = self.resolve_offset_sigs(attrs);
+                    if sig_x.is_some() || sig_y.is_some() {
+                        let (content_w, content_h) = self
                             .atlas
                             .content_size(atlas_node)
                             .ok()
                             .flatten()
-                            .map_or(current_rect.h, |(_, h)| h);
+                            .unwrap_or((current_rect.w, current_rect.h));
                         self.scroll_targets.push(ScrollTarget {
                             rect: crate::interp::intrinsics::Rect::new(
                                 clip.x,
@@ -1704,8 +1737,14 @@ impl Interpreter {
                                 clip.width,
                                 clip.height,
                             ),
-                            sig,
-                            max: (content_h - current_rect.h).max(0.0),
+                            x: sig_x.map(|sig| ScrollAxis {
+                                sig,
+                                max: (content_w - current_rect.w).max(0.0),
+                            }),
+                            y: sig_y.map(|sig| ScrollAxis {
+                                sig,
+                                max: (content_h - current_rect.h).max(0.0),
+                            }),
                         });
                     }
                     Some(clip)
@@ -2411,14 +2450,36 @@ impl Interpreter {
             "Row" => FlexDir::Row,
             _ => FlexDir::Column,
         };
-        // RFC-0005 `ScrollView`: a vertical scroll container — content is
-        // measured at natural size and overflows the fixed viewport (clipped +
-        // scrolled by the renderer), rather than flex-shrunk to fit.
-        style.scroll = element_name == "ScrollView";
+        // RFC-0005 `ScrollView`: a scroll container — content is measured at
+        // natural size and overflows the fixed viewport (clipped + scrolled by
+        // the renderer), rather than flex-shrunk to fit. `axis` (default
+        // `vertical`) picks the overflowing axes; `both` scrolls in 2D.
+        if element_name == "ScrollView" {
+            style = style.with_scroll_axes(false, true);
+        }
         for attr in attrs {
             if let AttrKind::Prop { value } = &attr.kind {
                 let val = self.eval_pure(value);
                 match attr.name.as_str() {
+                    "axis" if element_name == "ScrollView" => {
+                        if let Value::Str(s) = &val {
+                            let (x, y) = match s.as_str() {
+                                "horizontal" => (true, false),
+                                "both" => (true, true),
+                                _ => (false, true),
+                            };
+                            style = style.with_scroll_axes(x, y);
+                            // A ScrollView is `Column`, so its cross axis is x. To
+                            // scroll horizontally, content must keep its natural
+                            // width instead of being stretched to the viewport, or
+                            // Taffy caps the content extent at the viewport and
+                            // there is nothing to scroll. A `stretch` on the block
+                            // axis (vertical-only) is still what fills row width.
+                            if x {
+                                style.align = Align::Start;
+                            }
+                        }
+                    }
                     "width" => style.width = val.as_int().map(|n| n as f32),
                     "height" => style.height = val.as_int().map(|n| n as f32),
                     "direction" => {
@@ -3509,6 +3570,61 @@ impl Interpreter {
         }))
     }
 
+    /// Reads a scroll offset signal as an `f32` (an `Int` or `Float` `var`);
+    /// anything else reads as the origin.
+    fn peek_scroll(&self, sig: SignalId) -> f32 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        match self.peek(sig) {
+            Value::Int(n) => n as f32,
+            Value::Float(f) => f as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Writes `value` back to a scroll offset signal, preserving its `Int`/`Float`
+    /// kind so a whole-pixel `var off: Int` never becomes a `Float` mid-scroll.
+    fn write_scroll(&mut self, sig: SignalId, value: f32) {
+        #[allow(clippy::cast_possible_truncation)]
+        let v = match self.peek(sig) {
+            Value::Int(_) => Value::Int(value.round() as i64),
+            _ => Value::Float(f64::from(value)),
+        };
+        self.write_var(sig, v);
+    }
+
+    /// Nudges one scroll axis by `delta` logical px (wheel/trackpad), clamped to
+    /// `[0, max]`. A forward delta reveals earlier content, so the offset shrinks.
+    fn nudge_scroll(&mut self, axis: ScrollAxis, delta: f32) {
+        let next = (self.peek_scroll(axis.sig) - delta).clamp(0.0, axis.max);
+        self.write_scroll(axis.sig, next);
+    }
+
+    /// Snapshots one axis of a drag at the press: its live offset becomes the
+    /// baseline the pointer travel is subtracted from (RFC-0005, IMPL-10).
+    fn capture_drag_axis(&self, axis: ScrollAxis) -> ScrollDragAxis {
+        let is_int = matches!(self.peek(axis.sig), Value::Int(_));
+        ScrollDragAxis {
+            sig: axis.sig,
+            start_offset: self.peek_scroll(axis.sig),
+            max: axis.max,
+            is_int,
+        }
+    }
+
+    /// Applies a drag's pointer `travel` (current − press) to one axis: the
+    /// content follows the pointer, so the offset is the press offset minus the
+    /// travel, clamped to `[0, max]` (RFC-0005 drag-to-scroll).
+    fn write_drag_axis(&mut self, axis: ScrollDragAxis, travel: f32) {
+        let next = (axis.start_offset - travel).clamp(0.0, axis.max);
+        let value = if axis.is_int {
+            #[allow(clippy::cast_possible_truncation)]
+            Value::Int(next.round() as i64)
+        } else {
+            Value::Float(f64::from(next))
+        };
+        self.write_var(axis.sig, value);
+    }
+
     /// Converts winit-sourced input events to interpreter event payloads and dispatches them to the `EventRouter`.
     pub fn dispatch_events(&mut self, events: &[byard_core::InputEvent]) {
         use crate::interp::events::{EventKind as CompKind, InputEvent as CompEvent};
@@ -3555,11 +3671,11 @@ impl Interpreter {
             .collect();
 
         // RFC-0005 `ScrollView` wheel: a wheel/scroll over a recorded scroll
-        // target writes its `offset.y` signal, clamped to `[0, content −
-        // viewport]`. Wheel deltas are line-based (× a per-line step); trackpad
-        // `Scroll` deltas are already pixels. Done here, before the render, so
-        // the same tick paints the new offset (paint-time translate, no
-        // relayout — INV-8).
+        // target nudges whichever of `offset.x`/`offset.y` is writable, each
+        // clamped to `[0, content − viewport]`. Wheel deltas are line-based (× a
+        // per-line step); trackpad `Scroll` deltas are already pixels. Done here,
+        // before the render, so the same tick paints the new offset (paint-time
+        // translate, no relayout — INV-8).
         for ev in events {
             let step = match ev.kind {
                 CoreKind::Wheel => WHEEL_LINE_PX,
@@ -3581,26 +3697,21 @@ impl Interpreter {
             else {
                 continue;
             };
-            let cur = match self.peek(t.sig) {
-                Value::Int(n) => n as f32,
-                Value::Float(f) => f as f32,
-                _ => 0.0,
-            };
-            // Wheel forward (delta.y > 0) reveals earlier content → offset down.
-            let next = (cur - ev.delta.1 * step).clamp(0.0, t.max);
-            let value = match self.peek(t.sig) {
-                Value::Int(_) => Value::Int(next.round() as i64),
-                _ => Value::Float(f64::from(next)),
-            };
-            self.write_var(t.sig, value);
+            // Wheel forward (delta > 0) reveals earlier content → offset shrinks.
+            if let Some(axis) = t.x {
+                self.nudge_scroll(axis, ev.delta.0 * step);
+            }
+            if let Some(axis) = t.y {
+                self.nudge_scroll(axis, ev.delta.1 * step);
+            }
         }
 
         // RFC-0005 `ScrollView` drag-to-scroll: a pointer press on inert scroll
-        // content starts a drag; each move slides the offset so the content
-        // tracks the pointer (the offset is a pure function of the press-relative
-        // travel — no accumulated drift, IMPL-10); release ends it. The press
-        // defers to interactive children via `claims_pointer`, so a button or
-        // slider inside the list still wins its own gesture.
+        // content starts a drag; each move slides the offset (on every writable
+        // axis) so the content tracks the pointer — a pure function of the
+        // press-relative travel, no accumulated drift (IMPL-10); release ends it.
+        // The press defers to interactive children via `claims_pointer`, so a
+        // button or slider inside the list still wins its own gesture.
         for ev in events {
             match ev.kind {
                 CoreKind::PointerDown => {
@@ -3619,32 +3730,22 @@ impl Interpreter {
                             })
                             .copied()
                     };
-                    self.scroll_drag = target.map(|t| {
-                        let (start_offset, is_int) = match self.peek(t.sig) {
-                            Value::Int(n) => (n as f32, true),
-                            Value::Float(f) => (f as f32, false),
-                            _ => (0.0, false),
-                        };
-                        ScrollDrag {
-                            sig: t.sig,
-                            start_y: py,
-                            start_offset,
-                            max: t.max,
-                            is_int,
-                        }
+                    self.scroll_drag = target.map(|t| ScrollDrag {
+                        start_pos: (px, py),
+                        x: t.x.map(|a| self.capture_drag_axis(a)),
+                        y: t.y.map(|a| self.capture_drag_axis(a)),
                     });
                 }
                 CoreKind::PointerMove => {
                     if let Some(d) = self.scroll_drag {
-                        // Dragging down (pointer y grows) reveals earlier content,
-                        // so the offset shrinks and the content follows the finger.
-                        let next = (d.start_offset - (ev.pos.1 - d.start_y)).clamp(0.0, d.max);
-                        let value = if d.is_int {
-                            Value::Int(next.round() as i64)
-                        } else {
-                            Value::Float(f64::from(next))
-                        };
-                        self.write_var(d.sig, value);
+                        if let Some(a) = d.x {
+                            let travel = ev.pos.0 - d.start_pos.0;
+                            self.write_drag_axis(a, travel);
+                        }
+                        if let Some(a) = d.y {
+                            let travel = ev.pos.1 - d.start_pos.1;
+                            self.write_drag_axis(a, travel);
+                        }
                     }
                 }
                 CoreKind::PointerUp | CoreKind::Tap => self.scroll_drag = None,
@@ -5443,6 +5544,133 @@ mod tests {
         assert!(
             scrolled.abs() < 0.01,
             "a press on a Button must not drag-scroll the list, got {scrolled}"
+        );
+    }
+
+    /// RFC-0005 `axis: horizontal`: content overflows on the inline axis and the
+    /// wheel's x delta scrolls `offset.x`, clamped to the horizontal extent.
+    #[test]
+    fn horizontal_scrollview_scrolls_offset_x_by_wheel() {
+        // A Row of 4 × 100px cards = 400 wide in a 200px viewport → max x 200.
+        let src = "View V() { var panX: Float = 0.0 \
+             ScrollView #[width: 200, height: 80, axis: horizontal, offset: (panX, 0)] { \
+                 Row { \
+                     Box #[bg: 0xFF0000, width: 100, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 100, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 100, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 100, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let pan = interp.var_signal(&Symbol::intern("panX")).unwrap();
+        let peek = |interp: &Interpreter| match interp.peek(pan) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        // Sample the red card's paint translate.x, so we prove the content
+        // actually shifts left (−offset), not just that the signal moved.
+        let red_tx = |interp: &mut Interpreter| -> f32 {
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 400.0, 300.0);
+            f.instances()
+                .iter()
+                .find(|b| b.color[0] > 0.8 && b.color[1] < 0.3 && b.color[2] < 0.3)
+                .map_or(0.0, |b| b.transform.translate[0])
+        };
+        let tx0 = red_tx(&mut interp);
+
+        let wheel_x = |interp: &mut Interpreter, dx: f32| {
+            interp.dispatch_events(&[byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (100.0, 40.0),
+                delta: (dx, 0.0),
+                payload: None,
+                time_ms: 0,
+            }]);
+            interp.tick();
+        };
+
+        // Wheel 2 lines right (×40) → scroll right 80; red card shifts left 80.
+        wheel_x(&mut interp, -2.0);
+        assert!(
+            (peek(&interp) - 80.0).abs() < 1.0,
+            "x wheel scrolls, got {}",
+            peek(&interp)
+        );
+        assert!(
+            (tx0 - red_tx(&mut interp) - 80.0).abs() < 0.5,
+            "content shifts left by the x offset"
+        );
+
+        // A big wheel clamps to content−viewport (400 − 200 = 200).
+        wheel_x(&mut interp, -20.0);
+        assert!(
+            (peek(&interp) - 200.0).abs() < 1.0,
+            "x clamps to extent, got {}",
+            peek(&interp)
+        );
+    }
+
+    /// RFC-0005 `axis: both`: a single drag pans the content in 2D, each axis
+    /// clamped independently.
+    #[test]
+    fn both_axis_scrollview_pans_in_two_dimensions_by_drag() {
+        use byard_core::platform::EventKind as K;
+        // A 400×400 content grid in a 200×200 viewport → max 200 on each axis.
+        let src = "View V() { var panX: Float = 0.0 var panY: Float = 0.0 \
+             ScrollView #[width: 200, height: 200, axis: both, offset: (panX, panY)] { \
+                 Column { \
+                     Row { Box #[bg: 0xFF0000, width: 200, height: 200] {} \
+                           Box #[bg: 0x00FF00, width: 200, height: 200] {} } \
+                     Row { Box #[bg: 0x0000FF, width: 200, height: 200] {} \
+                           Box #[bg: 0xFFFF00, width: 200, height: 200] {} } \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let px = interp.var_signal(&Symbol::intern("panX")).unwrap();
+        let py = interp.var_signal(&Symbol::intern("panY")).unwrap();
+        let peek = |interp: &Interpreter, s| match interp.peek(s) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press mid-viewport, drag up-left 60px each → pan right 60, down 60.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 100.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 40.0, 40.0)]);
+        assert!(
+            (peek(&interp, px) - 60.0).abs() < 1.0,
+            "panX, got {}",
+            peek(&interp, px)
+        );
+        assert!(
+            (peek(&interp, py) - 60.0).abs() < 1.0,
+            "panY, got {}",
+            peek(&interp, py)
         );
     }
 
