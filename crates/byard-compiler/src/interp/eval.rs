@@ -776,6 +776,41 @@ impl Interpreter {
         None
     }
 
+    /// Whether a `ScrollView` child's laid-out rectangle, mapped through the
+    /// scroll-shifted `transform`, falls entirely outside `clip` — the emission-
+    /// culling test (RFC-0005 §3.3). All four corners are transformed so a scaled
+    /// ancestor is handled; an unknown rect is conservatively kept (never culled).
+    fn child_fully_clipped(
+        &self,
+        child_id: byard_core::atlas::layout::AtlasNodeId,
+        transform: byard_core::frame::Transform,
+        clip: byard_core::frame::Rect,
+    ) -> bool {
+        let Ok(Some(r)) = self.atlas.resolved_rect(child_id) else {
+            return false;
+        };
+        let corners = [
+            transform.apply_point([r.x, r.y]),
+            transform.apply_point([r.x + r.width, r.y]),
+            transform.apply_point([r.x, r.y + r.height]),
+            transform.apply_point([r.x + r.width, r.y + r.height]),
+        ];
+        let min_x = corners.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|c| c[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+        let max_y = corners
+            .iter()
+            .map(|c| c[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        max_x <= clip.x
+            || min_x >= clip.x + clip.width
+            || max_y <= clip.y
+            || min_y >= clip.y + clip.height
+    }
+
     /// Lowers an element to a [`RenderNode`], validating it against the §5
     /// attribute contract first (diagnostics accumulate in [`Interpreter::errors`]).
     /// `known_views` are user `ViewDecl` names in scope.
@@ -1174,6 +1209,7 @@ impl Interpreter {
                         parent_rect,
                         1.0,
                         byard_core::frame::Transform::IDENTITY,
+                        None,
                     );
                 }
             }
@@ -1292,6 +1328,12 @@ impl Interpreter {
         // translated container carries its children, text, and widgets with it —
         // not only its own background box. `IDENTITY` at the root.
         inherited_transform: byard_core::frame::Transform,
+        // The nearest enclosing `ScrollView` viewport, in screen space (RFC-0005
+        // emission culling). A node whose scroll-shifted rect falls entirely
+        // outside it is skipped — the scissor already hides such fragments, so
+        // this only spares the CPU the emission. `None` outside any scroll
+        // container (the whole viewport is live).
+        cull_clip: Option<byard_core::frame::Rect>,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
@@ -1611,7 +1653,7 @@ impl Interpreter {
                 // is a two-way `Vec2` the app can read or drive; wheel/drag land
                 // next. Rotation of a scroll viewport is out of scope (the clip
                 // is an axis-aligned screen rect).
-                let scroll_open = if name.as_str() == "ScrollView" {
+                let scroll_clip = if name.as_str() == "ScrollView" {
                     let (ox, oy) = self.resolve_axis_pair(attrs, "offset", (0.0, 0.0));
                     let tl = inherited_transform.apply_point([current_rect.x, current_rect.y]);
                     let clip = byard_core::frame::Rect::new(
@@ -1645,12 +1687,28 @@ impl Interpreter {
                             max: (content_h - current_rect.h).max(0.0),
                         });
                     }
-                    true
+                    Some(clip)
                 } else {
-                    false
+                    None
                 };
+                // Children cull against this box's own scroll viewport when it is
+                // a `ScrollView`, otherwise against whatever viewport an ancestor
+                // `ScrollView` established — so rows nested under an inner `Column`
+                // are culled too, not just the `ScrollView`'s direct child.
+                let child_clip = scroll_clip.or(cull_clip);
                 for child in children {
                     let child_id = flat_ids[*flat_idx];
+                    // RFC-0005 emission culling (north star): a child the scroll
+                    // has pushed entirely out of the viewport is never pushed to
+                    // the frame — a long list costs only its visible slice, not
+                    // its full height. Advance the flat-id cursor past the skipped
+                    // subtree so the remaining children stay aligned.
+                    if let Some(clip) = child_clip {
+                        if self.child_fully_clipped(child_id, child_transform, clip) {
+                            *flat_idx += flat_len(child);
+                            continue;
+                        }
+                    }
                     self.render_node_with_atlas(
                         child,
                         child_id,
@@ -1660,9 +1718,10 @@ impl Interpreter {
                         current_rect,
                         child_opacity,
                         child_transform,
+                        child_clip,
                     );
                 }
-                if scroll_open {
+                if scroll_clip.is_some() {
                     frame.end_clip();
                 }
             }
@@ -3520,6 +3579,17 @@ impl Interpreter {
     }
 }
 
+/// The number of flattened layout nodes a [`RenderNode`] subtree contributes,
+/// mirroring [`Interpreter::build_layout_tree`] exactly (each node is one entry
+/// plus its children; value widgets are leaves). Used to advance the flat-id
+/// cursor past a culled `ScrollView` child without walking it (RFC-0005).
+fn flat_len(node: &RenderNode) -> usize {
+    match node {
+        RenderNode::Box { children, .. } => 1 + children.iter().map(flat_len).sum::<usize>(),
+        _ => 1,
+    }
+}
+
 /// Renders a value for string interpolation (`"Count: {count}"`).
 /// Coerces a spacing side/scalar value to `f32`; only numeric values are valid
 /// `Len`s (a non-numeric side is a `TypeMismatch`).
@@ -5136,6 +5206,54 @@ mod tests {
         wheel(&mut interp, 20.0);
         let top = peek_f(&interp);
         assert!(top.abs() < 1.0, "scroll must clamp at 0, got {top}");
+    }
+
+    /// RFC-0005 emission culling: a `ScrollView` child scrolled entirely out of
+    /// the viewport is never pushed to the frame (only its visible slice costs
+    /// anything), while the flat-id cursor stays aligned so siblings still paint.
+    #[test]
+    fn scrollview_culls_children_scrolled_out_of_view() {
+        let src = "View V() { var off: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // Present iff a box with the given dominant colour channel was emitted.
+        let has = |interp: &mut Interpreter, chan: usize| -> bool {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame
+                .instances()
+                .iter()
+                .any(|b| b.color[chan] > 0.8 && b.color[(chan + 1) % 3] < 0.3)
+        };
+
+        // At rest, the third box (y 120..180) sits fully below the 100px
+        // viewport → culled. The first two overlap it → kept.
+        assert!(has(&mut interp, 0), "red (top) is visible at rest");
+        assert!(has(&mut interp, 1), "green (straddling) is visible at rest");
+        assert!(!has(&mut interp, 2), "blue (below) is culled at rest");
+
+        // Scroll down 120px: the first box (now y -120..-60) leaves the top →
+        // culled; the third box scrolls into view.
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        interp.write_var(off, Value::Int(120));
+        interp.tick();
+        assert!(
+            !has(&mut interp, 0),
+            "red is culled once scrolled past the top"
+        );
+        assert!(has(&mut interp, 2), "blue scrolls into view");
     }
 
     #[test]
