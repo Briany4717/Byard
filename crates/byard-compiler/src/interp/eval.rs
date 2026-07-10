@@ -301,6 +301,27 @@ pub struct Interpreter {
     /// reads this to convert a wheel into a clamped scroll — the same
     /// render-then-dispatch handshake the router's hit rects use.
     scroll_targets: Vec<ScrollTarget>,
+    /// The drag-to-scroll gesture in flight, if any (RFC-0005). Set when a
+    /// pointer press lands on inert `ScrollView` content; each move writes the
+    /// offset so the content tracks the pointer; cleared on release.
+    scroll_drag: Option<ScrollDrag>,
+}
+
+/// A live drag-to-scroll gesture (RFC-0005 `ScrollView`): the content follows
+/// the pointer between press and release. Captured at press so the offset is a
+/// pure function of the pointer travel — no accumulated drift (IMPL-10).
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    /// The signal backing `offset.y`, written as the pointer moves.
+    sig: SignalId,
+    /// Pointer Y at the press, in logical screen px.
+    start_y: f32,
+    /// The offset at the press; the live offset is this minus the pointer travel.
+    start_offset: f32,
+    /// Maximum scroll distance (content height − viewport height), clamped ≥ 0.
+    max: f32,
+    /// Whether `sig` holds an `Int` (write back rounded) or a `Float`.
+    is_int: bool,
 }
 
 impl Interpreter {
@@ -3574,6 +3595,63 @@ impl Interpreter {
             self.write_var(t.sig, value);
         }
 
+        // RFC-0005 `ScrollView` drag-to-scroll: a pointer press on inert scroll
+        // content starts a drag; each move slides the offset so the content
+        // tracks the pointer (the offset is a pure function of the press-relative
+        // travel — no accumulated drift, IMPL-10); release ends it. The press
+        // defers to interactive children via `claims_pointer`, so a button or
+        // slider inside the list still wins its own gesture.
+        for ev in events {
+            match ev.kind {
+                CoreKind::PointerDown => {
+                    let (px, py) = ev.pos;
+                    let target = if self.router.claims_pointer(ev.pos) {
+                        None
+                    } else {
+                        self.scroll_targets
+                            .iter()
+                            .rev()
+                            .find(|t| {
+                                px >= t.rect.x
+                                    && px < t.rect.x + t.rect.w
+                                    && py >= t.rect.y
+                                    && py < t.rect.y + t.rect.h
+                            })
+                            .copied()
+                    };
+                    self.scroll_drag = target.map(|t| {
+                        let (start_offset, is_int) = match self.peek(t.sig) {
+                            Value::Int(n) => (n as f32, true),
+                            Value::Float(f) => (f as f32, false),
+                            _ => (0.0, false),
+                        };
+                        ScrollDrag {
+                            sig: t.sig,
+                            start_y: py,
+                            start_offset,
+                            max: t.max,
+                            is_int,
+                        }
+                    });
+                }
+                CoreKind::PointerMove => {
+                    if let Some(d) = self.scroll_drag {
+                        // Dragging down (pointer y grows) reveals earlier content,
+                        // so the offset shrinks and the content follows the finger.
+                        let next = (d.start_offset - (ev.pos.1 - d.start_y)).clamp(0.0, d.max);
+                        let value = if d.is_int {
+                            Value::Int(next.round() as i64)
+                        } else {
+                            Value::Float(f64::from(next))
+                        };
+                        self.write_var(d.sig, value);
+                    }
+                }
+                CoreKind::PointerUp | CoreKind::Tap => self.scroll_drag = None,
+                _ => {}
+            }
+        }
+
         self.router
             .dispatch_tick(&mut self.ctx, Some(&self.atlas), comp_events);
     }
@@ -5254,6 +5332,118 @@ mod tests {
             "red is culled once scrolled past the top"
         );
         assert!(has(&mut interp, 2), "blue scrolls into view");
+    }
+
+    /// RFC-0005: dragging on inert `ScrollView` content scrolls it — the content
+    /// tracks the pointer between press and release, clamped to the extent.
+    #[test]
+    fn drag_on_scrollview_content_scrolls_and_clamps() {
+        use byard_core::platform::EventKind as K;
+        // Content = 4 × 60px = 240 tall in a 100px viewport → max scroll 140.
+        let src = "View V() { var off: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let peek_f = |interp: &Interpreter| match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("offset must be numeric"),
+        };
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press on inert content, then drag up 50px → content scrolls down 50.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 80.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, 30.0)]);
+        assert!(
+            (peek_f(&interp) - 50.0).abs() < 1.0,
+            "drag up 50px scrolls down 50, got {}",
+            peek_f(&interp)
+        );
+
+        // Dragging further up clamps at the content extent (140).
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, -200.0)]);
+        assert!(
+            (peek_f(&interp) - 140.0).abs() < 1.0,
+            "drag clamps to content−viewport, got {}",
+            peek_f(&interp)
+        );
+
+        // Releasing ends the gesture: a later stray move no longer scrolls.
+        interp.dispatch_events(&[ev(K::PointerUp, 100.0, -200.0)]);
+        let held = peek_f(&interp);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, 300.0)]);
+        assert!(
+            (peek_f(&interp) - held).abs() < 0.01,
+            "no drag is in flight after release, got {} (was {held})",
+            peek_f(&interp)
+        );
+    }
+
+    /// RFC-0005: a press that lands on an interactive child (here a `Button`)
+    /// is that child's gesture — drag-to-scroll defers and the list stays put.
+    #[test]
+    fn drag_defers_to_interactive_children() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var off: Float = 0.0 var c: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Button(\"tap\") #[width: 180, height: 60] => c++ \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press on the Button (top 60px), then drag: the button owns the press,
+        // so the list must not scroll.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 30.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, -60.0)]);
+        let scrolled = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        assert!(
+            scrolled.abs() < 0.01,
+            "a press on a Button must not drag-scroll the list, got {scrolled}"
+        );
     }
 
     #[test]
