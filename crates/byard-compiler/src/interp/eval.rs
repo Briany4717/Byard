@@ -163,6 +163,24 @@ struct ScrollTarget {
     y: Option<ScrollAxis>,
 }
 
+/// The visible slice of a windowed `ScrollView` list (RFC-0005 windowed layout):
+/// only rows `start..end` of a uniform-height list are built, laid out, and
+/// emitted, with a leading/trailing [`Spacer`] standing in for the elided rows so
+/// the content extent (and thus the scroll clamp) and every visible row's
+/// position stay exact. Computed identically in the build and render passes from
+/// the same offset, so the parallel flat-id cursor stays aligned.
+#[derive(Clone, Copy)]
+struct WindowSpec {
+    /// Index of the first materialised row.
+    start: usize,
+    /// One past the last materialised row (`start..end` is the live slice).
+    end: usize,
+    /// Fixed per-row extent in logical px (spacing folded in).
+    row_height: f32,
+    /// Total row count, so the trailing spacer covers `n − end` rows.
+    n: usize,
+}
+
 /// One resolved drop shadow (RFC-0011 custom shadows): offset, blur, spread, and
 /// resolved RGBA colour. A box may carry several — CSS-style layered shadows —
 /// each emitted as its own shadow-only `DecoratedBox` beneath the surface.
@@ -558,6 +576,15 @@ impl Interpreter {
         self.ctx.peek_signal(sig)
     }
 
+    /// The number of nodes in the last-computed layout atlas — the direct
+    /// witness that a windowed `ScrollView` lays out O(visible), not O(list)
+    /// (RFC-0005 windowed layout).
+    #[cfg(test)]
+    #[must_use]
+    fn atlas_node_count(&self) -> usize {
+        self.atlas.node_count()
+    }
+
     // ── M23: Controller boundary ─────────────────────────────────────────
 
     /// Provides an ambient value keyed by `ty` to this view and its
@@ -826,6 +853,43 @@ impl Interpreter {
             }
         };
         (sig_at(0), sig_at(1))
+    }
+
+    /// The visible row window of a windowed `ScrollView` (RFC-0005), or `None`
+    /// when it is not `windowed`, its `row_height` is unset/≤ 0, or it has no
+    /// uniform list child. The window brackets the viewport with a couple of
+    /// overscan rows so a partially-scrolled row is always materialised. Computed
+    /// from the *current* `offset.y`, and — because both passes read the same
+    /// offset within one render — identically in build and render.
+    fn scroll_window(&mut self, sv_attrs: &[Attr], child_count: usize) -> Option<WindowSpec> {
+        // Overscan rows on each side keep a row that is only partly scrolled into
+        // view fully materialised, and hide the one-frame lag between an input
+        // and the re-render that follows it.
+        const OVERSCAN: usize = 2;
+        if self.eval_bool_prop(sv_attrs, "windowed") != Some(true) {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let row_height = self.eval_int_prop(sv_attrs, "row_height").unwrap_or(0) as f32;
+        if row_height <= 0.0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let viewport_h = self.eval_int_prop(sv_attrs, "height").unwrap_or(0) as f32;
+        let (_, offset_y) = self.resolve_axis_pair(sv_attrs, "offset", (0.0, 0.0));
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let first = (offset_y / row_height).floor().max(0.0) as usize;
+        let start = first.saturating_sub(OVERSCAN);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let span = (viewport_h / row_height).ceil() as usize + 2 * OVERSCAN + 1;
+        let end = start.saturating_add(span).min(child_count);
+        Some(WindowSpec {
+            start,
+            end,
+            row_height,
+            n: child_count,
+        })
     }
 
     /// Whether a `ScrollView` child's laid-out rectangle, mapped through the
@@ -1262,6 +1326,7 @@ impl Interpreter {
                         1.0,
                         byard_core::frame::Transform::IDENTITY,
                         None,
+                        None,
                     );
                 }
             }
@@ -1345,6 +1410,37 @@ impl Interpreter {
                     }
                     _ => {}
                 }
+                // RFC-0005 windowed ScrollView: when opted in, build only the
+                // visible slice of a single uniform-height list child, bracketed
+                // by spacer leaves for the elided rows — so layout is O(visible),
+                // not O(list). The same window is recomputed in the render pass.
+                if name.as_str() == "ScrollView" {
+                    if let [
+                        RenderNode::Box {
+                            name: list_name,
+                            attrs: list_attrs,
+                            children: rows,
+                            ..
+                        },
+                    ] = children.as_slice()
+                    {
+                        if let Some(win) = self.scroll_window(attrs, rows.len()) {
+                            let mut temp_flat = Vec::new();
+                            let list_id = self.build_windowed_list(
+                                list_name,
+                                list_attrs,
+                                rows,
+                                win,
+                                &mut temp_flat,
+                            )?;
+                            let style = self.eval_container_style(name.as_str(), attrs);
+                            let id = self.atlas.add_container(style, &[list_id])?;
+                            flat_ids.push(id);
+                            flat_ids.extend(temp_flat);
+                            return Ok(id);
+                        }
+                    }
+                }
                 let mut child_ids = Vec::with_capacity(children.len());
                 let mut temp_flat = Vec::new();
                 for child in children {
@@ -1358,6 +1454,51 @@ impl Interpreter {
                 Ok(id)
             }
         }
+    }
+
+    /// Builds the atlas subtree for a windowed `ScrollView`'s list child
+    /// (RFC-0005): a leading spacer sized to the rows scrolled off the top, the
+    /// materialised rows `win.start..win.end`, then a trailing spacer for the
+    /// rows below the window. The two spacers preserve the container's content
+    /// extent (so the scroll clamp is exact) and every visible row's position,
+    /// while only `end − start` rows are ever laid out. `flat_ids` receives the
+    /// same `[container, top-spacer, rows…, bottom-spacer]` order the render pass
+    /// walks, keeping the parallel cursor aligned.
+    fn build_windowed_list(
+        &mut self,
+        list_name: &Symbol,
+        list_attrs: &[Attr],
+        rows: &[RenderNode],
+        win: WindowSpec,
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
+        use byard_core::atlas::layout::LeafSize;
+        #[allow(clippy::cast_precision_loss)]
+        let top_h = win.start as f32 * win.row_height;
+        #[allow(clippy::cast_precision_loss)]
+        let bottom_h = (win.n - win.end) as f32 * win.row_height;
+
+        let mut child_ids = Vec::with_capacity(win.end - win.start + 2);
+        let mut temp = Vec::new();
+        let top = self.atlas.add_leaf(LeafSize::new(0.0, top_h))?;
+        temp.push(top);
+        child_ids.push(top);
+        for row in &rows[win.start..win.end] {
+            let id = self.build_layout_tree(row, &mut temp)?;
+            child_ids.push(id);
+        }
+        let bottom = self.atlas.add_leaf(LeafSize::new(0.0, bottom_h))?;
+        temp.push(bottom);
+        child_ids.push(bottom);
+
+        let mut style = self.eval_container_style(list_name.as_str(), list_attrs);
+        // Rows are positioned purely by `row_height` (spacing folded in); a flex
+        // gap would add phantom space around the spacers and desync the window.
+        style.gap = 0.0;
+        let id = self.atlas.add_container(style, &child_ids)?;
+        flat_ids.push(id);
+        flat_ids.extend(temp);
+        Ok(id)
     }
 
     #[allow(clippy::similar_names)]
@@ -1386,6 +1527,11 @@ impl Interpreter {
         // this only spares the CPU the emission. `None` outside any scroll
         // container (the whole viewport is live).
         cull_clip: Option<byard_core::frame::Rect>,
+        // Set only on a windowed `ScrollView`'s list child (RFC-0005 windowed
+        // layout): this node renders just rows `start..end`, bracketed by the two
+        // spacer leaves the build pass emitted, so the flat-id cursor stays
+        // aligned. `None` everywhere else — the ordinary full child walk.
+        window: Option<WindowSpec>,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
@@ -1756,20 +1902,36 @@ impl Interpreter {
                 // `ScrollView` established — so rows nested under an inner `Column`
                 // are culled too, not just the `ScrollView`'s direct child.
                 let child_clip = scroll_clip.or(cull_clip);
-                for child in children {
+                // A windowed `ScrollView` hands its computed row window to its
+                // single list child (mirrors the build pass); nothing else
+                // propagates one.
+                let child_window = if name.as_str() == "ScrollView" {
+                    match children.as_slice() {
+                        [RenderNode::Box { children: rows, .. }] => {
+                            self.scroll_window(attrs, rows.len())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let render_child = |this: &mut Self,
+                                    child: &RenderNode,
+                                    frame: &mut byard_core::frame::RenderFrame,
+                                    flat_idx: &mut usize| {
                     let child_id = flat_ids[*flat_idx];
-                    // RFC-0005 emission culling (north star): a child the scroll
-                    // has pushed entirely out of the viewport is never pushed to
-                    // the frame — a long list costs only its visible slice, not
-                    // its full height. Advance the flat-id cursor past the skipped
-                    // subtree so the remaining children stay aligned.
+                    // RFC-0005 emission culling (north star): a child the
+                    // scroll has pushed entirely out of the viewport is never
+                    // pushed to the frame — a long list costs only its visible
+                    // slice. Advance the cursor past the skipped subtree so the
+                    // remaining children stay aligned.
                     if let Some(clip) = child_clip {
-                        if self.child_fully_clipped(child_id, child_transform, clip) {
+                        if this.child_fully_clipped(child_id, child_transform, clip) {
                             *flat_idx += flat_len(child);
-                            continue;
+                            return;
                         }
                     }
-                    self.render_node_with_atlas(
+                    this.render_node_with_atlas(
                         child,
                         child_id,
                         frame,
@@ -1779,7 +1941,23 @@ impl Interpreter {
                         child_opacity,
                         child_transform,
                         child_clip,
+                        child_window,
                     );
+                };
+                if let Some(win) = window {
+                    // This box is a windowed list child (RFC-0005): the build pass
+                    // wrapped its rows in a leading + trailing spacer leaf. Consume
+                    // the leading spacer, render only rows `start..end`, then the
+                    // trailing spacer — keeping the flat-id cursor in lockstep.
+                    *flat_idx += 1;
+                    for row in &children[win.start..win.end] {
+                        render_child(self, row, frame, flat_idx);
+                    }
+                    *flat_idx += 1;
+                } else {
+                    for child in children {
+                        render_child(self, child, frame, flat_idx);
+                    }
                 }
                 if scroll_clip.is_some() {
                     frame.end_clip();
@@ -5671,6 +5849,156 @@ mod tests {
             (peek(&interp, py) - 60.0).abs() < 1.0,
             "panY, got {}",
             peek(&interp, py)
+        );
+    }
+
+    /// RFC-0005 windowed layout: a `windowed` ScrollView lays out only the
+    /// visible slice of a long uniform list — O(visible), not O(list) — while a
+    /// plain ScrollView over the same list lays out every row.
+    #[test]
+    fn windowed_scrollview_lays_out_only_the_visible_window() {
+        // 1000 rows × 20px in a 100px viewport. A windowed pass should build only
+        // a handful of rows (viewport/row + overscan) + 2 spacers + containers.
+        let list = |windowed: &str| {
+            format!(
+                "View V() {{ var y: Float = 0.0 \
+                 ScrollView #[width: 200, height: 100, row_height: 20, {windowed} offset: (0, y)] {{ \
+                     Column {{ \
+                         for i in [{}] {{ \
+                             Box #[bg: 0x6495ED, width: 180, height: 20] {{}} \
+                         }} \
+                     }} \
+                 }} }}",
+                (0..1000)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let node_count = |src: String| {
+            let parsed = parse(&src);
+            assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            let mut interp = Interpreter::new();
+            let tree = interp.lower_view(&parsed.views[0], &[]);
+            assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            (interp.atlas_node_count(), frame.instances().len())
+        };
+        let (windowed_nodes, windowed_boxes) = node_count(list("windowed: true,"));
+        let (plain_nodes, _) = node_count(list(""));
+
+        assert!(
+            windowed_nodes < 40,
+            "a windowed 1000-row list lays out O(visible), got {windowed_nodes} nodes"
+        );
+        assert!(
+            plain_nodes > 1000,
+            "a plain list lays out every row, got {plain_nodes} nodes"
+        );
+        assert!(
+            windowed_boxes < 30,
+            "only the visible rows are emitted, got {windowed_boxes}"
+        );
+    }
+
+    /// RFC-0005 windowed layout: the two spacer leaves preserve the full content
+    /// extent, so the scroll clamp still reaches the true bottom of the list.
+    #[test]
+    fn windowed_scrollview_preserves_scroll_extent() {
+        // 500 rows × 20 = 10 000 tall in a 100px viewport → max scroll 9 900.
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, row_height: 20, windowed: true, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+        // A huge wheel must clamp to content − viewport = 9 900, proving the
+        // elided rows still count toward the extent (spacers, not shrinkage).
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::Wheel,
+            pos: (100.0, 50.0),
+            delta: (0.0, -10_000.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        let clamped = match interp.peek(y) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        assert!(
+            (clamped - 9_900.0).abs() < 1.0,
+            "windowed extent must span the whole list, clamped at {clamped}"
+        );
+    }
+
+    /// RFC-0005 windowed layout: as the offset grows the window slides, so a row
+    /// deep in the list becomes visible while the atlas stays O(visible).
+    #[test]
+    fn windowed_scrollview_slides_the_window_on_scroll() {
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, row_height: 20, windowed: true, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // The emitted rows' *layout* Y band (their true list positions, not the
+        // scrolled screen position), and the atlas size, at the current offset.
+        let sample = |interp: &mut Interpreter| -> (f32, f32, usize) {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let ys: Vec<f32> = frame.instances().iter().map(|b| b.rect[1]).collect();
+            let min = ys.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            (min, max, interp.atlas_node_count())
+        };
+        let (_, at_rest_bottom, nodes0) = sample(&mut interp);
+        assert!(
+            at_rest_bottom < 300.0,
+            "at rest the window sits at the top of the list, got bottom {at_rest_bottom}"
+        );
+
+        // Jump near the bottom (offset 8000 → row ~400 of 500). The window must
+        // slide to the deep rows: they lay out at y ≈ 8000 (row_index × 20).
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+        interp.write_var(y, Value::Float(8000.0));
+        interp.tick();
+        let (deep_top, _, nodes1) = sample(&mut interp);
+        assert!(
+            deep_top > 7000.0,
+            "the window slid to the deep rows (laid out near y≈8000), got top {deep_top}"
+        );
+        assert!(nodes0 < 40, "the window is O(visible) at rest: {nodes0}");
+        assert!(
+            nodes1 < 40,
+            "the window stays O(visible) after scrolling deep: {nodes1}"
         );
     }
 

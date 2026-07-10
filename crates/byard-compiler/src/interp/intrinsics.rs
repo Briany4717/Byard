@@ -335,6 +335,12 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
             props.insert("axis", PropType::Enum(AXIS));
             props.insert("offset", PropType::Vec2);
+            // RFC-0005 windowed layout: opt-in list virtualization. `windowed`
+            // materialises only the visible slice of a uniform-height vertical
+            // list; `row_height` is that fixed per-row extent (padding/gap folded
+            // in) the window math indexes by.
+            props.insert("windowed", PropType::Bool);
+            props.insert("row_height", PropType::Int);
             Intrinsic {
                 arity: 0,
                 content: None,
