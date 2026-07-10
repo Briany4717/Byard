@@ -11,7 +11,8 @@ use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
 use taffy::{
     AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, NodeId, Rect as TaffyRect, Size, Style, TaffyError, TaffyTree,
+    LengthPercentageAuto, NodeId, Overflow, Point, Rect as TaffyRect, Size, Style, TaffyError,
+    TaffyTree,
 };
 
 use super::spatial::SpatialGrid;
@@ -169,6 +170,16 @@ pub struct ContainerStyle {
     /// Flex-grow factor (how much this node expands to fill its parent's main
     /// axis).
     pub grow: f32,
+    /// Whether this is a **horizontal scroll container** (RFC-0005 `ScrollView`
+    /// `axis: horizontal|both`): content is measured at natural width and
+    /// overflows the fixed viewport on the inline axis (Taffy `overflow.x =
+    /// Scroll`), rather than being shrunk to fit. The renderer clips and scrolls
+    /// the overflow.
+    pub scroll_x: bool,
+    /// Whether this is a **vertical scroll container** (RFC-0005 `ScrollView`,
+    /// the default `axis: vertical`): content overflows on the block axis
+    /// (Taffy `overflow.y = Scroll`). Clipped and scrolled by the renderer.
+    pub scroll_y: bool,
 }
 
 impl ContainerStyle {
@@ -232,6 +243,15 @@ impl ContainerStyle {
         self
     }
 
+    /// Marks this a scroll container on the given axes (RFC-0005 `ScrollView`):
+    /// content overflows the viewport where enabled instead of shrinking to fit.
+    #[must_use]
+    pub fn with_scroll_axes(mut self, scroll_x: bool, scroll_y: bool) -> Self {
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
+        self
+    }
+
     /// Builds the Taffy `Style` this container maps to.
     fn to_taffy(self) -> Style {
         Style {
@@ -276,6 +296,22 @@ impl ContainerStyle {
                 Justify::Evenly => JustifyContent::SpaceEvenly,
             }),
             flex_grow: self.grow,
+            // RFC-0005 `ScrollView`: a scroll container measures its content at
+            // natural size and lets it overflow the fixed viewport on the
+            // scrolling axes, instead of flex-shrinking children to fit. The
+            // renderer clips and scrolls the overflow.
+            overflow: Point {
+                x: if self.scroll_x {
+                    Overflow::Scroll
+                } else {
+                    Overflow::Visible
+                },
+                y: if self.scroll_y {
+                    Overflow::Scroll
+                } else {
+                    Overflow::Visible
+                },
+            },
             ..Default::default()
         }
     }
@@ -714,6 +750,26 @@ impl LayoutAtlas {
         self.validate_node(node)?;
 
         Ok(self.resolved_rect_internal(node))
+    }
+
+    /// The `(width, height)` of a node's **content** — the extent of its
+    /// children, which for a `ScrollView` (Taffy `overflow: Scroll`) exceeds the
+    /// node's own box. Subtracting the viewport size gives the maximum scroll
+    /// distance (RFC-0005). `None` if the node is unknown or not yet computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::ForeignNode`] if `node` belongs to another atlas.
+    pub fn content_size(&self, node: AtlasNodeId) -> Result<Option<(f32, f32)>, AtlasError> {
+        self.validate_node(node)?;
+        if self.state != AtlasState::Computed {
+            return Ok(None);
+        }
+        Ok(self
+            .tree
+            .layout(node.node_id)
+            .ok()
+            .map(|l| (l.content_size.width, l.content_size.height)))
     }
 
     /// Writes the resolved geometry of every node into `frame`, marking each

@@ -335,6 +335,17 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
             props.insert("axis", PropType::Enum(AXIS));
             props.insert("offset", PropType::Vec2);
+            // RFC-0005 windowed layout: opt-in list virtualization. `windowed`
+            // materialises only the visible slice of a uniform-height vertical
+            // list; `row_height` is that fixed per-row **stride** the window math
+            // indexes by. It MUST equal each row's laid-out outer height, because
+            // windowing lays the list out gap-free (a flex `gap` can't survive
+            // virtualization) — so fold any inter-row spacing into the row itself
+            // (its `height` or a `mb` margin), not the container's `gap`. A
+            // `row_height` that disagrees with the real stride makes the content
+            // jump as rows scroll past the edge.
+            props.insert("windowed", PropType::Bool);
+            props.insert("row_height", PropType::Int);
             Intrinsic {
                 arity: 0,
                 content: None,

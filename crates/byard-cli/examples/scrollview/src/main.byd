@@ -1,0 +1,61 @@
+// RFC-0005 ScrollView — content clipped to a viewport and scrolled by `offset`.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/scrollview
+//   cargo run -p byard-cli -- dev
+//
+// Scroll with the **mouse wheel**, **drag on the list itself**, or drag the
+// slider — all three drive the same `scrollY` (the y of the two-way `offset`
+// Vec2), clamped to the content extent. The content is measured at its natural
+// height and *overflows* the 220px viewport; the overflow is clipped (GPU
+// scissor) and the whole content is translated by −offset at paint time, so
+// scrolling never re-runs layout (INV-8). Rows scrolled out of the viewport are
+// culled — never emitted — so a long list costs only its visible slice.
+//
+// The bottom strip is a **horizontal** ScrollView (`axis: horizontal`): wheel or
+// drag sideways to pan `panX`. `axis: both` would pan in 2-D from one drag.
+//
+// The vertical list is **windowed** (`windowed: true, row_height: 54`): only the
+// rows in view (± a little overscan) are laid out and drawn, so the list stays
+// O(visible) no matter how long it grows. Windowing lays the list out gap-free,
+// so `row_height` must equal each row's real stride and spacing goes *in the
+// row*: here 44px tall + a 10px bottom margin = a 54px stride. (A `row_height`
+// that disagrees with the stride makes the content jump as rows scroll off.)
+View Main() {
+    var scrollY: Float = 0.0
+    var panX: Float = 0.0
+
+    Column #[bg: 0x14141C, p: 28, gap: 16, width: 380] {
+        Text("Scrollable list") #[color: 0xFFFFFF, size: 20, weight: bold]
+
+        ScrollView #[width: 320, height: 220, windowed: true, row_height: 54, offset: (0, scrollY), bg: 0x1E1E2A, radius: 12] {
+            Column #[p: 12] {
+                for label in ["Inbox", "Starred", "Sent", "Drafts", "Archive",
+                              "Spam", "Trash", "Important", "Chats", "Scheduled",
+                              "All Mail", "Snoozed"] {
+                    Row #[bg: 0x262636, radius: 8, p: (vertical: 12, horizontal: 14), gap: 10, width: 288, height: 44, mb: 10] {
+                        Box #[bg: 0x6495ED, radius: 5, width: 10, height: 10]
+                        Text("{label}") #[color: 0xE6E1E5, size: 15]
+                    }
+                }
+            }
+        }
+
+        Slider #[bind: scrollY, min: 0.0, max: 320.0, step: 4.0, width: 320, height: 26]
+
+        Text("Horizontal strip") #[color: 0xFFFFFF, size: 16, weight: bold]
+        ScrollView #[width: 320, height: 84, axis: horizontal, offset: (panX, 0), bg: 0x1E1E2A, radius: 12] {
+            Row #[p: 12, gap: 12] {
+                for tag in ["Work", "Home", "Travel", "Music", "Photos", "Notes",
+                            "Reading", "Fitness", "Recipes", "Projects"] {
+                    Column #[bg: 0x2E2A40, radius: 10, p: 14, gap: 6, width: 96, height: 56] {
+                        Box #[bg: 0xB48EAD, radius: 6, width: 20, height: 20]
+                        Text("{tag}") #[color: 0xE6E1E5, size: 13]
+                    }
+                }
+            }
+        }
+
+        Text("windowed vertical list + horizontal strip · wheel or drag") #[color: 0x9AA0AA, size: 13]
+    }
+}

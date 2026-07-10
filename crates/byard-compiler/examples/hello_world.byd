@@ -4,8 +4,8 @@
 // keyboard focus + Tab, structural `for`/`when … else`, themed typography,
 // the four `Len` padding forms, decoration (radius/border/opacity), custom &
 // layered drop shadows (named/positional/array, with spread), an MSDF
-// `VectorIcon`, paint-time transforms, coherent paint order, and a textured
-// `Image`.
+// `VectorIcon`, paint-time transforms, coherent paint order, a wheel-scrollable
+// `ScrollView`, and a textured `Image`.
 //
 // Laid out as two side-by-side columns in a ~16:9 landscape frame. Run with:
 //   cargo run -p byard-cli -- dev crates/byard-compiler/examples/hello_world.byd
@@ -24,6 +24,7 @@ View Main() {
     var scrollTicks: Int = 0
     var cardHovered: Bool = false
     var raised: Bool = false
+    var listScroll: Float = 0.0
 
     // A parameterized `fn` + a derived `let` consuming it (declared before use).
     fn describe(n: Int) => "the counter is {n}"
@@ -275,14 +276,28 @@ View Main() {
                 }
                 Text("pokes: {pokes} (click +1, double-tap +10, long-press +100, right-click resets)") #[color: 0x9AA0AC, size: 13]
 
-                // Hardware wheel/scroll origin (RFC-0012 §A loose end): hover
-                // this area and use a physical mouse wheel (`wheelTicks`) or a
-                // trackpad scroll gesture (`scrollTicks`) over it. `scroll` is
-                // only in `ScrollView`'s accepted vocabulary today; `wheel` is
-                // universal.
-                ScrollView #[bg: 0x1E1E2A, radius: 10, p: (vertical: 14, horizontal: 18), width: 320, wheel => wheelTicks++, scroll => scrollTicks++] {
-                    Text("wheel: {wheelTicks}   scroll: {scrollTicks}") #[color: 0xFFFFFF, size: 14]
+                // A real ScrollView (RFC-0005): eight rows overflow the 96px
+                // viewport, so scroll the list with the mouse wheel (or drive
+                // `listScroll` two-way). The content is measured at natural
+                // height, clipped to the viewport (GPU scissor), and translated
+                // by −offset at paint time — scrolling never re-runs layout
+                // (INV-8). The wheel also bumps the raw `wheel`/`scroll` counters
+                // shown below.
+                ScrollView #[
+                    bg: 0x1E1E2A, radius: 10, width: 320, height: 96,
+                    offset: (0, listScroll),
+                    wheel => wheelTicks++, scroll => scrollTicks++,
+                ] {
+                    Column #[p: (vertical: 12, horizontal: 16), gap: 8] {
+                        for feature in ["Reactive var / let", "Two-way bind:",
+                                        "for / when … else", "Themed typography",
+                                        "Paint-time transforms", "Custom shadows",
+                                        "MSDF vector icons", "Disk-cached fields"] {
+                            Text("• {feature}") #[color: 0xC9C9D4, size: 14]
+                        }
+                    }
                 }
+                Text("wheel the list ↑ · wheel: {wheelTicks}  scroll: {scrollTicks}") #[color: 0x9AA0AC, size: 13]
             }
         }
     }

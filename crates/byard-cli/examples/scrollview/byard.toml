@@ -1,0 +1,3 @@
+[project]
+name = "scrollview"
+entry = "src/main.byd"

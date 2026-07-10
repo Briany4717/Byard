@@ -280,6 +280,25 @@ impl EventRouter {
         });
     }
 
+    /// Whether a pointer press at `pos` lands on an element that claims the
+    /// gesture — one carrying a tap/press/drag/change handler. A `ScrollView`
+    /// consults this to defer drag-to-scroll to interactive children (buttons,
+    /// sliders) while still scrolling when the press lands on inert content
+    /// (RFC-0005). Style-only hover/press regions do not claim the gesture.
+    #[must_use]
+    pub fn claims_pointer(&self, pos: (f32, f32)) -> bool {
+        self.handlers.iter().any(|h| {
+            contains(h.rect, pos)
+                && matches!(
+                    h.kind,
+                    EventKind::Tap
+                        | EventKind::PointerDown
+                        | EventKind::PointerDrag
+                        | EventKind::Change
+                )
+        })
+    }
+
     /// Registers a focusable element bound to `focused_sig` (`#[focused: …]`).
     pub fn focusable(&mut self, elem: u32, rect: Rect, focused_sig: SignalId) {
         self.focusables.push(Focusable {

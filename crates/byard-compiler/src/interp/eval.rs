@@ -140,6 +140,47 @@ pub enum RenderNode {
 /// A lowered reactive computation (see the module docs).
 type Lowered = Box<dyn FnMut(&mut ReactiveCtx) -> Value>;
 
+/// One scrollable axis of a [`ScrollTarget`]: the `var` behind `offset.x` or
+/// `offset.y` and how far it may travel (content extent − viewport, ≥ 0).
+#[derive(Clone, Copy)]
+struct ScrollAxis {
+    /// The signal backing this axis's offset component; the wheel/drag writes it.
+    sig: SignalId,
+    /// Maximum scroll distance on this axis (content − viewport), clamped ≥ 0.
+    max: f32,
+}
+
+/// A wheel/drag-scrollable region recorded during render (RFC-0005
+/// `ScrollView`). `dispatch_events` turns a wheel or a drag over `rect` into a
+/// clamped write to whichever of `offset.x`/`offset.y` is a writable `var`.
+#[derive(Clone, Copy)]
+struct ScrollTarget {
+    /// Viewport rect in logical screen px (the wheel/drag hit region).
+    rect: crate::interp::intrinsics::Rect,
+    /// Horizontal axis, present when `offset.x` is a writable `var`.
+    x: Option<ScrollAxis>,
+    /// Vertical axis, present when `offset.y` is a writable `var`.
+    y: Option<ScrollAxis>,
+}
+
+/// The visible slice of a windowed `ScrollView` list (RFC-0005 windowed layout):
+/// only rows `start..end` of a uniform-height list are built, laid out, and
+/// emitted, with a leading/trailing [`Spacer`] standing in for the elided rows so
+/// the content extent (and thus the scroll clamp) and every visible row's
+/// position stay exact. Computed identically in the build and render passes from
+/// the same offset, so the parallel flat-id cursor stays aligned.
+#[derive(Clone, Copy)]
+struct WindowSpec {
+    /// Index of the first materialised row.
+    start: usize,
+    /// One past the last materialised row (`start..end` is the live slice).
+    end: usize,
+    /// Fixed per-row extent in logical px (spacing folded in).
+    row_height: f32,
+    /// Total row count, so the trailing spacer covers `n − end` rows.
+    n: usize,
+}
+
 /// One resolved drop shadow (RFC-0011 custom shadows): offset, blur, spread, and
 /// resolved RGBA colour. A box may carry several — CSS-style layered shadows —
 /// each emitted as its own shadow-only `DecoratedBox` beneath the surface.
@@ -283,6 +324,42 @@ pub struct Interpreter {
     /// §2). Drained once per [`render`](Self::render) call, before the tree
     /// walk, so a freshly-resident glyph is visible the same tick it lands.
     vector_jit: crate::vector::VectorJit,
+    /// Wheel-scroll targets recorded during the last render (RFC-0005): one per
+    /// `ScrollView` whose `offset.y` is a writable signal. `dispatch_events`
+    /// reads this to convert a wheel into a clamped scroll — the same
+    /// render-then-dispatch handshake the router's hit rects use.
+    scroll_targets: Vec<ScrollTarget>,
+    /// The drag-to-scroll gesture in flight, if any (RFC-0005). Set when a
+    /// pointer press lands on inert `ScrollView` content; each move writes the
+    /// offset so the content tracks the pointer; cleared on release.
+    scroll_drag: Option<ScrollDrag>,
+}
+
+/// One axis of a live [`ScrollDrag`]: the signal to write and its value at the
+/// press, so the live offset is a pure function of the pointer travel.
+#[derive(Clone, Copy)]
+struct ScrollDragAxis {
+    /// The signal backing this axis's offset component, written as it moves.
+    sig: SignalId,
+    /// The offset at the press; the live offset is this minus the pointer travel.
+    start_offset: f32,
+    /// Maximum scroll distance on this axis (content − viewport), clamped ≥ 0.
+    max: f32,
+    /// Whether `sig` holds an `Int` (write back rounded) or a `Float`.
+    is_int: bool,
+}
+
+/// A live drag-to-scroll gesture (RFC-0005 `ScrollView`): the content follows
+/// the pointer between press and release. Captured at press so the offset is a
+/// pure function of the pointer travel — no accumulated drift (IMPL-10).
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    /// Pointer position at the press, in logical screen px.
+    start_pos: (f32, f32),
+    /// Horizontal axis, present when `offset.x` is a writable `var`.
+    x: Option<ScrollDragAxis>,
+    /// Vertical axis, present when `offset.y` is a writable `var`.
+    y: Option<ScrollDragAxis>,
 }
 
 impl Interpreter {
@@ -497,6 +574,15 @@ impl Interpreter {
     #[must_use]
     pub fn peek(&self, sig: SignalId) -> Value {
         self.ctx.peek_signal(sig)
+    }
+
+    /// The number of nodes in the last-computed layout atlas — the direct
+    /// witness that a windowed `ScrollView` lays out O(visible), not O(list)
+    /// (RFC-0005 windowed layout).
+    #[cfg(test)]
+    #[must_use]
+    fn atlas_node_count(&self) -> usize {
+        self.atlas.node_count()
     }
 
     // ── M23: Controller boundary ─────────────────────────────────────────
@@ -735,6 +821,110 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    /// The signals backing a `ScrollView`'s `offset.x` and `offset.y` (RFC-0005),
+    /// each present when that tuple component is a writable `var` — e.g.
+    /// `offset: (panX, scrollY)` yields both, `offset: (0, scrollY)` only the y.
+    /// A component that is a literal or computed value yields `None` (that axis
+    /// is inert to wheel/drag; the app drives it). Returned as `(x, y)`.
+    fn resolve_offset_sigs(
+        &self,
+        attrs: &[Attr],
+    ) -> (Option<super::env::SignalId>, Option<super::env::SignalId>) {
+        use crate::parser::ast::Expr;
+        let Some(value) = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == "offset" => Some(value),
+            _ => None,
+        }) else {
+            return (None, None);
+        };
+        // `offset: (x, y)` — a component is scrollable iff it names a `var`.
+        let sig_at = |i: usize| -> Option<super::env::SignalId> {
+            let Expr::Tuple(args, _) = value else {
+                return None;
+            };
+            let Some(Expr::Ident(name, _)) = args.get(i).map(|a| &a.value) else {
+                return None;
+            };
+            match self.env.lookup(name) {
+                Some(super::env::Value::Signal(sig)) => Some(*sig),
+                _ => None,
+            }
+        };
+        (sig_at(0), sig_at(1))
+    }
+
+    /// The visible row window of a windowed `ScrollView` (RFC-0005), or `None`
+    /// when it is not `windowed`, its `row_height` is unset/≤ 0, or it has no
+    /// uniform list child. The window brackets the viewport with a couple of
+    /// overscan rows so a partially-scrolled row is always materialised. Computed
+    /// from the *current* `offset.y`, and — because both passes read the same
+    /// offset within one render — identically in build and render.
+    fn scroll_window(&mut self, sv_attrs: &[Attr], child_count: usize) -> Option<WindowSpec> {
+        // Overscan rows on each side keep a row that is only partly scrolled into
+        // view fully materialised, and hide the one-frame lag between an input
+        // and the re-render that follows it.
+        const OVERSCAN: usize = 2;
+        if self.eval_bool_prop(sv_attrs, "windowed") != Some(true) {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let row_height = self.eval_int_prop(sv_attrs, "row_height").unwrap_or(0) as f32;
+        if row_height <= 0.0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let viewport_h = self.eval_int_prop(sv_attrs, "height").unwrap_or(0) as f32;
+        let (_, offset_y) = self.resolve_axis_pair(sv_attrs, "offset", (0.0, 0.0));
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let first = (offset_y / row_height).floor().max(0.0) as usize;
+        let start = first.saturating_sub(OVERSCAN);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let span = (viewport_h / row_height).ceil() as usize + 2 * OVERSCAN + 1;
+        let end = start.saturating_add(span).min(child_count);
+        Some(WindowSpec {
+            start,
+            end,
+            row_height,
+            n: child_count,
+        })
+    }
+
+    /// Whether a `ScrollView` child's laid-out rectangle, mapped through the
+    /// scroll-shifted `transform`, falls entirely outside `clip` — the emission-
+    /// culling test (RFC-0005 §3.3). All four corners are transformed so a scaled
+    /// ancestor is handled; an unknown rect is conservatively kept (never culled).
+    fn child_fully_clipped(
+        &self,
+        child_id: byard_core::atlas::layout::AtlasNodeId,
+        transform: byard_core::frame::Transform,
+        clip: byard_core::frame::Rect,
+    ) -> bool {
+        let Ok(Some(r)) = self.atlas.resolved_rect(child_id) else {
+            return false;
+        };
+        let corners = [
+            transform.apply_point([r.x, r.y]),
+            transform.apply_point([r.x + r.width, r.y]),
+            transform.apply_point([r.x, r.y + r.height]),
+            transform.apply_point([r.x + r.width, r.y + r.height]),
+        ];
+        let min_x = corners.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|c| c[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+        let max_y = corners
+            .iter()
+            .map(|c| c[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        max_x <= clip.x
+            || min_x >= clip.x + clip.width
+            || max_y <= clip.y
+            || min_y >= clip.y + clip.height
     }
 
     /// Lowers an element to a [`RenderNode`], validating it against the §5
@@ -1091,6 +1281,9 @@ impl Interpreter {
         // gesture state (a pending `down`, the focused element) so a tap that
         // spans this re-render is still recognized (RFC-0003 E4).
         self.router.clear_handlers();
+        // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
+        // router's hit rects.
+        self.scroll_targets.clear();
 
         // Drain any MSDF generations that finished since the last tick,
         // before the tree walk below, so a freshly-resident glyph is visible
@@ -1132,6 +1325,8 @@ impl Interpreter {
                         parent_rect,
                         1.0,
                         byard_core::frame::Transform::IDENTITY,
+                        None,
+                        None,
                     );
                 }
             }
@@ -1215,6 +1410,37 @@ impl Interpreter {
                     }
                     _ => {}
                 }
+                // RFC-0005 windowed ScrollView: when opted in, build only the
+                // visible slice of a single uniform-height list child, bracketed
+                // by spacer leaves for the elided rows — so layout is O(visible),
+                // not O(list). The same window is recomputed in the render pass.
+                if name.as_str() == "ScrollView" {
+                    if let [
+                        RenderNode::Box {
+                            name: list_name,
+                            attrs: list_attrs,
+                            children: rows,
+                            ..
+                        },
+                    ] = children.as_slice()
+                    {
+                        if let Some(win) = self.scroll_window(attrs, rows.len()) {
+                            let mut temp_flat = Vec::new();
+                            let list_id = self.build_windowed_list(
+                                list_name,
+                                list_attrs,
+                                rows,
+                                win,
+                                &mut temp_flat,
+                            )?;
+                            let style = self.eval_container_style(name.as_str(), attrs);
+                            let id = self.atlas.add_container(style, &[list_id])?;
+                            flat_ids.push(id);
+                            flat_ids.extend(temp_flat);
+                            return Ok(id);
+                        }
+                    }
+                }
                 let mut child_ids = Vec::with_capacity(children.len());
                 let mut temp_flat = Vec::new();
                 for child in children {
@@ -1228,6 +1454,51 @@ impl Interpreter {
                 Ok(id)
             }
         }
+    }
+
+    /// Builds the atlas subtree for a windowed `ScrollView`'s list child
+    /// (RFC-0005): a leading spacer sized to the rows scrolled off the top, the
+    /// materialised rows `win.start..win.end`, then a trailing spacer for the
+    /// rows below the window. The two spacers preserve the container's content
+    /// extent (so the scroll clamp is exact) and every visible row's position,
+    /// while only `end − start` rows are ever laid out. `flat_ids` receives the
+    /// same `[container, top-spacer, rows…, bottom-spacer]` order the render pass
+    /// walks, keeping the parallel cursor aligned.
+    fn build_windowed_list(
+        &mut self,
+        list_name: &Symbol,
+        list_attrs: &[Attr],
+        rows: &[RenderNode],
+        win: WindowSpec,
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
+        use byard_core::atlas::layout::LeafSize;
+        #[allow(clippy::cast_precision_loss)]
+        let top_h = win.start as f32 * win.row_height;
+        #[allow(clippy::cast_precision_loss)]
+        let bottom_h = (win.n - win.end) as f32 * win.row_height;
+
+        let mut child_ids = Vec::with_capacity(win.end - win.start + 2);
+        let mut temp = Vec::new();
+        let top = self.atlas.add_leaf(LeafSize::new(0.0, top_h))?;
+        temp.push(top);
+        child_ids.push(top);
+        for row in &rows[win.start..win.end] {
+            let id = self.build_layout_tree(row, &mut temp)?;
+            child_ids.push(id);
+        }
+        let bottom = self.atlas.add_leaf(LeafSize::new(0.0, bottom_h))?;
+        temp.push(bottom);
+        child_ids.push(bottom);
+
+        let mut style = self.eval_container_style(list_name.as_str(), list_attrs);
+        // Rows are positioned purely by `row_height` (spacing folded in); a flex
+        // gap would add phantom space around the spacers and desync the window.
+        style.gap = 0.0;
+        let id = self.atlas.add_container(style, &child_ids)?;
+        flat_ids.push(id);
+        flat_ids.extend(temp);
+        Ok(id)
     }
 
     #[allow(clippy::similar_names)]
@@ -1250,6 +1521,17 @@ impl Interpreter {
         // translated container carries its children, text, and widgets with it —
         // not only its own background box. `IDENTITY` at the root.
         inherited_transform: byard_core::frame::Transform,
+        // The nearest enclosing `ScrollView` viewport, in screen space (RFC-0005
+        // emission culling). A node whose scroll-shifted rect falls entirely
+        // outside it is skipped — the scissor already hides such fragments, so
+        // this only spares the CPU the emission. `None` outside any scroll
+        // container (the whole viewport is live).
+        cull_clip: Option<byard_core::frame::Rect>,
+        // Set only on a windowed `ScrollView`'s list child (RFC-0005 windowed
+        // layout): this node renders just rows `start..end`, bracketed by the two
+        // spacer leaves the build pass emitted, so the flat-id cursor stays
+        // aligned. `None` everywhere else — the ordinary full child walk.
+        window: Option<WindowSpec>,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
@@ -1562,9 +1844,94 @@ impl Interpreter {
                         self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
-                for child in children {
+                // RFC-0005 `ScrollView`: clip children to this viewport and
+                // translate the content by `−offset`. The overflow is scissored
+                // by the encoder (an off-viewport child costs no fragments), and
+                // the content was measured unbounded (layout `scroll`). `offset`
+                // is a two-way `Vec2` the app can read or drive on either axis;
+                // wheel and drag write it below. Rotation of a scroll viewport is
+                // out of scope (the clip is an axis-aligned screen rect).
+                let scroll_clip = if name.as_str() == "ScrollView" {
+                    let (ox, oy) = self.resolve_axis_pair(attrs, "offset", (0.0, 0.0));
+                    let tl = inherited_transform.apply_point([current_rect.x, current_rect.y]);
+                    let clip = byard_core::frame::Rect::new(
+                        tl[0],
+                        tl[1],
+                        current_rect.w * inherited_transform.scale[0],
+                        current_rect.h * inherited_transform.scale[1],
+                    );
+                    frame.begin_clip(clip);
+                    child_transform.translate[0] -= ox * inherited_transform.scale[0];
+                    child_transform.translate[1] -= oy * inherited_transform.scale[1];
+                    // Record a wheel/drag scroll target for whichever of
+                    // `offset.x`/`offset.y` is a writable signal (e.g.
+                    // `offset: (panX, scrollY)`): the input scrolls by writing it,
+                    // clamped to the content extent. `dispatch_events` consumes
+                    // these next tick (render-then-dispatch handshake).
+                    let (sig_x, sig_y) = self.resolve_offset_sigs(attrs);
+                    if sig_x.is_some() || sig_y.is_some() {
+                        let (content_w, content_h) = self
+                            .atlas
+                            .content_size(atlas_node)
+                            .ok()
+                            .flatten()
+                            .unwrap_or((current_rect.w, current_rect.h));
+                        self.scroll_targets.push(ScrollTarget {
+                            rect: crate::interp::intrinsics::Rect::new(
+                                clip.x,
+                                clip.y,
+                                clip.width,
+                                clip.height,
+                            ),
+                            x: sig_x.map(|sig| ScrollAxis {
+                                sig,
+                                max: (content_w - current_rect.w).max(0.0),
+                            }),
+                            y: sig_y.map(|sig| ScrollAxis {
+                                sig,
+                                max: (content_h - current_rect.h).max(0.0),
+                            }),
+                        });
+                    }
+                    Some(clip)
+                } else {
+                    None
+                };
+                // Children cull against this box's own scroll viewport when it is
+                // a `ScrollView`, otherwise against whatever viewport an ancestor
+                // `ScrollView` established — so rows nested under an inner `Column`
+                // are culled too, not just the `ScrollView`'s direct child.
+                let child_clip = scroll_clip.or(cull_clip);
+                // A windowed `ScrollView` hands its computed row window to its
+                // single list child (mirrors the build pass); nothing else
+                // propagates one.
+                let child_window = if name.as_str() == "ScrollView" {
+                    match children.as_slice() {
+                        [RenderNode::Box { children: rows, .. }] => {
+                            self.scroll_window(attrs, rows.len())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let render_child = |this: &mut Self,
+                                    child: &RenderNode,
+                                    frame: &mut byard_core::frame::RenderFrame,
+                                    flat_idx: &mut usize| {
                     let child_id = flat_ids[*flat_idx];
-                    self.render_node_with_atlas(
+                    // RFC-0005 emission culling (north star): a child the
+                    // scroll has pushed entirely out of the viewport is never
+                    // pushed to the frame — a long list costs only its visible
+                    // slice. Advance the cursor past the skipped subtree so the
+                    // remaining children stay aligned.
+                    if let Some(clip) = child_clip {
+                        if this.child_fully_clipped(child_id, child_transform, clip) {
+                            *flat_idx += flat_len(child);
+                            return;
+                        }
+                    }
+                    this.render_node_with_atlas(
                         child,
                         child_id,
                         frame,
@@ -1573,7 +1940,27 @@ impl Interpreter {
                         current_rect,
                         child_opacity,
                         child_transform,
+                        child_clip,
+                        child_window,
                     );
+                };
+                if let Some(win) = window {
+                    // This box is a windowed list child (RFC-0005): the build pass
+                    // wrapped its rows in a leading + trailing spacer leaf. Consume
+                    // the leading spacer, render only rows `start..end`, then the
+                    // trailing spacer — keeping the flat-id cursor in lockstep.
+                    *flat_idx += 1;
+                    for row in &children[win.start..win.end] {
+                        render_child(self, row, frame, flat_idx);
+                    }
+                    *flat_idx += 1;
+                } else {
+                    for child in children {
+                        render_child(self, child, frame, flat_idx);
+                    }
+                }
+                if scroll_clip.is_some() {
+                    frame.end_clip();
                 }
             }
             RenderNode::Image {
@@ -2241,10 +2628,36 @@ impl Interpreter {
             "Row" => FlexDir::Row,
             _ => FlexDir::Column,
         };
+        // RFC-0005 `ScrollView`: a scroll container — content is measured at
+        // natural size and overflows the fixed viewport (clipped + scrolled by
+        // the renderer), rather than flex-shrunk to fit. `axis` (default
+        // `vertical`) picks the overflowing axes; `both` scrolls in 2D.
+        if element_name == "ScrollView" {
+            style = style.with_scroll_axes(false, true);
+        }
         for attr in attrs {
             if let AttrKind::Prop { value } = &attr.kind {
                 let val = self.eval_pure(value);
                 match attr.name.as_str() {
+                    "axis" if element_name == "ScrollView" => {
+                        if let Value::Str(s) = &val {
+                            let (x, y) = match s.as_str() {
+                                "horizontal" => (true, false),
+                                "both" => (true, true),
+                                _ => (false, true),
+                            };
+                            style = style.with_scroll_axes(x, y);
+                            // A ScrollView is `Column`, so its cross axis is x. To
+                            // scroll horizontally, content must keep its natural
+                            // width instead of being stretched to the viewport, or
+                            // Taffy caps the content extent at the viewport and
+                            // there is nothing to scroll. A `stretch` on the block
+                            // axis (vertical-only) is still what fills row width.
+                            if x {
+                                style.align = Align::Start;
+                            }
+                        }
+                    }
                     "width" => style.width = val.as_int().map(|n| n as f32),
                     "height" => style.height = val.as_int().map(|n| n as f32),
                     "direction" => {
@@ -3335,10 +3748,68 @@ impl Interpreter {
         }))
     }
 
+    /// Reads a scroll offset signal as an `f32` (an `Int` or `Float` `var`);
+    /// anything else reads as the origin.
+    fn peek_scroll(&self, sig: SignalId) -> f32 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        match self.peek(sig) {
+            Value::Int(n) => n as f32,
+            Value::Float(f) => f as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Writes `value` back to a scroll offset signal, preserving its `Int`/`Float`
+    /// kind so a whole-pixel `var off: Int` never becomes a `Float` mid-scroll.
+    fn write_scroll(&mut self, sig: SignalId, value: f32) {
+        #[allow(clippy::cast_possible_truncation)]
+        let v = match self.peek(sig) {
+            Value::Int(_) => Value::Int(value.round() as i64),
+            _ => Value::Float(f64::from(value)),
+        };
+        self.write_var(sig, v);
+    }
+
+    /// Nudges one scroll axis by `delta` logical px (wheel/trackpad), clamped to
+    /// `[0, max]`. A forward delta reveals earlier content, so the offset shrinks.
+    fn nudge_scroll(&mut self, axis: ScrollAxis, delta: f32) {
+        let next = (self.peek_scroll(axis.sig) - delta).clamp(0.0, axis.max);
+        self.write_scroll(axis.sig, next);
+    }
+
+    /// Snapshots one axis of a drag at the press: its live offset becomes the
+    /// baseline the pointer travel is subtracted from (RFC-0005, IMPL-10).
+    fn capture_drag_axis(&self, axis: ScrollAxis) -> ScrollDragAxis {
+        let is_int = matches!(self.peek(axis.sig), Value::Int(_));
+        ScrollDragAxis {
+            sig: axis.sig,
+            start_offset: self.peek_scroll(axis.sig),
+            max: axis.max,
+            is_int,
+        }
+    }
+
+    /// Applies a drag's pointer `travel` (current − press) to one axis: the
+    /// content follows the pointer, so the offset is the press offset minus the
+    /// travel, clamped to `[0, max]` (RFC-0005 drag-to-scroll).
+    fn write_drag_axis(&mut self, axis: ScrollDragAxis, travel: f32) {
+        let next = (axis.start_offset - travel).clamp(0.0, axis.max);
+        let value = if axis.is_int {
+            #[allow(clippy::cast_possible_truncation)]
+            Value::Int(next.round() as i64)
+        } else {
+            Value::Float(f64::from(next))
+        };
+        self.write_var(axis.sig, value);
+    }
+
     /// Converts winit-sourced input events to interpreter event payloads and dispatches them to the `EventRouter`.
     pub fn dispatch_events(&mut self, events: &[byard_core::InputEvent]) {
         use crate::interp::events::{EventKind as CompKind, InputEvent as CompEvent};
         use byard_core::platform::{EventKind as CoreKind, InputPayload};
+
+        /// Logical pixels a `ScrollView` scrolls per wheel line (RFC-0005).
+        const WHEEL_LINE_PX: f32 = 40.0;
 
         let comp_events: Vec<CompEvent> = events
             .iter()
@@ -3377,8 +3848,102 @@ impl Interpreter {
             })
             .collect();
 
+        // RFC-0005 `ScrollView` wheel: a wheel/scroll over a recorded scroll
+        // target nudges whichever of `offset.x`/`offset.y` is writable, each
+        // clamped to `[0, content − viewport]`. Wheel deltas are line-based (× a
+        // per-line step); trackpad `Scroll` deltas are already pixels. Done here,
+        // before the render, so the same tick paints the new offset (paint-time
+        // translate, no relayout — INV-8).
+        for ev in events {
+            let step = match ev.kind {
+                CoreKind::Wheel => WHEEL_LINE_PX,
+                CoreKind::Scroll => 1.0,
+                _ => continue,
+            };
+            let (px, py) = ev.pos;
+            let Some(t) = self
+                .scroll_targets
+                .iter()
+                .rev()
+                .find(|t| {
+                    px >= t.rect.x
+                        && px < t.rect.x + t.rect.w
+                        && py >= t.rect.y
+                        && py < t.rect.y + t.rect.h
+                })
+                .copied()
+            else {
+                continue;
+            };
+            // Wheel forward (delta > 0) reveals earlier content → offset shrinks.
+            if let Some(axis) = t.x {
+                self.nudge_scroll(axis, ev.delta.0 * step);
+            }
+            if let Some(axis) = t.y {
+                self.nudge_scroll(axis, ev.delta.1 * step);
+            }
+        }
+
+        // RFC-0005 `ScrollView` drag-to-scroll: a pointer press on inert scroll
+        // content starts a drag; each move slides the offset (on every writable
+        // axis) so the content tracks the pointer — a pure function of the
+        // press-relative travel, no accumulated drift (IMPL-10); release ends it.
+        // The press defers to interactive children via `claims_pointer`, so a
+        // button or slider inside the list still wins its own gesture.
+        for ev in events {
+            match ev.kind {
+                CoreKind::PointerDown => {
+                    let (px, py) = ev.pos;
+                    let target = if self.router.claims_pointer(ev.pos) {
+                        None
+                    } else {
+                        self.scroll_targets
+                            .iter()
+                            .rev()
+                            .find(|t| {
+                                px >= t.rect.x
+                                    && px < t.rect.x + t.rect.w
+                                    && py >= t.rect.y
+                                    && py < t.rect.y + t.rect.h
+                            })
+                            .copied()
+                    };
+                    self.scroll_drag = target.map(|t| ScrollDrag {
+                        start_pos: (px, py),
+                        x: t.x.map(|a| self.capture_drag_axis(a)),
+                        y: t.y.map(|a| self.capture_drag_axis(a)),
+                    });
+                }
+                CoreKind::PointerMove => {
+                    if let Some(d) = self.scroll_drag {
+                        if let Some(a) = d.x {
+                            let travel = ev.pos.0 - d.start_pos.0;
+                            self.write_drag_axis(a, travel);
+                        }
+                        if let Some(a) = d.y {
+                            let travel = ev.pos.1 - d.start_pos.1;
+                            self.write_drag_axis(a, travel);
+                        }
+                    }
+                }
+                CoreKind::PointerUp | CoreKind::Tap => self.scroll_drag = None,
+                _ => {}
+            }
+        }
+
         self.router
             .dispatch_tick(&mut self.ctx, Some(&self.atlas), comp_events);
+    }
+}
+
+/// The number of flattened layout nodes a [`RenderNode`] subtree contributes,
+/// mirroring [`Interpreter::build_layout_tree`] exactly (each node is one entry
+/// plus its children; value widgets are leaves). Used to advance the flat-id
+/// cursor past a culled `ScrollView` child without walking it (RFC-0005).
+fn flat_len(node: &RenderNode) -> usize {
+    match node {
+        RenderNode::Box { children, .. } => 1 + children.iter().map(flat_len).sum::<usize>(),
+        _ => 1,
     }
 }
 
@@ -4877,6 +5442,610 @@ mod tests {
         assert!((a - 2.0).abs() < 0.6, "starts near 2, got {a}");
         assert!((b - 7.0).abs() < 1.5, "~halfway, got {b}");
         assert!((c - 12.0).abs() < 0.6, "arrives at 12, got {c}");
+    }
+
+    /// RFC-0005 `ScrollView`: content is clipped to the viewport and translated
+    /// by `−offset`, so scrolling moves the content up without relayout.
+    #[test]
+    fn scrollview_clips_and_translates_content_by_offset() {
+        let src = "View V() { var off: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // The red content box's paint-time translate.y (where the scroll offset
+        // lives — the shader applies it, so the layout rect is untouched, i.e.
+        // no relayout on scroll), plus whether a content clip was emitted.
+        let sample = |interp: &mut Interpreter| -> (f32, f32, usize) {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let red = *frame
+                .instances()
+                .iter()
+                .find(|b| b.color[0] > 0.8 && b.color[1] < 0.3 && b.color[2] < 0.3)
+                .expect("the red content box is emitted");
+            (red.rect[1], red.transform.translate[1], frame.clips().len())
+        };
+
+        let (rect_y0, tx0, clips0) = sample(&mut interp);
+        assert!(clips0 >= 1, "the ScrollView must emit a content clip");
+
+        // Scroll down by 40 logical px → the content's paint translate moves up
+        // by 40, while its layout rect is unchanged (INV-8: no relayout).
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        interp.write_var(off, Value::Int(40));
+        interp.tick();
+        let (rect_y1, tx1, clips1) = sample(&mut interp);
+        assert!(clips1 >= 1);
+        assert!(
+            (rect_y0 - rect_y1).abs() < 0.01,
+            "layout rect must not move on scroll (no relayout): {rect_y0} vs {rect_y1}"
+        );
+        assert!(
+            (tx0 - tx1 - 40.0).abs() < 0.5,
+            "content must translate up by the offset: tx0={tx0} tx1={tx1}"
+        );
+    }
+
+    /// RFC-0005: the mouse wheel over a `ScrollView` scrolls it by writing the
+    /// signal behind `offset.y`, clamped to `[0, content − viewport]`.
+    #[test]
+    fn wheel_over_a_scrollview_scrolls_and_clamps_the_offset() {
+        // Content = 4 × 60px = 240 tall in a 100px viewport → max scroll 140.
+        let src = "View V() { var off: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // Render once to record the scroll target (viewport at the top-left).
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let peek_f = |interp: &Interpreter| -> f32 {
+            match interp.peek(off) {
+                Value::Float(f) => f as f32,
+                Value::Int(n) => n as f32,
+                _ => panic!("offset must be numeric"),
+            }
+        };
+        let wheel = |interp: &mut Interpreter, dy: f32| {
+            interp.dispatch_events(&[byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (100.0, 50.0), // inside the 200×100 viewport
+                delta: (0.0, dy),
+                payload: None,
+                time_ms: 0,
+            }]);
+            interp.tick();
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 400.0, 300.0);
+        };
+
+        // Wheel forward by 2 lines (× 40px) → scroll down by 80.
+        wheel(&mut interp, -2.0);
+        let after_one = peek_f(&interp);
+        assert!(
+            (after_one - 80.0).abs() < 1.0,
+            "one wheel notch scrolls by lines×40, got {after_one}"
+        );
+
+        // A big wheel clamps to the content extent (max = 240 − 100 = 140).
+        wheel(&mut interp, -20.0);
+        let clamped = peek_f(&interp);
+        assert!(
+            (clamped - 140.0).abs() < 1.0,
+            "scroll must clamp to content−viewport, got {clamped}"
+        );
+
+        // Wheel back up past the top clamps at 0.
+        wheel(&mut interp, 20.0);
+        let top = peek_f(&interp);
+        assert!(top.abs() < 1.0, "scroll must clamp at 0, got {top}");
+    }
+
+    /// RFC-0005 emission culling: a `ScrollView` child scrolled entirely out of
+    /// the viewport is never pushed to the frame (only its visible slice costs
+    /// anything), while the flat-id cursor stays aligned so siblings still paint.
+    #[test]
+    fn scrollview_culls_children_scrolled_out_of_view() {
+        let src = "View V() { var off: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // Present iff a box with the given dominant colour channel was emitted.
+        let has = |interp: &mut Interpreter, chan: usize| -> bool {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame
+                .instances()
+                .iter()
+                .any(|b| b.color[chan] > 0.8 && b.color[(chan + 1) % 3] < 0.3)
+        };
+
+        // At rest, the third box (y 120..180) sits fully below the 100px
+        // viewport → culled. The first two overlap it → kept.
+        assert!(has(&mut interp, 0), "red (top) is visible at rest");
+        assert!(has(&mut interp, 1), "green (straddling) is visible at rest");
+        assert!(!has(&mut interp, 2), "blue (below) is culled at rest");
+
+        // Scroll down 120px: the first box (now y -120..-60) leaves the top →
+        // culled; the third box scrolls into view.
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        interp.write_var(off, Value::Int(120));
+        interp.tick();
+        assert!(
+            !has(&mut interp, 0),
+            "red is culled once scrolled past the top"
+        );
+        assert!(has(&mut interp, 2), "blue scrolls into view");
+    }
+
+    /// RFC-0005: dragging on inert `ScrollView` content scrolls it — the content
+    /// tracks the pointer between press and release, clamped to the extent.
+    #[test]
+    fn drag_on_scrollview_content_scrolls_and_clamps() {
+        use byard_core::platform::EventKind as K;
+        // Content = 4 × 60px = 240 tall in a 100px viewport → max scroll 140.
+        let src = "View V() { var off: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Box #[bg: 0xFF0000, width: 180, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let peek_f = |interp: &Interpreter| match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("offset must be numeric"),
+        };
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press on inert content, then drag up 50px → content scrolls down 50.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 80.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, 30.0)]);
+        assert!(
+            (peek_f(&interp) - 50.0).abs() < 1.0,
+            "drag up 50px scrolls down 50, got {}",
+            peek_f(&interp)
+        );
+
+        // Dragging further up clamps at the content extent (140).
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, -200.0)]);
+        assert!(
+            (peek_f(&interp) - 140.0).abs() < 1.0,
+            "drag clamps to content−viewport, got {}",
+            peek_f(&interp)
+        );
+
+        // Releasing ends the gesture: a later stray move no longer scrolls.
+        interp.dispatch_events(&[ev(K::PointerUp, 100.0, -200.0)]);
+        let held = peek_f(&interp);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, 300.0)]);
+        assert!(
+            (peek_f(&interp) - held).abs() < 0.01,
+            "no drag is in flight after release, got {} (was {held})",
+            peek_f(&interp)
+        );
+    }
+
+    /// RFC-0005: a press that lands on an interactive child (here a `Button`)
+    /// is that child's gesture — drag-to-scroll defers and the list stays put.
+    #[test]
+    fn drag_defers_to_interactive_children() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var off: Float = 0.0 var c: Int = 0 \
+             ScrollView #[width: 200, height: 100, offset: (0, off)] { \
+                 Column { \
+                     Button(\"tap\") #[width: 180, height: 60] => c++ \
+                     Box #[bg: 0x00FF00, width: 180, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 180, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press on the Button (top 60px), then drag: the button owns the press,
+        // so the list must not scroll.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 30.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 100.0, -60.0)]);
+        let scrolled = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        assert!(
+            scrolled.abs() < 0.01,
+            "a press on a Button must not drag-scroll the list, got {scrolled}"
+        );
+    }
+
+    /// RFC-0005 `axis: horizontal`: content overflows on the inline axis and the
+    /// wheel's x delta scrolls `offset.x`, clamped to the horizontal extent.
+    #[test]
+    fn horizontal_scrollview_scrolls_offset_x_by_wheel() {
+        // A Row of 4 × 100px cards = 400 wide in a 200px viewport → max x 200.
+        let src = "View V() { var panX: Float = 0.0 \
+             ScrollView #[width: 200, height: 80, axis: horizontal, offset: (panX, 0)] { \
+                 Row { \
+                     Box #[bg: 0xFF0000, width: 100, height: 60] {} \
+                     Box #[bg: 0x00FF00, width: 100, height: 60] {} \
+                     Box #[bg: 0x0000FF, width: 100, height: 60] {} \
+                     Box #[bg: 0xFFFF00, width: 100, height: 60] {} \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let pan = interp.var_signal(&Symbol::intern("panX")).unwrap();
+        let peek = |interp: &Interpreter| match interp.peek(pan) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        // Sample the red card's paint translate.x, so we prove the content
+        // actually shifts left (−offset), not just that the signal moved.
+        let red_tx = |interp: &mut Interpreter| -> f32 {
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 400.0, 300.0);
+            f.instances()
+                .iter()
+                .find(|b| b.color[0] > 0.8 && b.color[1] < 0.3 && b.color[2] < 0.3)
+                .map_or(0.0, |b| b.transform.translate[0])
+        };
+        let tx0 = red_tx(&mut interp);
+
+        let wheel_x = |interp: &mut Interpreter, dx: f32| {
+            interp.dispatch_events(&[byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::Wheel,
+                pos: (100.0, 40.0),
+                delta: (dx, 0.0),
+                payload: None,
+                time_ms: 0,
+            }]);
+            interp.tick();
+        };
+
+        // Wheel 2 lines right (×40) → scroll right 80; red card shifts left 80.
+        wheel_x(&mut interp, -2.0);
+        assert!(
+            (peek(&interp) - 80.0).abs() < 1.0,
+            "x wheel scrolls, got {}",
+            peek(&interp)
+        );
+        assert!(
+            (tx0 - red_tx(&mut interp) - 80.0).abs() < 0.5,
+            "content shifts left by the x offset"
+        );
+
+        // A big wheel clamps to content−viewport (400 − 200 = 200).
+        wheel_x(&mut interp, -20.0);
+        assert!(
+            (peek(&interp) - 200.0).abs() < 1.0,
+            "x clamps to extent, got {}",
+            peek(&interp)
+        );
+    }
+
+    /// RFC-0005 `axis: both`: a single drag pans the content in 2D, each axis
+    /// clamped independently.
+    #[test]
+    fn both_axis_scrollview_pans_in_two_dimensions_by_drag() {
+        use byard_core::platform::EventKind as K;
+        // A 400×400 content grid in a 200×200 viewport → max 200 on each axis.
+        let src = "View V() { var panX: Float = 0.0 var panY: Float = 0.0 \
+             ScrollView #[width: 200, height: 200, axis: both, offset: (panX, panY)] { \
+                 Column { \
+                     Row { Box #[bg: 0xFF0000, width: 200, height: 200] {} \
+                           Box #[bg: 0x00FF00, width: 200, height: 200] {} } \
+                     Row { Box #[bg: 0x0000FF, width: 200, height: 200] {} \
+                           Box #[bg: 0xFFFF00, width: 200, height: 200] {} } \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let px = interp.var_signal(&Symbol::intern("panX")).unwrap();
+        let py = interp.var_signal(&Symbol::intern("panY")).unwrap();
+        let peek = |interp: &Interpreter, s| match interp.peek(s) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        // Press mid-viewport, drag up-left 60px each → pan right 60, down 60.
+        interp.dispatch_events(&[ev(K::PointerDown, 100.0, 100.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 40.0, 40.0)]);
+        assert!(
+            (peek(&interp, px) - 60.0).abs() < 1.0,
+            "panX, got {}",
+            peek(&interp, px)
+        );
+        assert!(
+            (peek(&interp, py) - 60.0).abs() < 1.0,
+            "panY, got {}",
+            peek(&interp, py)
+        );
+    }
+
+    /// RFC-0005 windowed layout: a `windowed` ScrollView lays out only the
+    /// visible slice of a long uniform list — O(visible), not O(list) — while a
+    /// plain ScrollView over the same list lays out every row.
+    #[test]
+    fn windowed_scrollview_lays_out_only_the_visible_window() {
+        // 1000 rows × 20px in a 100px viewport. A windowed pass should build only
+        // a handful of rows (viewport/row + overscan) + 2 spacers + containers.
+        let list = |windowed: &str| {
+            format!(
+                "View V() {{ var y: Float = 0.0 \
+                 ScrollView #[width: 200, height: 100, row_height: 20, {windowed} offset: (0, y)] {{ \
+                     Column {{ \
+                         for i in [{}] {{ \
+                             Box #[bg: 0x6495ED, width: 180, height: 20] {{}} \
+                         }} \
+                     }} \
+                 }} }}",
+                (0..1000)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let node_count = |src: String| {
+            let parsed = parse(&src);
+            assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            let mut interp = Interpreter::new();
+            let tree = interp.lower_view(&parsed.views[0], &[]);
+            assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            (interp.atlas_node_count(), frame.instances().len())
+        };
+        let (windowed_nodes, windowed_boxes) = node_count(list("windowed: true,"));
+        let (plain_nodes, _) = node_count(list(""));
+
+        assert!(
+            windowed_nodes < 40,
+            "a windowed 1000-row list lays out O(visible), got {windowed_nodes} nodes"
+        );
+        assert!(
+            plain_nodes > 1000,
+            "a plain list lays out every row, got {plain_nodes} nodes"
+        );
+        assert!(
+            windowed_boxes < 30,
+            "only the visible rows are emitted, got {windowed_boxes}"
+        );
+    }
+
+    /// RFC-0005 windowed layout: the two spacer leaves preserve the full content
+    /// extent, so the scroll clamp still reaches the true bottom of the list.
+    #[test]
+    fn windowed_scrollview_preserves_scroll_extent() {
+        // 500 rows × 20 = 10 000 tall in a 100px viewport → max scroll 9 900.
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, row_height: 20, windowed: true, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+        // A huge wheel must clamp to content − viewport = 9 900, proving the
+        // elided rows still count toward the extent (spacers, not shrinkage).
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::Wheel,
+            pos: (100.0, 50.0),
+            delta: (0.0, -10_000.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        let clamped = match interp.peek(y) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => panic!("numeric"),
+        };
+        assert!(
+            (clamped - 9_900.0).abs() < 1.0,
+            "windowed extent must span the whole list, clamped at {clamped}"
+        );
+    }
+
+    /// RFC-0005 windowed layout: as the offset grows the window slides, so a row
+    /// deep in the list becomes visible while the atlas stays O(visible).
+    #[test]
+    fn windowed_scrollview_slides_the_window_on_scroll() {
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, row_height: 20, windowed: true, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+
+        // The emitted rows' *layout* Y band (their true list positions, not the
+        // scrolled screen position), and the atlas size, at the current offset.
+        let sample = |interp: &mut Interpreter| -> (f32, f32, usize) {
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let ys: Vec<f32> = frame.instances().iter().map(|b| b.rect[1]).collect();
+            let min = ys.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            (min, max, interp.atlas_node_count())
+        };
+        let (_, at_rest_bottom, nodes0) = sample(&mut interp);
+        assert!(
+            at_rest_bottom < 300.0,
+            "at rest the window sits at the top of the list, got bottom {at_rest_bottom}"
+        );
+
+        // Jump near the bottom (offset 8000 → row ~400 of 500). The window must
+        // slide to the deep rows: they lay out at y ≈ 8000 (row_index × 20).
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+        interp.write_var(y, Value::Float(8000.0));
+        interp.tick();
+        let (deep_top, _, nodes1) = sample(&mut interp);
+        assert!(
+            deep_top > 7000.0,
+            "the window slid to the deep rows (laid out near y≈8000), got top {deep_top}"
+        );
+        assert!(nodes0 < 40, "the window is O(visible) at rest: {nodes0}");
+        assert!(
+            nodes1 < 40,
+            "the window stays O(visible) after scrolling deep: {nodes1}"
+        );
+    }
+
+    /// RFC-0005 windowed layout regression: with uniform rows whose stride equals
+    /// `row_height`, the materialised rows must stay on an exact `row_height` grid
+    /// at every offset — including across a window-slide boundary. A spacer sized
+    /// off-grid would shift the whole content when `start` ticks (the "small
+    /// jumps" bug), so this pins the invariant that a scroll of 1px moves the
+    /// content by exactly 1px, never a row.
+    #[test]
+    fn windowed_rows_stay_on_an_exact_grid_across_slides() {
+        // 500 rows laid out at exactly row_height (height 20, no gap → stride 20).
+        let src = format!(
+            "View V() {{ var y: Float = 0.0 \
+             ScrollView #[width: 200, height: 100, windowed: true, row_height: 20, offset: (0, y)] {{ \
+                 Column {{ for i in [{}] {{ Box #[bg: 0x6495ED, width: 180, height: 20] {{}} }} }} \
+             }} }}",
+            (0..500)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let y = interp.var_signal(&Symbol::intern("y")).unwrap();
+
+        // Sweep offsets straddling several window-slide boundaries (start ticks
+        // every 20px). At each, the emitted rows must be exactly 20px apart.
+        for off in [0.0, 19.0, 20.0, 21.0, 79.0, 80.0, 81.0, 200.0, 205.0] {
+            interp.write_var(y, Value::Float(off));
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let mut ys: Vec<f32> = frame.instances().iter().map(|b| b.rect[1]).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for w in ys.windows(2) {
+                let stride = w[1] - w[0];
+                assert!(
+                    (stride - 20.0).abs() < 0.01,
+                    "rows must stay on the 20px grid at offset {off}, got stride {stride} in {ys:?}"
+                );
+            }
+        }
     }
 
     #[test]
