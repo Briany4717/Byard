@@ -202,7 +202,8 @@ defaults chosen so settling is imperceptible (<0.5px, <0.5px/s).
 **packed POD** (`from,to,start_ms,curve`) crosses into `RenderFrame` — the same
 atomic frame hand-off already used for every primitive. The render thread reads
 the global clock uniform; it never reads a `Signal` and never writes back. This
-preserves INV-1/INV-2 (no back-dependency; only `Send` PODs cross threads).
+preserves the RFC-0001 §5 concurrency invariants (no back-dependency; only
+`Send` PODs cross threads).
 
 ### Layout properties
 
@@ -255,8 +256,9 @@ already parameterize time-based effects.
 - **A4 — `EPS_POS`/`EPS_VEL`:** **internal fixed constants per unit** (not public):
   <0.5px position, <0.5px/s velocity, 1/256 per color channel. Exposing them would
   let devs break settling (battery). Revisable internally.
-- **A5 — `Motion` packing:** **inline 4 with arena spill** (mirrors IMPL-01's
-  `SmallVec<[_;4]>`); covers opacity+scale+bg+radius without heap.
+- **A5 — `Motion` packing:** **inline 4 with arena spill** (the same
+  `SmallVec<[_;4]>` inline-capacity pattern used elsewhere on the hot path);
+  covers opacity+scale+bg+radius without heap.
 
 ## Unresolved questions (deferred to implementation)
 

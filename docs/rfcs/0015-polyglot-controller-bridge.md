@@ -4,7 +4,7 @@
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
-- **Depends on:** RFC-0001 (§5 concurrency, `!Send`/`!Sync`, `frame.rs` boundary, controller model), RFC-0003 (§6 callback props), RFC-0002 (`inject` / ambient values), RFC-0006/M23 (Rust controller boundary — this generalizes it).
+- **Depends on:** RFC-0001 (§5 concurrency, `!Send`/`!Sync`, `frame.rs` boundary, controller model), RFC-0003 (§6 callback props), RFC-0002 (`inject` / ambient values), RFC-0006 (the Rust controller boundary — this generalizes it).
 - **Positioning:** an *optional, feature-gated* extension of the Rust controller boundary — never a replacement, never on the hot path.
 
 ---
@@ -82,8 +82,8 @@ from both the logic thread and the render thread:
   at tick step 3. It has **no handle** to `ViewArena`, `Signal`, or `RenderFrame`.
 - Values crossing the boundary are a closed `enum GuestValue` of POD scalars +
   the shared-ring reference (below). No Rust reference ever escapes into guest
-  memory and vice-versa. This preserves INV-1/INV-2 and the `!Send`/`!Sync`
-  discipline: nothing non-`Send` crosses.
+  memory and vice-versa. This preserves the RFC-0001 §5 concurrency invariants
+  and the `!Send`/`!Sync` discipline: nothing non-`Send` crosses.
 
 ### GIL / GC isolation — the frame guarantee
 
@@ -127,10 +127,10 @@ soundness bug the project explicitly forbids. The design:
   keeps CPython out of the app binary entirely. The message contract is identical
   whether the guest is in-thread or out-of-process.
 
-### The `@byard_controller` metadata (shared with M23)
+### The `@byard_controller` metadata (shared with the Rust controller boundary)
 
 Guest controllers expose the same metadata the interpreter's `inject`/member-type
-inference needs (RFC-0006 M23). For guests, the macro/decorator emits a small
+inference needs (RFC-0006's Rust controller boundary). For guests, the macro/decorator emits a small
 manifest (method names, arg/return POD types) so the `byld` side can type-check
 `weather.temp`/`weather.fetch(city)` at compile time even though the body is
 Python/JS. Type mismatches at the boundary are compile errors, not runtime
@@ -188,7 +188,7 @@ Apache Arrow / shared-memory columnar transfer (validated zero-copy), `bytemuck`
   last state matters, like the D10 watcher); guest→Byard **bounded + visible error**
   when full (silent result loss is dangerous).
 - **X4 — error propagation:** guest exceptions become a **`ByardError`** with guest
-  context (file/line when available) — no silent swallowing (INV-4).
+  context (file/line when available) — no silent swallowing.
 - **X5 — guest hot-reload:** **reload only the affected guest, preserving bound
   `var`s** (same promise as `.byd` hot-reload, RFC-0006 E5).
 - **X6 — sandbox:** **declared per-controller capabilities** (which resources a
