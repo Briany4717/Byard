@@ -20,8 +20,10 @@ use std::collections::HashMap;
 /// factor in per-tick cost on a continuously-redrawing logic thread.
 pub struct TextMeasurer {
     font_system: FontSystem,
-    /// `(text, font_size.to_bits())` → shaped `(width, height)`.
-    cache: HashMap<(String, u32), (f32, f32)>,
+    /// `(text, font_size.to_bits(), wrap_width.to_bits())` → shaped
+    /// `(width, height)`. The wrap width is part of the key because it changes
+    /// the line breaks and thus the measured size (RFC-0018).
+    cache: HashMap<(String, u32, u32), (f32, f32)>,
 }
 
 impl Default for TextMeasurer {
@@ -46,21 +48,40 @@ impl TextMeasurer {
     /// height so an empty label keeps its baseline.
     #[must_use]
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
-        let key = (text.to_string(), font_size.to_bits());
+        self.measure_wrapped(text, font_size, None)
+    }
+
+    /// Like [`measure`](Self::measure), but bounds shaping to `max_width` logical
+    /// pixels when `Some`, so the text wraps onto multiple lines and the returned
+    /// height reflects the wrapped line count (RFC-0018 text wrap). `None` is the
+    /// natural single-line measurement.
+    #[must_use]
+    pub fn measure_wrapped(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+    ) -> (f32, f32) {
+        let key = (
+            text.to_string(),
+            font_size.to_bits(),
+            max_width.map_or(u32::MAX, f32::to_bits),
+        );
         if let Some(&hit) = self.cache.get(&key) {
             return hit;
         }
-        let measured = self.shape(text, font_size);
+        let measured = self.shape(text, font_size, max_width);
         self.cache.insert(key, measured);
         measured
     }
 
-    /// Shapes `text` through `cosmic-text` and returns its `(width, height)`.
-    fn shape(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+    /// Shapes `text` through `cosmic-text` and returns its `(width, height)`,
+    /// optionally bounded to `max_width` so it wraps.
+    fn shape(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
         let line_height = font_size * 1.2;
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
-        // Unbounded so the natural (single-line) width is measured.
-        buffer.set_size(&mut self.font_system, None, None);
+        // `None` measures the natural single-line width; `Some(w)` wraps to `w`.
+        buffer.set_size(&mut self.font_system, max_width, None);
         buffer.set_text(
             &mut self.font_system,
             text,
@@ -93,6 +114,21 @@ mod tests {
             "more glyphs ⇒ wider: {w_short} vs {w_long}"
         );
         assert!(w_short > 0.0 && h > 0.0);
+    }
+
+    #[test]
+    fn wrapping_to_a_width_makes_text_taller_and_narrower() {
+        // RFC-0018: bounding the shaping width wraps a long line onto several,
+        // so it measures taller and no wider than the bound.
+        let mut m = TextMeasurer::new();
+        let long = "the quick brown fox jumps over the lazy dog again and again";
+        let (nat_w, nat_h) = m.measure(long, 16.0);
+        let (wrap_w, wrap_h) = m.measure_wrapped(long, 16.0, Some(120.0));
+        assert!(wrap_h > nat_h, "wrapped text is taller: {nat_h} → {wrap_h}");
+        assert!(
+            wrap_w <= 120.5 && wrap_w < nat_w,
+            "wrapped width is bounded and narrower: nat {nat_w}, wrapped {wrap_w}"
+        );
     }
 
     #[test]

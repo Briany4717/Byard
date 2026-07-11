@@ -511,9 +511,33 @@ impl Interpreter {
     /// Glyph-accurate `(width, height)` of `text` at `font_size`, lazily
     /// initializing the font system on first use.
     fn measure_text(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        self.measure_text_wrapped(text, font_size, None)
+    }
+
+    /// Measures `text`, wrapping to `max_width` logical pixels when `Some`
+    /// (RFC-0018 text wrap). Returns the wrapped `(width, height)`.
+    fn measure_text_wrapped(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+    ) -> (f32, f32) {
         self.text_measurer
             .get_or_insert_with(byard_core::text::TextMeasurer::new)
-            .measure(text, font_size)
+            .measure_wrapped(text, font_size, max_width)
+    }
+
+    /// The wrap width of a `Text` (RFC-0018): `Some(width)` when `wrap: true` and
+    /// a `width` is set, else `None` (natural single-line). Wrapping needs an
+    /// explicit width — there is no containing-block width to wrap against in the
+    /// leaf-measured layout model.
+    fn text_wrap_width(&mut self, attrs: &[Attr]) -> Option<f32> {
+        if self.eval_bool_prop(attrs, "wrap") == Some(true) {
+            #[allow(clippy::cast_precision_loss)]
+            self.eval_int_prop(attrs, "width").map(|w| w as f32)
+        } else {
+            None
+        }
     }
 
     // ── declarations ────────────────────────────────────────────────────
@@ -1809,7 +1833,15 @@ impl Interpreter {
                     .eval_int_prop(attrs, "size")
                     .or(typo_size)
                     .unwrap_or(self.theme.font_size as i64) as f32;
-                let (w, h) = self.measure_text(&text, font_size);
+                // RFC-0018 text wrap: when `wrap: true` with a `width`, measure
+                // bounded to that width so the leaf is `width` wide and as tall as
+                // the wrapped line count; otherwise the natural single-line size.
+                let wrap_w = self.text_wrap_width(attrs);
+                let (measured_w, h) = self.measure_text_wrapped(&text, font_size, wrap_w);
+                // A wrapped leaf reserves the full requested width (the wrap
+                // bound), even when the widest laid-out line is narrower; an
+                // unwrapped leaf takes its natural measured width.
+                let w = wrap_w.unwrap_or(measured_w);
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
                 flat_ids.push(id);
                 Ok(id)
@@ -2017,14 +2049,23 @@ impl Interpreter {
                     // primitives (shader-applied) — a documented limitation.
                     let anchor = inherited_transform.apply_point([rect.x, rect.y]);
                     let scaled_size = size * inherited_transform.uniform_scale();
-                    frame.push_text(byard_core::TextLine {
-                        x: anchor[0],
-                        y: anchor[1],
-                        text,
-                        font_size: scaled_size,
-                        color: rgba,
-                        dirty: true,
-                    });
+                    // RFC-0018 text wrap: shape the run bounded to the wrap width
+                    // (scaled by any ancestor scale, since the run's glyphs scale
+                    // about the pivot). `None` keeps the natural single-line run.
+                    let wrap_w = self
+                        .text_wrap_width(attrs)
+                        .map(|w| w * inherited_transform.uniform_scale());
+                    frame.push_text_wrapped(
+                        byard_core::TextLine {
+                            x: anchor[0],
+                            y: anchor[1],
+                            text,
+                            font_size: scaled_size,
+                            color: rgba,
+                            dirty: true,
+                        },
+                        wrap_w,
+                    );
 
                     let has_events = attrs
                         .iter()
@@ -8158,6 +8199,50 @@ mod tests {
 
         assert_eq!(frame.instances().len(), 1, "plain box → BoxInstance");
         assert_eq!(frame.decorated().len(), 0);
+    }
+
+    // ── RFC-0018: text wrap ──────────────────────────────────────────────
+
+    #[test]
+    fn wrapped_text_emits_a_wrap_width_and_a_taller_leaf() {
+        let long = "the quick brown fox jumps over the lazy dog again and again";
+        // Same text, once natural and once wrapped to width 120.
+        let src = format!(
+            "View C() {{\n Text(\"{long}\")\n Text(\"{long}\") #[wrap: true, width: 120]\n}}"
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Two text lines: the first natural (no wrap), the second wrapped to 120.
+        assert_eq!(frame.texts().len(), 2);
+        assert_eq!(frame.text_wraps().len(), 2, "wrap slice parallel to texts");
+        assert_eq!(frame.text_wraps()[0], None, "natural line: no wrap");
+        assert_eq!(
+            frame.text_wraps()[1],
+            Some(120.0),
+            "wrapped line carries its wrap width"
+        );
+
+        // The wrapped leaf is 120 wide and taller than the natural single line.
+        let nat = frame.rects()[1]; // C root is rects[0]; first Text is rects[1]
+        let wrapped = frame.rects()[2];
+        assert!(
+            (wrapped.width - 120.0).abs() < 1.0,
+            "wrapped leaf is its wrap width, got {}",
+            wrapped.width
+        );
+        assert!(
+            wrapped.height > nat.height,
+            "wrapped leaf is taller (multi-line): {} vs {}",
+            wrapped.height,
+            nat.height
+        );
     }
 
     // ── RFC-0017: Overlay & z-layer system ───────────────────────────────
