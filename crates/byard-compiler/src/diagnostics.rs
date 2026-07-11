@@ -380,6 +380,39 @@ pub enum CompileError {
         /// Anchor span of the `VectorIcon` call site.
         span: Span,
     },
+    /// A callback prop (`Fn(...)` parameter) was invoked with the wrong number
+    /// of arguments (RFC-0019 §4) — e.g. `on_change()` where the parameter is
+    /// declared `Fn(Str)`.
+    CallbackArityMismatch {
+        /// Source range of the invocation.
+        span: Span,
+        /// The callback parameter name.
+        name: String,
+        /// How many arguments the `Fn(...)` type declares.
+        expected: usize,
+        /// How many were supplied at the invocation.
+        found: usize,
+    },
+    /// A callback prop (`Fn(...)` parameter) was referenced somewhere other than
+    /// an invocation (RFC-0019 §4) — callbacks are fire-and-forget action
+    /// handlers, not first-class values, so `on_tap` may only appear as
+    /// `on_tap(...)` in an event handler.
+    CallbackNotInvocable {
+        /// Source range of the offending reference.
+        span: Span,
+        /// The callback parameter name.
+        name: String,
+    },
+    /// A non-callback expression was passed to a `Fn(...)` parameter, or a
+    /// callback literal was passed to a scalar parameter (RFC-0019 §4).
+    CallbackTypeMismatch {
+        /// Source range of the offending argument.
+        span: Span,
+        /// The callee view name.
+        callee: String,
+        /// The parameter name.
+        name: String,
+    },
 }
 
 impl CompileError {
@@ -424,7 +457,10 @@ impl CompileError {
             | Self::Project { span, .. }
             | Self::SvgUnsupportedFeatures { span }
             | Self::SvgTooComplexForMssdf { span, .. }
-            | Self::VectorAssetNotStatic { span } => *span,
+            | Self::VectorAssetNotStatic { span }
+            | Self::CallbackArityMismatch { span, .. }
+            | Self::CallbackNotInvocable { span, .. }
+            | Self::CallbackTypeMismatch { span, .. } => *span,
         }
     }
 
@@ -471,7 +507,10 @@ impl CompileError {
             | Self::Project { span, .. }
             | Self::SvgUnsupportedFeatures { span }
             | Self::SvgTooComplexForMssdf { span, .. }
-            | Self::VectorAssetNotStatic { span } => {
+            | Self::VectorAssetNotStatic { span }
+            | Self::CallbackArityMismatch { span, .. }
+            | Self::CallbackNotInvocable { span, .. }
+            | Self::CallbackTypeMismatch { span, .. } => {
                 span.start = (i64::from(span.start) + delta).max(0) as u32;
                 span.end = (i64::from(span.end) + delta).max(0) as u32;
             }
@@ -521,6 +560,9 @@ impl CompileError {
             Self::SvgUnsupportedFeatures { .. } => "SvgUnsupportedFeatures",
             Self::SvgTooComplexForMssdf { .. } => "SvgTooComplexForMssdf",
             Self::VectorAssetNotStatic { .. } => "VectorAssetNotStatic",
+            Self::CallbackArityMismatch { .. } => "CallbackArityMismatch",
+            Self::CallbackNotInvocable { .. } => "CallbackNotInvocable",
+            Self::CallbackTypeMismatch { .. } => "CallbackTypeMismatch",
         }
     }
 
@@ -669,6 +711,22 @@ impl CompileError {
                  `byard.toml` under `[assets.vectors] include`"
                     .to_string()
             }
+            Self::CallbackArityMismatch {
+                name,
+                expected,
+                found,
+                ..
+            } => format!(
+                "callback `{name}` expects {expected} argument(s), but was invoked with {found}"
+            ),
+            Self::CallbackNotInvocable { name, .. } => format!(
+                "callback prop `{name}` can only be invoked (`{name}(...)`) inside an event \
+                 handler; it is not a first-class value"
+            ),
+            Self::CallbackTypeMismatch { callee, name, .. } => format!(
+                "parameter `{name}` of view `{callee}` is a callback (`Fn(...)`); pass an action \
+                 block like `{name}: {{ … }}`"
+            ),
         }
     }
 

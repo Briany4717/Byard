@@ -1,0 +1,77 @@
+// RFC-0019 — Callback props & event forwarding.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/callbacks
+//   cargo run -p byard-cli -- dev
+//
+// `ActionButton` and `Stepper` are *reusable* interactive wrappers: neither one
+// hard-codes what it does. Each declares an `on_tap: Fn()` callback parameter
+// and forwards its inner `Box`'s `tap` event to it (`tap => on_tap()`). The
+// caller passes an inline action block (`{ count++ }`) that is evaluated in the
+// *caller's* scope — so a tap deep inside the wrapper mutates the caller's
+// `var count`, even though the wrapper never sees `count`. That is the whole
+// point of callback props: the same visual component can drive any action the
+// call site defines.
+//
+// Click the buttons: the count changes, the label re-renders reactively, and
+// each button runs the distinct block its call site gave it (increment, reset,
+// decrement, or set-to-a-value). Hover a button and it tints to its `hover`
+// colour; press it and it shrinks — the `on hover`/`on pressed` style states
+// light up straight from the engine's live interaction state, giving visual
+// proof the forwarded event is landing.
+View Main() {
+    var count = 0
+
+    Column #[bg: 0x14141C, p: 32, gap: 20, width: 520] {
+        Text("RFC-0019 — callback props") #[color: 0xFFFFFF, size: 22, weight: bold]
+        Text("Reusable wrappers forward their tap to the caller's action.")
+            #[color: 0x9AA0AC, size: 14]
+
+        // A big reactive readout of the caller-owned state.
+        Box #[bg: 0x262636, radius: 16, p: 24, border: 0x3C3C52] {
+            Text("count = {count}") #[color: 0xFFFFFF, size: 34, weight: bold]
+        }
+
+        // Each ActionButton is the *same* component with a *different* action.
+        Row #[gap: 12] {
+            ActionButton(label: "− Decrement", accent: 0x964747, hover: 0xB25A5A, on_tap: { count-- })
+            ActionButton(label: "+ Increment", accent: 0x477A96, hover: 0x5A96B2, on_tap: { count++ })
+        }
+        Row #[gap: 12] {
+            ActionButton(label: "Reset", accent: 0x3C3C52, hover: 0x50506A, on_tap: { count = 0 })
+            ActionButton(label: "Set to 100", accent: 0x6750A4, hover: 0x7E63C4, on_tap: { count = 100 })
+        }
+
+        // A second wrapper shape (`Stepper`) proving the pattern composes: it
+        // wraps ActionButtons and forwards *their* callbacks outward, so the tap
+        // travels two views deep back to this caller's `count`.
+        Text("Composed wrapper (forwards a callback it received):")
+            #[color: 0x9AA0AC, size: 13]
+        Stepper(on_up: { count++ }, on_down: { count-- })
+    }
+}
+
+// A reusable tappable button. `on_tap: Fn()` is the callback prop; the inner
+// Box forwards its `tap` to it. `accent`/`hover` colour it, and the `on hover`/
+// `on pressed` state blocks react to the engine's live interaction state — so
+// the button tints on hover and shrinks on press with no `var` and no handler.
+View ActionButton(label: Str, accent: Int, hover: Int, on_tap: Fn() = {}) {
+    let look = style {
+        bg: accent, radius: 12, p: (vertical: 12, horizontal: 18)
+        on hover   { bg: hover }
+        on pressed { bg: accent, scale: 0.96 }
+    }
+    Box #[..look, tap => on_tap()] {
+        Text(label) #[color: 0xFFFFFF, size: 15, weight: bold]
+    }
+}
+
+// A composed wrapper: it accepts two callbacks and forwards each to an
+// ActionButton, which in turn forwards its own `on_tap` to the inner Box. The
+// tap crosses two view boundaries back to the caller (RFC-0019 forwarding).
+View Stepper(on_up: Fn() = {}, on_down: Fn() = {}) {
+    Row #[bg: 0x1E1E2A, radius: 14, p: 10, gap: 10, border: 0x3C3C52] {
+        ActionButton(label: "▼ down", accent: 0x3C3C52, hover: 0x50506A, on_tap: on_down)
+        ActionButton(label: "▲ up", accent: 0x3C3C52, hover: 0x50506A, on_tap: on_up)
+    }
+}

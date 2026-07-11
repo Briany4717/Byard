@@ -575,6 +575,16 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<HoverTarget> {
             }
             None
         }
+        // RFC-0019 callback block: descend into the action statements so hover
+        // works inside `on_tap: { count++ }`.
+        Expr::Block(stmts, _) => {
+            for stmt in stmts {
+                if span_contains(stmt.span(), offset) {
+                    return find_in_expr(stmt, offset);
+                }
+            }
+            None
+        }
         Expr::StrLit(parts, _) => {
             for part in parts {
                 if let StrPart::Interp(expr) = part {
@@ -1461,6 +1471,14 @@ fn find_class_ref_in_expr(expr: &Expr, offset: usize) -> Option<String> {
             None
         }
         Expr::Lambda { body, .. } => find_class_ref_in_expr(body, offset),
+        Expr::Block(stmts, _) => {
+            for stmt in stmts {
+                if let Some(name) = find_class_ref_in_expr(stmt, offset) {
+                    return Some(name);
+                }
+            }
+            None
+        }
         Expr::Assign { target, value, .. } => {
             if let Some(name) = find_class_ref_in_expr(target, offset) {
                 return Some(name);
