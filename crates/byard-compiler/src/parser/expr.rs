@@ -70,6 +70,7 @@ impl Parser<'_> {
             Some(Token::LBrack) => self.parse_array(),
             Some(Token::LParen) => self.parse_paren_or_lambda(),
             Some(Token::Pipe) => self.parse_pipe_lambda(),
+            Some(Token::LBrace) => self.parse_callback_block(),
             Some(Token::Dot) => self.parse_class_ref(),
             _ => {
                 self.error("an expression");
@@ -422,6 +423,54 @@ impl Parser<'_> {
             params,
             body,
             span: self.span_from(start),
+        }
+    }
+
+    /// A callback-prop literal `{ (|params|)? stmt* }` (RFC-0019). The optional
+    /// `|params|` header names the callback's arguments (`{|text| … }`, `{|_|}`);
+    /// the body is a sequence of self-delimiting action statements (byld has no
+    /// statement separator — each `count++` / `x = e` / `f()` is its own node),
+    /// run in order when the callback fires. `{}` is the no-op default.
+    ///
+    /// Represented as an [`Expr::Lambda`] over an [`Expr::Block`] so invocation
+    /// reuses the parameterized-`fn` inlining path: the caller's block is
+    /// evaluated in the caller's scope, its `var` writes routed through the
+    /// reactive system by `SignalId` (RFC-0019 §2).
+    fn parse_callback_block(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // {
+        // Optional `|params|` header.
+        let mut params = Vec::new();
+        if self.eat(&Token::Pipe) {
+            while !matches!(self.cur(), Some(Token::Pipe) | None) {
+                if let Some(sym) = self.expect_ident("a callback parameter") {
+                    params.push(sym);
+                } else {
+                    break;
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::Pipe, "'|' to close the callback parameter list");
+        }
+        // Body statements up to `}`.
+        let mut stmts = Vec::new();
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            stmts.push(self.parse_expr(0));
+            // Guard against a non-advancing parse (a stray token that is neither
+            // a statement start nor `}`) so recovery never spins.
+            if self.pos == before {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RBrace, "'}' to close the callback block");
+        let span = self.span_from(start);
+        Expr::Lambda {
+            params,
+            body: Box::new(Expr::Block(stmts, span)),
+            span,
         }
     }
 

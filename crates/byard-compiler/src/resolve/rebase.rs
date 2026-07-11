@@ -222,6 +222,12 @@ fn shift_expr(expr: &mut Expr, delta: u32) {
             shift(span, delta);
             shift_expr(body, delta);
         }
+        Expr::Block(stmts, span) => {
+            shift(span, delta);
+            for stmt in stmts {
+                shift_expr(stmt, delta);
+            }
+        }
         Expr::Assign {
             target,
             value,

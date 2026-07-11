@@ -209,6 +209,18 @@ impl<'p> Env<'p> {
     pub fn truncate(&mut self, len: usize) {
         self.bindings.truncate(len);
     }
+
+    /// A cheap clone of this environment's own bindings (not ancestors) — the
+    /// `EnvSnapshot` of RFC-0019 §2. Every [`Value`] is an id (`SignalId`/
+    /// `ScopeId`/`AstId`) or a small scalar, so the clone is shallow and `Send`.
+    /// A user-view instance captures this at lower time and restores it during
+    /// render, so an event action lowered inside the instance body (a forwarded
+    /// callback, or any param reference) resolves against the bindings that were
+    /// live at instantiation — not the truncated post-instantiation env.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(Symbol, Value)> {
+        self.bindings.clone()
+    }
 }
 
 #[cfg(test)]

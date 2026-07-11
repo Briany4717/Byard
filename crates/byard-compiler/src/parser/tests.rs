@@ -494,6 +494,62 @@ fn error_recovery_collects_multiple_diagnostics() {
 }
 
 #[test]
+fn callback_param_type_is_a_function() {
+    // RFC-0019: `on_tap: Fn()` declares a callback parameter; `Fn(Str)` carries
+    // its argument types.
+    let view = one_view("View W(on_tap: Fn(), on_change: Fn(Str)) { Text(\"x\") }");
+    assert_eq!(view.params.len(), 2);
+    assert!(matches!(
+        view.params[0].ty,
+        Some(Type::Function { ref params, .. }) if params.is_empty()
+    ));
+    let Some(Type::Function { params, .. }) = &view.params[1].ty else {
+        panic!("expected Fn(Str), got {:?}", view.params[1].ty);
+    };
+    assert_eq!(params.len(), 1);
+}
+
+#[test]
+fn callback_block_parses_as_lambda_over_block() {
+    // RFC-0019: a `{ … }` action block in expression position parses as a
+    // parameterless lambda whose body is an `Expr::Block` of statements.
+    let view = one_view("View V() { Card(on_tap: { count++ x = 0 }) }");
+    let card = as_element(&view.body[0]);
+    let value = &card.content[0].value;
+    let Expr::Lambda { params, body, .. } = value else {
+        panic!("expected a Lambda, got {value:?}");
+    };
+    assert!(params.is_empty(), "no-arg callback");
+    let Expr::Block(stmts, _) = body.as_ref() else {
+        panic!("expected a Block body, got {body:?}");
+    };
+    assert_eq!(stmts.len(), 2, "two statements run in order");
+}
+
+#[test]
+fn callback_block_with_params_and_empty_default() {
+    // A `{|text| … }` header names the callback's arguments; `{}` is the empty
+    // no-op default.
+    let view = one_view("View V(on_change: Fn(Str) = {}) { Field(on_change: {|text| q = text}) }");
+    // The default `{}` is a Lambda over an empty Block.
+    let Some(Expr::Lambda { params, body, .. }) = &view.params[0].default else {
+        panic!(
+            "expected a Lambda default, got {:?}",
+            view.params[0].default
+        );
+    };
+    assert!(params.is_empty());
+    assert!(matches!(body.as_ref(), Expr::Block(s, _) if s.is_empty()));
+    // The call-site block names its parameter.
+    let field = as_element(&view.body[0]);
+    let value = &field.content[0].value;
+    let Expr::Lambda { params, .. } = value else {
+        panic!("expected a Lambda, got {value:?}");
+    };
+    assert_eq!(params, &[sym("text")]);
+}
+
+#[test]
 fn style_value_captures_base_attrs_and_state_blocks() {
     // RFC-0016: `style { … on <state> { … } }` collects base attributes and
     // interaction-state blocks into `Expr::StyleValue`.

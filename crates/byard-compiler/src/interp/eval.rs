@@ -25,7 +25,7 @@ use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
     Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
-    StrPart, StyleStateKind, ViewDecl,
+    StrPart, StyleStateKind, Type, ViewDecl,
 };
 use crate::symbol::Symbol;
 use crate::util::closest_match;
@@ -106,6 +106,13 @@ pub enum RenderNode {
         action: Option<Expr>,
         /// The `var` signal bound via `bind:` or `value:` (M16: value widgets).
         bound_sig: Option<super::env::SignalId>,
+        /// The instance environment captured at lower time (RFC-0019 §2), or
+        /// empty at the top level. Event attrs and the `action` are re-lowered
+        /// each frame during the render walk; for a box lowered inside a
+        /// user-view instance this snapshot restores the callee's `Fn` params
+        /// and argument bindings, so a forwarded callback (`tap => on_tap()`)
+        /// resolves against the scope it was instantiated in.
+        env_snapshot: Vec<(Symbol, super::env::Value)>,
     },
     /// A text run.
     Text {
@@ -241,6 +248,14 @@ fn param_default(param: &Param) -> Option<&Expr> {
     param.default.as_ref()
 }
 
+/// Whether a parameter is a callback prop — declared with a function type
+/// `Fn(...)` (RFC-0019). Callback params bind a caller-supplied action block
+/// rather than a projected value, so they take a separate binding path and are
+/// skipped by the ordinary value-argument machinery in [`Interpreter::bind_args`].
+fn is_callback_param(param: &Param) -> bool {
+    matches!(param.ty, Some(Type::Function { .. }))
+}
+
 /// The reserved parameter/element name for a user view's child-block slot
 /// (RFC-0007 D-A). A `View` declaring a `content` parameter accepts a
 /// `{ ... }` block at its call sites; referencing `content` as an element inside
@@ -272,9 +287,14 @@ pub struct Interpreter {
     text_measurer: Option<byard_core::text::TextMeasurer>,
     /// Active design-token theme (M22, D5 layer 1).
     pub theme: super::theme::Theme,
-    /// Parameterized fn definitions: `fn f(params) => body` stored as
-    /// `(param names, body expr)`, indexed by `AstId` (M25).
-    fn_table: Vec<(Vec<Symbol>, Expr)>,
+    /// Parameterized `fn` definitions (`fn f(params) => body`, M25) *and*
+    /// callback-prop bindings (RFC-0019): stored as `(param names, body expr,
+    /// is_callback)` and indexed by `AstId`. Both share the invocation path in
+    /// [`Self::lower_call`] — a callback is a caller-supplied action block
+    /// inlined at the callee's invocation site; the `is_callback` flag turns on
+    /// the RFC-0019 §4 arity/invocability diagnostics that plain `fn`s don't
+    /// want.
+    fn_table: Vec<(Vec<Symbol>, Expr, bool)>,
     /// The resolved user-`View` registry for this program (RFC-0007 §1).
     /// Built once from `ParsedFile::views` via [`Interpreter::load_views`]; a
     /// call whose name resolves here is a user-view instantiation, not a
@@ -521,7 +541,7 @@ impl Interpreter {
                         u32::try_from(self.fn_table.len()).unwrap_or(u32::MAX),
                     );
                     let param_names: Vec<Symbol> = params.iter().map(|p| p.name.clone()).collect();
-                    self.fn_table.push((param_names, body.clone()));
+                    self.fn_table.push((param_names, body.clone(), false));
                     self.env.push(name.clone(), Value::Fn(id));
                 }
             }
@@ -691,6 +711,10 @@ impl Interpreter {
             return;
         }
         match params.iter().position(|p| &p.name == name) {
+            // A callback prop is bound separately (RFC-0019): it captures the
+            // caller's action block, not a projected value, so leave its slot
+            // empty here and let `bind_callbacks` handle it.
+            Some(i) if is_callback_param(&params[i]) => {}
             Some(i) if slots[i].is_none() => {
                 slots[i] = Some(self.project_arg(value));
             }
@@ -728,7 +752,7 @@ impl Interpreter {
         let value_param_idx: Vec<usize> = params
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.name.as_str() != RESERVED_CONTENT)
+            .filter(|(_, p)| p.name.as_str() != RESERVED_CONTENT && !is_callback_param(p))
             .map(|(i, _)| i)
             .collect();
         let mut positional_count = 0usize;
@@ -783,6 +807,8 @@ impl Interpreter {
             if slot.is_none()
                 && param_default(&params[i]).is_none()
                 && params[i].name.as_str() != RESERVED_CONTENT
+                // Callback params are checked for presence in `bind_callbacks`.
+                && !is_callback_param(&params[i])
             {
                 self.errors.push(CompileError::MissingParam {
                     span: call.span,
@@ -798,6 +824,106 @@ impl Interpreter {
                 .enumerate()
                 .filter_map(|(i, s)| s.map(|sc| (params[i].name.clone(), sc)))
                 .collect(),
+        }
+    }
+
+    // ── callback props (RFC-0019) ───────────────────────────────────────
+
+    /// Registers a caller-supplied callback body in the shared `fn_table`,
+    /// returning its [`AstId`]. The body is the caller's action block; it is
+    /// lowered later, at the callee's invocation site, against the shared flat
+    /// env — which still holds the caller's `var` bindings below the callee
+    /// frame — so writes route to the caller's signals (RFC-0019 §2/§3).
+    fn register_callback(&mut self, params: &[Symbol], body: &Expr) -> super::env::AstId {
+        let id = super::env::AstId(u32::try_from(self.fn_table.len()).unwrap_or(u32::MAX));
+        self.fn_table.push((params.to_vec(), body.clone(), true));
+        id
+    }
+
+    /// Registers an arity-matched no-op callback (an empty action block with
+    /// `arity` ignored parameters), used when a bare-identifier forward cannot
+    /// be resolved to a live callback in the current lowering context. Matching
+    /// the declared arity keeps the invocation-site arity check (§4) quiet.
+    fn noop_callback(&mut self, arity: usize, span: Span) -> super::env::AstId {
+        let params: Vec<Symbol> = (0..arity)
+            .map(|i| Symbol::intern(&format!("__cb_arg{i}")))
+            .collect();
+        self.register_callback(&params, &Expr::Block(Vec::new(), span))
+    }
+
+    /// The caller-supplied argument expression for a named parameter — a `name:`
+    /// entry in the `(...)` content or a `#[name: value]` attribute. Callback
+    /// props are always passed by name.
+    fn find_named_arg<'a>(&self, call: &'a ElementNode, name: &Symbol) -> Option<&'a Expr> {
+        call.content
+            .iter()
+            .find(|a| a.name.as_ref() == Some(name))
+            .map(|a| &a.value)
+            .or_else(|| {
+                call.attrs.iter().find_map(|attr| match &attr.kind {
+                    AttrKind::Prop { value } if &attr.name == name => Some(value),
+                    _ => None,
+                })
+            })
+    }
+
+    /// Binds a callback-prop parameter (RFC-0019): pushes a `Value::Fn` naming
+    /// the caller's action block (or the `= { … }` default, or a forwarded
+    /// callback already in scope). Emits the §4 diagnostics — arity mismatch
+    /// between the `Fn(...)` type and the block's `|params|`, a non-callback
+    /// argument, or a missing required callback.
+    fn bind_callback_param(&mut self, param: &Param, call: &ElementNode) {
+        let arg_ty_count = match &param.ty {
+            Some(Type::Function { params, .. }) => params.len(),
+            _ => 0,
+        };
+        if let Some(arg) = self.find_named_arg(call, &param.name) {
+            match arg {
+                Expr::Lambda {
+                    params, body, span, ..
+                } => {
+                    if params.len() != arg_ty_count {
+                        self.errors.push(CompileError::CallbackArityMismatch {
+                            span: *span,
+                            name: param.name.as_str().to_string(),
+                            expected: arg_ty_count,
+                            found: params.len(),
+                        });
+                    }
+                    let id = self.register_callback(params, body);
+                    self.env.push(param.name.clone(), Value::Fn(id));
+                }
+                // Forwarding: `on_tap: outer_on_tap` re-binds a callback already
+                // in scope (a wrapper forwarding its own callback prop inward).
+                // A bare identifier that does *not* currently resolve to a
+                // callback is bound to an arity-matched no-op rather than a hard
+                // type error — a wrapper checked in isolation has its own
+                // callback params unbound, and that must not false-positive.
+                Expr::Ident(other, span) => {
+                    if let Some(&Value::Fn(id)) = self.env.lookup(other) {
+                        self.env.push(param.name.clone(), Value::Fn(id));
+                    } else {
+                        let id = self.noop_callback(arg_ty_count, *span);
+                        self.env.push(param.name.clone(), Value::Fn(id));
+                    }
+                }
+                other => self.errors.push(CompileError::CallbackTypeMismatch {
+                    span: other.span(),
+                    callee: call.name.as_str().to_string(),
+                    name: param.name.as_str().to_string(),
+                }),
+            }
+        } else if let Some(Expr::Lambda { params, body, .. }) = param_default(param) {
+            // The default is an action block (`= {}` / `= {|_|}`); register it.
+            let id = self.register_callback(params, body);
+            self.env.push(param.name.clone(), Value::Fn(id));
+        } else {
+            // A required callback with no default and no argument.
+            self.errors.push(CompileError::MissingParam {
+                span: call.span,
+                name: param.name.as_str().to_string(),
+                callee: call.name.as_str().to_string(),
+            });
         }
     }
 
@@ -958,6 +1084,7 @@ impl Interpreter {
                         }],
                         action: el.action.clone(),
                         bound_sig: None,
+                        env_snapshot: self.capture_env_snapshot(),
                     }
                 } else {
                     RenderNode::Text {
@@ -1005,6 +1132,7 @@ impl Interpreter {
                     children: Vec::new(),
                     action: el.action.clone(),
                     bound_sig,
+                    env_snapshot: self.capture_env_snapshot(),
                 }
             }
             _ => {
@@ -1017,8 +1145,22 @@ impl Interpreter {
                     children,
                     action: el.action.clone(),
                     bound_sig: None,
+                    env_snapshot: self.capture_env_snapshot(),
                 }
             }
+        }
+    }
+
+    /// Captures the instance environment for a box being lowered (RFC-0019 §2),
+    /// or an empty snapshot at the top level. Only boxes lowered *inside* a
+    /// user-view instance need one — a top-level box's event actions re-lower
+    /// against the persistent root env, exactly as before, so its snapshot stays
+    /// empty and render behaviour is unchanged.
+    fn capture_env_snapshot(&self) -> Vec<(Symbol, Value)> {
+        if self.instance_depth == 0 {
+            Vec::new()
+        } else {
+            self.env.snapshot()
         }
     }
 
@@ -1095,6 +1237,13 @@ impl Interpreter {
         //    own declarations.
         let snapshot = self.env.len();
         for param in &callee.params {
+            // A callback prop (RFC-0019) binds the caller's action block as a
+            // `Value::Fn`, resolved at invocation in `lower_call`, rather than a
+            // projected value memo.
+            if is_callback_param(param) {
+                self.bind_callback_param(param, el);
+                continue;
+            }
             if let Some((_, scope)) = bindings.bindings.iter().find(|(n, _)| n == &param.name) {
                 self.env.push(param.name.clone(), Value::Memo(*scope));
             } else if let Some(default) = param_default(param) {
@@ -1612,7 +1761,16 @@ impl Interpreter {
                 children,
                 action,
                 bound_sig,
+                env_snapshot,
             } => {
+                // RFC-0019 §2: restore the instance environment captured at lower
+                // time so event actions re-lowered below (a forwarded callback,
+                // or any param reference in `attrs`) resolve against the scope
+                // this box was instantiated in. Empty at the top level (no-op).
+                let env_base = self.env.len();
+                for (k, v) in env_snapshot {
+                    self.env.push(k.clone(), v.clone());
+                }
                 let mut current_rect = parent_rect;
                 // Opacity children inherit from this box: its effective opacity
                 // when it has a resolved rect (set below), else whatever it
@@ -1962,6 +2120,10 @@ impl Interpreter {
                 if scroll_clip.is_some() {
                     frame.end_clip();
                 }
+                // Close the RFC-0019 instance-env scope opened at the top of this
+                // arm (balanced with `env_base`), restoring the caller's env for
+                // the remaining siblings.
+                self.env.truncate(env_base);
             }
             RenderNode::Image {
                 attrs,
@@ -3392,7 +3554,21 @@ impl Interpreter {
                 Box::new(move |_| Value::Float(rad))
             }
             Expr::StrLit(parts, _) => self.lower_strlit(parts, payload_name),
-            Expr::Ident(name, _) => self.lower_ident(name, payload_name),
+            Expr::Ident(name, span) => {
+                // A bare reference to a callback prop (RFC-0019 §4) — reached only
+                // when it is *not* the callee of a call (`on_tap()` is handled in
+                // `lower_call`) — is invalid: callbacks are fire-and-forget, not
+                // first-class values.
+                if let Some(&Value::Fn(id)) = self.env.lookup(name) {
+                    if self.fn_table.get(id.0 as usize).is_some_and(|e| e.2) {
+                        self.errors.push(CompileError::CallbackNotInvocable {
+                            span: *span,
+                            name: name.as_str().to_string(),
+                        });
+                    }
+                }
+                self.lower_ident(name, payload_name)
+            }
             Expr::Array(elems, _) => {
                 let mut cs: Vec<Lowered> = elems
                     .iter()
@@ -3489,6 +3665,25 @@ impl Interpreter {
             // slice, so for now the target resolves instantly (as it did before
             // any `with` was written), which is a safe, correct fallback.
             Expr::Animated { value, .. } => self.lower_expr(value, payload_name),
+            // A callback-prop action block (RFC-0019): lower each statement in
+            // order and run them in sequence when the callback fires, returning
+            // the last statement's value (`Unit` for the no-op default `{}`).
+            // Mutations inside route through the reactive system exactly like any
+            // event-handler action, because each `Assign`/`Postfix` statement
+            // lowers to a signal write.
+            Expr::Block(stmts, _) => {
+                let mut cs: Vec<Lowered> = stmts
+                    .iter()
+                    .map(|s| self.lower_expr(s, payload_name))
+                    .collect();
+                Box::new(move |ctx| {
+                    let mut last = Value::Unit;
+                    for c in &mut cs {
+                        last = c(ctx);
+                    }
+                    last
+                })
+            }
             // Member access needs controller metadata (not modeled in Phase 2);
             // lambdas/assignments are actions, not projected values.
             Expr::Member { .. } | Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
@@ -3573,12 +3768,27 @@ impl Interpreter {
                 let m = *scope;
                 return Box::new(move |ctx| ctx.read_memo(m));
             }
-            // Parameterized fn call (M25): inline the body with args bound as memos.
+            // Parameterized fn call (M25) *or* callback-prop invocation
+            // (RFC-0019 §3): inline the body with args bound as memos. For a
+            // callback, the body is the *caller's* action block — still resolved
+            // here, where the caller's `var`s remain live below the callee frame
+            // in the shared flat env, so `count++` routes to the caller's signal.
             if let Some(Value::Fn(id)) = self.env.lookup(name).cloned() {
                 if (id.0 as usize) < self.fn_table.len() {
-                    let (params, body) = self.fn_table[id.0 as usize].clone();
+                    let (params, body, is_callback) = self.fn_table[id.0 as usize].clone();
+                    // A callback invoked with the wrong arity is a hard error
+                    // (RFC-0019 §4); a plain `fn` keeps the historical lenient
+                    // zip (extra args ignored, missing bound to nothing).
+                    if is_callback && params.len() != args.len() {
+                        self.errors.push(CompileError::CallbackArityMismatch {
+                            span: callee.span(),
+                            name: name.as_str().to_string(),
+                            expected: params.len(),
+                            found: args.len(),
+                        });
+                    }
                     // Bind each arg as a reactive memo so signal reads inside the
-                    // fn body are tracked by the enclosing scope.
+                    // body are tracked by the enclosing scope.
                     let snapshot = self.env.len();
                     for (param, arg) in params.iter().zip(args.iter()) {
                         let arg_lowered = self.lower_expr(&arg.value, payload_name);

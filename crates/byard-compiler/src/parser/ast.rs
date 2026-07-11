@@ -410,6 +410,15 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A brace-delimited action block `{ stmt* }` (RFC-0019): the body of a
+    /// callback-prop literal (`on_tap: { count++ }`). Holds zero or more action
+    /// statements evaluated in order; the value is the last statement's (or
+    /// [`Value::Unit`] for the empty no-op default `{}`). Distinct from a
+    /// `style { … }` value and from a View/`when`/`for` body — those consume
+    /// their braces structurally and never reach expression position.
+    ///
+    /// [`Value::Unit`]: crate::interp::env::Value::Unit
+    Block(Vec<Expr>, Span),
     /// An assignment `target op value` (`= += -=`).
     Assign {
         /// The l-value target.
@@ -497,6 +506,7 @@ impl Expr {
             | Self::Member { span, .. }
             | Self::Call { span, .. }
             | Self::Lambda { span, .. }
+            | Self::Block(_, span)
             | Self::Assign { span, .. }
             | Self::Postfix { span, .. }
             | Self::Ternary { span, .. }
