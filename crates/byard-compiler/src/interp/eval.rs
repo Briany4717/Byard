@@ -1557,7 +1557,16 @@ impl Interpreter {
         // top (the shared depth buffer resolves cross-layer order — no separate
         // GPU pass needed). Emitted in mount order, so a later overlay stacks
         // over an earlier one. A modal overlay installs a scrim first.
+        //
+        // `begin_layer` marks the z-layer boundary: the Encoder draws each
+        // layer's pools — including its *text* — as one interleaved batch
+        // inside the single render pass, so this overlay's transparent
+        // geometry (scrim, shadow) alpha-blends over the text and images of
+        // everything beneath it instead of being drawn before a frame-final
+        // text batch. With no overlay, no mark is recorded and the frame
+        // renders through the exact single-layer draw stream.
         for ol in &overlay_layouts {
+            frame.begin_layer();
             self.emit_overlay(ol, frame, width, height);
         }
     }
