@@ -75,25 +75,33 @@ semantics and a square visual.
 ### 2. `RadioButton` — single-selection within a group
 
 - **Content:** none. **Children:** none.
-- **Props:** Layout + Decoration + `group: Str` (required — the group name that
-  coordinates mutual exclusion).
-- **Reflected (two-way):** `value: Bool` (or `bind:`). `true` = selected.
-- **States:** RFC-0024's `selected` pseudo-state is driven by `value`.
-- **Events:** `change(e: ChangeEvent<Bool>)`, all pointer + focus; **focusable**.
+- **Props:** Layout + Decoration + `value: Str` (required — the value this button
+  represents within the group).
+- **Reflected (two-way):** `bind: Str` (required — binds to the group's shared
+  `var`). The RadioButton is selected when `bind == value`.
+- **States:** RFC-0024's `selected` pseudo-state is driven by `bind == value`.
+- **Events:** `change(e: ChangeEvent<Str>)`, all pointer + focus; **focusable**.
   Arrow keys move selection within the group (accessibility pattern).
 - **Pipeline:** `DecoratedBox` (outer circle) + `DecoratedBox` (inner filled
   circle when selected). Both use corner radius = 50%.
 - **Accessibility role:** `radio`.
 
-**Group coordination:** all `RadioButton`s sharing the same `group` string form
-a mutual-exclusion group. When one is selected (tap or keyboard), the engine
-writes `false` to all other `RadioButton` `value` bindings in the same group
-before writing `true` to the tapped one. This happens atomically within a single
-tick — no intermediate state where two are selected.
+**Group-var model:** RadioButtons sharing the same `bind:` var form a mutual-
+exclusion group automatically:
 
-The `group` prop is validated: if two `RadioButton`s in the same group bind to
-the same `var`, it is a `CompileWarning` (they should bind to separate `var`s
-or a single enum `var` — enum support deferred).
+```byld
+var choice = "home"
+RadioButton(value: "home", bind: choice)   // selected when choice == "home"
+RadioButton(value: "work", bind: choice)   // selected when choice == "work"
+RadioButton(value: "other", bind: choice)  // selected when choice == "other"
+```
+
+When one is tapped (or selected via keyboard), the engine writes its `value`
+to the bound var (`choice = "work"`). Because all RadioButtons in the group
+read the same var, the previously selected one deselects reactively via
+Mark-and-Pull — no explicit mutual-exclusion logic needed. This is the
+standard group-var model (SwiftUI Picker, Flutter RadioListTile `groupValue`,
+HTML `<input type="radio" name="group">`).
 
 ### 3. `Grid` — CSS-grid layout
 
@@ -198,24 +206,45 @@ A dedicated `ZStack` makes the overlap intent explicit and keeps `Box`/`Column`/
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **RadioButton value type.** `Bool` per button (current proposal) vs. a
-    single `Str`/`Int` var per group with each button carrying a `groupValue`
-    prop. The per-button `Bool` is simpler; the group-var model is more
-    ergonomic for large groups. Decide.
-  - [ ] **Grid auto-placement.** Does Taffy's auto-placement (children without
-    explicit `col`/`row` fill cells left-to-right, top-to-bottom) need explicit
-    byld surface, or is it the implicit default?
-  - [ ] **ZStack sizing.** Does the ZStack size to its largest child (SwiftUI
-    model) or require explicit dimensions?
+  - [x] **RadioButton value type.** **Group-var model.** A single `var` per
+    group, each RadioButton carries a `value` prop, and the group is linked
+    via `bind:` to the shared var:
+    ```byld
+    var choice = "home"
+    RadioButton(value: "home", bind: choice)
+    RadioButton(value: "work", bind: choice)
+    ```
+    The engine enforces mutual exclusion: setting `choice = "work"` deselects
+    "home" automatically. This is the standard model (SwiftUI Picker, Flutter
+    RadioListTile groupValue, HTML radio name). The per-button Bool model is
+    rejected — it forces the developer to manually coordinate exclusion,
+    which is error-prone for 3+ options.
+  - [x] **Grid auto-placement.** Implicit default. Children without explicit
+    `col`/`row` props fill cells left-to-right, top-to-bottom (Taffy's
+    auto-placement). This matches CSS Grid's default behavior and requires
+    zero configuration for the common case. Explicit `col`/`row` overrides
+    are available for manual placement.
+  - [x] **ZStack sizing.** Sizes to its **largest child** (SwiftUI model).
+    The ZStack's intrinsic size is `(max(child.width), max(child.height))`.
+    Explicit `width`/`height` props override this. Rationale: the SwiftUI
+    model is intuitive — the stack is "as big as it needs to be" — and avoids
+    forcing dimensions on every ZStack.
 
 - **During implementation:**
-  - [ ] **Checkbox checkmark asset.** Engine-provided SVG path or a simple
-    `TextGlyph("✓")`? The SVG path is crisper at all sizes.
-  - [ ] **RadioButton arrow-key wrapping.** Should arrow-key focus wrap from the
-    last radio to the first within a group?
+  - [x] **Checkbox checkmark asset.** Engine-provided **SVG path** baked into
+    the VectorMSDF atlas. The path is a simple polyline (two strokes forming
+    a checkmark), rendered via the existing MSDF pipeline (RFC-0009). This
+    gives crisp rendering at all sizes and DPI scales. `TextGlyph("✓")` is
+    rejected because glyph appearance varies across fonts and is not
+    pixel-consistent.
+  - [x] **RadioButton arrow-key wrapping.** Yes, arrow-key focus **wraps**
+    from the last radio to the first within a group. This matches WAI-ARIA
+    Radio Group pattern and platform behavior (HTML radio groups, iOS/Android
+    accessibility). Up/Left goes to previous, Down/Right goes to next, both
+    wrap.
 
 ---
 

@@ -304,24 +304,42 @@ express the same patterns without any handles.
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Max keyframe steps.** Cap at 8 (covers all real-world UI patterns) or
-    allow arbitrary? Recommendation: 8, with a `CompileError` above the limit.
-  - [ ] **Easing per keyframe segment.** Is per-segment easing essential for v1,
-    or can all segments be linear with a global easing? Recommendation: per-
-    segment — indeterminate progress needs `ease_in_out` on its segments.
-  - [ ] **`delay` on springs.** Does delay compose well with spring physics (the
-    spring starts from rest after the delay)? Recommendation: yes, the spring
-    simply begins at `t = start_time + delay`.
+  - [x] **Max keyframe steps.** **Cap at 8.** `CompileError::TooManyKeyframes`
+    above 8 steps. This covers all real-world UI patterns: M3 indeterminate
+    progress uses 3–4 steps, a complex shimmer uses 4–5. The cap keeps the GPU
+    uniform buffer compact (8 × `vec4` = 128 bytes per animation). If a future
+    pattern needs more, raise the cap — but 8 is the v1 contract.
+  - [x] **Easing per keyframe segment.** **Per-segment.** Each keyframe step
+    specifies its own easing function (the easing applies from the *previous*
+    step to *this* step). Default per-segment easing is `linear`. This is
+    essential: M3's indeterminate progress bar uses `ease_in_out` on some
+    segments and `linear` on others. A global-only easing would force all
+    segments to the same curve, producing incorrect motion.
+  - [x] **`delay` on springs.** Yes, delay composes cleanly. The spring starts
+    from rest (velocity = 0) at `t = start_time + delay`. During the delay
+    period, the property holds its initial value — no motion, no GPU cost.
+    The spring's physics are unaffected; delay is purely a time offset. This
+    is the standard model (CSS `animation-delay`, SwiftUI `.delay()`).
 
 - **During implementation:**
-  - [ ] **Keyframe uniform buffer format.** Pack steps as `vec4` arrays
-    (percent, value, easing_id, padding) for GPU consumption.
-  - [ ] **Framerate reduction for idle+animated.** When no user interaction is
-    happening but an infinite animation is visible, should the engine drop to
-    30fps to save power?
+  - [x] **Keyframe uniform buffer format.** Pack as `vec4` arrays:
+    `[percent, value, easing_id, 0.0]` per step. Total per animation:
+    `8 × vec4 = 128 bytes` plus a header `vec4` (duration, repeat_mode,
+    reverse, iteration_count). The shader binary-searches the step array
+    by `progress` to find the surrounding pair, then interpolates with the
+    segment's easing function (easing_id indexes a switch in the shader).
+  - [x] **Framerate reduction for idle+animated.** **No.** The engine maintains
+    full refresh rate (60/120fps matching VSync) whenever any animation is in
+    the active set, even during idle. Dropping to 30fps would cause visible
+    jank in smooth animations (spinners, progress bars) and inconsistent motion.
+    Power savings come from the offscreen pause optimization (§2): animations
+    not in the viewport are paused entirely, which is a binary 0-cost rather
+    than a half-cost compromise. If future profiling shows battery drain from
+    background spinners, revisit with a `reduce_motion` accessibility toggle
+    that disables animations entirely.
 
 ---
 

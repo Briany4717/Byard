@@ -326,25 +326,44 @@ The generated View is the ergonomic path; controllers handle dynamic color.
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Token naming convention.** camelCase (`primaryContainer`) or
-    snake_case (`primary_container`) in manifests and byld references?
-    Recommendation: snake_case in manifests (TOML convention), camelCase in
-    byld (language convention), with automatic mapping.
-  - [ ] **Theme inheritance.** Does `extends` support multi-level chains
-    (`A extends B extends byard-base`)? Recommendation: yes, resolved linearly.
-  - [ ] **Font subsetting.** Should the engine subset TTF/OTF to only the glyphs
-    used in the app (saves memory, slower build)? Recommendation: deferred.
+  - [x] **Token naming convention.** **Auto-map.** TOML manifests use
+    `snake_case` (TOML convention): `primary_container`, `title_large`. Byld
+    references use `camelCase` (byld convention): `theme.primaryContainer`,
+    `theme.titleLarge`. The compiler maps automatically:
+    `primary_container` ↔ `primaryContainer` via the standard snake→camel
+    conversion. A `CompileError::UnknownThemeToken` with a Levenshtein hint
+    fires if neither casing matches. This preserves idiomatic conventions in
+    both languages without forcing developers to remember a foreign casing
+    rule.
+  - [x] **Theme inheritance.** Yes, multi-level chains are supported.
+    `A extends B extends byard-base` resolves linearly: A's tokens override
+    B's, B's override byard-base's. Resolution is a simple HashMap merge in
+    dependency order (deepest ancestor first). Circular `extends` is a
+    `CompileError::CircularThemeInheritance`.
+  - [x] **Font subsetting.** Deferred. Full TTF/OTF files are loaded in v1.
+    Font subsetting (stripping unused glyphs) is a build-time optimization
+    that requires glyph usage analysis across all `.byd` files — significant
+    toolchain work for marginal memory savings on desktop. Revisit when
+    targeting WASM or memory-constrained mobile devices.
 
 - **During implementation:**
-  - [ ] **Hot-reload of theme tokens.** When a package's `byard.toml` changes
-    during `byard dev`, do tokens live-update? Recommendation: yes, consistent
-    with Pillar E (multi-file hot-reload).
-  - [ ] **System dark mode detection.** Should the engine expose the OS dark-mode
-    preference as an injectable value? Recommendation: yes, as
-    `inject SystemAppearance as appearance`.
+  - [x] **Hot-reload of theme tokens.** Yes. When `byard.toml`'s `[theme]`
+    section changes during `byard dev`, the engine reloads the token set and
+    writes new values to all theme signals → Mark-and-Pull propagates → all
+    themed elements update with animated transitions (if `with anim` is on
+    the properties). Consistent with Pillar E's hot-reload model.
+  - [x] **System dark mode detection.** Yes. The engine exposes the OS
+    appearance preference as an injectable:
+    ```byld
+    inject SystemAppearance as appearance  // "light" | "dark"
+    ```
+    This is a reactive `Signal<Str>` that updates when the OS switches mode.
+    The developer can wire it to the theme: `inject m.Theme(mode: appearance)`.
+    On platforms without system dark mode (some Linux DEs), defaults to
+    `"light"`.
 
 ---
 

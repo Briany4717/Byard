@@ -277,21 +277,33 @@ patterns (`validate: email`, `validate: /regex/`).
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Mutual exclusion.** Should `checked` and `indeterminate` be mutually
-    exclusive (setting one clears the other)? Recommendation: yes.
-  - [ ] **`dragging` scope.** Should `dragging` activate during any pointer-move
-    after pointer-down, or only after a drag threshold? Recommendation: after
-    threshold (consistent with platform conventions).
-  - [ ] **Negation.** Should `on !hover { ... }` (not-hovered) be supported?
-    Recommendation: deferred — it's rarely needed and adds parser complexity.
+  - [x] **Mutual exclusion.** Yes, `checked` and `indeterminate` are **mutually
+    exclusive**. Setting `indeterminate: true` clears `checked`; checking the
+    Checkbox clears `indeterminate`. The engine enforces this at the state-mask
+    level: `CHECKED & INDETERMINATE` is an invalid combination that never
+    occurs. This matches HTML's `<input type="checkbox" indeterminate>` behavior
+    and M3's tri-state checkbox spec.
+  - [x] **`dragging` scope.** Activates **after a drag threshold** of 8 logical
+    pixels of pointer movement after pointer-down. Below the threshold, the
+    gesture is a tap/press, not a drag. This matches platform conventions:
+    iOS uses 10pt, Android uses 8dp, CSS drag-and-drop uses a similar slop.
+    The threshold is an engine constant (not developer-facing).
+  - [x] **Negation.** **Deferred.** `on !hover { ... }` is not supported in v1.
+    Negation is rarely needed (the base style already covers the non-hovered
+    case), adds parser complexity (`!` is also logical-not in expressions), and
+    has subtle specificity implications. Documented in Future possibilities.
 
 - **During implementation:**
-  - [ ] **Animation on state change.** When `checked` transitions, do properties
-    in `on checked { ... }` animate? Recommendation: yes, through RFC-0010's
-    existing `with` on each property.
+  - [x] **Animation on state change.** Yes. Properties declared inside
+    `on checked { bg: 0x6750A4 with anim.spring() }` animate when `checked`
+    transitions from false→true and back. This works through RFC-0010's
+    existing mechanism: the `with anim` modifier on the property creates a
+    `Motion` that triggers whenever the resolved value changes, regardless of
+    whether the change came from a reactive var or a state transition. No
+    special state-animation machinery needed.
 
 ---
 

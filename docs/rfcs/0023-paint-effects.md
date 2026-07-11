@@ -272,25 +272,37 @@ curve" model.
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Blur quality tiers.** Should the engine auto-select quality (Gaussian
-    vs. box blur) based on GPU capability, or let the developer choose?
-    Recommendation: auto-select with an optional `blur_quality` prop.
-  - [ ] **Ripple clipping.** Should ripple clip to the element's border-radius
-    automatically? Recommendation: yes, always — an unclipped ripple looks
-    wrong.
-  - [ ] **Blur on `Canvas`.** Can a `Canvas` (RFC-0020) element have a blur
-    background? Recommendation: yes, the blur sampling doesn't care about the
-    element type.
+  - [x] **Blur quality tiers.** **Auto-select with optional override.** The
+    engine queries GPU capability at startup and selects: Gaussian (2-pass
+    separable) on discrete/high-end mobile GPUs, box blur (single-pass, 3-tap)
+    on integrated/low-end GPUs. An optional `blur_quality: "high" | "low"`
+    prop lets the developer force a tier. Default is `"auto"`. This keeps the
+    common case zero-config while allowing perf-sensitive apps to force low.
+  - [x] **Ripple clipping.** **Always clip to border-radius.** The ripple circle
+    is clipped to the element's rounded rect (using the same corner radii as
+    `DecoratedBox`). An unclipped ripple extending beyond rounded corners looks
+    broken. No opt-out — this is visual correctness, not a preference.
+  - [x] **Blur on `Canvas`.** Yes. A `Canvas` element (RFC-0020) can have `blur`
+    as a style property. The blur sampling reads the scene behind the Canvas's
+    bounding rect, regardless of what the Canvas itself draws. The Canvas
+    shapes render on top of the blurred backdrop, same as any other child
+    content.
 
 - **During implementation:**
-  - [ ] **Blur texture resolution.** Full resolution or downsampled (e.g., 0.5x)?
-    Downsampled is cheaper and the blur hides the resolution loss.
-  - [ ] **Multiple blurred elements overlap.** If two blurred elements overlap,
-    does the upper one blur the lower one's blur? Recommendation: yes (natural
-    painter's order), but flag if performance is poor.
+  - [x] **Blur texture resolution.** **Downsampled to 0.5x** (half resolution
+    in each dimension = 25% pixel count). The blur kernel hides the resolution
+    loss, and the 4× reduction in texture memory and fill rate is critical for
+    mobile GPUs. For `blur_quality: "high"`, use 0.75x. The blit-back to the
+    main render target uses bilinear filtering to smooth the upscale.
+  - [x] **Multiple blurred elements overlap.** Yes, natural painter's order:
+    the upper blurred element reads the already-blurred output of the lower
+    one. This produces a "double blur" effect — physically correct (stacking
+    frosted glass) and visually expected. Performance diagnostic: if ≥3
+    overlapping blurred elements exist in the same frame, emit
+    `PerfWarning::OverlappingBlurs` with the count.
 
 ---
 
