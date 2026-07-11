@@ -37,10 +37,15 @@ View Main() {
         Text("The dialog floats above this screen, centred, behind a scrim.")
             #[color: 0x9A94A4, size: 15]
 
+        // Live status line. `pokes` only advances when the app is reachable —
+        // i.e. NOT while the modal dialog is up. `deleted` flips when the
+        // dialog's "Delete" fires, proving the overlay content is interactive
+        // even as the app behind it is blocked (value reactivity is live; only
+        // structural mount/unmount waits for a hot-reload).
         Row #[gap: 12, p: (vertical: 8, horizontal: 0)] {
             Button("Poke the app") #[bg: 0x3C3C52, radius: 10, p: (vertical: 12, horizontal: 18),
                                      color: 0xECE6F0] => pokes++
-            Text("pokes: {pokes}") #[color: 0x9A94A4, size: 15]
+            Text("pokes: {pokes}  ·  deleted: {confirmed}") #[color: 0x9A94A4, size: 15]
         }
 
         // Some filler cards so the scrim visibly dims real content. Text wrap is
