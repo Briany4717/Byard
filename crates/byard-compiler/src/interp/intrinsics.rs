@@ -28,6 +28,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "Image",
     "ScrollView",
     "VectorIcon",
+    "Overlay",
 ];
 
 /// The scalar type an attribute value must have (RFC-0005 §1).
@@ -66,6 +67,12 @@ const WEIGHT: &[&str] = &["thin", "regular", "medium", "bold"];
 const FIT: &[&str] = &["fill", "contain", "cover", "none"];
 const DIRECTION: &[&str] = &["row", "column"];
 const AXIS: &[&str] = &["vertical", "horizontal", "both"];
+/// Overlay child placement within the full-viewport coordinate space
+/// (RFC-0017 §"Positioning"). `center` centres; the edge tokens pin the child
+/// to that viewport edge, centred on the cross axis. Absolute `(x, y)` and
+/// `relative(ref)` anchoring are deferred (RFC-0017 Future possibilities) —
+/// coordinate-passing covers the gap in the interim.
+const ANCHOR: &[&str] = &["center", "top", "bottom", "start", "end"];
 
 const LAYOUT: &[(&str, PropType)] = &[
     ("width", PropType::Int),
@@ -216,6 +223,10 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         }
         props.insert("focused", PropType::Bool);
         props.insert("disabled", PropType::Bool);
+        // RFC-0017: a child of an `Overlay` may carry an `anchor` placing it
+        // within the viewport. Harmless outside an overlay (no-op in normal
+        // flow), so it lives on every container rather than a special case.
+        props.insert("anchor", PropType::Enum(ANCHOR));
         Intrinsic {
             arity: 0,
             content: None,
@@ -376,6 +387,28 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
                 interactive: true,
                 props,
                 events: events_from(false, &[]),
+            }
+        }
+        // RFC-0017: the overlay escape-hatch. Content: none. Children: the
+        // overlay's floating subtree, laid out against the viewport rather than
+        // the parent's flow. Props: `modal` (default true — captures all input
+        // behind a scrim) and `dismiss_on_outside` (default true when modal). It
+        // is layout-only itself (occupies zero space in its parent); its children
+        // route to their own pipelines. The `dismiss` event fires when a modal
+        // overlay's scrim is tapped or `Escape` is pressed.
+        "Overlay" => {
+            let mut props: HashMap<&'static str, PropType> = HashMap::new();
+            props.insert("modal", PropType::Bool);
+            props.insert("dismiss_on_outside", PropType::Bool);
+            props.insert("style", PropType::Class);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: true,
+                focusable: false,
+                interactive: true,
+                props,
+                events: events_from(false, &["dismiss"]),
             }
         }
         _ => return None,
@@ -907,6 +940,46 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
         );
+    }
+
+    #[test]
+    fn overlay_validates_as_a_childful_layout_intrinsic() {
+        // Valid: modal overlay with a scrim + content, and a `dismiss` event.
+        assert!(
+            errs(
+                "View V() { Overlay #[modal: true] { Box #[bg: 0x000000, opacity: 0.3, grow: 1] {} \
+                 Column #[anchor: center, bg: 0xFFFFFF] { Text(\"hi\") } } }"
+            )
+            .is_empty()
+        );
+        // `dismiss` is an event, so `=>` is correct.
+        assert!(errs("View V() { Overlay #[dismiss => x] { Box {} } }").is_empty());
+        // Content args are rejected (arity 0).
+        assert!(
+            errs("View V() { Overlay(\"x\") { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 0, .. }))
+        );
+        // A stray prop → UnknownAttribute.
+        assert!(
+            errs("View V() { Overlay #[z_index: 3] { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
+        // `dismiss` with `:` instead of `=>` is a separator error (it's an event).
+        assert!(
+            errs("View V() { Overlay #[dismiss: 1] { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
+        );
+    }
+
+    #[test]
+    fn anchor_enum_is_accepted_on_containers_and_rejects_unknown_tokens() {
+        assert!(errs("View V() { Column #[anchor: bottom] {} }").is_empty());
+        assert!(errs("View V() { Box #[anchor: center] {} }").is_empty());
+        let e = errs("View V() { Box #[anchor: middle] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
     }
 
     #[test]

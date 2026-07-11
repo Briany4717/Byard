@@ -213,6 +213,22 @@ pub struct EventRouter {
     /// pointer state a purely-declarative interactive style depends on. Rebuilt
     /// every render like the handler set.
     hover_regions: Vec<(u32, Rect)>,
+    /// RFC-0017 modality floor: a modal `Overlay` registers a full-viewport
+    /// scrim and raises this to the scrim's handler index, so every handler
+    /// registered *before* it (the main tree, and any lower overlay) is
+    /// excluded from hit-testing. The scrim itself sits exactly at the floor
+    /// and covers the viewport, so an outside tap always lands on it rather
+    /// than falling through. `0` when no modal overlay is mounted (no effect).
+    /// Rebuilt every render.
+    modal_floor: usize,
+    /// RFC-0017 focus-trap floor: the `focusables` index at which the topmost
+    /// modal overlay's scope begins. `Tab` traversal is restricted to
+    /// focusables at or above it, so focus cannot leave a modal overlay.
+    focusable_floor: usize,
+    /// Handler indices of the mounted modal scrims, in mount order (topmost
+    /// last). `Escape` fires the topmost one's `dismiss` action (RFC-0017
+    /// resolved-questions: accessibility). Rebuilt every render.
+    modal_scrims: Vec<usize>,
 }
 
 impl EventRouter {
@@ -232,6 +248,33 @@ impl EventRouter {
         self.focusables.clear();
         self.disabled.clear();
         self.hover_regions.clear();
+        self.modal_floor = 0;
+        self.focusable_floor = 0;
+        self.modal_scrims.clear();
+    }
+
+    /// Registers a modal `Overlay`'s full-viewport scrim (RFC-0017 §Modality).
+    ///
+    /// Must be called *after* the main tree's handlers and *before* the
+    /// overlay's own content handlers are registered, so the scrim sits below
+    /// the content (content wins where it overlaps) but above the whole main
+    /// tree. Raising [`modal_floor`](Self::modal_floor) to the scrim's index
+    /// excludes every earlier handler from hit-testing — that is the modality:
+    /// input can no longer reach anything beneath the overlay. `dismiss` is the
+    /// action run when the scrim is tapped or `Escape` is pressed; a modal
+    /// overlay with no `dismiss` still blocks input but cannot be dismissed by
+    /// an outside tap (the caller relies on its own controls).
+    pub fn push_modal_scrim(&mut self, elem: u32, rect: Rect, dismiss: Option<Action>) {
+        self.modal_floor = self.handlers.len();
+        self.focusable_floor = self.focusables.len();
+        let idx = self.handlers.len();
+        self.handlers.push(Handler {
+            elem,
+            rect,
+            kind: EventKind::Tap,
+            action: dismiss.unwrap_or_else(|| Box::new(|_, _| {})),
+        });
+        self.modal_scrims.push(idx);
     }
 
     /// Registers `elem`'s `rect` as a hover/press hit region (RFC-0016) so an
@@ -487,6 +530,11 @@ impl EventRouter {
                         self.tab_focus(ctx, false);
                         return;
                     }
+                    // RFC-0017: Escape dismisses the topmost modal overlay.
+                    if key == "Escape" && !self.modal_scrims.is_empty() {
+                        self.dismiss_topmost_modal(ctx);
+                        return;
+                    }
                 }
                 self.fire_focused(ctx, EventKind::KeyDown, ev.value.as_ref());
             }
@@ -591,7 +639,9 @@ impl EventRouter {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, h)| h.kind == kind && contains(h.rect, pos))
+            // RFC-0017: a mounted modal overlay raises `modal_floor`, hiding every
+            // handler beneath its scrim so input can't reach the main tree.
+            .find(|(i, h)| *i >= self.modal_floor && h.kind == kind && contains(h.rect, pos))
             .map(|(i, _)| i)
     }
 
@@ -604,12 +654,18 @@ impl EventRouter {
     ) -> Option<u32> {
         self.handlers
             .iter()
+            .enumerate()
             .rev()
-            .find(|h| contains(h.rect, pos))
-            .map(|h| h.elem)
+            .find(|(i, h)| *i >= self.modal_floor && contains(h.rect, pos))
+            .map(|(_, h)| h.elem)
             // Fall back to declarative hover/press regions (RFC-0016) for
             // elements that style interaction states but register no handler.
+            // Suppressed under a modal overlay — nothing beneath the scrim may
+            // report hover/press either.
             .or_else(|| {
+                if self.modal_floor > 0 {
+                    return None;
+                }
                 self.hover_regions
                     .iter()
                     .rev()
@@ -625,9 +681,12 @@ impl EventRouter {
     ) -> Option<u32> {
         self.focusables
             .iter()
+            .enumerate()
             .rev()
-            .find(|f| contains(f.rect, pos))
-            .map(|f| f.elem)
+            // RFC-0017 focus trap: a modal overlay confines focus to its own
+            // scope; a press below the focus floor cannot steal focus.
+            .find(|(i, f)| *i >= self.focusable_floor && contains(f.rect, pos))
+            .map(|(_, f)| f.elem)
     }
 
     /// Fires the handler of `kind` registered on the currently focused element,
@@ -658,13 +717,18 @@ impl EventRouter {
     /// Advances keyboard focus to the next (or previous) focusable element
     /// (M18, Tab traversal).
     fn tab_focus(&mut self, ctx: &mut ReactiveCtx, reverse: bool) {
-        if self.focusables.is_empty() {
+        // RFC-0017 focus trap: when a modal overlay is mounted, cycle only within
+        // its scope (`focusables[focusable_floor..]`), wrapping last→first inside
+        // it. Outside a modal overlay, `focusable_floor` is 0 — the whole set.
+        let floor = self.focusable_floor;
+        let scope = &self.focusables[floor..];
+        if scope.is_empty() {
             return;
         }
-        let n = self.focusables.len();
+        let n = scope.len();
         let cur_idx = self
             .focused
-            .and_then(|elem| self.focusables.iter().position(|f| f.elem == elem));
+            .and_then(|elem| scope.iter().position(|f| f.elem == elem));
         let next_idx = match cur_idx {
             Some(i) => {
                 if reverse {
@@ -681,8 +745,19 @@ impl EventRouter {
                 }
             }
         };
-        let next_elem = self.focusables[next_idx].elem;
+        let next_elem = scope[next_idx].elem;
         self.steal_focus(ctx, Some(next_elem));
+    }
+
+    /// Fires the topmost mounted modal overlay's `dismiss` action (RFC-0017:
+    /// `Escape` dismisses the topmost modal overlay). No-op when none is mounted.
+    fn dismiss_topmost_modal(&mut self, ctx: &mut ReactiveCtx) {
+        let Some(&i) = self.modal_scrims.last() else {
+            return;
+        };
+        let mut action = std::mem::replace(&mut self.handlers[i].action, Box::new(|_, _| {}));
+        action(ctx, None);
+        self.handlers[i].action = action;
     }
 
     /// Test/inspection accessor: the `(elem, kind, rect)` of every registered
@@ -1152,5 +1227,135 @@ mod tests {
             }],
         );
         assert_eq!(ctx.peek_signal(sec), Value::Int(1), "secondary fired");
+    }
+
+    // ── RFC-0017: overlay modality & focus trap ──────────────────────────
+
+    fn viewport() -> Rect {
+        Rect::new(0.0, 0.0, 200.0, 200.0)
+    }
+
+    #[test]
+    fn modal_scrim_blocks_lower_handlers_and_dismisses_outside_taps() {
+        let mut ctx = ReactiveCtx::new();
+        let behind = ctx.create_signal(Value::Int(0));
+        let dismissed = ctx.create_signal(Value::Int(0));
+        let content = ctx.create_signal(Value::Int(0));
+
+        let mut router = EventRouter::new();
+        // Main tree: a full-viewport tap handler behind the overlay.
+        router.on(1, viewport(), EventKind::Tap, inc(behind));
+        // Modal scrim, then the overlay's centred content handler.
+        router.push_modal_scrim(2, viewport(), Some(inc(dismissed)));
+        router.on(
+            3,
+            Rect::new(80.0, 80.0, 40.0, 40.0),
+            EventKind::Tap,
+            inc(content),
+        );
+
+        // Tap outside the content (top-left): the scrim dismisses, the button
+        // behind never fires.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 0),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 20),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(dismissed), Value::Int(1), "scrim dismissed");
+        assert_eq!(ctx.peek_signal(behind), Value::Int(0), "main tree blocked");
+
+        // Tap on the content: it wins over the scrim (registered after it).
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (100.0, 100.0), 100),
+                InputEvent::pointer(EventKind::PointerUp, (100.0, 100.0), 120),
+            ],
+        );
+        assert_eq!(ctx.peek_signal(content), Value::Int(1), "content fired");
+        assert_eq!(
+            ctx.peek_signal(dismissed),
+            Value::Int(1),
+            "scrim did not re-fire"
+        );
+
+        // Escape dismisses the topmost modal overlay.
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![InputEvent {
+                kind: EventKind::KeyDown,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                value: Some(Value::Str("Escape".to_string())),
+                time_ms: 200,
+            }],
+        );
+        assert_eq!(
+            ctx.peek_signal(dismissed),
+            Value::Int(2),
+            "Escape dismissed"
+        );
+
+        // A rebuild clears the modal floor so the main tree is live again.
+        router.clear_handlers();
+        router.on(1, viewport(), EventKind::Tap, inc(behind));
+        router.dispatch_tick(
+            &mut ctx,
+            None,
+            vec![
+                InputEvent::pointer(EventKind::PointerDown, (5.0, 5.0), 300),
+                InputEvent::pointer(EventKind::PointerUp, (5.0, 5.0), 320),
+            ],
+        );
+        assert_eq!(
+            ctx.peek_signal(behind),
+            Value::Int(1),
+            "main tree live once the overlay unmounts"
+        );
+    }
+
+    #[test]
+    fn modal_focus_trap_confines_tab_to_the_overlay_scope() {
+        let mut ctx = ReactiveCtx::new();
+        let fa = ctx.create_signal(Value::Bool(false)); // main, below the floor
+        let fb = ctx.create_signal(Value::Bool(false)); // overlay
+        let fc = ctx.create_signal(Value::Bool(false)); // overlay
+
+        let mut router = EventRouter::new();
+        router.focusable(1, viewport(), fa);
+        router.push_modal_scrim(9, viewport(), None);
+        router.focusable(2, viewport(), fb);
+        router.focusable(3, viewport(), fc);
+
+        let tab = || InputEvent {
+            kind: EventKind::KeyDown,
+            pos: (0.0, 0.0),
+            delta: (0.0, 0.0),
+            value: Some(Value::Str("Tab".to_string())),
+            time_ms: 0,
+        };
+
+        // First Tab → first focusable in the overlay scope (fb), not fa.
+        router.dispatch_tick(&mut ctx, None, vec![tab()]);
+        assert_eq!(ctx.peek_signal(fb), Value::Bool(true));
+        assert_eq!(
+            ctx.peek_signal(fa),
+            Value::Bool(false),
+            "focus never leaves the modal"
+        );
+
+        // Second Tab → fc.
+        router.dispatch_tick(&mut ctx, None, vec![tab()]);
+        assert_eq!(ctx.peek_signal(fc), Value::Bool(true));
+
+        // Third Tab wraps back to fb, still never touching fa.
+        router.dispatch_tick(&mut ctx, None, vec![tab()]);
+        assert_eq!(ctx.peek_signal(fb), Value::Bool(true));
+        assert_eq!(ctx.peek_signal(fa), Value::Bool(false));
     }
 }
