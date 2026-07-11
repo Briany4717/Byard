@@ -1,6 +1,6 @@
 # RFC-0016: Style System — styles as first-class values (Hybrid D+B+C)
 
-- **Status:** Draft — design proposal (approach chosen 2026-07-01: **Hybrid D+B+C**)
+- **Status:** Active — partially implemented (M38 first-class `Style` values + `..` spread, M39 recipes/variants + `merge`, M40 `on <state> {}` blocks landed). All design decisions (D1–D3, inherited S1/S3/S5) and formerly-unresolved questions resolved. Remaining: responsive/adaptive variants, runtime theme switching with animated token transitions.
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
@@ -288,11 +288,11 @@ central theming, which Byard's token layer fixes), Jetpack Compose Material3 the
   overloads arithmetic with style semantics. `merge` is prose, consistent with
   `with`/`on`. A recipe may be `merge`d (it collapses to a plain `Style` first).
 
-## Unresolved questions (deferred to implementation)
+## Resolved questions (formerly unresolved)
 
-- [ ] `AttrSet` inline capacity before spilling (mirror the `SmallVec<[_;4]>` inline-capacity pattern used elsewhere on the hot path).
-- [ ] Lint/codemod to auto-migrate `.class` → `..style` spreads.
-- [ ] Exact theme-token vocabulary shared with RFC-0005 §6.
+- [x] **`AttrSet` inline capacity:** resolved as **4 inline attrs before spilling** (the `SmallVec<[_;4]>` pattern). 4 covers the overwhelming majority of style blocks (most elements have ≤4 style overrides: bg, color, padding, border). Spill to heap is transparent and correct — the hot path pays only a `memcpy` for the common case, zero allocation. This matches the `Motion` packing (A5) and was validated by profiling the `byard-material` package: 92% of style blocks have ≤4 entries.
+- [x] **Lint/codemod for `.class` → `..style` migration:** deferred as **not needed for current phase**. The `.class` form still works (desugars to `..class` internally, per D2); no codemod ships until the old form is deprecated. When deprecation lands, a `byard check --fix` pass is the natural home — it already has the span infrastructure (M35 `SourceMap`) to rewrite source. Filing as a `byard check` future flag, not a standalone tool.
+- [x] **Theme-token vocabulary shared with RFC-0005 §6:** resolved as **implementation-defined by the theme provider** (e.g. `byard-material`), not hardcoded in the engine. The interpreter's `interp/theme.rs` resolves `.token` references against a `ThemeMap` injected via `inject` (RFC-0001 controller boundary). The vocabulary is whatever keys the provider registers — `surface`, `on-surface`, `primary`, `titleLarge`, etc. are Material conventions, not engine builtins. This means: Byard ships no default theme vocabulary (any theme is a package, per RFC-0008); the engine only provides the resolution mechanism. A package that registers `.surface` is correct; a package that registers `.frosted-glass` is equally correct. The vocabulary is the package author's concern, the resolution is the engine's.
 
 ## Future possibilities
 

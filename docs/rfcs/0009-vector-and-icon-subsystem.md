@@ -1,6 +1,6 @@
 # RFC-0009: Vector and Icon Subsystem (MSDF, JIT-Dev / AOT-Release Pipeline)
 
-- **Status:** Draft
+- **Status:** Active — fully implemented (M44–M52 all landed). M53+ future pipelines deferred. IMPL-58–68 + IMPL-91–93 logged in `DESICIONS.md`, all Decided.
 - **Author(s):** Briany4717
 - **Created:** 2026-06-24
 - **Last updated:** 2026-06-26
@@ -379,22 +379,16 @@ arm branch-free.
 - **Material Symbols.** The 6,000-glyph variable icon font that motivates the
   tree-shaking AOT pass and the typed downstream-package model.
 
-## Unresolved questions
+## Resolved questions (formerly unresolved)
 
-- **Before merge:**
-  - [ ] **Generation grid size.** Ratify the 32×32 default vs. 64×64 for high-PPI
-    (8K) precision against dev-mode memory.
-  - [ ] **Edge-coloring threshold.** Confirm 48° for the channel-separation angle
-    so sharp joints never wobble under extreme scaling.
-  - [ ] **Generator dependency.** `msdf` crate vs. a vendored generator, pending a
-    licence/quality review.
-- **During implementation:**
-  - [ ] **Dev-atlas cap and eviction tuning.** Layer count and LRU threshold
-    before eviction visibly churns on a large icon set.
-  - [ ] **Inclusion-list ergonomics.** Final `byard.toml` `[assets.vectors]` shape
-    for the dynamic-reference escape hatch.
-  - [ ] **Persistent cache pruning.** On-disk size bound and prune policy for
-    `.byard/cache/vectors/`.
+- **Before merge (all resolved, IMPL-62–63):**
+  - [x] **Generation grid size:** **32×32**, `px_range = 4` (IMPL-62). Sharp-corner and determinism tests pass; raise to 64² only if 8K regression surfaces.
+  - [x] **Edge-coloring threshold:** **48°** confirmed (IMPL-62). Channel separation holds under extreme scaling in the test suite.
+  - [x] **Generator dependency:** **`bymsdfgen-core`** — a pure-Rust, MIT, data-oriented msdfgen rewrite (IMPL-63). SVG normalization via `usvg`; path adaptation in `vector/generate.rs`.
+- **During implementation (IMPL-64–68):**
+  - [x] **Dev-atlas cap and eviction:** shelf/skyline allocator + array-texture layers + LRU-evict recommended (IMPL-64, open pending M48 implementation). Evicted handles fall back to placeholder + regenerate (INV-9).
+  - [x] **Inclusion-list ergonomics:** `byard.toml` `[assets.vectors] include = [...]` (IMPL-65, resolved). Seeds the closed set for dynamic `asset()` sites; absent = hard build error on non-literal handles.
+  - [x] **Persistent cache pruning:** deferred — cache grows unbounded until `byard clean` (IMPL-68). On-disk LRU mirrors M48's in-memory eviction, which is itself still to be tuned.
 
 ## Future possibilities
 

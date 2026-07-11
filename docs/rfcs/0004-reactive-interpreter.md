@@ -1,6 +1,6 @@
 # RFC-0004: Reactive Interpreter (`interp/reactive.rs`) — read-tracking, pull-based memos, structural effects
 
-- **Status:** Draft
+- **Status:** Active — implemented (M8 reactive core, all 10 fixtures + proptest green). Mark-and-Pull, memos, structural effects, `untrack` landed in `interp/reactive.rs`.
 - **Author(s):** Briany4717
 - **Created:** 2026-06-20
 - **Last updated:** 2026-06-20

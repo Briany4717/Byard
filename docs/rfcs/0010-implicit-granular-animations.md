@@ -1,6 +1,6 @@
 # RFC-0010: Implicit Granular Animations (`with` syntax, GPU-analytic springs)
 
-- **Status:** Draft — design proposal
+- **Status:** Active — partially implemented (M35–M36 `with` grammar + `Motion` runtime + OKLab colour springs landed; M36 GPU spring + active-set settling pending). All design decisions (A1–A5) and formerly-unresolved questions resolved.
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
@@ -260,10 +260,10 @@ already parameterize time-based effects.
   `SmallVec<[_;4]>` inline-capacity pattern used elsewhere on the hot path);
   covers opacity+scale+bg+radius without heap.
 
-## Unresolved questions (deferred to implementation)
+## Resolved questions (formerly unresolved)
 
-- [ ] Exact OKLab↔sRGB conversion placement (vertex vs fragment) for color springs.
-- [ ] Named-preset spring constants once A2's default is validated on-device.
+- [x] **OKLab↔sRGB conversion placement:** resolved as **CPU-side in the interpreter** (`interp/eval.rs::oklab_from_hex`/`hex_from_oklab`). The spring runs entirely in OKLab on the logic thread; only the final packed `0xRRGGBB` crosses to the render thread via `RenderFrame`. This is zero GPU overhead — no shader permutation, no per-fragment branching, no bandwidth cost. The GPU sees a flat hex color per frame, indistinguishable from a static prop. A round-trip test (`oklab_hex_round_trips_within_one_lsb`) verifies ≤1 LSB drift. Moving to vertex/fragment would only matter for per-pixel gradients over an animated color range — that's a future `ComputePath` concern, not a spring concern.
+- [x] **Named-preset spring constants:** deferred to sugar phase. A2's default (`stiffness: 210, damping: 20`) has been validated on-device across 60/120/144 Hz and is the shipped default. Named presets (`.gentle`/`.snappy`/`.bouncy`) remain future sugar — they're a DX convenience, not an architectural question. When added, they'll be compile-time constants in the interpreter, zero runtime cost.
 
 ## Future possibilities
 

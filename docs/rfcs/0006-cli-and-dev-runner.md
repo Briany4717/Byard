@@ -1,6 +1,6 @@
 # RFC-0006: `byard` CLI and Dev Runner — Project Scaffolding, Live Reload, and the Developer Loop
 
-- **Status:** Draft
+- **Status:** Active — implemented (M25 dev runner, `byard new/dev/check/build/add/get/clean` all landed in `byard-cli`). Hot-reload, error overlay, manifest parsing, and dependency commands operational.
 - **Author(s):** Briany4717
 - **Created:** 2026-06-21
 - **Last updated:** 2026-06-21
@@ -638,30 +638,19 @@ needs today.
 
 ---
 
-## Unresolved questions
+## Resolved questions (formerly unresolved)
 
 **Before implementation:**
 
-- [ ] **`byard.toml` in `Cargo.toml`?** Phase 3 will evaluate `[workspace.byard]`
-  as an alternative to a separate file. Decision deferred.
-- [ ] **Window title / taskbar icon.** `byard dev` sets the title to
-  `"Byard dev — <name>"`. Should it use the `.byd` file's first `View` name
-  instead? No strong opinion; resolved during implementation.
-- [ ] **`byard dev --no-watch`.** A flag to run without the file watcher (for
-  embedded / headless scenarios). Possibly needed for testing; not required for
-  Phase 2.
+- [x] **`byard.toml` in `Cargo.toml`?** Resolved: **keep `byard.toml` separate**. The manifest has grown to include `[dependencies]`, `[assets.vectors]`, and `[project]` — embedding it in `Cargo.toml` as `[workspace.byard]` would couple the byld ecosystem's versioning and tooling to Cargo's schema evolution. Separate files also let non-Rust controller languages (RFC-0015) use the same manifest. Revisit only if the Rust ecosystem converges on a unified manifest standard.
+- [x] **Window title / taskbar icon.** Resolved: `byard dev` uses `"Byard dev — <project-name>"` from `byard.toml` `[project].name`. Using the first `View` name would change on every file save in a multi-view project — confusing. The project name is stable.
+- [x] **`byard dev --no-watch`.** Deferred — no use case has materialized. Headless testing uses the `Interpreter` directly (no window, no watcher). If needed, a `--no-watch` flag is a trivial addition to `clap`.
 
 **During implementation:**
 
-- [ ] **Error overlay position and opacity.** The RFC specifies a full-screen
-  overlay at 80% opacity. If the error message is very long, it may overflow.
-  A scrollable overlay or truncation heuristic is an implementation decision.
-- [ ] **Multiple view files.** `byard.toml` currently specifies one entry file.
-  A multi-file project (`import` or a `views/` directory) is not in scope for
-  Phase 2 and will require a grammar-amendment RFC.
-- [ ] **`byard check` exit code for warnings.** Currently 0 on warnings. If
-  "unknown `byard.toml` key" becomes a structured warning, CI authors may want
-  `--strict` to treat warnings as errors. Deferred.
+- [x] **Error overlay position and opacity.** Resolved by implementation: the overlay renders headline-only (file, line, error kind) — long messages are truncated to fit. The telemetry overlay (M31) reuses the same screen space with a throttled refresh. No scrolling needed at current diagnostic verbosity.
+- [x] **Multiple view files.** Resolved by RFC-0008 (M35): `use` imports + module resolver + `PackageProvider` trait landed. `byard.toml` still specifies one entry file; the resolver discovers all `.byd` files in the project and dependency trees.
+- [x] **`byard check` exit code for warnings.** Resolved: exit 0 on warnings. A `--strict` flag is a future CLI addition, not an architectural question. `byard check` currently treats `UnknownAttribute` and all catalog violations as hard errors (exit 1) — the boundary between error and warning is defined by the diagnostics, not a flag.
 
 ---
 

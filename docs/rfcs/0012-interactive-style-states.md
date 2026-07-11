@@ -1,6 +1,6 @@
 # RFC-0012: Interactive Style States (`:hover`, `:pressed`, `:focused`, `:disabled`) & Full Event Exposure
 
-- **Status:** Draft — design proposal
+- **Status:** Active — partially implemented (M32 full event exposure + wheel origin, M37 `StyleState` mask + disabled gate landed). All design decisions (S1–S5) and formerly-unresolved questions resolved. IMPL-76–80 logged. Remaining: `checked`/`selected`/`invalid` value-widget states, combined selectors.
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
@@ -248,10 +248,10 @@ booleans resolved reference-free, and transitions ride RFC-0010's GPU springs.
 > the engine `StyleState` mask below remain and are consumed by RFC-0016's
 > `on <state> { }` blocks.
 
-## Unresolved questions (deferred to implementation)
+## Resolved questions (formerly unresolved)
 
-- [ ] Whether `hover` should still fire on a `disabled` element for tooltips (S5 edge).
-- [ ] Exact `StyleState` bitflag layout shared with RFC-0016's resolver.
+- [x] **`hover` on `disabled` elements for tooltips:** resolved as **yes, hover fires on disabled** (S5 edge, decided during M37 implementation). A `disabled` element gates *dispatch* of action events (`tap`, `pointer_down`, `key_down`, etc.) but **not** `hover`/`pointer_enter`/`pointer_exit`. Rationale: tooltips are the primary use case for hovering a disabled control ("this button is disabled because…"), and blocking hover would force developers to wrap every disabled element in an invisible hover-target — anti-DX. The gate is applied at the `EventRouter::dispatch` level: `disabled` checks `is_action_event(kind)`, which returns `false` for `Hover`/`PointerEnter`/`PointerExit`. This matches web platform behavior (`pointer-events` on disabled elements still fires `mouseenter`).
+- [x] **`StyleState` layout shared with RFC-0016:** resolved as a **4-variant enum** (`StyleStateKind { Hover, Pressed, Focused, Disabled }`) in `parser/ast.rs`, not a bitflag. The `StyleState` type in `interp/events.rs` is a simple wrapper around a `u8` bitmask built from these variants — the enum names the bits, the mask stores them. RFC-0016's `on <state> { }` resolver queries `EventRouter::style_state(element_idx)` which returns the live mask; each `StyleBlock.state` is matched against it. The layout is: `Hover = 0x01`, `Pressed = 0x02`, `Focused = 0x04`, `Disabled = 0x08`. Future value-widget states (`checked`/`selected`/`invalid`) extend the mask at bits 4–6 without breaking existing styles.
 
 ## Future possibilities
 

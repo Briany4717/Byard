@@ -1,6 +1,6 @@
 # RFC-0007: User-View Instantiation — Composing `View`s Within a File
 
-- **Status:** Draft
+- **Status:** Active — implemented (M30–M35 in `IMPLEMENTATION_4.md`). ViewTable, arg binding, body expansion, recursion/cycles, hot-reload, slots/defaults all landed. Decisions D-A through D-E resolved (IMPL-46–50).
 - **Author(s):** Briany4717
 - **Created:** 2026-06-24
 - **Last updated:** 2026-06-24
@@ -294,13 +294,8 @@ Each decision below is recorded with Context / Decision / Why / Consequences.
 
 ---
 
-## Unresolved questions
+## Resolved questions (formerly unresolved)
 
-- **Generic / typed `View` params beyond RFC-0002's `Type`.** Are `View`-typed
-  params (for slots, D-A) first-class in the type system, or a special form?
-- **Keying for `for`-instantiated views.** When `for` produces N instances of a
-  user view, what is the identity/key model for state preservation on reorder?
-  Likely a sub-RFC alongside RFC-0008's list ergonomics.
-- **Inspector/devtools.** Should instance boundaries be visible to a future
-  inspector, or fully erased by lowering? Affects whether a thin instance marker
-  survives in the render tree.
+- [x] **Generic / typed `View` params (slots, D-A).** Resolved by IMPL-46: slots use an explicit `content` parameter — the callee declares `content: View` and the caller passes a child block. This is a **special form** in the interpreter (the content block is lowered as a closure-like scope splice, not a first-class `View` value), avoiding the complexity of `View`-typed values in the type system. The type checker sees `content` as an opaque child slot, not a generic type parameter. This covers the 95% case (wrappers like `Card`, `Dialog`); multi-slot composition is a future extension.
+- [x] **Keying for `for`-instantiated views.** Deferred — RFC-0002 D7's coarse reconciliation (drop-and-rebuild) applies uniformly to user views and intrinsics. Keyed reconciliation lands only when `N>50` **and** churn is measured (D7's own trigger). State preservation on reorder is a sub-RFC concern, not a user-view concern — the identity model is the same regardless of whether the `for` body is a user view or an intrinsic.
+- [x] **Inspector/devtools.** Resolved: instance boundaries are **fully erased** by lowering. The interpreter expands a user view into its body's intrinsics inline — no marker node survives in the render tree. A future inspector can reconstruct boundaries from the `ViewTable` + call-site spans (the data exists in the compiler, not in the render tree). Keeping the render tree lean is a performance invariant; inspector metadata belongs in a debug side-channel, not in the hot path.
