@@ -59,7 +59,7 @@ View ActionButton(label: Str, accent: Int, hover: Int, on_tap: Fn() = {}) {
     let look = style {
         bg: accent, radius: 12, p: (vertical: 12, horizontal: 18)
         on hover   { bg: hover }
-        on pressed { scale: 0.96 }
+        on pressed { bg: accent, scale: 0.96 }
     }
     Box #[..look, tap => on_tap()] {
         Text(label) #[color: 0xFFFFFF, size: 15, weight: bold]
