@@ -1,6 +1,6 @@
 # RFC-0011: Transform & Paint-Time Properties
 
-- **Status:** Draft — design proposal
+- **Status:** Active — partially implemented (M33 engine primitives, M34 attribute surface, group-transform inheritance landed). All design decisions (T1–T4) and formerly-unresolved questions resolved. Remaining: hierarchical transform stack, group opacity (render-to-texture), text transforms (glyphon limitation).
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
@@ -233,10 +233,10 @@ standard game-engine model-matrix-in-vertex-shader approach.
   deferred** to the hierarchical transform stack (needs render-to-texture). Document
   the difference.
 
-## Unresolved questions (deferred to implementation)
+## Resolved questions (formerly unresolved)
 
-- [ ] std430 field ordering/padding specifics for `Transform` across backends.
-- [ ] When the hierarchical transform stack lands, the group-opacity compositing path.
+- [x] **std430 field ordering/padding for `Transform`:** resolved by implementation (IMPL-82, M33). `Transform` is a plain Rust struct with `translate: [f32; 2]`, `scale: [f32; 2]`, `rotate: f32`, `origin: [f32; 2]`, `opacity: f32` — no explicit `#[repr(C)]` padding needed because the fields are passed to the GPU through `BoxInstance`'s existing per-instance vertex buffer layout (already std430-aligned and validated by `wgsl_validation.rs`). `DecoratedBox` reads transform fields individually from `base.transform` into `DecoratedInstance::from`, not as a raw copy — so field ordering in the Rust struct has no cross-backend consequence. The key invariant: the GPU never sees a `Transform` struct directly; it sees the unpacked fields in the vertex buffer.
+- [x] **Group-opacity compositing path:** deferred by design (IMPL-81, T4). Per-instance opacity landed for `BoxInstance` (via `Transform.opacity`) and `DecoratedBox` (via its own `opacity` field, IMPL-82). **Group opacity** (a container's opacity applied to its composited subtree, not per-child) requires render-to-texture and is explicitly deferred to the hierarchical transform stack — a separate, larger RFC. `TextLine` also lacks transform support (IMPL-81) because `glyphon`'s API has no transform matrix per `TextArea`. Both gaps are documented; neither blocks the current feature set.
 
 ## Future possibilities
 

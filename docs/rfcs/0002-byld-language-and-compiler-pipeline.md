@@ -1,6 +1,6 @@
 # RFC-0002: `byld` Language Definition (Lume surface) — Compiler Pipeline, Automatic Reactivity, and Dev-Mode Interpreter
 
-- **Status:** Draft — all open questions resolved 2026-06-20 (ready for merge review)
+- **Status:** Active — implemented (M1–M15 core, M16–M25 interactive widgets). All design decisions (D1–D12, D4-bis) resolved 2026-06-20; code landed in `byard-compiler` and verified green.
 - **Author(s):** Briany4717
 - **Created:** 2026-06-20
 - **Last updated:** 2026-06-20

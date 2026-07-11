@@ -1,6 +1,6 @@
 # RFC-0013: Zero-Allocation Telemetry & Profiling
 
-- **Status:** Draft — design proposal
+- **Status:** Active — implemented (M30 CPU capture + frame hand-off, M31 GPU timestamps + overlay). Decisions P1–P5 resolved; IMPL-69–75 logged in `DESICIONS.md`.
 - **Author(s):** Brian (byard_v2)
 - **Created:** 2026-07-01
 - **Last updated:** 2026-07-01
@@ -192,10 +192,10 @@ Rust `tracing` span model (but allocation-free and fixed-capacity here).
 - **P5 — backends without timestamp queries:** **degrade to CPU-only with a clear
   overlay notice** (honesty over invented numbers).
 
-## Unresolved questions (deferred to implementation)
+## Resolved questions (formerly unresolved)
 
-- [ ] Whether the flamegraph view ships in the first cut or a follow-up.
-- [ ] Calibration refresh automation (CI job vs manual per release).
+- [x] **Flamegraph view:** deferred to a follow-up. M31 ships the flat-list overlay (scope name + duration, at-a-glance per P2). A flamegraph requires either a tree-structured `SampleBlock` or post-hoc tree reconstruction from the flat ring — both add complexity with no blocking use case today. The flat list is the honest first cut; flamegraph is a natural overlay-panel extension.
+- [x] **Calibration refresh automation:** manual per release (CI infrastructure for benchmarking is not yet in place and would couple the project to a specific CI provider). The `benches/` microbenchmarks run locally; a regression gate in CI (future possibility) is the natural automation point when CI matures.
 
 ## Future possibilities
 
