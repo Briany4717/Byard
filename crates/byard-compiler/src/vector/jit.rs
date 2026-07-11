@@ -8,8 +8,12 @@
 //! This module never touches a `wgpu::Queue` (INV-8) — the render thread
 //! alone applies the resulting uploads.
 //!
-//! The atlas allocator here is a minimal fixed-grid bump allocator (no reuse,
-//! no eviction) — a stand-in until the shelf/skyline + LRU allocator lands.
+//! The atlas allocator is a **free-cell list with LRU eviction** (M48,
+//! IMPL-64). All glyphs are uniform `GRID_SIZE × GRID_SIZE` cells, so a
+//! shelf/skyline allocator would be overkill — a simple free-cell stack is
+//! optimal. When the atlas is full, the least-recently-sampled glyph is
+//! evicted and its cell reused; the evicted handle falls back to the
+//! placeholder → regenerate-on-next-use path (INV-9).
 
 use std::collections::HashMap;
 
@@ -46,6 +50,11 @@ enum CacheEntry {
         upload_id: u64,
         /// Set once the render thread confirms it applied `upload_id`.
         acked: bool,
+        /// Tick at which this glyph was last sampled (via `lookup_or_dispatch`).
+        /// The LRU eviction policy (M48, IMPL-64) evicts the entry with the
+        /// smallest `last_used_tick` when the atlas is full — ensuring actively
+        /// displayed icons are never evicted.
+        last_used_tick: u64,
     },
     /// A hot-reload (RFC-0009 §3, M47) is regenerating this asset. The previous
     /// field's atlas cell is retained in `glyph` so the freshly generated field
@@ -67,20 +76,28 @@ struct JitMessage {
 
 const CELLS_PER_ROW: u32 = ATLAS_SIZE / GRID_SIZE;
 const CELLS_PER_LAYER: u32 = CELLS_PER_ROW * CELLS_PER_ROW;
-/// Fixed layer cap for this minimal allocator. Tied to the atlas the render
-/// thread actually creates ([`ATLAS_LAYERS`]) so the allocator can never hand
-/// out a layer the atlas doesn't have — an upload to a nonexistent layer is
-/// dropped by `VectorAtlas::apply_uploads`. The shelf/skyline + LRU allocator
-/// (M48) replaces this with growth + eviction.
+/// Fixed layer cap. Tied to the atlas the render thread actually creates
+/// ([`ATLAS_LAYERS`]) so the allocator can never hand out a layer the atlas
+/// doesn't have.
 const MAX_LAYERS: u32 = ATLAS_LAYERS;
+/// Total cells across all layers.
+const TOTAL_CELLS: u32 = CELLS_PER_LAYER * MAX_LAYERS;
 
 /// Cache + dispatcher for dev-mode MSDF generation, owned by the interpreter.
 pub struct VectorJit {
     entries: HashMap<String, CacheEntry>,
     sender: Sender<JitMessage>,
     receiver: Receiver<JitMessage>,
-    next_cell: u32,
+    /// Free-cell stack (M48, IMPL-64). Each entry is `(pixel_x, pixel_y,
+    /// layer)`. Initialized with every cell in the atlas; cells are popped on
+    /// alloc and pushed back on eviction or `Failed` cleanup. Since all glyphs
+    /// are uniform `GRID_SIZE × GRID_SIZE`, a free-cell list is optimal — a
+    /// shelf/skyline allocator would add complexity with zero benefit.
+    free_cells: Vec<(u32, u32, u32)>,
     next_upload_id: u64,
+    /// Monotonic tick counter, incremented once per [`drain_ready`] call.
+    /// Used for LRU tracking (INV-2: logic-thread-only).
+    tick: u64,
     /// Receives the ids of uploads the render thread has actually applied
     /// (wired in by the host via [`VectorJit::set_ack_receiver`]; `None` in
     /// contexts with no render thread, e.g. most unit tests — an upload then
@@ -95,12 +112,23 @@ pub struct VectorJit {
 impl Default for VectorJit {
     fn default() -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
+        // Pre-populate the free-cell stack with every cell, last-to-first so
+        // the first `pop()` yields cell (0, 0, 0) — the natural fill order.
+        let mut free_cells = Vec::with_capacity(TOTAL_CELLS as usize);
+        for layer in (0..MAX_LAYERS).rev() {
+            for cy in (0..CELLS_PER_ROW).rev() {
+                for cx in (0..CELLS_PER_ROW).rev() {
+                    free_cells.push((cx * GRID_SIZE, cy * GRID_SIZE, layer));
+                }
+            }
+        }
         Self {
             entries: HashMap::new(),
             sender,
             receiver,
-            next_cell: 0,
+            free_cells,
             next_upload_id: 0,
+            tick: 0,
             ack_receiver: None,
             cache_dir: None,
         }
@@ -139,10 +167,18 @@ impl VectorJit {
         if handle.is_empty() {
             return None;
         }
-        match self.entries.get(handle) {
+        match self.entries.get_mut(handle) {
             // While regenerating, keep returning the *old* resident glyph so the
             // previous field stays on screen until the new one lands (M47).
-            Some(CacheEntry::Resident { glyph, .. } | CacheEntry::Regenerating { glyph }) => {
+            Some(CacheEntry::Resident {
+                glyph,
+                last_used_tick,
+                ..
+            }) => {
+                *last_used_tick = self.tick;
+                return Some(*glyph);
+            }
+            Some(CacheEntry::Regenerating { glyph }) => {
                 return Some(*glyph);
             }
             Some(CacheEntry::Pending | CacheEntry::Failed) => return None,
@@ -233,6 +269,7 @@ impl VectorJit {
     /// render thread happens to skip never permanently loses one. **Logic
     /// thread only** (INV-2) — call once per tick, before building the frame.
     pub fn drain_ready(&mut self) -> Vec<AtlasUpload> {
+        self.tick += 1;
         let mut uploads = Vec::new();
 
         // Mark acknowledged uploads first, so the resend pass below doesn't
@@ -268,14 +305,16 @@ impl VectorJit {
                     // UV slot is stable (M47); a first-time miss allocates one.
                     let cell = match self.entries.get(&msg.handle) {
                         Some(CacheEntry::Regenerating { glyph }) => Some(cell_of(glyph)),
-                        _ => self.alloc_cell(),
+                        _ => self.alloc_cell_or_evict(),
                     };
                     if let Some((x, y, layer)) = cell {
                         just_completed.insert(msg.handle.clone());
                         self.place_glyph(msg.handle, &glyph, x, y, layer, &mut uploads);
                     } else {
+                        // Should never happen: eviction guarantees a cell unless
+                        // every entry is Pending/Regenerating (no evictable target).
                         eprintln!(
-                            "vector atlas is full; {} could not be placed (eviction is not yet implemented)",
+                            "vector atlas is full with no evictable entry; {} could not be placed",
                             msg.handle
                         );
                         self.entries.insert(msg.handle, CacheEntry::Failed);
@@ -305,6 +344,7 @@ impl VectorJit {
                 height,
                 upload_id,
                 acked,
+                ..
             } = entry
             {
                 if !*acked {
@@ -376,21 +416,78 @@ impl VectorJit {
                 height: glyph.height,
                 upload_id,
                 acked: false,
+                last_used_tick: self.tick,
             },
         );
     }
 
-    fn alloc_cell(&mut self) -> Option<(u32, u32, u32)> {
-        let idx = self.next_cell;
-        let layer = idx / CELLS_PER_LAYER;
-        if layer >= MAX_LAYERS {
-            return None;
+    /// Pops a free cell, or LRU-evicts the least-recently-sampled **acked**
+    /// resident glyph to reclaim one (M48, IMPL-64). Evicted handles are
+    /// removed from `entries` so a subsequent `lookup_or_dispatch` dispatches
+    /// a fresh generation — the INV-9 placeholder path handles the one-frame
+    /// gap transparently. Returns `None` only if every cell is occupied by a
+    /// non-evictable entry (Pending, Regenerating, or unacked Resident).
+    fn alloc_cell_or_evict(&mut self) -> Option<(u32, u32, u32)> {
+        if let Some(cell) = self.free_cells.pop() {
+            return Some(cell);
         }
-        let local = idx % CELLS_PER_LAYER;
-        let cx = local % CELLS_PER_ROW;
-        let cy = local / CELLS_PER_ROW;
-        self.next_cell += 1;
-        Some((cx * GRID_SIZE, cy * GRID_SIZE, layer))
+        // Atlas full — find the LRU eviction candidate. Only evict acked
+        // Resident entries: an unacked entry's upload hasn't reached the
+        // render thread yet (evicting it would leak a GPU cell), and
+        // Pending/Regenerating entries have in-flight workers.
+        let victim = self
+            .entries
+            .iter()
+            .filter_map(|(handle, entry)| match entry {
+                CacheEntry::Resident {
+                    acked: true,
+                    last_used_tick,
+                    glyph,
+                    ..
+                } => Some((handle.clone(), *last_used_tick, *glyph)),
+                _ => None,
+            })
+            .min_by_key(|(_, tick, _)| *tick);
+
+        if let Some((handle, _, glyph)) = victim {
+            let cell = cell_of(&glyph);
+            self.entries.remove(&handle);
+            eprintln!(
+                "vector: evicted LRU {handle:?} to reclaim cell ({}, {}, layer {})",
+                cell.0, cell.1, cell.2
+            );
+            Some(cell)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the number of free cells currently available (for testing).
+    #[cfg(test)]
+    fn free_cell_count(&self) -> usize {
+        self.free_cells.len()
+    }
+
+    /// Creates a `VectorJit` with a tiny atlas for tests that need to exercise
+    /// eviction without spawning thousands of threads. `n_cells` cells are
+    /// placed in layer 0, each at `(i * GRID_SIZE, 0)`.
+    #[cfg(test)]
+    fn new_tiny(n_cells: u32) -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut free_cells = Vec::with_capacity(n_cells as usize);
+        for i in (0..n_cells).rev() {
+            free_cells.push((i * GRID_SIZE, 0, 0));
+        }
+        Self {
+            entries: HashMap::new(),
+            sender,
+            receiver,
+            free_cells,
+            next_upload_id: 0,
+            tick: 0,
+            ack_receiver: None,
+            cache_dir: None,
+        }
     }
 }
 
@@ -672,5 +769,156 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── M48: LRU eviction ────────────────────────────────────────────────
+
+    #[test]
+    fn free_cells_are_consumed_and_correct() {
+        let jit = VectorJit::new();
+        assert_eq!(jit.free_cell_count(), TOTAL_CELLS as usize);
+    }
+
+    /// Number of cells for the tiny test atlas — small enough to fill with
+    /// real MSDF generations without spawning thousands of threads.
+    const TINY_CELLS: u32 = 4;
+
+    #[test]
+    fn filling_the_atlas_evicts_the_lru_glyph() {
+        // Use a tiny atlas (4 cells) so we only spawn 5 worker threads total.
+        let mut jit = VectorJit::new_tiny(TINY_CELLS);
+        let (ack_tx, ack_rx) = crossbeam_channel::unbounded();
+        jit.set_ack_receiver(ack_rx);
+
+        let total = TINY_CELLS as usize;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let path = temp_svg(&format!("lru_{i}"), SQUARE_SMALL);
+            assert!(jit.lookup_or_dispatch(&path).is_none());
+            paths.push(path);
+        }
+        // Drain all at once — each gets a cell.
+        loop {
+            let uploads = jit.drain_ready();
+            for up in &uploads {
+                ack_tx.send(up.id).unwrap();
+            }
+            jit.drain_ready();
+            let all_resident = paths.iter().all(|p| jit.lookup_or_dispatch(p).is_some());
+            if all_resident {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(jit.free_cell_count(), 0, "atlas should be full");
+
+        // Access all except the first one to make it the LRU.
+        jit.drain_ready(); // bump tick
+        for p in &paths[1..] {
+            jit.lookup_or_dispatch(p);
+        }
+
+        // Now add one more — it should evict the LRU (paths[0]).
+        let extra = temp_svg("lru_extra", SQUARE_SMALL);
+        assert!(jit.lookup_or_dispatch(&extra).is_none());
+        let uploads = wait_for_drain(&mut jit);
+        assert!(
+            !uploads.is_empty(),
+            "the new glyph must have been placed via LRU eviction"
+        );
+
+        // The evicted glyph (paths[0]) should no longer be resident.
+        assert!(
+            jit.lookup_or_dispatch(&paths[0]).is_none(),
+            "the LRU glyph must have been evicted"
+        );
+        // The new glyph should be resident.
+        assert!(
+            jit.lookup_or_dispatch(&extra).is_some(),
+            "the newly placed glyph must be resident"
+        );
+
+        // Clean up.
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&extra);
+    }
+
+    #[test]
+    fn evicted_then_recalled_glyph_resolves_correctly() {
+        // A glyph that was evicted and then looked up again must dispatch a
+        // fresh generation and resolve correctly — never panic.
+        let mut jit = VectorJit::new_tiny(TINY_CELLS);
+        let (ack_tx, ack_rx) = crossbeam_channel::unbounded();
+        jit.set_ack_receiver(ack_rx);
+
+        let total = TINY_CELLS as usize;
+        let mut paths = Vec::with_capacity(total);
+        for i in 0..total {
+            let path = temp_svg(&format!("recall_{i}"), SQUARE_SMALL);
+            assert!(jit.lookup_or_dispatch(&path).is_none());
+            paths.push(path);
+        }
+        loop {
+            let uploads = jit.drain_ready();
+            for up in &uploads {
+                ack_tx.send(up.id).unwrap();
+            }
+            jit.drain_ready();
+            if paths.iter().all(|p| jit.lookup_or_dispatch(p).is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Make paths[0] the LRU.
+        jit.drain_ready();
+        for p in &paths[1..] {
+            jit.lookup_or_dispatch(p);
+        }
+
+        // Trigger eviction by adding a new glyph.
+        let extra = temp_svg("recall_extra", SQUARE_SMALL);
+        jit.lookup_or_dispatch(&extra);
+        // Drain and ack the extra glyph so its resends don't pollute later drains.
+        loop {
+            let uploads = jit.drain_ready();
+            for up in &uploads {
+                ack_tx.send(up.id).unwrap();
+            }
+            jit.drain_ready();
+            if jit.lookup_or_dispatch(&extra).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // paths[0] was evicted. Look it up again — must re-dispatch.
+        assert!(
+            jit.lookup_or_dispatch(&paths[0]).is_none(),
+            "evicted glyph must return None (placeholder)"
+        );
+        // Drain and ack until the re-dispatched glyph becomes resident.
+        loop {
+            let uploads = jit.drain_ready();
+            for up in &uploads {
+                ack_tx.send(up.id).unwrap();
+            }
+            jit.drain_ready();
+            if jit.lookup_or_dispatch(&paths[0]).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            jit.lookup_or_dispatch(&paths[0]).is_some(),
+            "re-dispatched glyph must be resident again"
+        );
+
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&extra);
     }
 }
