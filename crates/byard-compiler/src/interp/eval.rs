@@ -8167,17 +8167,39 @@ mod tests {
             .find(|(_, b)| (b.color[0] - 0.078).abs() < 0.02)
             .map(|(i, _)| i)
             .expect("base app background emitted");
-        let dialog = frame
+        let (dialog, dialog_box) = frame
             .instances()
             .iter()
             .enumerate()
             .find(|(_, b)| b.color[0] > 0.9 && b.color[1] > 0.85)
-            .map(|(i, _)| i)
+            .map(|(i, b)| (i, *b))
             .expect("dialog surface emitted");
         assert!(
             frame.solid_depths()[dialog] < frame.solid_depths()[base],
             "the modal dialog must composite above the base app"
         );
+
+        // No dialog text line may overflow the dialog surface — line wrap is not
+        // built yet, so the example is authored to fit. Guards the reported
+        // overflow against regression: every dark-on-light label painted inside
+        // the surface must end before the surface's right edge.
+        let mut measurer = byard_core::text::TextMeasurer::new();
+        let surf_left = dialog_box.rect[0];
+        let surf_right = dialog_box.rect[0] + dialog_box.rect[2];
+        for line in frame.texts() {
+            let inside = line.x >= surf_left && line.x < surf_right && line.color[0] < 0.5;
+            if inside {
+                let (w, _) = measurer.measure(&line.text, line.font_size);
+                assert!(
+                    line.x + w <= surf_right + 0.5,
+                    "dialog text {:?} overflows the surface: {} + {} > {}",
+                    line.text,
+                    line.x,
+                    w,
+                    surf_right
+                );
+            }
+        }
     }
 
     #[test]

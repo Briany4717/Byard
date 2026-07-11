@@ -43,15 +43,17 @@ View Main() {
             Text("pokes: {pokes}") #[color: 0x9A94A4, size: 15]
         }
 
-        // Some filler cards so the scrim visibly dims real content.
+        // Some filler cards so the scrim visibly dims real content. Text wrap is
+        // a separate (unbuilt) feature, so each label is one short line that fits
+        // its card's width.
         Row #[gap: 16] {
-            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 260] {
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 300] {
                 Text("Inbox") #[color: 0xECE6F0, size: 18, weight: medium]
-                Text("Nothing behind a modal is clickable.") #[color: 0x9A94A4, size: 13]
+                Text("Blocked while the modal is up.") #[color: 0x9A94A4, size: 13]
             }
-            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 260] {
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 300] {
                 Text("Activity") #[color: 0xECE6F0, size: 18, weight: medium]
-                Text("Tap the scrim or press Escape to dismiss.") #[color: 0x9A94A4, size: 13]
+                Text("Tap the scrim or press Escape.") #[color: 0x9A94A4, size: 13]
             }
         }
     }
@@ -78,12 +80,13 @@ View Main() {
             // Scrim: a dim, semi-transparent sheet filling the viewport (grow).
             Box #[bg: 0x000000, opacity: 0.45, grow: 1] {}
 
-            // Dialog surface, centred (Material-ish).
+            // Dialog surface, centred (Material-ish). One short line per `Text`
+            // (line wrap is a separate, unbuilt feature), sized to the surface.
             Column #[anchor: center, bg: 0xECE6F0, radius: 28, shadow: "lg",
-                     p: 24, gap: 16, width: 340] {
+                     p: 24, gap: 12, width: 380] {
                 Text("Delete this file?") #[color: 0x1D1B20, size: 22, weight: medium]
-                Text("This can't be undone. The overlay traps focus and blocks the app until you choose.")
-                    #[color: 0x49454F, size: 14]
+                Text("This action can't be undone.") #[color: 0x49454F, size: 14]
+                Text("The modal blocks the app behind it.") #[color: 0x49454F, size: 14]
                 Row #[gap: 8, justify: end] {
                     Button("Cancel") #[bg: 0xE7E0EC, radius: 20,
                                        p: (vertical: 10, horizontal: 18), color: 0x6750A4]
