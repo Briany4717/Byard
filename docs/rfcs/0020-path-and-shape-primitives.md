@@ -256,23 +256,40 @@ RFC-0003 forbids. Declarative shape commands fit the reactive model: when
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Gradient support.** Should `fill` accept gradients (`linear(...)`,
-    `radial(...)`) or only solid colors? Recommendation: solid only in v1;
-    gradients are a separate concern.
-  - [ ] **Shape hit-testing.** Are individual shapes within a Canvas
-    hit-testable, or only the Canvas rect? Recommendation: Canvas rect only;
-    per-shape hit-testing adds complexity for little gain.
-  - [ ] **Tier selection.** Is the tier (analytic vs. MSDF) automatic based on
-    shape type, or can the developer force one? Recommendation: automatic.
+  - [x] **Gradient support.** **Solid colors only in v1.** `fill` and `stroke`
+    accept `Color` values. Gradients (`linear(...)`, `radial(...)`, `conic(...)`)
+    are deferred to a follow-up RFC — they require additional shader variants
+    and a gradient stop interpolation pipeline. Documented in Future
+    possibilities.
+  - [x] **Shape hit-testing.** **Canvas rect only.** Individual shapes within a
+    Canvas are not hit-testable; pointer events fire on the Canvas element's
+    bounding rect. Per-shape hit-testing would require SDF evaluation on the
+    CPU per pointer event — expensive and rarely needed (most Canvas uses are
+    decorative: progress indicators, spinners, badges). If a developer needs
+    per-shape interaction, they overlay transparent `Box` elements with
+    pointer handlers.
+  - [x] **Tier selection.** **Automatic.** The compiler selects the rendering
+    tier based on shape type: `arc`, `circle`, `rect`, `line` → Tier 1
+    (analytic SDF); `path`, `bezier` → Tier 2 (VectorMSDF). No manual
+    override. Rationale: the developer shouldn't need to know about rendering
+    internals. If a future profiling need arises, a `render_hint` prop can
+    be added.
 
 - **During implementation:**
-  - [ ] **Anti-aliasing quality.** The analytic SDF approach needs tuning for
-    thin strokes at small sizes. Test with 1px strokes on high-DPI displays.
-  - [ ] **Batch limits.** How many shape instances per Canvas before performance
-    degrades? Set a reasonable limit with a diagnostic.
+  - [x] **Anti-aliasing quality.** The analytic SDF approach uses
+    `fwidth()`-based anti-aliasing, which scales correctly with DPI. For thin
+    strokes (≤1px logical), clamp the minimum rendered width to 1 physical
+    pixel and reduce alpha proportionally (sub-pixel stroke rendering). Test
+    matrix: 1px/2px/4px strokes × @1x/@2x/@3x DPI during the milestone.
+  - [x] **Batch limits.** Warn at **64 shapes per Canvas** via
+    `CompileWarning::CanvasShapeCount`. This covers all real UI patterns
+    (a Cupertino activity indicator has ~12 arcs, a complex gauge ~20 shapes).
+    The limit is a diagnostic, not a hard cap — the engine renders all shapes
+    but flags performance risk. The uniform buffer supports up to 256 shapes
+    before requiring a second draw call.
 
 ---
 

@@ -263,22 +263,36 @@ work (one at a time, the latest one wins).
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Relative anchoring.** Should `anchor: relative(element_id)` ship in
-    v1, or is coordinate-passing sufficient for menus/tooltips initially?
-  - [ ] **Nested overlays.** Can an overlay's content mount another overlay?
-    (Needed for a menu inside a dialog.) Recommendation: yes, they stack.
-  - [ ] **Transition on dismiss.** When `when` unmounts the overlay, animated
-    children are immediately destroyed. Should there be a `leave` transition
-    mechanism (deferred to RFC-0025)?
+  - [x] **Relative anchoring.** Deferred to post-v1. Coordinate-passing
+    (the caller computes position and passes it as `x`/`y` props) is sufficient
+    for menus and tooltips initially. Relative anchoring (`anchor: relative(ref)`)
+    requires an element-reference mechanism that conflicts with RFC-0003's
+    reference-free model; the proper solution is a layout-query API designed
+    later. Documented in Future possibilities.
+  - [x] **Nested overlays.** Yes — an overlay's content can mount another
+    overlay. They stack in declaration order within the overlay layer. This is
+    required for common patterns (confirmation dialog inside a bottom sheet,
+    submenu inside a menu). The overlay stack is a flat list; nesting is just
+    sequential pushes.
+  - [x] **Transition on dismiss.** Deferred to RFC-0025's `on unmount { ... }`
+    future possibility. For v1, `when` unmount is instant. Developers can
+    work around this by animating `opacity → 0` before flipping the `when`
+    condition to false (two-step dismiss pattern).
 
 - **During implementation:**
-  - [ ] **Scissor interaction.** An overlay child that extends beyond the
-    viewport — clamp or allow offscreen painting?
-  - [ ] **Accessibility.** Modal overlays must trap focus (Tab cycles within the
-    overlay). Wire this with RFC-0003 E3's focus system.
+  - [x] **Scissor interaction.** Clamp to viewport. Overlay children that extend
+    beyond the viewport are scissored at the viewport edge. This prevents
+    offscreen painting waste and matches platform behavior (iOS/Android both
+    clip overlays to screen bounds). A future `allow_offscreen: true` prop
+    could relax this for edge cases.
+  - [x] **Accessibility.** Modal overlays trap focus: Tab cycles within the
+    overlay's focusable children, wrapping from last to first. This is wired
+    through RFC-0003 E3's focus system — the overlay sets a `focus_scope` that
+    restricts traversal. Non-modal overlays do not trap focus. `Escape` key
+    dismisses the topmost modal overlay (fires a `dismiss` event).
 
 ---
 

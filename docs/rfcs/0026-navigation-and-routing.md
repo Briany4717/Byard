@@ -340,25 +340,56 @@ tab switch as a stack push) breaks the mental model and the back-button contract
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Route parameter types.** Should `:id` always be `Str`, or can routes
-    declare typed params (`:id(Int)`)? Recommendation: `Str` only in v1; the
-    View's `Fn` params can parse as needed.
-  - [ ] **Nested NavStacks.** A tab containing its own NavStack (common pattern:
-    each tab has independent navigation). Recommendation: supported — each
-    NavStack manages its own stack independently.
-  - [ ] **Shared-element (hero) transitions.** Should this RFC include a
-    `hero_tag` prop for cross-route element matching? Recommendation: deferred
-    to a follow-up — the rendering is complex (element must animate between two
-    layout positions during the transition).
+  - [x] **Route parameter types.** **`Str` only in v1.** All route parameters
+    (`:id`, `:uid`, `:slug`) resolve to `Str`. The View receiving the param
+    parses as needed (`let id_num = Int(params.id)`). Typed params (`:id(Int)`)
+    would require runtime type-checking in the route trie and error handling
+    for mismatches — complexity with minimal benefit since the parse happens
+    one line later anyway. Revisit if the type system gains enum route params.
+  - [x] **Nested NavStacks.** **Supported.** Each NavStack manages its own
+    stack independently. A tab containing a NavStack:
+    ```byld
+    NavHost(active: tab) {
+        tab "home" {
+            NavStack(path: homePath) { ... }
+        }
+        tab "profile" {
+            NavStack(path: profilePath) { ... }
+        }
+    }
+    ```
+    Each NavStack has its own `path` var, its own history stack, and its own
+    back-button behavior. The system back button pops the *active tab's*
+    NavStack. This is the standard mobile pattern (iOS UITabBarController +
+    UINavigationController per tab, Android bottom nav + NavController).
+  - [x] **Shared-element (hero) transitions.** **Deferred.** Hero transitions
+    require: (a) matching elements across two route trees by tag, (b) computing
+    both elements' screen-space rects during the transition, (c) animating a
+    floating clone between the two positions. This is complex rendering work
+    that deserves its own RFC. Documented in Future possibilities.
 
 - **During implementation:**
-  - [ ] **Memory pressure.** How many preserved routes before the engine warns
-    or evicts old state? Recommendation: warn at 10 stack depth; configurable.
-  - [ ] **Route guards.** Can a route be conditionally accessible (auth check)?
-    Recommendation: the route's `when` block handles this — no special guard API.
+  - [x] **Memory pressure.** Warn at **10 stack depth** via
+    `PerfWarning::DeepNavStack`. Above 10, the engine still works but the
+    warning flags likely navigation bugs (forgetting to pop, infinite push
+    loops). Configurable via `NavStack(max_depth: N)` prop — set to 0 to
+    disable the warning. At `max_depth`, further pushes are rejected with a
+    runtime warning (not a crash).
+  - [x] **Route guards.** **No special guard API.** Route access control is
+    handled with `when` blocks inside the route:
+    ```byld
+    route "/admin" {
+        when isAuthenticated { AdminPage() }
+        else { LoginPage() }
+    }
+    ```
+    This is the declarative Byard way — no imperative `canActivate()` hooks,
+    no guard middleware. The `when` block already handles conditional rendering,
+    and the navigation state (`navPath`) can be redirected from the `else`
+    branch (`navPath = "/login"`).
 
 ---
 

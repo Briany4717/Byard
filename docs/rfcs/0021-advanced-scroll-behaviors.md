@@ -259,23 +259,49 @@ interpolate), and avoids the layout complexity.
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Custom refresh indicator.** Slot-based (`refresh_content: { ... }`) vs.
-    engine default themed by the design system. Recommendation: slot-based for
-    maximum flexibility.
-  - [ ] **Nested scroll coordination.** A vertical `ScrollView` containing a
-    horizontal snapping `ScrollView` — how do they share gesture priority?
-  - [ ] **`scroll_fraction` injection.** Is `scroll_fraction` a magic binding
-    available in the header's scope, or must it be explicitly declared?
-    Recommendation: implicit binding within a `collapse_header` child.
+  - [x] **Custom refresh indicator.** **Slot-based.** The `pull_refresh` prop
+    accepts an optional content block:
+    ```byld
+    ScrollView #[pull_refresh: { MySpinner(progress: refresh_progress) }]
+    ```
+    If no content block is provided, the engine renders a default circular
+    indicator (a simple arc, styled by the active theme). The slot receives
+    an implicit `refresh_progress: Float` binding (0.0 = idle, 1.0 = threshold
+    reached, >1.0 = overscroll). This gives design systems full control
+    (Material uses a circular indicator, Cupertino uses a different spinner)
+    while providing a sensible default.
+  - [x] **Nested scroll coordination.** **Axis-based priority.** The inner
+    ScrollView captures gestures along its scroll axis; the outer captures
+    the orthogonal axis. A vertical outer + horizontal inner: horizontal
+    swipes go to the inner, vertical swipes go to the outer. When axes match
+    (vertical inside vertical), the inner ScrollView consumes the gesture
+    until it hits its scroll extent, then the outer takes over (scroll
+    chaining). This matches platform behavior (iOS nested UIScrollView,
+    Android NestedScrollView). Formalized as: the innermost ScrollView whose
+    axis matches the gesture direction gets priority; overflow chains upward.
+  - [x] **`scroll_fraction` injection.** **Implicit binding.** Within a
+    `collapse_header { ... }` child block, `scroll_fraction` is available
+    as an implicit reactive binding (0.0 = fully expanded, 1.0 = fully
+    collapsed). No explicit `var` declaration needed. This is consistent
+    with the implicit `refresh_progress` in pull-to-refresh and with
+    `route.params` in RFC-0026. The binding is scoped — it only exists
+    inside `collapse_header`, not in the broader ScrollView scope.
 
 - **During implementation:**
-  - [ ] **Fling velocity threshold.** Below what velocity does snap just spring
-    to the nearest instead of projecting to the next item?
-  - [ ] **Overscroll elasticity curve.** Tune the diminishing-returns exponent
-    per platform (iOS is bouncier than Android).
+  - [x] **Fling velocity threshold.** **150 dp/s.** Below this velocity, snap
+    springs to the nearest item. Above, the engine projects the fling and
+    targets the item the velocity would reach, clamped to ±1 item (no
+    multi-item skip on moderate fling). This threshold is tunable per
+    platform via an engine constant. Derived from iOS's
+    `UIScrollView.decelerationRate` behavior at the snap boundary.
+  - [x] **Overscroll elasticity curve.** Platform-specific exponent:
+    `offset = raw_offset * (1 / (1 + raw_offset / max_overscroll)^exp)`.
+    iOS: `exp = 0.55` (bouncier, matches UIScrollView). Android: `exp = 0.75`
+    (stiffer, matches EdgeEffect). Desktop: `exp = 1.0` (no rubber-banding,
+    hard stop). These are engine constants, not developer-facing props.
 
 ---
 

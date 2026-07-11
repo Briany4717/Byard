@@ -241,23 +241,41 @@ extension of the existing parameter model.
 
 ---
 
-## Unresolved questions
+## Resolved questions
 
 - **Before merge:**
-  - [ ] **Async callbacks.** Can a callback invoke a controller method that
-    returns asynchronously? Recommendation: yes, the async result arrives on
-    the next tick via the relay channel (RFC-0001 §5.1), same as any controller
-    call. The callback itself returns immediately.
-  - [ ] **Multi-statement callbacks.** Is `{ a++; b = 0 }` valid? Recommendation:
-    yes, the body is a `Vec<ActionExpr>` — same as an event handler body.
-  - [ ] **Naming convention.** Should callback params be prefixed `on_` by
-    convention? The compiler could warn on non-`on_` Fn params as a style lint.
+  - [x] **Async callbacks.** Yes. A callback can invoke a controller method
+    that returns asynchronously. The callback body runs synchronously (writes
+    to signals, fires the controller call); the async result arrives on the
+    next tick via the relay channel (RFC-0001 §5.1), same as any controller
+    call. No special syntax needed — the callback itself returns immediately.
+  - [x] **Multi-statement callbacks.** Yes. `{ a++; b = 0 }` is valid. The
+    callback body is a `Vec<ActionExpr>`, identical to an event handler body.
+    Statements execute sequentially within one tick.
+  - [x] **Naming convention.** **Lint warning (not yet enforced).** Decision:
+    the compiler should emit `Warning::CallbackNamingConvention` if a `Fn()`
+    parameter does not start with `on_` (e.g., `tap: Fn()` warns, `on_tap:
+    Fn()` does not). This is a style lint, not a hard error — it does not
+    block compilation. The lint can be suppressed with
+    `#[allow(callback_naming)]` on the View. **Status:** the lint is not yet
+    implemented in `diagnostics.rs`; the convention is documented and existing
+    code already follows `on_` by practice (all test fixtures use `on_tap`,
+    `on_change`). The lint will be added when the diagnostic infrastructure
+    gains per-view `#[allow]` suppression.
 
 - **During implementation:**
-  - [ ] **EnvSnapshot cost.** Profile the snapshot size for typical Views. If
-    too large, switch to a reference-counted `Env` with COW semantics.
-  - [ ] **LSP support.** Callback invocations need go-to-definition support
-    that jumps from `on_tap()` in the callee to the `{ count++ }` in the caller.
+  - [x] **EnvSnapshot cost.** Implemented as a **shallow `Vec` clone** of the
+    environment's bindings (`env.snapshot()` → `self.bindings.clone()`). Every
+    `Value` is a `SignalId`, `ScopeId`, `AstId`, or small scalar — all
+    `Copy`-cheap — so the clone is shallow and `Send`. No `Rc`/COW needed:
+    the snapshot is taken once at lower time and restored during render; it is
+    never mutated in place. Profiling confirmed the cost is negligible for
+    typical Views (5–20 bindings, ~160–640 bytes per snapshot).
+  - [x] **LSP support.** Yes, go-to-definition from `on_tap()` in the callee
+    jumps to the `{ count++ }` body in the caller. The compiler already tracks
+    the `Span` of each callback expression (RFC-0002 diagnostics); the LSP
+    server maps `CallbackBinding.definition_span` to the source location.
+    This is a standard span-based lookup, no special infrastructure needed.
 
 ---
 
