@@ -106,6 +106,16 @@ pub enum CompileError {
         /// Source range of the offending target.
         span: Span,
     },
+    /// A `theme.<field>` access named a token the active theme does not declare
+    /// in any of its color / typography / shape namespaces (RFC-0022 §1).
+    UnknownThemeToken {
+        /// Source range of the member access.
+        span: Span,
+        /// The unknown token name (`camelCase`).
+        field: String,
+        /// The theme's name, for the message.
+        theme: String,
+    },
     /// An element name is neither a known intrinsic nor a `ViewDecl` in scope
     /// (RFC-0002 D4); `hint` carries a Levenshtein "did you mean …?".
     UnknownView {
@@ -429,6 +439,7 @@ impl CompileError {
             | Self::TextUsedAsType { span }
             | Self::UnresolvedInject { span, .. }
             | Self::NotAssignable { span }
+            | Self::UnknownThemeToken { span, .. }
             | Self::UnknownView { span, .. }
             | Self::UnknownAttribute { span, .. }
             | Self::WrongAttributeSeparator { span, .. }
@@ -479,6 +490,7 @@ impl CompileError {
             | Self::TextUsedAsType { span }
             | Self::UnresolvedInject { span, .. }
             | Self::NotAssignable { span }
+            | Self::UnknownThemeToken { span, .. }
             | Self::UnknownView { span, .. }
             | Self::UnknownAttribute { span, .. }
             | Self::WrongAttributeSeparator { span, .. }
@@ -531,6 +543,7 @@ impl CompileError {
             Self::TextUsedAsType { .. } => "TextUsedAsType",
             Self::UnresolvedInject { .. } => "UnresolvedInject",
             Self::NotAssignable { .. } => "NotAssignable",
+            Self::UnknownThemeToken { .. } => "UnknownThemeToken",
             Self::UnknownView { .. } => "UnknownView",
             Self::UnknownAttribute { .. } => "UnknownAttribute",
             Self::WrongAttributeSeparator { .. } => "WrongAttributeSeparator",
@@ -591,6 +604,10 @@ impl CompileError {
                 format!("no ambient `{name}` is provided by any ancestor view")
             }
             Self::NotAssignable { .. } => "this is not an assignable `var`".to_string(),
+            Self::UnknownThemeToken { field, theme, .. } => format!(
+                "theme `{theme}` declares no token `{field}` \
+                 (checked color, typography, and shape namespaces)"
+            ),
             Self::UnknownView { name, hint, .. } => {
                 with_hint(format!("unknown view `{name}`"), hint.as_deref())
             }

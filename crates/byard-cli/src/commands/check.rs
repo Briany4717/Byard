@@ -21,7 +21,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         println!("  {n_files} file(s), {n_pkgs} package(s)");
     }
 
-    let errors = check_program(&program);
+    let errors = check_program_with_theme(&program, manifest.theme);
 
     if errors.is_empty() {
         println!("  ok (0 errors)");
@@ -47,12 +47,25 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
 /// exercised across the whole module graph.
 #[must_use]
 pub fn check_program(program: &ResolvedProgram) -> Vec<CompileError> {
+    check_program_with_theme(program, byard_compiler::interp::theme::Theme::byard_base())
+}
+
+/// Like [`check_program`], but validates against a specific design-token theme
+/// (RFC-0022) so `inject Theme as t` resolves and `t.token` references are
+/// checked against the project's *actual* declared tokens — a custom manifest
+/// token must not be flagged `UnknownThemeToken`.
+#[must_use]
+pub fn check_program_with_theme(
+    program: &ResolvedProgram,
+    theme: byard_compiler::interp::theme::Theme,
+) -> Vec<CompileError> {
     if !program.errors.is_empty() {
         return program.errors.clone();
     }
 
     let known: Vec<&str> = program.views.iter().map(|v| v.name.as_str()).collect();
     let mut interp = Interpreter::new();
+    interp.set_theme(theme);
     // Build the user-`View` registry once for the whole program so user-view
     // calls resolve and expand during lowering (RFC-0007 §1).
     interp.load_views(&program.views);

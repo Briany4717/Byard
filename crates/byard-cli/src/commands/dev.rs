@@ -94,6 +94,7 @@ pub fn run(file: Option<&Path>) -> Result<(), String> {
         vector_cache_dir,
         initial_views,
         initial_errors,
+        initial_theme: manifest.theme.clone(),
         last_gpu_telemetry: byard_core::telemetry::SampleBlock::default(),
         last_telemetry_print: std::time::Instant::now(),
     })
@@ -367,6 +368,9 @@ struct App {
     vector_cache_dir: PathBuf,
     initial_views: Vec<ViewDecl>,
     initial_errors: Vec<CompileError>,
+    /// The resolved design-token theme (RFC-0022), installed on the interpreter
+    /// so `inject Theme as t` resolves and `t.token` references paint.
+    initial_theme: byard_compiler::interp::theme::Theme,
     /// This (render/main) thread's GPU telemetry ring, drained on **every**
     /// redraw — not just when about to print — so it only ever holds
     /// samples produced since the *previous redraw*. `byard dev`'s Poll-mode
@@ -449,6 +453,7 @@ impl PlatformHost for App {
         std::mem::forget(watcher);
 
         let initial_views = self.initial_views.clone();
+        let initial_theme = self.initial_theme.clone();
         let initial_errors = if self.initial_errors.is_empty() {
             None
         } else {
@@ -476,9 +481,14 @@ impl PlatformHost for App {
 
         engine.start_logic_from_view(move |_arena| {
             let (mut interp, tree, current_views) = if initial_views.is_empty() {
-                (Interpreter::new(), vec![], vec![])
+                let mut interp = Interpreter::new();
+                interp.set_theme(initial_theme);
+                (interp, vec![], vec![])
             } else {
                 let mut interp = Interpreter::new();
+                // Install the theme (RFC-0022) before lowering so `inject Theme`
+                // resolves and token references paint from the first frame.
+                interp.set_theme(initial_theme);
                 interp.load_views(&initial_views);
                 let known: Vec<&str> = initial_views.iter().map(|v| v.name.as_str()).collect();
                 let tree = interp.lower_view(&initial_views[0], &known);

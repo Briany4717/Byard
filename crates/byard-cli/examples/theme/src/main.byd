@@ -1,0 +1,41 @@
+// RFC-0022 — theme runtime: manifest-declared reactive design tokens.
+//
+// Run it (from the repo root):
+//   cargo run -p byard-cli -- dev crates/byard-cli/examples/theme
+//
+// The colours, type scale, and corner radii below come from `byard.toml`
+// `[theme]`, not from hex literals in this file. `inject Theme as t` binds the
+// engine-resolved theme; `t.primary`, `t.titleLarge`, `t.cornerLg` resolve
+// against the *active* scheme. Tapping either control flips `t.dark`, which is a
+// single reactive write that recolours the entire tree in one tick — every `bg`
+// / `color` that reads a token animates via `with anim` (RFC-0010).
+View Main() {
+    inject Theme as t
+
+    Column #[bg: t.surface with anim.spring(), p: 32, gap: 20, width: 520] {
+        Text("Theme runtime") #[typo: t.headlineLarge, color: t.onSurface]
+        Text("Colour, type, and shape from the manifest — no hex literals here.")
+            #[typo: t.bodyLarge, color: t.onSurfaceVariant]
+
+        // A filled card painted entirely from tokens.
+        Column #[bg: t.primaryContainer with anim.spring(), radius: t.cornerXl,
+                 p: 20, gap: 8] {
+            Text("Primary container") #[typo: t.titleLarge,
+                                        color: t.onPrimaryContainer with anim.spring()]
+            Box #[bg: t.primary with anim.spring(), radius: t.cornerMd,
+                  p: (10, 16)] {
+                Text("Primary") #[typo: t.labelLarge, color: t.onPrimary]
+            }
+        }
+
+        // Two ways to switch the scheme, both writing the same reactive flag.
+        Row #[gap: 12, align: center] {
+            Box #[bg: t.surfaceContainer, radius: t.cornerLg, p: (10, 16),
+                  tap => t.dark = t.dark ? false : true] {
+                Text("Toggle light / dark") #[typo: t.labelLarge, color: t.onSurface]
+            }
+            Toggle #[bind: t.dark, bg: t.primary, width: 52, height: 30]
+            Text("Scheme: {t.mode}") #[typo: t.bodyLarge, color: t.onSurfaceVariant]
+        }
+    }
+}
