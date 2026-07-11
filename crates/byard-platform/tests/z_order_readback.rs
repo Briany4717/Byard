@@ -262,3 +262,77 @@ fn later_box_occludes_earlier_text() {
          expected green at ({gx},{gy}), got BGR=({b},{g},{r})"
     );
 }
+
+/// RFC-0017 regression: a **translucent** box emitted after text must NOT cull
+/// it. A translucent box (an overlay scrim, a see-through fill) blends over what
+/// is already drawn; it must not write draw-order depth, or every earlier text
+/// glyph beneath it — drawn in the later text pass at a farther depth — would
+/// fail the depth test and vanish. This is the "all app text disappears under a
+/// modal scrim" bug. Contrast with `later_box_occludes_earlier_text`, where an
+/// *opaque* box legitimately occludes the text.
+#[test]
+fn translucent_box_over_text_does_not_cull_it() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping z-order readback");
+        return;
+    };
+
+    let (w, h) = (400.0_f32, 200.0_f32);
+    let text = || TextLine {
+        x: 40.0,
+        y: 60.0,
+        text: "SCRIM".to_string(),
+        font_size: 64.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        dirty: true,
+    };
+
+    // ── Render A: text only. Find the reddest glyph pixel. ──
+    let mut frame_a = RenderFrame::new();
+    frame_a.push_text(text());
+    let rb_a = render(&device, &queue, &frame_a, w, h);
+
+    let mut best = None;
+    let mut best_red = 0i32;
+    let mut ly = 40.0_f32;
+    while ly < 130.0 {
+        let mut lx = 40.0_f32;
+        while lx < 360.0 {
+            let (b, g, r, _a) = rb_a.at(lx, ly);
+            let redness = i32::from(r) - i32::from(b).max(i32::from(g));
+            if redness > best_red {
+                best_red = redness;
+                best = Some((lx, ly));
+            }
+            lx += 2.0;
+        }
+        ly += 2.0;
+    }
+    let (gx, gy) = best.expect("text-only render must contain a glyph pixel");
+    assert!(
+        best_red > 40,
+        "expected a clearly red glyph pixel, got {best_red}"
+    );
+
+    // ── Render B: same text, then a TRANSLUCENT green box (opacity 0.5) emitted
+    // AFTER it covering the whole band. Because the box does not write depth, the
+    // text still passes the depth test and paints on top — the glyph pixel stays
+    // red-dominant (not culled to green).
+    let mut frame_b = RenderFrame::new();
+    frame_b.push_text(text());
+    frame_b.push_decorated(DecoratedBox {
+        base: solid([30.0, 20.0, 340.0, 100.0], [0.0, 0.85, 0.2, 1.0]),
+        opacity: 0.5,
+        dirty: true,
+        ..Default::default()
+    });
+    let rb_b = render(&device, &queue, &frame_b, w, h);
+
+    let (b, g, r, a) = rb_b.at(gx, gy);
+    assert!(a > 10, "pixel must be opaque, got alpha {a}");
+    assert!(
+        r > g && r > b,
+        "text under a translucent box must survive (red-dominant), not be culled; \
+         got BGR=({b},{g},{r}) at ({gx},{gy})"
+    );
+}

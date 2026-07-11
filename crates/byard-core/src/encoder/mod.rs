@@ -176,6 +176,10 @@ pub struct EncoderSubsystem {
     /// `DecoratedBox` pipeline (M21) — border/shadow/opacity boxes. Shares the
     /// viewport bind group (group 0) with `SolidBox`.
     decorated_pipeline: wgpu::RenderPipeline,
+    /// Depth-write-disabled `DecoratedBox` pipeline for translucent boxes
+    /// (RFC-0017 overlay scrim / see-through fills), so they blend without
+    /// culling the app text drawn beneath them.
+    decorated_pipeline_no_depth: wgpu::RenderPipeline,
     /// `TextureSampler` pipeline (M21) — `Image` quads.
     texture_pipeline: wgpu::RenderPipeline,
     /// Texture+sampler bind group layout (group 1) for `texture_pipeline`.
@@ -440,8 +444,13 @@ impl EncoderSubsystem {
         let text_pipeline = TextGlyphPipeline::new(&device, &queue, surface_format).await?;
 
         // M21 pipelines (RFC-0001 §3.1).
-        let (decorated_pipeline, texture_pipeline, texture_bind_group_layout, image_sampler) =
-            build_m21_pipelines(&device, &bind_group_layout, surface_format).await?;
+        let (
+            decorated_pipeline,
+            decorated_pipeline_no_depth,
+            texture_pipeline,
+            texture_bind_group_layout,
+            image_sampler,
+        ) = build_m21_pipelines(&device, &bind_group_layout, surface_format).await?;
 
         // `VectorMSDF` pipeline (RFC-0009 §1, the fifth pipeline).
         let vector_atlas_layout = vector_msdf::bind_group_layout(&device);
@@ -490,6 +499,7 @@ impl EncoderSubsystem {
             viewport_bind_group,
             text_pipeline,
             decorated_pipeline,
+            decorated_pipeline_no_depth,
             texture_pipeline,
             texture_bind_group_layout,
             image_sampler,
@@ -802,6 +812,7 @@ impl EncoderSubsystem {
                     solid: &self.render_pipeline,
                     clear: &self.clear_pipeline,
                     decorated: &self.decorated_pipeline,
+                    decorated_no_depth: &self.decorated_pipeline_no_depth,
                     texture: &self.texture_pipeline,
                     vector: &self.vector_pipeline,
                 },
@@ -1046,6 +1057,8 @@ struct DrawPipelines<'a> {
     solid: &'a wgpu::RenderPipeline,
     clear: &'a wgpu::RenderPipeline,
     decorated: &'a wgpu::RenderPipeline,
+    /// Depth-write-disabled decorated pipeline for translucent boxes (RFC-0017).
+    decorated_no_depth: &'a wgpu::RenderPipeline,
     texture: &'a wgpu::RenderPipeline,
     vector: &'a wgpu::RenderPipeline,
 }
@@ -1151,6 +1164,7 @@ fn draw_ui_pass(
         solid: render_pipeline,
         clear: clear_pipeline,
         decorated: decorated_pipeline,
+        decorated_no_depth: decorated_pipeline_no_depth,
         texture: texture_pipeline,
         vector: vector_pipeline,
     } = *pipelines;
@@ -1265,6 +1279,7 @@ fn draw_ui_pass(
         &mut render_pass,
         device,
         decorated_pipeline,
+        decorated_pipeline_no_depth,
         viewport_bind_group,
         quad_buffer,
         decorated,
@@ -1745,6 +1760,7 @@ async fn build_m21_pipelines(
     (
         wgpu::RenderPipeline,
         wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
         wgpu::BindGroupLayout,
         wgpu::Sampler,
     ),
@@ -1760,8 +1776,25 @@ async fn build_m21_pipelines(
         }],
     };
 
-    let decorated_pipeline =
-        decorated_box::build_pipeline(device, viewport_layout, quad(), surface_format).await?;
+    let decorated_pipeline = decorated_box::build_pipeline(
+        device,
+        viewport_layout,
+        quad(),
+        surface_format,
+        draw_depth_stencil(),
+    )
+    .await?;
+    // RFC-0017: the depth-write-disabled variant for translucent decorated boxes
+    // (a modal scrim / see-through fill), so they blend without culling the app
+    // text drawn beneath them.
+    let decorated_pipeline_no_depth = decorated_box::build_pipeline(
+        device,
+        viewport_layout,
+        quad(),
+        surface_format,
+        draw_depth_stencil_no_write(),
+    )
+    .await?;
 
     let texture_bind_group_layout = texture_sampler::bind_group_layout(device);
     let image_sampler = texture_sampler::sampler(device);
@@ -1776,6 +1809,7 @@ async fn build_m21_pipelines(
 
     Ok((
         decorated_pipeline,
+        decorated_pipeline_no_depth,
         texture_pipeline,
         texture_bind_group_layout,
         image_sampler,
@@ -1794,6 +1828,23 @@ pub(crate) fn draw_depth_stencil() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Depth-stencil state for **translucent** decorated boxes (RFC-0017 overlay
+/// scrim / see-through fills): still *tests* draw-order depth (`LessEqual`, so a
+/// nearer opaque surface occludes it) but does **not** *write* it. A translucent
+/// box blends over what is already drawn; writing its nearer depth would cull
+/// every earlier-emitted primitive drawn in a later pass (most visibly all app
+/// text beneath a modal scrim). `pub(crate)` so the encoder can build the
+/// second decorated pipeline from it.
+pub(crate) fn draw_depth_stencil_no_write() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
         depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
