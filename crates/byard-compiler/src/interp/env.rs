@@ -51,6 +51,12 @@ pub enum Value {
     Signal(SignalId),
     /// A computed memo (`let`/`fn`), referenced by its reactive scope id.
     Memo(ScopeId),
+    /// An injected design-token theme (RFC-0022). The [`SignalId`] backs the
+    /// active scheme's dark flag (`Bool`): reading a token (`theme.primary`)
+    /// tracks it, and `theme.dark = …` writes it, so a scheme flip drives
+    /// Mark-and-Pull across every token reference. Token data itself lives on
+    /// the interpreter's [`Theme`](crate::interp::theme::Theme).
+    Theme(SignalId),
     /// The unit value (e.g. the result of a mutation).
     Unit,
 }

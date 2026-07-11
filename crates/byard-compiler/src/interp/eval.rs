@@ -285,8 +285,13 @@ pub struct Interpreter {
     /// Glyph-accurate text measurer, created lazily on first layout so the
     /// non-rendering paths (parsing, reactivity tests) never load fonts.
     text_measurer: Option<byard_core::text::TextMeasurer>,
-    /// Active design-token theme (M22, D5 layer 1).
+    /// Active design-token theme (RFC-0022; the theme-default layer).
     pub theme: super::theme::Theme,
+    /// The reactive `Bool` signal backing the theme's active scheme (`true` ⇒
+    /// dark), created by [`set_theme`](Self::set_theme). `theme.primary` reads it
+    /// (tracked) and `theme.dark = …` / `bind: theme.dark` writes it, so a scheme
+    /// flip drives Mark-and-Pull across every token reference (RFC-0022 §1).
+    theme_scheme: Option<SignalId>,
     /// Parameterized `fn` definitions (`fn f(params) => body`, M25) *and*
     /// callback-prop bindings (RFC-0019): stored as `(param names, body expr,
     /// is_callback)` and indexed by `AstId`. Both share the invocation path in
@@ -615,6 +620,49 @@ impl Interpreter {
         self.env.provide(Symbol::intern(ty), value);
     }
 
+    /// Installs `theme` as the active design-token theme and provides it as the
+    /// ambient `Theme` so `inject Theme as t` resolves in every view (RFC-0022).
+    ///
+    /// Creates the reactive scheme signal (a `Bool`, `true` ⇒ dark) seeded from
+    /// the theme's active scheme, then provides a [`Value::Theme`] carrying it.
+    /// Call once, before [`lower_view`](Self::lower_view). Idempotent: re-calling
+    /// reuses the existing scheme signal (so a hot-reload keeps the toggle state).
+    pub fn set_theme(&mut self, theme: super::theme::Theme) {
+        let dark = theme.active_dark;
+        self.theme = theme;
+        let sig = if let Some(sig) = self.theme_scheme {
+            sig
+        } else {
+            let sig = self.ctx.create_signal(Value::Bool(dark));
+            self.theme_scheme = Some(sig);
+            sig
+        };
+        self.env.provide(Symbol::intern("Theme"), Value::Theme(sig));
+    }
+
+    /// Flips the active color scheme (RFC-0022 §1): writes the reactive scheme
+    /// signal — marking every binding that reads a theme token dirty — and
+    /// mirrors the flag into the theme's non-reactive default accessors. The
+    /// next [`tick`](Self::tick) recomputes; the next [`render`](Self::render)
+    /// paints the new scheme. A no-op if no theme has been installed.
+    ///
+    /// This is the programmatic entry point (a controller, or a future OS
+    /// dark-mode observer) equivalent to `theme.dark = <dark>` in `byld`.
+    pub fn set_theme_dark(&mut self, dark: bool) {
+        self.theme.active_dark = dark;
+        if let Some(sig) = self.theme_scheme {
+            self.ctx.write_signal(sig, Value::Bool(dark));
+        }
+    }
+
+    /// Whether the active theme scheme is currently dark (RFC-0022 §1).
+    #[must_use]
+    pub fn theme_is_dark(&self) -> bool {
+        self.theme_scheme.map_or(self.theme.active_dark, |sig| {
+            self.ctx.peek_signal(sig).as_bool().unwrap_or(false)
+        })
+    }
+
     /// Applies a batch of pending I/O results from the async controller pool
     /// (RFC-0001 §5.1). Each callback receives a mutable reference to `self`
     /// and writes to whatever `var` signals it needs via [`write_var`](Self::write_var).
@@ -936,13 +984,22 @@ impl Interpreter {
         use crate::parser::ast::Expr;
         for attr in attrs {
             if matches!(attr.name.as_str(), "bind" | "value") {
-                if let AttrKind::Prop {
-                    value: Expr::Ident(name, _),
-                } = &attr.kind
-                {
-                    if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
-                        return Some(*sig);
+                match &attr.kind {
+                    AttrKind::Prop {
+                        value: Expr::Ident(name, _),
+                    } => {
+                        if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
+                            return Some(*sig);
+                        }
                     }
+                    // `bind: theme.dark` binds a toggle straight to the reactive
+                    // scheme flag (RFC-0022 §1) — tapping it recolors the tree.
+                    AttrKind::Prop { value } => {
+                        if let Some(sig) = self.resolve_theme_scheme_target(value) {
+                            return Some(sig);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1514,10 +1571,7 @@ impl Interpreter {
                     Some(Value::Str(s)) => s,
                     other => other.map_or_else(String::new, |v| format!("{v:?}")),
                 };
-                let typo_size = self
-                    .eval_str_prop(attrs, "typo")
-                    .and_then(|t| super::theme::resolve_typo(&t))
-                    .map(|s| s as i64);
+                let typo_size = self.eval_typo_size(attrs);
                 #[allow(clippy::cast_precision_loss)]
                 let font_size = self
                     .eval_int_prop(attrs, "size")
@@ -1709,12 +1763,10 @@ impl Interpreter {
                     // M22: fall back to theme on-surface color when unset.
                     let color = self
                         .eval_color_prop(attrs, "color")
-                        .unwrap_or(self.theme.on_surface);
-                    // M22: resolve `typo:` token to font size; inline `size:` overrides.
-                    let typo_size = self
-                        .eval_str_prop(attrs, "typo")
-                        .and_then(|t| super::theme::resolve_typo(&t))
-                        .map(|s| s as i64);
+                        .unwrap_or(self.theme.on_surface());
+                    // Resolve `typo:` token to font size; inline `size:` overrides
+                    // (RFC-0005 `Typo`, completed by RFC-0022).
+                    let typo_size = self.eval_typo_size(attrs);
                     let size =
                         self.eval_int_prop(attrs, "size")
                             .or(typo_size)
@@ -2242,7 +2294,7 @@ impl Interpreter {
         // primary); OFF is a muted surface tint.
         let accent = self
             .eval_color_prop(attrs, "bg")
-            .unwrap_or(self.theme.primary);
+            .unwrap_or(self.theme.primary());
         let track_color = if is_on {
             super::intrinsics::color_to_rgba(accent, false)
         } else {
@@ -2322,7 +2374,7 @@ impl Interpreter {
         // is a muted tint.
         let accent = self
             .eval_color_prop(attrs, "bg")
-            .unwrap_or(self.theme.primary);
+            .unwrap_or(self.theme.primary());
         let accent_rgba = super::intrinsics::color_to_rgba(accent, false);
 
         // Track (unfilled remainder).
@@ -2447,7 +2499,7 @@ impl Interpreter {
             frame.push_instance(byard_core::BoxInstance {
                 rect: [rect.x, rect.y + rect.h - bar_h, rect.w, bar_h],
                 color: dim_alpha(
-                    super::intrinsics::color_to_rgba(self.theme.primary, false),
+                    super::intrinsics::color_to_rgba(self.theme.primary(), false),
                     opacity,
                 ),
                 radii: [0.0; 4],
@@ -2744,6 +2796,39 @@ impl Interpreter {
             }
             None
         })
+    }
+
+    /// Resolves the `typo:` prop to a font size in logical pixels (RFC-0005
+    /// `Typo`, completed by RFC-0022). Accepts either a bare token
+    /// (`typo: titleLarge` → a `Str`, resolved against the theme's typography
+    /// then the built-in M3 scale) or a theme accessor (`typo: t.titleLarge` →
+    /// an `Int` size projected by [`lower_theme_member`](Self::lower_theme_member)).
+    fn eval_typo_size(&mut self, attrs: &[Attr]) -> Option<i64> {
+        let value = attrs.iter().find_map(|a| match (&a.name, &a.kind) {
+            (n, AttrKind::Prop { value }) if n.as_str() == "typo" => Some(value),
+            _ => None,
+        })?;
+        match self.eval_pure(value) {
+            // A theme accessor already resolved to a concrete pixel size.
+            Value::Int(px) => Some(px),
+            Value::Float(px) =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                Some(px as i64)
+            }
+            // A bare token name → theme typography, falling back to M3 sizes.
+            Value::Str(token) => self
+                .theme
+                .typo_size(&token)
+                .or_else(|| super::theme::resolve_typo(&token))
+                .map(|s| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        s as i64
+                    }
+                }),
+            _ => None,
+        }
     }
 
     fn eval_str_prop(&mut self, attrs: &[Attr], name: &str) -> Option<String> {
@@ -3684,10 +3769,91 @@ impl Interpreter {
                     last
                 })
             }
-            // Member access needs controller metadata (not modeled in Phase 2);
-            // lambdas/assignments are actions, not projected values.
-            Expr::Member { .. } | Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
+            // A `theme.<token>` access (RFC-0022): reads the reactive scheme
+            // signal and projects the token's value for the active scheme. Any
+            // other member access needs controller metadata (not modeled in
+            // Phase 2); lambdas/assignments are actions, not projected values.
+            Expr::Member { base, field, span } => self
+                .lower_theme_member(base, field, *span)
+                .unwrap_or_else(|| Box::new(|_| Value::Unit)),
+            Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
         }
+    }
+
+    /// Lowers a `theme.<field>` access to a reactive projection (RFC-0022 §1),
+    /// or returns `None` when `base` does not resolve to an injected
+    /// [`Value::Theme`] (leaving the caller to fall back to `Unit`).
+    ///
+    /// The returned closure reads the active-scheme signal *tracked*, so any
+    /// binding that projects a token re-runs when the scheme flips. Token data
+    /// is resolved once, here, and captured by value — the closure never borrows
+    /// the interpreter.
+    fn lower_theme_member(&mut self, base: &Expr, field: &Symbol, span: Span) -> Option<Lowered> {
+        let Expr::Ident(base_name, _) = base else {
+            return None;
+        };
+        let sig = match self.env.lookup(base_name) {
+            Some(Value::Theme(sig)) => *sig,
+            _ => return None,
+        };
+        let f = field.as_str();
+
+        // Reserved reactive members: the scheme flag itself.
+        if f == "dark" {
+            return Some(Box::new(move |ctx| ctx.read_signal(sig)));
+        }
+        if f == "mode" {
+            return Some(Box::new(move |ctx| {
+                let dark = ctx.read_signal(sig).as_bool().unwrap_or(false);
+                Value::Str(if dark { "dark" } else { "light" }.to_string())
+            }));
+        }
+
+        // Color tokens differ per scheme → capture both resolved values.
+        let light = self.theme.color(f, false);
+        let dark = self.theme.color(f, true);
+        if light.is_some() || dark.is_some() {
+            return Some(Box::new(move |ctx| {
+                let is_dark = ctx.read_signal(sig).as_bool().unwrap_or(false);
+                let v = if is_dark {
+                    dark.or(light)
+                } else {
+                    light.or(dark)
+                };
+                Value::Int(v.unwrap_or(0))
+            }));
+        }
+
+        // Typography tokens: project the size (the current `typo:`/`size:`
+        // pipeline is size-only; weight/family land with font byte-loading).
+        if let Some(size) = self.theme.typo_size(f) {
+            #[allow(clippy::cast_possible_truncation)]
+            let size = size as i64;
+            // Still read the signal so the binding is theme-scoped and re-runs on
+            // a scheme flip (typography can differ per scheme in future themes).
+            return Some(Box::new(move |ctx| {
+                let _ = ctx.read_signal(sig);
+                Value::Int(size)
+            }));
+        }
+
+        // Shape (corner-radius) tokens.
+        if let Some(radius) = self.theme.shape(f) {
+            #[allow(clippy::cast_possible_truncation)]
+            let radius = radius.round() as i64;
+            return Some(Box::new(move |ctx| {
+                let _ = ctx.read_signal(sig);
+                Value::Int(radius)
+            }));
+        }
+
+        // A member of a theme that names no known token is a hard error.
+        self.errors.push(CompileError::UnknownThemeToken {
+            span,
+            field: f.to_string(),
+            theme: self.theme.name.clone(),
+        });
+        Some(Box::new(|_| Value::Unit))
     }
 
     fn lower_ident(&self, name: &Symbol, payload_name: Option<&Symbol>) -> Lowered {
@@ -3932,7 +4098,30 @@ impl Interpreter {
                 return Ok(*sig);
             }
         }
+        // `theme.dark = …` writes the reactive scheme signal (RFC-0022 §1), so a
+        // scheme flip drives Mark-and-Pull across every token reference.
+        if let Some(sig) = self.resolve_theme_scheme_target(target) {
+            return Ok(sig);
+        }
         Err(CompileError::NotAssignable { span })
+    }
+
+    /// Resolves `theme.dark` (the assignable/bindable scheme flag) to its backing
+    /// scheme signal, or `None` if `target` is not that member (RFC-0022 §1).
+    fn resolve_theme_scheme_target(&self, target: &Expr) -> Option<SignalId> {
+        let Expr::Member { base, field, .. } = target else {
+            return None;
+        };
+        if field.as_str() != "dark" {
+            return None;
+        }
+        let Expr::Ident(base_name, _) = base.as_ref() else {
+            return None;
+        };
+        match self.env.lookup(base_name) {
+            Some(Value::Theme(sig)) => Some(*sig),
+            _ => None,
+        }
     }
 
     /// Lowers an action expression to an event handler closure, capturing any optional payload bindings.
@@ -7458,7 +7647,7 @@ mod tests {
         interp.render(&tree, &mut frame, 400.0, 300.0);
 
         let expected_color =
-            crate::interp::intrinsics::color_to_rgba(interp.theme.on_surface, false);
+            crate::interp::intrinsics::color_to_rgba(interp.theme.on_surface(), false);
         assert_eq!(
             frame.texts()[0].color,
             expected_color,
@@ -7482,6 +7671,154 @@ mod tests {
             "titleLarge → 22pt, got {}",
             frame.texts()[0].font_size
         );
+    }
+
+    // ── RFC-0022: theme runtime (injected reactive tokens) ────────────────
+
+    /// Lowers `src`'s first view against `theme` (installed as the ambient
+    /// `Theme`, RFC-0022), ticks, and renders one frame.
+    fn theme_render(interp: &mut Interpreter, src: &str) -> byard_core::frame::RenderFrame {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        frame
+    }
+
+    #[test]
+    fn injected_theme_color_token_paints_and_flips_with_scheme() {
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let src = "View C() {\n inject Theme as t\n Column #[bg: t.primary] {}\n}";
+
+        let frame = theme_render(&mut interp, src);
+        let light = frame.instances()[0].color;
+        let expected_light = crate::interp::intrinsics::color_to_rgba(
+            interp.theme.color("primary", false).unwrap(),
+            false,
+        );
+        assert_eq!(
+            light, expected_light,
+            "light scheme paints the light primary"
+        );
+
+        // Flip the scheme — a single reactive write — and re-render.
+        interp.set_theme_dark(true);
+        let mut frame2 = byard_core::frame::RenderFrame::new();
+        // Re-lower against the same env so the injected `t` still resolves.
+        let tree = interp.lower_view(&parse(src).views[0], &[]);
+        interp.tick();
+        interp.render(&tree, &mut frame2, 400.0, 300.0);
+        let dark = frame2.instances()[0].color;
+        let expected_dark = crate::interp::intrinsics::color_to_rgba(
+            interp.theme.color("primary", true).unwrap(),
+            false,
+        );
+        assert_eq!(dark, expected_dark, "dark scheme paints the dark primary");
+        assert_ne!(light, dark, "flipping the scheme recolours the box");
+    }
+
+    #[test]
+    fn theme_typo_accessor_sets_font_size() {
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let frame = theme_render(
+            &mut interp,
+            "View C() {\n inject Theme as t\n Text(\"hi\") #[typo: t.titleLarge]\n}",
+        );
+        assert!(
+            (frame.texts()[0].font_size - 22.0).abs() < f32::EPSILON,
+            "t.titleLarge → 22pt, got {}",
+            frame.texts()[0].font_size
+        );
+    }
+
+    #[test]
+    fn theme_shape_accessor_sets_corner_radius() {
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let frame = theme_render(
+            &mut interp,
+            "View C() {\n inject Theme as t\n Box #[bg: 0x222222, radius: t.cornerLg] {}\n}",
+        );
+        assert!(
+            (frame.instances()[0].radii[0] - 16.0).abs() < f32::EPSILON,
+            "t.cornerLg → 16px radius, got {:?}",
+            frame.instances()[0].radii
+        );
+    }
+
+    #[test]
+    fn manifest_custom_token_resolves_over_base() {
+        let mut theme = super::super::theme::Theme::byard_base();
+        theme.set_color("light", "primary", 0x0012_3456);
+        let mut interp = Interpreter::new();
+        interp.set_theme(theme);
+        let frame = theme_render(
+            &mut interp,
+            "View C() {\n inject Theme as t\n Column #[bg: t.primary] {}\n}",
+        );
+        assert_eq!(
+            frame.instances()[0].color,
+            crate::interp::intrinsics::color_to_rgba(0x0012_3456, false),
+            "a manifest-overridden token wins over byard-base"
+        );
+    }
+
+    #[test]
+    fn unknown_theme_token_is_a_compile_error() {
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let parsed = parse("View C() {\n inject Theme as t\n Column #[bg: t.nope] {}\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        // The bad token surfaces when the `bg` prop is evaluated at render time.
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            interp.errors().iter().any(
+                |e| matches!(e, CompileError::UnknownThemeToken { field, .. } if field == "nope")
+            ),
+            "t.nope → UnknownThemeToken, got {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn theme_dark_is_assignable_and_bindable() {
+        // `t.dark = …` (assign) and `bind: t.dark` (Toggle) must both resolve to
+        // the scheme signal — neither is `NotAssignable` (RFC-0022 §1).
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let _ = theme_render(
+            &mut interp,
+            "View C() {\n inject Theme as t\n \
+             Column {\n Button(\"x\") => t.dark = true\n \
+             Toggle #[bind: t.dark]\n }\n}",
+        );
+        assert!(
+            interp.errors().is_empty(),
+            "assignable/bindable theme.dark should not error: {:?}",
+            interp.errors()
+        );
+    }
+
+    #[test]
+    fn theme_mode_string_reflects_active_scheme() {
+        let mut interp = Interpreter::new();
+        interp.set_theme(super::super::theme::Theme::byard_base());
+        let frame = theme_render(
+            &mut interp,
+            "View C() {\n inject Theme as t\n Text(\"{t.mode}\")\n}",
+        );
+        assert_eq!(frame.texts()[0].text, "light");
+        assert!(!interp.theme_is_dark());
+        interp.set_theme_dark(true);
+        assert!(interp.theme_is_dark());
     }
 
     #[test]

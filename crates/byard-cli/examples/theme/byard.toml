@@ -1,0 +1,41 @@
+[project]
+name = "theme"
+entry = "src/main.byd"
+
+# RFC-0022 — a package/project declares design tokens here; the engine resolves
+# them into a reactive `Theme`, and `src/main.byd` references them as `t.token`.
+# Tokens are snake_case here and camelCase in byld (primary_container → t.primaryContainer).
+[theme]
+name = "demo"
+extends = "byard-base"
+
+[theme.color.light]
+primary = "#6750A4"
+on_primary = "#FFFFFF"
+primary_container = "#EADDFF"
+on_primary_container = "#21005D"
+surface = "#FEF7FF"
+surface_container = "#F3EDF7"
+on_surface = "#1D1B20"
+on_surface_variant = "#49454F"
+
+[theme.color.dark]
+primary = "#D0BCFF"
+on_primary = "#381E72"
+primary_container = "#4F378B"
+on_primary_container = "#EADDFF"
+surface = "#141218"
+surface_container = "#211F26"
+on_surface = "#E6E0E9"
+on_surface_variant = "#CAC4D0"
+
+[theme.typography]
+headline_large = { size = 32, weight = "regular" }
+title_large = { size = 22, weight = "regular" }
+body_large = { size = 16, weight = "regular", tracking = 0.5 }
+label_large = { size = 14, weight = "medium" }
+
+[theme.shape]
+corner_md = 12
+corner_lg = 16
+corner_xl = 28
