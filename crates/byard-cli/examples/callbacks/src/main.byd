@@ -15,8 +15,10 @@
 //
 // Click the buttons: the count changes, the label re-renders reactively, and
 // each button runs the distinct block its call site gave it (increment, reset,
-// decrement, or set-to-a-value). `on hover` / `on pressed` style states give
-// live visual feedback that the forwarded event is landing.
+// decrement, or set-to-a-value). Hover a button and it tints to its `hover`
+// colour; press it and it shrinks — the `on hover`/`on pressed` style states
+// light up straight from the engine's live interaction state, giving visual
+// proof the forwarded event is landing.
 View Main() {
     var count = 0
 
@@ -32,12 +34,12 @@ View Main() {
 
         // Each ActionButton is the *same* component with a *different* action.
         Row #[gap: 12] {
-            ActionButton(label: "− Decrement", accent: 0x964747, on_tap: { count-- })
-            ActionButton(label: "+ Increment", accent: 0x477A96, on_tap: { count++ })
+            ActionButton(label: "− Decrement", accent: 0x964747, hover: 0xB25A5A, on_tap: { count-- })
+            ActionButton(label: "+ Increment", accent: 0x477A96, hover: 0x5A96B2, on_tap: { count++ })
         }
         Row #[gap: 12] {
-            ActionButton(label: "Reset", accent: 0x3C3C52, on_tap: { count = 0 })
-            ActionButton(label: "Set to 100", accent: 0x6750A4, on_tap: { count = 100 })
+            ActionButton(label: "Reset", accent: 0x3C3C52, hover: 0x50506A, on_tap: { count = 0 })
+            ActionButton(label: "Set to 100", accent: 0x6750A4, hover: 0x7E63C4, on_tap: { count = 100 })
         }
 
         // A second wrapper shape (`Stepper`) proving the pattern composes: it
@@ -50,11 +52,16 @@ View Main() {
 }
 
 // A reusable tappable button. `on_tap: Fn()` is the callback prop; the inner
-// Box forwards its `tap` to it. `accent` colours it; the style states react to
-// hover/press so you can see the event landing.
-View ActionButton(label: Str, accent: Int, on_tap: Fn() = {}) {
-    Box #[bg: accent, radius: 12, p: (vertical: 12, horizontal: 18),
-          tap => on_tap()] {
+// Box forwards its `tap` to it. `accent`/`hover` colour it, and the `on hover`/
+// `on pressed` state blocks react to the engine's live interaction state — so
+// the button tints on hover and shrinks on press with no `var` and no handler.
+View ActionButton(label: Str, accent: Int, hover: Int, on_tap: Fn() = {}) {
+    let look = style {
+        bg: accent, radius: 12, p: (vertical: 12, horizontal: 18)
+        on hover   { bg: hover }
+        on pressed { scale: 0.96 }
+    }
+    Box #[..look, tap => on_tap()] {
         Text(label) #[color: 0xFFFFFF, size: 15, weight: bold]
     }
 }
@@ -64,7 +71,7 @@ View ActionButton(label: Str, accent: Int, on_tap: Fn() = {}) {
 // tap crosses two view boundaries back to the caller (RFC-0019 forwarding).
 View Stepper(on_up: Fn() = {}, on_down: Fn() = {}) {
     Row #[bg: 0x1E1E2A, radius: 14, p: 10, gap: 10, border: 0x3C3C52] {
-        ActionButton(label: "▼ down", accent: 0x3C3C52, on_tap: on_down)
-        ActionButton(label: "▲ up", accent: 0x3C3C52, on_tap: on_up)
+        ActionButton(label: "▼ down", accent: 0x3C3C52, hover: 0x50506A, on_tap: on_down)
+        ActionButton(label: "▲ up", accent: 0x3C3C52, hover: 0x50506A, on_tap: on_up)
     }
 }

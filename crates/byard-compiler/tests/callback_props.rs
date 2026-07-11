@@ -287,6 +287,44 @@ fn visual_example_forwards_every_button() {
     );
 }
 
+/// The wrappers' `on hover` style state re-tints the button from its `accent`
+/// to its `hover` colour — both param-driven, so this also proves a
+/// param-dependent style resolves at render time (RFC-0019 §2 env snapshot).
+/// Moving the pointer onto a button must change at least one rendered fill.
+#[test]
+fn visual_example_hover_tints_a_button() {
+    const EXAMPLE: &str = include_str!("../../byard-cli/examples/callbacks/src/main.byd");
+    let parsed = parse(EXAMPLE);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
+    let mut interp = Interpreter::new();
+    interp.load_views(&parsed.views);
+    let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+    let tree = interp.lower_view(&parsed.views[0], &known);
+    interp.tick();
+
+    // Base render: capture every solid fill colour.
+    let mut base = RenderFrame::new();
+    interp.render(&tree, &mut base, 800.0, 700.0);
+    let base_colors: Vec<[f32; 4]> = base.instances().iter().map(|b| b.color).collect();
+
+    // Hover the first button (a pointer move sets the engine's live hover state).
+    let center = tap_center(&interp);
+    interp.dispatch_events(&[ev(EventKind::PointerMove, center)]);
+    interp.tick();
+    let mut hovered = RenderFrame::new();
+    interp.render(&tree, &mut hovered, 800.0, 700.0);
+    let hover_colors: Vec<[f32; 4]> = hovered.instances().iter().map(|b| b.color).collect();
+
+    assert_ne!(
+        base_colors, hover_colors,
+        "hovering a button must apply its `on hover` tint (accent → hover colour)"
+    );
+}
+
 // ── diagnostics (RFC-0019 §4) ────────────────────────────────────────────
 
 /// Helper: lower the first view *and render one frame* (event actions are
