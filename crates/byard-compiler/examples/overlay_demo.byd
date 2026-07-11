@@ -1,0 +1,106 @@
+// overlay_demo.byd — RFC-0017 Overlay & Z-Layer System.
+//
+// Demonstrates the overlay layer end to end: a subtree escapes the normal
+// layout flow and composites *above* everything else, laid out against the
+// viewport by an `anchor`. Three overlays are mounted over the base app to show
+// the whole feature at a glance:
+//
+//   1. a MODAL dialog        — `anchor: center`, dims the app behind a scrim,
+//                              captures all input, dismisses on outside tap /
+//                              Escape (`dismiss => …`).
+//   2. a NON-MODAL snackbar  — `anchor: bottom`, floats over the app without a
+//                              scrim, so the app stays interactive beneath it.
+//   3. stacking              — the dialog is mounted after the snackbar, so it
+//                              composites on top (mount-order z-stacking).
+//
+// The `when open { Overlay … }` guard is how an overlay mounts and unmounts
+// (RFC-0017 §Dismissal): its scrim's `dismiss` action flips the guard `var`.
+// Structural mount/unmount re-derives on hot-reload; flip the initial values of
+// `dialogOpen` / `snackOpen` below and save to watch overlays appear and vanish.
+//
+// Run with:
+//   cargo run -p byard-cli -- dev crates/byard-compiler/examples/overlay_demo.byd
+
+View Main() {
+    // Overlay visibility is declarative — a `var` per overlay, flipped by the
+    // overlay's own `dismiss` action (RFC-0003 reference-free model).
+    var dialogOpen: Bool = true
+    var snackOpen: Bool = true
+    var confirmed: Bool = false
+    var pokes: Int = 0
+
+    // ══ BASE APP ════════════════════════════════════════════════════════════
+    // Ordinary in-flow content. It keeps rendering beneath the overlays; the
+    // modal scrim dims it and blocks its input, the non-modal snackbar does not.
+    Column #[bg: 0x14141C, p: 32, gap: 16, width: 900, height: 560] {
+        Text("RFC-0017 · Overlay & Z-Layer System") #[color: 0xECE6F0, size: 26, weight: bold]
+        Text("The dialog floats above this screen, centred, behind a scrim.")
+            #[color: 0x9A94A4, size: 15]
+
+        // Live status line. `pokes` only advances when the app is reachable —
+        // i.e. NOT while the modal dialog is up. `deleted` flips when the
+        // dialog's "Delete" fires, proving the overlay content is interactive
+        // even as the app behind it is blocked (value reactivity is live; only
+        // structural mount/unmount waits for a hot-reload).
+        Row #[gap: 12, p: (vertical: 8, horizontal: 0)] {
+            Button("Poke the app") #[bg: 0x3C3C52, radius: 10, p: (vertical: 12, horizontal: 18),
+                                     color: 0xECE6F0] => pokes++
+            Text("pokes: {pokes}  ·  deleted: {confirmed}") #[color: 0x9A94A4, size: 15]
+        }
+
+        // Some filler cards so the scrim visibly dims real content. Text wrap is
+        // a separate (unbuilt) feature, so each label is one short line that fits
+        // its card's width.
+        Row #[gap: 16] {
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 300] {
+                Text("Inbox") #[color: 0xECE6F0, size: 18, weight: medium]
+                Text("Blocked while the modal is up.") #[color: 0x9A94A4, size: 13]
+            }
+            Column #[bg: 0x262636, radius: 16, p: 20, gap: 6, width: 300] {
+                Text("Activity") #[color: 0xECE6F0, size: 18, weight: medium]
+                Text("Tap the scrim or press Escape.") #[color: 0x9A94A4, size: 13]
+            }
+        }
+    }
+
+    // ══ NON-MODAL SNACKBAR ═════════════════════════════════════════════════
+    // `modal: false` → no scrim, input falls through to the app. Anchored to the
+    // bottom edge of the viewport. Mounted first, so the dialog stacks above it.
+    when snackOpen {
+        Overlay #[modal: false] {
+            Row #[anchor: bottom, bg: 0x323240, radius: 12, shadow: "lg",
+                  p: (vertical: 14, horizontal: 20), gap: 16, mb: 24] {
+                Text("Changes saved") #[color: 0xECE6F0, size: 15]
+                Text("DISMISS") #[color: 0x8AB4F8, size: 15, weight: medium]
+            }
+        }
+    }
+
+    // ══ MODAL DIALOG ═══════════════════════════════════════════════════════
+    // `modal: true` (the default) captures all input behind a scrim. The scrim
+    // is the first child — a translucent full-viewport box. `dismiss => …` fires
+    // on an outside tap or Escape, flipping the guard `var` to unmount.
+    when dialogOpen {
+        Overlay #[modal: true, dismiss => dialogOpen = false] {
+            // Scrim: a dim, semi-transparent sheet filling the viewport (grow).
+            Box #[bg: 0x000000, opacity: 0.45, grow: 1] {}
+
+            // Dialog surface, centred (Material-ish). One short line per `Text`
+            // (line wrap is a separate, unbuilt feature), sized to the surface.
+            Column #[anchor: center, bg: 0xECE6F0, radius: 28, shadow: "lg",
+                     p: 24, gap: 12, width: 380] {
+                Text("Delete this file?") #[color: 0x1D1B20, size: 22, weight: medium]
+                Text("This action can't be undone.") #[color: 0x49454F, size: 14]
+                Text("The modal blocks the app behind it.") #[color: 0x49454F, size: 14]
+                Row #[gap: 8, justify: end] {
+                    Button("Cancel") #[bg: 0xE7E0EC, radius: 20,
+                                       p: (vertical: 10, horizontal: 18), color: 0x6750A4]
+                        => dialogOpen = false
+                    Button("Delete") #[bg: 0x6750A4, radius: 20,
+                                       p: (vertical: 10, horizontal: 18), color: 0xFFFFFF]
+                        => confirmed = true
+                }
+            }
+        }
+    }
+}

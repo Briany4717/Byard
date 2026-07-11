@@ -102,6 +102,7 @@ pub async fn build_pipeline(
     bind_group_layout: &wgpu::BindGroupLayout,
     quad_layout: wgpu::VertexBufferLayout<'static>,
     surface_format: wgpu::TextureFormat,
+    depth_stencil: wgpu::DepthStencilState,
 ) -> Result<wgpu::RenderPipeline, ByardError> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
@@ -146,7 +147,7 @@ pub async fn build_pipeline(
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: Some(super::draw_depth_stencil()),
+        depth_stencil: Some(depth_stencil),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -164,6 +165,18 @@ pub async fn build_pipeline(
 
 /// Draws every [`DecoratedBox`], scissored to its content clip (RFC-0005). The
 /// active GPU scissor bounds which pixels are actually touched.
+///
+/// The whole decorated pass is **transparent geometry** — shadows (blurred, a
+/// transparent fill), borders (a stroked ring over a transparent interior), and
+/// translucent fills (`opacity < 1`). Its pipeline therefore *tests* the
+/// draw-order depth buffer (so a nearer opaque surface still occludes a border
+/// or a scrim) but never *writes* to it. That is the standard opaque/transparent
+/// split: only opaque geometry (the `SolidBox`/`TextureSampler`/`VectorMSDF`
+/// passes) writes depth. Writing depth here would make a translucent box stamp a
+/// nearer z across its whole rect and cull every earlier-emitted primitive drawn
+/// in a later pass — most visibly all the app text beneath an overlay scrim or a
+/// shadow's halo, which would simply vanish (RFC-0017). Opaque fills never reach
+/// this pass; the compiler routes them to `SolidBox`, which occludes correctly.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     render_pass: &mut wgpu::RenderPass<'_>,

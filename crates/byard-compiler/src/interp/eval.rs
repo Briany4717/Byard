@@ -142,6 +142,22 @@ pub enum RenderNode {
         /// The reactive scope evaluating to the asset handle (a `Str` path).
         src: ScopeId,
     },
+    /// An `Overlay` — the RFC-0017 escape-hatch. Its children leave the normal
+    /// layout flow and render in the overlay layer, above all main content and
+    /// laid out against the viewport. In the parent tree the node occupies zero
+    /// space (a 0×0 layout leaf); the render walk collects it into the overlay
+    /// stack and emits it in a deferred second phase.
+    Overlay {
+        /// Styling/behaviour attributes: `modal`, `dismiss_on_outside`, and the
+        /// `dismiss =>` event action.
+        attrs: Vec<Attr>,
+        /// The overlay's floating content subtree.
+        children: Vec<RenderNode>,
+        /// The instance environment captured at lower time (RFC-0019 §2), so a
+        /// `dismiss` action or a child's forwarded callback resolves against the
+        /// scope the overlay was instantiated in. Empty at the top level.
+        env_snapshot: Vec<(Symbol, super::env::Value)>,
+    },
 }
 
 /// A lowered reactive computation (see the module docs).
@@ -1179,6 +1195,17 @@ impl Interpreter {
                     src,
                 }
             }
+            // RFC-0017: the `Overlay` escape-hatch. Its children are lowered
+            // normally, but the node itself carries them out of the parent flow
+            // — the render walk defers them to the overlay layer.
+            "Overlay" => {
+                let children = self.lower_members(&el.children, known_views);
+                RenderNode::Overlay {
+                    attrs,
+                    children,
+                    env_snapshot: self.capture_env_snapshot(),
+                }
+            }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
             "Toggle" | "Slider" | "TextField" => {
                 let bound_sig = self.resolve_bind_sig(&attrs);
@@ -1506,37 +1533,233 @@ impl Interpreter {
             }
         }
 
-        if !root_children.is_empty() {
+        // RFC-0017: collect every mounted `Overlay` (pre-order = declaration =
+        // mount order) and build each into the *same* atlas as an absolutely
+        // positioned wrapper floating over the main tree. Nothing is built when
+        // no overlay is mounted, so the overlay path is truly zero-cost — the
+        // render root stays the plain main container it always was.
+        let mut overlays: Vec<&RenderNode> = Vec::new();
+        for node in tree {
+            collect_overlays(node, &mut overlays);
+        }
+        let mut overlay_layouts: Vec<OverlayLayout<'_>> = Vec::new();
+        for ov in overlays {
+            if let Some(layout) = self.build_overlay_layout(ov) {
+                overlay_layouts.push(layout);
+            }
+        }
+
+        // The main content container (viewport-sized, column). `None` when the
+        // whole view is nothing but overlays.
+        let main_id = if root_children.is_empty() {
+            None
+        } else {
             let root_style =
                 byard_core::atlas::layout::ContainerStyle::new(Some(width), Some(height))
                     .with_direction(byard_core::atlas::layout::FlexDir::Column);
-            if let Ok(root_id) = self.atlas.add_container(root_style, &root_children) {
-                self.atlas.set_root(root_id).unwrap();
-                self.atlas.compute(Viewport::new(width, height)).unwrap();
+            self.atlas.add_container(root_style, &root_children).ok()
+        };
 
-                // Populate frame layout bounds
-                self.atlas.populate_frame(frame, &[]);
+        // The render root: with no overlay it is the main container itself (the
+        // pre-RFC-0017 shape, unchanged). With overlays it is a super-root
+        // holding the main content plus each overlay wrapper as an absolute
+        // sibling that neither displaces nor is displaced by the main tree.
+        let root_id = if overlay_layouts.is_empty() {
+            main_id
+        } else {
+            let mut super_children = Vec::new();
+            if let Some(m) = main_id {
+                super_children.push(m);
+            }
+            for ol in &overlay_layouts {
+                super_children.push(ol.wrapper_id);
+            }
+            let super_style =
+                byard_core::atlas::layout::ContainerStyle::new(Some(width), Some(height))
+                    .with_direction(byard_core::atlas::layout::FlexDir::Column);
+            self.atlas.add_container(super_style, &super_children).ok()
+        };
 
-                // Emit instances and text lines at computed positions
-                let mut flat_idx = 0;
-                let parent_rect = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
-                for (i, node) in tree.iter().enumerate() {
-                    let node_id = root_children[i];
-                    self.render_node_with_atlas(
-                        node,
-                        node_id,
-                        frame,
-                        &flat_ids,
-                        &mut flat_idx,
-                        parent_rect,
-                        1.0,
-                        byard_core::frame::Transform::IDENTITY,
-                        None,
-                        None,
-                    );
+        let Some(root_id) = root_id else {
+            return;
+        };
+        self.atlas.set_root(root_id).unwrap();
+        self.atlas.compute(Viewport::new(width, height)).unwrap();
+        self.atlas.populate_frame(frame, &[]);
+
+        let parent_rect = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
+
+        // Emit the main tree (below every overlay in painter's order).
+        if main_id.is_some() {
+            let mut flat_idx = 0;
+            for (i, node) in tree.iter().enumerate() {
+                let node_id = root_children[i];
+                self.render_node_with_atlas(
+                    node,
+                    node_id,
+                    frame,
+                    &flat_ids,
+                    &mut flat_idx,
+                    parent_rect,
+                    1.0,
+                    byard_core::frame::Transform::IDENTITY,
+                    None,
+                    None,
+                );
+            }
+        }
+
+        // RFC-0017 overlay phase: emit each overlay's children *after* the main
+        // tree, so their emission-order depth is nearer and they composite on
+        // top (the shared depth buffer resolves cross-layer order — no separate
+        // GPU pass needed). Emitted in mount order, so a later overlay stacks
+        // over an earlier one. A modal overlay installs a scrim first.
+        //
+        // `begin_layer` marks the z-layer boundary: the Encoder draws each
+        // layer's pools — including its *text* — as one interleaved batch
+        // inside the single render pass, so this overlay's transparent
+        // geometry (scrim, shadow) alpha-blends over the text and images of
+        // everything beneath it instead of being drawn before a frame-final
+        // text batch. With no overlay, no mark is recorded and the frame
+        // renders through the exact single-layer draw stream.
+        for ol in &overlay_layouts {
+            frame.begin_layer();
+            self.emit_overlay(ol, frame, width, height);
+        }
+    }
+
+    /// Builds one `Overlay`'s layout into the atlas (RFC-0017): each child is
+    /// laid out at its natural size, then wrapped in an absolute, inset-0
+    /// container whose `justify`/`align` realise the child's `anchor` within the
+    /// viewport. All the anchor wrappers hang off one absolute overlay wrapper.
+    /// Returns the wrapper id and per-child emission slots. `None` if `ov` is not
+    /// an `Overlay` or the atlas rejects the nodes.
+    fn build_overlay_layout<'a>(&mut self, ov: &'a RenderNode) -> Option<OverlayLayout<'a>> {
+        let RenderNode::Overlay { children, .. } = ov else {
+            return None;
+        };
+        let mut anchor_ids = Vec::with_capacity(children.len());
+        let mut slots = Vec::with_capacity(children.len());
+        for child in children {
+            let mut cflat = Vec::new();
+            let Ok(cid) = self.build_layout_tree(child, &mut cflat) else {
+                continue;
+            };
+            let anchor = self.anchor_token(child);
+            let style = anchor_wrapper_style(anchor.as_deref());
+            let Ok(anchor_id) = self.atlas.add_container(style, &[cid]) else {
+                continue;
+            };
+            anchor_ids.push(anchor_id);
+            slots.push(OverlayChildSlot {
+                node: child,
+                id: cid,
+                flat_ids: cflat,
+            });
+        }
+        let wrapper_style =
+            byard_core::atlas::layout::ContainerStyle::default().with_absolute(true);
+        let wrapper_id = self.atlas.add_container(wrapper_style, &anchor_ids).ok()?;
+        Some(OverlayLayout {
+            node: ov,
+            wrapper_id,
+            children: slots,
+        })
+    }
+
+    /// The `anchor:` token of an overlay child (RFC-0017), or `None` for an
+    /// unanchored child (a scrim, which fills the viewport via `grow`).
+    fn anchor_token(&mut self, child: &RenderNode) -> Option<String> {
+        match child {
+            RenderNode::Box { attrs, .. } => self.eval_str_prop(attrs, "anchor"),
+            _ => None,
+        }
+    }
+
+    /// Emits one overlay's children on top of the main scene (RFC-0017 overlay
+    /// phase). Clips them to the viewport, installs a modal scrim first when
+    /// `modal` (the input barrier + `dismiss` target), then walks each child
+    /// through the ordinary render path so it uses every existing pipeline.
+    fn emit_overlay(
+        &mut self,
+        ol: &OverlayLayout<'_>,
+        frame: &mut byard_core::frame::RenderFrame,
+        width: f32,
+        height: f32,
+    ) {
+        let RenderNode::Overlay {
+            attrs,
+            env_snapshot,
+            ..
+        } = ol.node
+        else {
+            return;
+        };
+        let viewport = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
+        // `modal` defaults true (RFC-0017 §Modality); `dismiss_on_outside`
+        // defaults to whatever `modal` is.
+        let modal = self.eval_bool_prop(attrs, "modal").unwrap_or(true);
+        let dismiss_on_outside = self
+            .eval_bool_prop(attrs, "dismiss_on_outside")
+            .unwrap_or(modal);
+
+        // Clamp everything the overlay paints to the viewport (RFC-0017
+        // resolved-question: scissor interaction).
+        frame.begin_clip(byard_core::frame::Rect::new(0.0, 0.0, width, height));
+
+        // A modal overlay installs its scrim *before* its content so the content
+        // wins hit-testing where it overlaps, while the scrim blocks (and
+        // optionally dismisses) everything beneath the overlay.
+        if modal {
+            // Restore the overlay's instance environment so a `dismiss` action
+            // referencing an instance `var`/param resolves correctly (RFC-0019).
+            let env_base = self.env.len();
+            for (k, v) in env_snapshot {
+                self.env.push(k.clone(), v.clone());
+            }
+            let dismiss = if dismiss_on_outside {
+                self.lower_overlay_dismiss(attrs)
+            } else {
+                None
+            };
+            self.env.truncate(env_base);
+            let elem = self.atlas.node_index(ol.wrapper_id).unwrap_or(u32::MAX);
+            self.router.push_modal_scrim(elem, viewport, dismiss);
+        }
+
+        for slot in &ol.children {
+            let mut flat_idx = 0;
+            self.render_node_with_atlas(
+                slot.node,
+                slot.id,
+                frame,
+                &slot.flat_ids,
+                &mut flat_idx,
+                viewport,
+                1.0,
+                byard_core::frame::Transform::IDENTITY,
+                None,
+                None,
+            );
+        }
+
+        frame.end_clip();
+    }
+
+    /// Lowers an `Overlay`'s `dismiss =>` action to a router [`Action`], if
+    /// present (RFC-0017 §Dismissal). The action runs on scrim tap and on
+    /// `Escape`.
+    ///
+    /// [`Action`]: super::events::Action
+    fn lower_overlay_dismiss(&mut self, attrs: &[Attr]) -> Option<super::events::Action> {
+        for attr in attrs {
+            if attr.name.as_str() == "dismiss" {
+                if let AttrKind::Event { payload, action } = &attr.kind {
+                    return self.lower_action(action, payload.clone()).ok();
                 }
             }
         }
+        None
     }
 
     fn build_layout_tree(
@@ -1548,6 +1771,15 @@ impl Interpreter {
         match node {
             RenderNode::Spacer => {
                 let id = self.atlas.add_leaf(LeafSize::new(0.0, 12.0))?;
+                flat_ids.push(id);
+                Ok(id)
+            }
+            // RFC-0017: an `Overlay` occupies zero space in its parent's flow —
+            // its children are laid out separately against the viewport in the
+            // deferred overlay phase. A 0×0 leaf keeps the parallel flat-id
+            // cursor aligned without displacing any sibling.
+            RenderNode::Overlay { .. } => {
+                let id = self.atlas.add_leaf(LeafSize::new(0.0, 0.0))?;
                 flat_ids.push(id);
                 Ok(id)
             }
@@ -1740,7 +1972,11 @@ impl Interpreter {
         *flat_idx += 1;
 
         match node {
-            RenderNode::Spacer => {}
+            // A `Spacer` is layout-only. An `Overlay` renders nothing in the main
+            // flow — its 0×0 leaf holds a slot in the flat-id cursor (already
+            // advanced above) while its children are emitted separately in the
+            // deferred overlay phase (RFC-0017).
+            RenderNode::Spacer | RenderNode::Overlay { .. } => {}
             RenderNode::Text {
                 attrs,
                 state_blocks,
@@ -4344,6 +4580,77 @@ fn flat_len(node: &RenderNode) -> usize {
         RenderNode::Box { children, .. } => 1 + children.iter().map(flat_len).sum::<usize>(),
         _ => 1,
     }
+}
+
+/// One `Overlay`'s built layout (RFC-0017): its absolute wrapper node plus a
+/// per-child emission slot. Holds borrows into the frozen render tree, so its
+/// lifetime is scoped to a single [`Interpreter::render`] call.
+struct OverlayLayout<'a> {
+    /// The `RenderNode::Overlay` this describes (source of `attrs`/`children`).
+    node: &'a RenderNode,
+    /// The absolute wrapper container in the atlas; its node index doubles as
+    /// the modal scrim's element id.
+    wrapper_id: byard_core::atlas::layout::AtlasNodeId,
+    /// One slot per built child, in declaration order.
+    children: Vec<OverlayChildSlot<'a>>,
+}
+
+/// A single overlay child ready to emit (RFC-0017): the child render node, its
+/// atlas id, and the flat-id list its render walk consumes.
+struct OverlayChildSlot<'a> {
+    node: &'a RenderNode,
+    id: byard_core::atlas::layout::AtlasNodeId,
+    flat_ids: Vec<byard_core::atlas::layout::AtlasNodeId>,
+}
+
+/// Collects every mounted `Overlay` under `node` in pre-order (RFC-0017 mount =
+/// declaration order). Recurses through `Box` children *and* through an
+/// overlay's own children, so a nested overlay (an overlay mounted inside an
+/// overlay's content) is collected as its own later — hence higher — stack
+/// entry, matching the RFC's flat-stack nesting model.
+fn collect_overlays<'a>(node: &'a RenderNode, out: &mut Vec<&'a RenderNode>) {
+    match node {
+        RenderNode::Overlay { children, .. } => {
+            out.push(node);
+            for c in children {
+                collect_overlays(c, out);
+            }
+        }
+        RenderNode::Box { children, .. } => {
+            for c in children {
+                collect_overlays(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The absolute, inset-0 anchor wrapper style for an overlay child (RFC-0017
+/// §Positioning). Direction is `Column`, so `justify` drives the vertical edge
+/// and `align` the horizontal one. An unanchored child keeps the default
+/// (`Start`/`Stretch`), so a `grow` scrim fills the viewport; an anchored child
+/// is pinned to the requested edge/centre.
+fn anchor_wrapper_style(anchor: Option<&str>) -> byard_core::atlas::layout::ContainerStyle {
+    use byard_core::atlas::layout::{Align, ContainerStyle, FlexDir, Justify};
+    let mut style = ContainerStyle::default()
+        .with_absolute(true)
+        .with_direction(FlexDir::Column);
+    let (justify, align) = match anchor {
+        Some("center") => (Some(Justify::Center), Some(Align::Center)),
+        Some("top") => (Some(Justify::Start), Some(Align::Center)),
+        Some("bottom") => (Some(Justify::End), Some(Align::Center)),
+        Some("start") => (Some(Justify::Center), Some(Align::Start)),
+        Some("end") => (Some(Justify::Center), Some(Align::End)),
+        // No anchor (a scrim): keep flow defaults so `grow` fills the viewport.
+        _ => (None, None),
+    };
+    if let Some(j) = justify {
+        style = style.with_justify(j);
+    }
+    if let Some(a) = align {
+        style = style.with_align(a);
+    }
+    style
 }
 
 /// Renders a value for string interpolation (`"Count: {count}"`).
@@ -7851,5 +8158,434 @@ mod tests {
 
         assert_eq!(frame.instances().len(), 1, "plain box → BoxInstance");
         assert_eq!(frame.decorated().len(), 0);
+    }
+
+    // ── RFC-0017: Overlay & z-layer system ───────────────────────────────
+
+    /// Finds the emitted solid box closest to the given colour channels.
+    fn find_solid_by_red(
+        frame: &byard_core::frame::RenderFrame,
+        red: f32,
+    ) -> Option<(usize, byard_core::BoxInstance)> {
+        frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| (b.color[0] - red).abs() < 0.05)
+            .map(|(i, b)| (i, *b))
+    }
+
+    #[test]
+    fn overlay_takes_no_flow_space_and_paints_above_main() {
+        // A main box (red) followed by an overlay whose scrim (blue, grow:1)
+        // fills the viewport. The overlay must not displace the main box, and
+        // its scrim must paint *above* the main box (nearer draw-order depth).
+        let src = "View C() {\n \
+            Box #[bg: 0xFF0000, width: 40, height: 40] {}\n \
+            Overlay #[modal: false] {\n \
+                Box #[bg: 0x0000FF, grow: 1] {}\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let (red_i, red) = find_solid_by_red(&frame, 1.0).expect("main red box emitted");
+        let (blue_i, blue) = frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.color[2] > 0.95 && b.color[0] < 0.05)
+            .map(|(i, b)| (i, *b))
+            .expect("overlay scrim emitted");
+
+        // Main box keeps its natural 40×40 at the origin — the overlay's 0×0
+        // flow leaf did not push it down.
+        assert!((red.rect[0]).abs() < 0.01 && (red.rect[1]).abs() < 0.01);
+        assert!((red.rect[2] - 40.0).abs() < 0.01);
+        // The scrim fills the whole viewport.
+        assert!((blue.rect[2] - 400.0).abs() < 0.5 && (blue.rect[3] - 300.0).abs() < 0.5);
+        // Painter's order: the overlay is emitted after the main tree, so its
+        // depth is strictly nearer (smaller NDC-z) → it composites on top.
+        assert!(
+            frame.solid_depths()[blue_i] < frame.solid_depths()[red_i],
+            "overlay scrim must paint above the main box"
+        );
+    }
+
+    #[test]
+    fn overlay_center_anchor_positions_content_in_the_viewport() {
+        let src = "View C() {\n \
+            Overlay {\n \
+                Column #[anchor: center, bg: 0x222222, width: 100, height: 60] {}\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let dialog = frame
+            .instances()
+            .iter()
+            .find(|b| (b.color[0] - 0.133).abs() < 0.05)
+            .expect("dialog emitted");
+        // Centred: (400−100)/2 = 150, (300−60)/2 = 120.
+        assert!(
+            (dialog.rect[0] - 150.0).abs() < 1.0,
+            "x centred, got {}",
+            dialog.rect[0]
+        );
+        assert!(
+            (dialog.rect[1] - 120.0).abs() < 1.0,
+            "y centred, got {}",
+            dialog.rect[1]
+        );
+    }
+
+    #[test]
+    fn overlay_bottom_anchor_pins_content_to_the_viewport_bottom() {
+        let src = "View C() {\n \
+            Overlay {\n \
+                Column #[anchor: bottom, bg: 0x333333, width: 200, height: 80] {}\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let sheet = frame
+            .instances()
+            .iter()
+            .find(|b| (b.color[0] - 0.2).abs() < 0.05)
+            .expect("sheet emitted");
+        // Pinned to the bottom: y = 300 − 80 = 220; centred x = (400−200)/2 = 100.
+        assert!(
+            (sheet.rect[1] - 220.0).abs() < 1.0,
+            "y bottom, got {}",
+            sheet.rect[1]
+        );
+        assert!(
+            (sheet.rect[0] - 100.0).abs() < 1.0,
+            "x centred, got {}",
+            sheet.rect[0]
+        );
+    }
+
+    #[test]
+    fn modal_overlay_blocks_the_main_tree_and_dismisses_on_outside_tap() {
+        // A main button sits behind a modal overlay. Its scrim fills the
+        // viewport; a small confirm button is centred. Tapping the scrim (an
+        // outside tap) fires `dismiss` and must NOT reach the button behind.
+        let src = "View C() {\n \
+            var open = true\n \
+            var behind = false\n \
+            var confirmed = false\n \
+            Button(\"behind\") #[width: 400, height: 300] => behind = true\n \
+            Overlay #[modal: true, dismiss => open = false] {\n \
+                Box #[bg: 0x000000, opacity: 0.3, grow: 1] {}\n \
+                Column #[anchor: center, width: 80, height: 40] {\n \
+                    Button(\"ok\") #[width: 80, height: 40] => confirmed = true\n \
+                }\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let open = interp
+            .var_signal(&crate::symbol::Symbol::intern("open"))
+            .unwrap();
+        let behind = interp
+            .var_signal(&crate::symbol::Symbol::intern("behind"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Tap the top-left corner — over the scrim, outside the centred content.
+        let tap = |t: u64, p: (f32, f32)| {
+            [
+                byard_core::platform::InputEvent {
+                    kind: byard_core::platform::EventKind::PointerDown,
+                    pos: p,
+                    delta: (0.0, 0.0),
+                    payload: None,
+                    time_ms: t,
+                },
+                byard_core::platform::InputEvent {
+                    kind: byard_core::platform::EventKind::PointerUp,
+                    pos: p,
+                    delta: (0.0, 0.0),
+                    payload: None,
+                    time_ms: t + 20,
+                },
+            ]
+        };
+        interp.dispatch_events(&tap(0, (10.0, 10.0)));
+        interp.tick();
+
+        assert_eq!(
+            interp.peek(open),
+            Value::Bool(false),
+            "outside tap dismissed"
+        );
+        assert_eq!(
+            interp.peek(behind),
+            Value::Bool(false),
+            "modal scrim blocked the button behind it"
+        );
+    }
+
+    #[test]
+    fn modal_overlay_content_wins_over_the_scrim() {
+        // A tap on the centred confirm button fires its action, not the scrim's
+        // dismiss — the content is registered after the scrim, so it wins.
+        let src = "View C() {\n \
+            var open = true\n \
+            var confirmed = false\n \
+            Overlay #[modal: true, dismiss => open = false] {\n \
+                Box #[bg: 0x000000, grow: 1] {}\n \
+                Column #[anchor: center, width: 80, height: 40] {\n \
+                    Button(\"ok\") #[width: 80, height: 40] => confirmed = true\n \
+                }\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        let open = interp
+            .var_signal(&crate::symbol::Symbol::intern("open"))
+            .unwrap();
+        let confirmed = interp
+            .var_signal(&crate::symbol::Symbol::intern("confirmed"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Centre of the viewport = centre of the confirm button.
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (200.0, 150.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (200.0, 150.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 20,
+            },
+        ]);
+        interp.tick();
+
+        assert_eq!(
+            interp.peek(confirmed),
+            Value::Bool(true),
+            "content button fired"
+        );
+        assert_eq!(
+            interp.peek(open),
+            Value::Bool(true),
+            "scrim dismiss did NOT fire"
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_the_topmost_modal_overlay() {
+        let src = "View C() {\n \
+            var open = true\n \
+            Overlay #[modal: true, dismiss => open = false] {\n \
+                Box #[grow: 1] {}\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        let open = interp
+            .var_signal(&crate::symbol::Symbol::intern("open"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::KeyDown,
+            pos: (0.0, 0.0),
+            delta: (0.0, 0.0),
+            payload: Some(byard_core::platform::InputPayload::Key("Escape".into())),
+            time_ms: 0,
+        }]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(open),
+            Value::Bool(false),
+            "Escape dismissed the modal"
+        );
+    }
+
+    #[test]
+    fn non_modal_overlay_lets_taps_fall_through() {
+        // A non-modal overlay (a snackbar-style surface) must not block the main
+        // tree: a tap on the button behind still fires.
+        let src = "View C() {\n \
+            var behind = false\n \
+            Button(\"behind\") #[width: 400, height: 300] => behind = true\n \
+            Overlay #[modal: false] {\n \
+                Column #[anchor: bottom, width: 100, height: 20] {}\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        let behind = interp
+            .var_signal(&crate::symbol::Symbol::intern("behind"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Tap top-left, away from the bottom-anchored surface.
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (10.0, 10.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (10.0, 10.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 20,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(behind),
+            Value::Bool(true),
+            "non-modal overlay let the tap fall through"
+        );
+    }
+
+    #[test]
+    fn overlay_demo_example_renders_dialog_above_the_base_app() {
+        // Ties the shipped visual example to the test suite: it must parse,
+        // lower, and render, with the modal dialog surface compositing above the
+        // base app (RFC-0017). Guards the demo against silent breakage.
+        let src = include_str!("../../examples/overlay_demo.byd");
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &known);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 900.0, 560.0);
+
+        // The base app background (0x14141C, red≈0.078) is emitted early; the
+        // dialog surface (0xECE6F0, red≈0.925) is an overlay emitted later, so it
+        // sits at a nearer depth than the base app.
+        let base = frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| (b.color[0] - 0.078).abs() < 0.02)
+            .map(|(i, _)| i)
+            .expect("base app background emitted");
+        let (dialog, dialog_box) = frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.color[0] > 0.9 && b.color[1] > 0.85)
+            .map(|(i, b)| (i, *b))
+            .expect("dialog surface emitted");
+        assert!(
+            frame.solid_depths()[dialog] < frame.solid_depths()[base],
+            "the modal dialog must composite above the base app"
+        );
+
+        // No dialog text line may overflow the dialog surface — line wrap is not
+        // built yet, so the example is authored to fit. Guards the reported
+        // overflow against regression: every dark-on-light label painted inside
+        // the surface must end before the surface's right edge.
+        let mut measurer = byard_core::text::TextMeasurer::new();
+        let surf_left = dialog_box.rect[0];
+        let surf_right = dialog_box.rect[0] + dialog_box.rect[2];
+        for line in frame.texts() {
+            let inside = line.x >= surf_left && line.x < surf_right && line.color[0] < 0.5;
+            if inside {
+                let (w, _) = measurer.measure(&line.text, line.font_size);
+                assert!(
+                    line.x + w <= surf_right + 0.5,
+                    "dialog text {:?} overflows the surface: {} + {} > {}",
+                    line.text,
+                    line.x,
+                    w,
+                    surf_right
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_overlays_stack_in_mount_order() {
+        // An overlay whose content mounts a second overlay: both are collected,
+        // and the inner one is emitted later (on top).
+        let src = "View C() {\n \
+            Overlay #[modal: false] {\n \
+                Box #[bg: 0x111111, grow: 1] {}\n \
+                Overlay #[modal: false] {\n \
+                    Box #[bg: 0x222222, grow: 1] {}\n \
+                }\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let outer = frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| (b.color[0] - 0.066).abs() < 0.02)
+            .map(|(i, _)| i)
+            .expect("outer overlay box");
+        let inner = frame
+            .instances()
+            .iter()
+            .enumerate()
+            .find(|(_, b)| (b.color[0] - 0.133).abs() < 0.02)
+            .map(|(i, _)| i)
+            .expect("inner overlay box");
+        assert!(
+            frame.solid_depths()[inner] < frame.solid_depths()[outer],
+            "nested overlay stacks above its parent overlay"
+        );
     }
 }

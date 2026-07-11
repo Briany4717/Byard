@@ -642,9 +642,10 @@ impl EncoderSubsystem {
     ///   alone cannot erase stale content (see that field's doc comment),
     ///   so this step is required, not optional. Every `BoxInstance` is
     ///   then redrawn too (the clear quad may have wiped one), bounded by
-    ///   the active scissor rect. `TextGlyphPipeline::prepare`/`render`
-    ///   still receive the **full, unfiltered** `texts` slice; see the note
-    ///   above the `render` call below for why.
+    ///   the active scissor rect. `TextGlyphPipeline::prepare`/`render_layer`
+    ///   still receive the **full, unfiltered** `texts` slice (partitioned by
+    ///   z-layer, never filtered); see the note above the `render_layer` call
+    ///   in [`draw_ui_pass`] for why.
     /// - **Nothing dirty**: the inner pass is skipped entirely — zero GPU
     ///   work beyond the mandatory composite step below.
     ///
@@ -669,7 +670,8 @@ impl EncoderSubsystem {
         texts: &[TextLine],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
         // No `RenderFrame` here (raw solid+text convenience path): empty depths
-        // → far-plane fallback, i.e. the pre-depth type-grouped pass order.
+        // → far-plane fallback, i.e. the pre-depth type-grouped pass order;
+        // empty layer marks → one z-layer, the pre-layering draw stream.
         self.encode_frame_with_decorations(
             target,
             instances,
@@ -680,6 +682,7 @@ impl EncoderSubsystem {
             &[],
             DrawDepths::default(),
             FrameClips::default(),
+            &[],
         )
     }
 
@@ -698,6 +701,7 @@ impl EncoderSubsystem {
         atlas_uploads: &[AtlasUpload],
         depths: DrawDepths<'_>,
         clips: FrameClips<'_>,
+        layers: &[crate::frame::LayerMark],
     ) -> Result<wgpu::CommandBuffer, ByardError> {
         // RFC-0009 §2-C / INV-8: the single place this atlas is ever written
         // to. Applied unconditionally (not gated on `should_draw` below) so a
@@ -772,6 +776,10 @@ impl EncoderSubsystem {
         // ── Text prepare (before the render pass) ─────────────────────────────
         if should_draw {
             let viewport_dirty = self.viewport_dirty;
+            // One glyph batch per z-layer (RFC-0017 layered draw batches) —
+            // shaping inside `prepare` stays global, so this partition costs
+            // nothing beyond one extra small vertex buffer per extra layer.
+            let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
             self.text_pipeline.prepare(
                 &self.device,
                 &self.queue,
@@ -781,6 +789,7 @@ impl EncoderSubsystem {
                 viewport_dirty,
                 clips.table,
                 clips.text,
+                &text_ranges,
             )?;
         }
         self.viewport_dirty = false;
@@ -823,6 +832,7 @@ impl EncoderSubsystem {
                     decorated_depths: depths.decorated,
                     texture_depths: depths.texture,
                     clips,
+                    layers,
                 },
                 self.gpu_timer.as_ref(),
             )?;
@@ -915,6 +925,7 @@ impl EncoderSubsystem {
                 frame.atlas_uploads(),
                 frame_draw_depths(frame),
                 frame_clips(frame),
+                frame.layer_marks(),
             )?;
             self.last_relay_version = frame.version();
             return Ok(cmd);
@@ -929,6 +940,7 @@ impl EncoderSubsystem {
             frame.atlas_uploads(),
             frame_draw_depths(frame),
             frame_clips(frame),
+            frame.layer_marks(),
         )?;
         self.last_relay_version = frame.version();
         Ok(cmd)
@@ -1128,6 +1140,37 @@ struct DrawPrimitives<'a> {
     texture_depths: &'a [f32],
     /// Content-clip table + per-pool clip slices (RFC-0005 `ScrollView`).
     clips: FrameClips<'a>,
+    /// Z-layer boundaries (RFC-0017 layered draw batches): pool cursors at
+    /// each [`RenderFrame::begin_layer`] call. Empty = one layer = the exact
+    /// pre-layering draw stream.
+    layers: &'a [crate::frame::LayerMark],
+}
+
+/// Partitions one drawable pool into its per-z-layer index ranges (RFC-0017
+/// layered draw batches): `marks` are the pool cursors recorded at each layer
+/// boundary, `total` is the pool's final length, and `field` selects this
+/// pool's cursor out of a [`LayerMark`](crate::frame::LayerMark). Always
+/// returns `marks.len() + 1` contiguous, non-overlapping ranges covering
+/// `0..total` — the degenerate no-marks case is the single full range.
+///
+/// Cursors are clamped monotonically (a decreasing or overshooting mark can
+/// come only from a logic-thread bug, and must degrade to an empty layer, not
+/// a panic or an out-of-bounds slice on the render thread). Pure and
+/// unit-testable without any GPU state, per the project's CPU-mirror pattern.
+fn layer_pool_ranges(
+    marks: &[crate::frame::LayerMark],
+    total: usize,
+    field: impl Fn(&crate::frame::LayerMark) -> u32,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(marks.len() + 1);
+    let mut start = 0usize;
+    for m in marks {
+        let cut = (field(m) as usize).clamp(start, total);
+        ranges.push(start..cut);
+        start = cut;
+    }
+    ranges.push(start..total);
+    ranges
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1166,6 +1209,7 @@ fn draw_ui_pass(
         decorated_depths,
         texture_depths,
         clips,
+        layers,
     } = *primitives;
     // The base scissor every clipped draw intersects with: the dirty region on
     // an incremental frame, or the whole physical target on a full redraw.
@@ -1236,92 +1280,133 @@ fn draw_ui_pass(
         );
     }
 
-    // Drawn on every call to this function, not just a full redraw — the
-    // clear quad above can wipe a box's area on an incremental frame, so
-    // boxes must be repainted afterwards or they would stay erased. The
-    // active GPU scissor rect (set above, incremental frames only) bounds
-    // which pixels this actually touches, so the cost is still proportional
-    // to the dirty region, not the full instance list.
-    if !instances.is_empty() {
-        draw_solid_box_instances(
+    // ── Z-layer interleaved draw batches (RFC-0017) ───────────────────────────
+    //
+    // One iteration per z-layer, all inside this single render pass (pipeline
+    // re-binds between batches are cheap; a pass break — the thing that
+    // flushes the tile buffer on TBDR GPUs — never happens). Within a layer
+    // the shared depth buffer keeps resolving paint order exactly as before;
+    // across layers, draw order itself now matches emission order, so a later
+    // layer's *transparent* geometry (a modal scrim, a dialog shadow)
+    // genuinely alpha-blends over an earlier layer's text and images instead
+    // of being drawn before the frame-final text batch. With no layer marks
+    // this loop runs exactly once over the full pools — the pre-layering draw
+    // stream, byte for byte.
+    let solid_ranges = layer_pool_ranges(layers, instances.len(), |m| m.solid);
+    let decorated_ranges = layer_pool_ranges(layers, decorated.len(), |m| m.decorated);
+    let texture_ranges = layer_pool_ranges(layers, textures.len(), |m| m.texture);
+    let vector_ranges = layer_pool_ranges(layers, vectors.len(), |m| m.vector);
+    let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
+
+    let layer_count = layers.len() + 1;
+    for layer in 0..layer_count {
+        let sr = &solid_ranges[layer];
+        let dr = &decorated_ranges[layer];
+        let tr = &texture_ranges[layer];
+        let vr = &vector_ranges[layer];
+        let xr = &text_ranges[layer];
+
+        // Drawn on every call to this function, not just a full redraw — the
+        // clear quad above can wipe a box's area on an incremental frame, so
+        // boxes must be repainted afterwards or they would stay erased. The
+        // active GPU scissor rect (set above, incremental frames only) bounds
+        // which pixels this actually touches, so the cost is still
+        // proportional to the dirty region, not the full instance list.
+        if !sr.is_empty() {
+            draw_solid_box_instances(
+                &mut render_pass,
+                device,
+                render_pipeline,
+                viewport_bind_group,
+                quad_buffer,
+                &instances[sr.clone()],
+                sub_slice(solid_depths, sr),
+                sub_slice(clips.solid, sr),
+                clip_ctx,
+            );
+        }
+
+        // M21: decorated boxes (border/shadow/opacity), then textured images.
+        // The order within a layer is unchanged; the shared depth buffer (each
+        // primitive carrying its emission-order z) resolves visibility — so a
+        // container's border no longer paints over a child that was emitted
+        // after it, and text (below) no longer sits unconditionally on top.
+        decorated_box::draw(
             &mut render_pass,
             device,
-            render_pipeline,
+            decorated_pipeline,
             viewport_bind_group,
             quad_buffer,
-            instances,
-            solid_depths,
-            clips.solid,
+            &decorated[dr.clone()],
+            sub_slice(decorated_depths, dr),
+            sub_slice(clips.decorated, dr),
             clip_ctx,
         );
-    }
+        texture_sampler::draw(
+            &mut render_pass,
+            device,
+            texture_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            texture_cache,
+            &textures[tr.clone()],
+            sub_slice(texture_depths, tr),
+            sub_slice(clips.texture, tr),
+            clip_ctx,
+        );
+        // RFC-0009 §1: crisp monochrome icons, sampled from the same MSDF
+        // atlas the JIT/AOT paths upload to. Each instance carries its own
+        // draw-order depth (RFC-0011), so paint order across pipelines is
+        // honoured here too.
+        vector_msdf::draw(
+            &mut render_pass,
+            device,
+            vector_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            vector_atlas,
+            &vectors[vr.clone()],
+            sub_slice(clips.vector, vr),
+            clip_ctx,
+        );
 
-    // M21: decorated boxes (border/shadow/opacity), then textured images. The
-    // pass order is unchanged, but the shared depth buffer (each primitive
-    // carrying its emission-order z) is now what resolves visibility — so a
-    // container's border no longer paints over a child that was emitted after
-    // it, and text (below) no longer sits unconditionally on top.
-    decorated_box::draw(
-        &mut render_pass,
-        device,
-        decorated_pipeline,
-        viewport_bind_group,
-        quad_buffer,
-        decorated,
-        decorated_depths,
-        clips.decorated,
-        clip_ctx,
-    );
-    texture_sampler::draw(
-        &mut render_pass,
-        device,
-        texture_pipeline,
-        viewport_bind_group,
-        quad_buffer,
-        texture_cache,
-        textures,
-        texture_depths,
-        clips.texture,
-        clip_ctx,
-    );
-    // RFC-0009 §1: crisp monochrome icons, sampled from the same MSDF atlas
-    // the JIT/AOT paths upload to. Each instance carries its own draw-order
-    // depth (RFC-0011), so paint order across pipelines is honoured here too.
-    vector_msdf::draw(
-        &mut render_pass,
-        device,
-        vector_pipeline,
-        viewport_bind_group,
-        quad_buffer,
-        vector_atlas,
-        vectors,
-        clips.vector,
-        clip_ctx,
-    );
+        // Restore the base scissor before this layer's text: the pool draws
+        // above left the GPU scissor at their last clip run, but text is
+        // clipped per-line via glyphon's own `TextBounds` (set in `prepare`),
+        // so its render must run under the full base region, not a stale
+        // ScrollView run.
+        {
+            let (x, y, w, h) = base_scissor;
+            if w > 0 && h > 0 {
+                render_pass.set_scissor_rect(x, y, w, h);
+            }
+        }
 
-    // Restore the base scissor before text: the pool draws above left the GPU
-    // scissor at their last clip run, but text is clipped per-line via glyphon's
-    // own `TextBounds` (set in `prepare`), so its render must run under the full
-    // base region, not a stale ScrollView run.
-    {
-        let (x, y, w, h) = base_scissor;
-        if w > 0 && h > 0 {
-            render_pass.set_scissor_rect(x, y, w, h);
+        // This layer's glyph batch. `prepare` (called before this pass began)
+        // saw the full, unfiltered `texts` slice partitioned by the same layer
+        // ranges — its internal cache is positionally index-aligned with that
+        // slice, so filtering to only the dirty lines here would silently
+        // associate a non-dirty line's cached glyph buffer with the wrong
+        // line. The scissor rect set above (on incremental frames) is what
+        // actually limits which pixels this call may write — not the slice
+        // contents.
+        if !xr.is_empty() {
+            text_pipeline.render_layer(&mut render_pass, layer)?;
         }
     }
 
-    // Always the full, unfiltered `texts` slice (the `prepare` call before
-    // this pass began did too) — `TextGlyphPipeline`'s internal cache is
-    // positionally index-aligned with whatever slice it last saw, so
-    // slicing down to only the dirty lines here would silently associate a
-    // non-dirty line's cached glyph buffer with the wrong line. The scissor
-    // rect set above (on incremental frames) is what actually limits which
-    // pixels this call may write — not the slice contents.
-    if !texts.is_empty() {
-        text_pipeline.render(&mut render_pass)?;
-    }
-
     Ok(())
+}
+
+/// Clamped subslice: `slice[range]` where the range is first clamped to the
+/// slice's bounds. The per-layer pool ranges are computed against the pool's
+/// own length, but the parallel depth/clip slices may legitimately be shorter
+/// (their contracts allow it, falling back to far-plane / unclipped), so this
+/// keeps that leniency instead of panicking on the render thread.
+fn sub_slice<'a, T>(slice: &'a [T], range: &std::ops::Range<usize>) -> &'a [T] {
+    let start = range.start.min(slice.len());
+    let end = range.end.clamp(start, slice.len());
+    &slice[start..end]
 }
 
 /// Creates the persistent off-screen colour target and its view.
@@ -1760,8 +1845,18 @@ async fn build_m21_pipelines(
         }],
     };
 
-    let decorated_pipeline =
-        decorated_box::build_pipeline(device, viewport_layout, quad(), surface_format).await?;
+    // RFC-0017: the decorated pass is transparent geometry (shadows, borders,
+    // translucent fills), so it *tests* draw-order depth but never *writes* it —
+    // otherwise a translucent box or a shadow halo would cull the app text drawn
+    // beneath it in the later text pass. Only opaque passes write depth.
+    let decorated_pipeline = decorated_box::build_pipeline(
+        device,
+        viewport_layout,
+        quad(),
+        surface_format,
+        draw_depth_stencil_no_write(),
+    )
+    .await?;
 
     let texture_bind_group_layout = texture_sampler::bind_group_layout(device);
     let image_sampler = texture_sampler::sampler(device);
@@ -1794,6 +1889,25 @@ pub(crate) fn draw_depth_stencil() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Depth-stencil state for the **transparent** geometry pass — the whole
+/// `DecoratedBox` pipeline (shadows, borders, translucent fills; RFC-0017). It
+/// still *tests* draw-order depth (`LessEqual`, so a nearer opaque surface
+/// occludes a border or a scrim) but does **not** *write* it. Only opaque
+/// geometry (solids/textures/vectors) writes depth; a transparent primitive that
+/// wrote its nearer depth would cull every earlier-emitted primitive drawn in a
+/// later pass — most visibly all app text beneath a modal scrim or a shadow's
+/// halo, which would simply vanish. This is the standard opaque/transparent
+/// split. `pub(crate)` so `decorated_box` builds its pipeline from it.
+pub(crate) fn draw_depth_stencil_no_write() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
         depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
@@ -1997,6 +2111,57 @@ fn solid_depth_layout() -> wgpu::VertexBufferLayout<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Z-layer pool partitioning (RFC-0017 layered draw batches) ──────────────
+
+    /// Shorthand: a [`crate::frame::LayerMark`] whose five cursors are all `n`.
+    fn mark(n: u32) -> crate::frame::LayerMark {
+        crate::frame::LayerMark {
+            solid: n,
+            decorated: n,
+            texture: n,
+            vector: n,
+            text: n,
+        }
+    }
+
+    #[test]
+    fn no_marks_is_one_full_range() {
+        let none: &[crate::frame::LayerMark] = &[];
+        assert_eq!(layer_pool_ranges(none, 5, |m| m.text), vec![0..5]);
+        assert_eq!(layer_pool_ranges(none, 0, |m| m.text), vec![0..0]);
+    }
+
+    #[test]
+    fn marks_split_the_pool_into_contiguous_layers() {
+        let marks = [mark(2), mark(2), mark(4)];
+        // Layer 1 is empty (two marks at the same cursor) — legal, draws nothing.
+        assert_eq!(
+            layer_pool_ranges(&marks, 6, |m| m.text),
+            vec![0..2, 2..2, 2..4, 4..6]
+        );
+    }
+
+    #[test]
+    fn malformed_marks_clamp_instead_of_panicking() {
+        // Overshooting cursor → clamped to the pool length; a decreasing
+        // cursor → clamped to monotonic (empty layer). Render-thread safety:
+        // a logic-thread bug degrades to a misdrawn layer, never a panic.
+        let marks = [mark(9), mark(1)];
+        assert_eq!(
+            layer_pool_ranges(&marks, 4, |m| m.text),
+            vec![0..4, 4..4, 4..4]
+        );
+    }
+
+    #[test]
+    fn sub_slice_clamps_to_the_slice_bounds() {
+        let s = [10, 20, 30];
+        assert_eq!(sub_slice(&s, &(1..3)), &[20, 30]);
+        // Parallel depth/clip slices may be shorter than the pool — clamp.
+        assert_eq!(sub_slice(&s, &(2..7)), &[30]);
+        assert_eq!(sub_slice(&s, &(5..7)), &[] as &[i32]);
+    }
 
     // ── INV-8: paint-time transforms never trigger a relayout ─────────────────
 

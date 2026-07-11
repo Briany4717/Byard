@@ -262,3 +262,173 @@ fn later_box_occludes_earlier_text() {
          expected green at ({gx},{gy}), got BGR=({b},{g},{r})"
     );
 }
+
+/// Finds the reddest glyph pixel of a text-only render (helper for the
+/// transparent-geometry regression below).
+fn reddest_glyph(rb: &Readback) -> Option<((f32, f32), i32)> {
+    let mut best = None;
+    let mut best_red = 0i32;
+    let mut ly = 40.0_f32;
+    while ly < 130.0 {
+        let mut lx = 40.0_f32;
+        while lx < 360.0 {
+            let (b, g, r, _a) = rb.at(lx, ly);
+            let redness = i32::from(r) - i32::from(b).max(i32::from(g));
+            if redness > best_red {
+                best_red = redness;
+                best = Some((lx, ly));
+            }
+            lx += 2.0;
+        }
+        ly += 2.0;
+    }
+    best.map(|p| (p, best_red))
+}
+
+/// RFC-0017 regression: **transparent geometry never writes draw-order depth**,
+/// so text emitted before it survives. The decorated pass (shadows, borders,
+/// translucent fills) only *tests* depth; if it wrote its nearer z, every
+/// earlier glyph beneath it — drawn in the later text pass at a farther depth —
+/// would fail `LessEqual` and vanish. This is the "all app text disappears under
+/// a modal scrim (or a shadow halo)" bug.
+///
+/// Both a translucent fill (`opacity 0.5`) **and** an opaque-`opacity` shadow
+/// are checked: the shadow carries `opacity: 1.0`, so a fix keyed only on
+/// `opacity < 1` still culled text under shadow halos. Contrast with
+/// `later_box_occludes_earlier_text`, where an *opaque solid* legitimately
+/// occludes the text.
+#[test]
+fn transparent_geometry_over_text_does_not_cull_it() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping z-order readback");
+        return;
+    };
+
+    let (w, h) = (400.0_f32, 200.0_f32);
+    let text = || TextLine {
+        x: 40.0,
+        y: 60.0,
+        text: "SCRIM".to_string(),
+        font_size: 64.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        dirty: true,
+    };
+
+    // ── Render A: text only. Find the reddest glyph pixel. ──
+    let mut frame_a = RenderFrame::new();
+    frame_a.push_text(text());
+    let rb_a = render(&device, &queue, &frame_a, w, h);
+    let ((gx, gy), best_red) = reddest_glyph(&rb_a).expect("a glyph pixel");
+    assert!(
+        best_red > 40,
+        "expected a clearly red glyph pixel, got {best_red}"
+    );
+
+    // ── Case 1: a translucent fill (opacity 0.5) emitted after the text. It does
+    // not write depth, so the text still passes and paints on top (red-dominant).
+    let mut frame_b = RenderFrame::new();
+    frame_b.push_text(text());
+    frame_b.push_decorated(DecoratedBox {
+        base: solid([30.0, 20.0, 340.0, 100.0], [0.0, 0.85, 0.2, 1.0]),
+        opacity: 0.5,
+        dirty: true,
+        ..Default::default()
+    });
+    let rb_b = render(&device, &queue, &frame_b, w, h);
+    let (b, g, r, a) = rb_b.at(gx, gy);
+    assert!(a > 10, "pixel must be opaque, got alpha {a}");
+    assert!(
+        r > g && r > b,
+        "text under a translucent fill must survive (red-dominant); got BGR=({b},{g},{r})"
+    );
+
+    // ── Case 2: a SHADOW (opacity 1.0) whose dark halo veils the text band. The
+    // shadow fill is transparent; despite opacity 1.0 it is transparent geometry
+    // and must not write depth, so the text still survives on top.
+    let mut frame_c = RenderFrame::new();
+    frame_c.push_text(text());
+    frame_c.push_decorated(DecoratedBox {
+        base: solid([30.0, 20.0, 340.0, 100.0], [0.0, 0.0, 0.0, 0.0]),
+        shadow_blur: 8.0,
+        shadow_color: [0.0, 0.0, 0.0, 0.85],
+        opacity: 1.0,
+        dirty: true,
+        ..Default::default()
+    });
+    let rb_c = render(&device, &queue, &frame_c, w, h);
+    let (b, g, r, a) = rb_c.at(gx, gy);
+    assert!(a > 10, "pixel must be opaque, got alpha {a}");
+    assert!(
+        r > g && r > b,
+        "text under a shadow halo must survive (red-dominant), not be culled; got BGR=({b},{g},{r})"
+    );
+}
+
+/// RFC-0017 layered draw batches: a translucent scrim in a **later z-layer**
+/// (`begin_layer` between the text and the scrim) must genuinely alpha-blend
+/// *over* the earlier layer's text — the glyph pixel reads as a true mix of
+/// glyph red and scrim green, proving the text is neither culled (the depth
+/// bug: red would vanish entirely) nor drawn on top undimmed (the old
+/// frame-final text batch: red would stay pure and green-free). Contrast with
+/// `transparent_geometry_over_text_does_not_cull_it`, where the scrim shares
+/// the text's layer and the text correctly paints on top.
+#[test]
+fn scrim_in_a_later_layer_dims_text_beneath_it() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping z-order readback");
+        return;
+    };
+
+    let (w, h) = (400.0_f32, 200.0_f32);
+    let text = || TextLine {
+        x: 40.0,
+        y: 60.0,
+        text: "DIMMED".to_string(),
+        font_size: 64.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        dirty: true,
+    };
+
+    // ── Render A: text only. Find the reddest glyph pixel. ──
+    let mut frame_a = RenderFrame::new();
+    frame_a.push_text(text());
+    let rb_a = render(&device, &queue, &frame_a, w, h);
+    let ((gx, gy), best_red) = reddest_glyph(&rb_a).expect("a glyph pixel");
+    assert!(
+        best_red > 40,
+        "expected a clearly red glyph pixel, got {best_red}"
+    );
+    let (_, _, pure_r, _) = rb_a.at(gx, gy);
+
+    // ── Render B: the same text, then a NEW LAYER carrying a green translucent
+    // scrim over the whole band (the modal-overlay shape). The scrim's layer
+    // draws after the text's layer inside the same pass, so it must blend over
+    // the glyph: both channels clearly present, and red measurably dimmed.
+    let mut frame_b = RenderFrame::new();
+    frame_b.push_text(text());
+    frame_b.begin_layer();
+    frame_b.push_decorated(DecoratedBox {
+        base: solid([30.0, 20.0, 340.0, 100.0], [0.0, 0.85, 0.2, 1.0]),
+        opacity: 0.5,
+        dirty: true,
+        ..Default::default()
+    });
+    let rb_b = render(&device, &queue, &frame_b, w, h);
+
+    let (b, g, r, a) = rb_b.at(gx, gy);
+    assert!(a > 10, "pixel must be opaque, got alpha {a}");
+    assert!(
+        r > 60,
+        "glyph must survive under the scrim (not culled by depth); got BGR=({b},{g},{r})"
+    );
+    assert!(
+        g > 60,
+        "the scrim must actually dim the glyph (not draw beneath a frame-final \
+         text batch); got BGR=({b},{g},{r})"
+    );
+    assert!(
+        r < pure_r,
+        "the dimmed glyph must be darker red than the uncovered one \
+         ({r} !< {pure_r}); the scrim had no effect"
+    );
+}

@@ -879,6 +879,12 @@ pub struct RenderFrame {
     /// Reset each [`clear`](Self::clear); advanced by every `push_*` drawable.
     draw_seq: u32,
 
+    /// Z-layer boundaries recorded by [`begin_layer`](Self::begin_layer)
+    /// (RFC-0017 layered draw batches). Empty for the overwhelmingly common
+    /// single-layer frame — the Encoder then draws the exact pre-layering
+    /// stream. See [`LayerMark`] for the full model.
+    layer_marks: Vec<LayerMark>,
+
     /// Monotonic version counter, incremented by the Logic thread whenever any
     /// content in this frame changes relative to the previous tick.
     ///
@@ -912,6 +918,37 @@ fn intersect_rect(a: Rect, b: Rect) -> Rect {
     let x1 = (a.x + a.width).min(b.x + b.width);
     let y1 = (a.y + a.height).min(b.y + b.height);
     Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
+
+/// A z-layer boundary: the length of every drawable pool at the instant
+/// [`RenderFrame::begin_layer`] was called (RFC-0017 layered draw batches).
+///
+/// The Encoder turns consecutive marks into per-pool index ranges and draws
+/// each layer's primitives — solids, decorated, textures, vectors, **and
+/// text** — as one interleaved group inside the single UI render pass, so a
+/// later layer's *transparent* geometry (a modal scrim, a dialog shadow)
+/// alpha-blends **over** an earlier layer's text and images instead of being
+/// painted before them. Within a layer, the shared draw-order depth buffer
+/// keeps resolving paint order exactly as before; across layers, draw order
+/// itself is now correct for blending. A frame with no marks is one layer —
+/// the exact pre-layering draw stream, byte for byte.
+///
+/// Kept as pool *cursors* (not per-primitive tags) because emission is
+/// strictly sequential — the main tree first, then each overlay — so a layer
+/// is always a contiguous range of every pool. Five `u32`s per layer instead
+/// of one tag per primitive.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct LayerMark {
+    /// `instances` (solid boxes) length at the boundary.
+    pub solid: u32,
+    /// `decorated` length at the boundary.
+    pub decorated: u32,
+    /// `textures` length at the boundary.
+    pub texture: u32,
+    /// `vector_instances` length at the boundary.
+    pub vector: u32,
+    /// `texts` length at the boundary.
+    pub text: u32,
 }
 
 /// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
@@ -967,6 +1004,7 @@ impl RenderFrame {
         self.texture_clips.clear();
         self.text_clips.clear();
         self.vector_clips.clear();
+        self.layer_marks.clear();
         self.draw_seq = 0;
         self.version = 0;
         // `Vec::clear` only, not `SampleBlock::default()` — the latter would
@@ -1067,6 +1105,37 @@ impl RenderFrame {
     /// drawing this frame (RFC-0009 §2-C / INV-8).
     pub fn push_atlas_upload(&mut self, upload: AtlasUpload) {
         self.atlas_uploads.push(upload);
+    }
+
+    /// Opens a new z-layer (RFC-0017): everything pushed from here on is drawn
+    /// — solids, decorated, textures, vectors, *and text*, interleaved — after
+    /// **everything** already in the frame, inside the same GPU render pass.
+    ///
+    /// Called by the overlay phase before emitting each overlay, so a modal
+    /// scrim genuinely alpha-blends over the main tree's text and images
+    /// instead of being drawn before the frame-final text batch. Consecutive
+    /// calls with no primitives in between are deduplicated, so an overlay
+    /// that emits nothing costs nothing. A frame that never calls this is a
+    /// single layer and renders through the exact pre-layering draw stream.
+    pub fn begin_layer(&mut self) {
+        let mark = LayerMark {
+            solid: u32::try_from(self.instances.len()).unwrap_or(u32::MAX),
+            decorated: u32::try_from(self.decorated.len()).unwrap_or(u32::MAX),
+            texture: u32::try_from(self.textures.len()).unwrap_or(u32::MAX),
+            vector: u32::try_from(self.vector_instances.len()).unwrap_or(u32::MAX),
+            text: u32::try_from(self.texts.len()).unwrap_or(u32::MAX),
+        };
+        if self.layer_marks.last() == Some(&mark) {
+            return; // empty layer — dedup, an overlay that emitted nothing is free
+        }
+        self.layer_marks.push(mark);
+    }
+
+    /// The z-layer boundaries recorded this frame (RFC-0017 layered draw
+    /// batches); empty for a single-layer frame. See [`LayerMark`].
+    #[must_use]
+    pub fn layer_marks(&self) -> &[LayerMark] {
+        &self.layer_marks
     }
 
     /// Sets the frame's version counter.
@@ -1783,5 +1852,56 @@ mod motion_tests {
         // The stack is empty, so a fresh push is unclipped.
         f.push_instance(box_at(0.0, 0.0));
         assert_eq!(f.solid_clips(), &[None]);
+    }
+
+    // ── Z-layer marks (RFC-0017 layered draw batches) ──────────────────────────
+
+    #[test]
+    fn begin_layer_records_every_pool_cursor() {
+        let mut f = RenderFrame::new();
+        f.push_instance(box_at(0.0, 0.0));
+        f.push_instance(box_at(1.0, 1.0));
+        f.push_text(TextLine {
+            x: 0.0,
+            y: 0.0,
+            text: "hi".to_string(),
+            font_size: 12.0,
+            color: [1.0; 4],
+            dirty: true,
+        });
+        f.begin_layer();
+        assert_eq!(
+            f.layer_marks(),
+            &[LayerMark {
+                solid: 2,
+                decorated: 0,
+                texture: 0,
+                vector: 0,
+                text: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn begin_layer_dedups_an_empty_layer() {
+        let mut f = RenderFrame::new();
+        f.push_instance(box_at(0.0, 0.0));
+        f.begin_layer();
+        f.begin_layer(); // nothing emitted in between — must not add a mark
+        assert_eq!(f.layer_marks().len(), 1);
+        f.push_instance(box_at(1.0, 1.0));
+        f.begin_layer(); // pool advanced — a real new layer
+        assert_eq!(f.layer_marks().len(), 2);
+    }
+
+    #[test]
+    fn a_frame_with_no_layers_has_no_marks_and_clear_resets_them() {
+        let mut f = RenderFrame::new();
+        f.push_instance(box_at(0.0, 0.0));
+        assert!(f.layer_marks().is_empty());
+        f.begin_layer();
+        f.push_instance(box_at(1.0, 1.0));
+        f.clear();
+        assert!(f.layer_marks().is_empty());
     }
 }

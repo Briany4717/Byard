@@ -11,8 +11,8 @@ use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
 use taffy::prelude::FromLength;
 use taffy::{
     AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, NodeId, Overflow, Point, Rect as TaffyRect, Size, Style, TaffyError,
-    TaffyTree,
+    LengthPercentageAuto, NodeId, Overflow, Point, Position, Rect as TaffyRect, Size, Style,
+    TaffyError, TaffyTree,
 };
 
 use super::spatial::SpatialGrid;
@@ -180,6 +180,14 @@ pub struct ContainerStyle {
     /// the default `axis: vertical`): content overflows on the block axis
     /// (Taffy `overflow.y = Scroll`). Clipped and scrolled by the renderer.
     pub scroll_y: bool,
+    /// Whether this node is **absolutely positioned** and pinned to its
+    /// containing block's edges (Taffy `position: Absolute`, `inset: 0`)
+    /// — RFC-0017 overlay layer. An absolute node is removed from its parent's
+    /// flex flow (it neither displaces siblings nor is displaced by them) and
+    /// stretched to fill the containing block, so several can stack over the
+    /// same viewport rect independently. The overlay compositor uses this to
+    /// float each overlay above the main tree without perturbing its layout.
+    pub absolute: bool,
 }
 
 impl ContainerStyle {
@@ -252,6 +260,14 @@ impl ContainerStyle {
         self
     }
 
+    /// Marks this node absolutely positioned, pinned to fill its containing
+    /// block (RFC-0017 overlay layer). See [`absolute`](Self::absolute).
+    #[must_use]
+    pub fn with_absolute(mut self, absolute: bool) -> Self {
+        self.absolute = absolute;
+        self
+    }
+
     /// Builds the Taffy `Style` this container maps to.
     fn to_taffy(self) -> Style {
         Style {
@@ -296,6 +312,25 @@ impl ContainerStyle {
                 Justify::Evenly => JustifyContent::SpaceEvenly,
             }),
             flex_grow: self.grow,
+            // RFC-0017 overlay layer: an absolute node leaves its parent's flex
+            // flow and is pinned to the containing block's edges (inset 0), so it
+            // stretches to fill the viewport and stacks over siblings without
+            // displacing them. A relative node keeps Taffy's `auto` insets.
+            position: if self.absolute {
+                Position::Absolute
+            } else {
+                Position::Relative
+            },
+            inset: if self.absolute {
+                TaffyRect {
+                    left: LengthPercentageAuto::length(0.0),
+                    right: LengthPercentageAuto::length(0.0),
+                    top: LengthPercentageAuto::length(0.0),
+                    bottom: LengthPercentageAuto::length(0.0),
+                }
+            } else {
+                TaffyRect::auto()
+            },
             // RFC-0005 `ScrollView`: a scroll container measures its content at
             // natural size and lets it overflow the fixed viewport on the
             // scrolling axes, instead of flex-shrinking children to fit. The
@@ -1384,6 +1419,42 @@ mod tests {
         assert_f32_eq(b_rect.y, 0.0);
         assert_f32_eq(b_rect.width, 50.0);
         assert_f32_eq(b_rect.height, 50.0);
+    }
+
+    #[test]
+    fn absolute_node_fills_containing_block_and_ignores_flow() {
+        // RFC-0017: two absolute children pinned inset-0 both fill the viewport
+        // and neither displaces the other (nor a flowing sibling).
+        let mut atlas = LayoutAtlas::new();
+        let flow = atlas.add_leaf(LeafSize::new(40.0, 40.0)).unwrap();
+        let overlay_a = atlas
+            .add_container(ContainerStyle::default().with_absolute(true), &[])
+            .unwrap();
+        let overlay_b = atlas
+            .add_container(ContainerStyle::default().with_absolute(true), &[])
+            .unwrap();
+        let root = atlas
+            .add_container(
+                ContainerStyle::new(Some(300.0), Some(200.0)),
+                &[flow, overlay_a, overlay_b],
+            )
+            .unwrap();
+        atlas.set_root(root).unwrap();
+        atlas.compute(Viewport::new(300.0, 200.0)).unwrap();
+
+        // The flowing child keeps its natural size at the origin — absolute
+        // siblings did not push it.
+        let flow_rect = atlas.resolved_rect(flow).unwrap().unwrap();
+        assert_f32_eq(flow_rect.x, 0.0);
+        assert_f32_eq(flow_rect.width, 40.0);
+
+        for ov in [overlay_a, overlay_b] {
+            let r = atlas.resolved_rect(ov).unwrap().unwrap();
+            assert_f32_eq(r.x, 0.0);
+            assert_f32_eq(r.y, 0.0);
+            assert_f32_eq(r.width, 300.0);
+            assert_f32_eq(r.height, 200.0);
+        }
     }
 
     #[test]

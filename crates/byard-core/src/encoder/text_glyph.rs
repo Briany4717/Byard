@@ -5,10 +5,23 @@
 //!
 //! ## Design constraints
 //!
-//! - **Single render pass** — `TextGlyphPipeline::render` is called *inside*
-//!   the same `wgpu::RenderPass` already started by the `SolidBox` draw. On
-//!   Apple Silicon (TBDR architecture) every render pass break flushes the
-//!   tile buffer to VRAM; sharing the pass with `SolidBox` eliminates that cost.
+//! - **Single render pass** — `TextGlyphPipeline::render_layer` is called
+//!   *inside* the same `wgpu::RenderPass` already started by the `SolidBox`
+//!   draw. On Apple Silicon (TBDR architecture) every render pass break
+//!   flushes the tile buffer to VRAM; sharing the pass with `SolidBox`
+//!   eliminates that cost.
+//! - **Layered text draws, one shared atlas** — RFC-0017 z-layers need a
+//!   later layer's transparent geometry (a modal scrim, a shadow) to
+//!   alpha-blend *over* an earlier layer's text, which a single frame-final
+//!   text draw can never provide. Instead of one `TextRenderer`, the pipeline
+//!   holds one **per z-layer** — all sharing the *same* `FontSystem`,
+//!   `SwashCache`, `TextAtlas`, `Viewport`, and shaped-buffer cache, so every
+//!   line is still shaped exactly once and every glyph is rasterised into one
+//!   atlas regardless of layer count. The only per-layer cost is one small
+//!   glyph vertex buffer and one draw call *inside* the existing pass — never
+//!   an extra render pass, never a re-shape, never a duplicate atlas. A
+//!   single-layer frame uses exactly one renderer: the pre-layering fast
+//!   path, unchanged.
 //! - **Upstream dirty flag, trusted in release** — each [`TextLine`] carries
 //!   a `dirty` bit set by the Evaluator → Atlas → `RenderFrame` pipeline
 //!   (see `frame.rs` and `atlas::layout::LayoutAtlas::populate_frame`).
@@ -154,11 +167,16 @@ pub struct TextGlyphPipeline {
     atlas: TextAtlas,
     /// glyphon viewport — maps logical → physical pixels for the render pass.
     viewport: Viewport,
-    /// glyphon renderer — records text draw calls into a `RenderPass`.
-    renderer: TextRenderer,
+    /// glyphon renderers, **one per z-layer** (RFC-0017 layered draw batches),
+    /// all sharing `atlas`/`viewport`/`font_system`/`swash_cache` above. Grown
+    /// lazily by `prepare` to the frame's layer count and truncated when it
+    /// shrinks (dropping a stale layer's glyph vertex buffer). Index = layer.
+    /// The common single-layer frame keeps exactly one entry.
+    renderers: Vec<TextRenderer>,
     /// Per-line cache: shaped buffers and content hashes.
     ///
-    /// Index-aligned with the `text_lines` slice passed to `prepare`.
+    /// Index-aligned with the **full** `text_lines` slice passed to `prepare`
+    /// — *global* across layers, so layering never re-shapes a line.
     /// Entries are added as new lines appear and never removed (Phase 1).
     cache: Vec<CachedLine>,
 }
@@ -196,7 +214,9 @@ impl TextGlyphPipeline {
         let viewport = Viewport::new(device, &glyph_cache);
         // Enable the same draw-order depth state as the box/texture pipelines so
         // glyphon's text participates in cross-pass paint ordering (RFC-0011)
-        // instead of always drawing on top.
+        // instead of always drawing on top. This first renderer is layer 0 —
+        // the only one a frame without overlays ever touches; `prepare` grows
+        // the vec on demand when a frame carries more z-layers.
         let renderer = TextRenderer::new(
             &mut atlas,
             device,
@@ -216,7 +236,7 @@ impl TextGlyphPipeline {
             swash_cache: SwashCache::new(),
             atlas,
             viewport,
-            renderer,
+            renderers: vec![renderer],
             cache: Vec::new(),
         })
     }
@@ -242,6 +262,15 @@ impl TextGlyphPipeline {
     /// stay DPI-correct. `viewport_dirty` forces a re-prepare even when no
     /// text content has changed (e.g. after a window resize).
     ///
+    /// `layer_ranges` partitions `text_lines` into the frame's z-layers
+    /// (RFC-0017 layered draw batches): contiguous, non-overlapping index
+    /// ranges covering the whole slice, one per layer, in draw order. Each
+    /// layer gets its own `TextRenderer` (grown here on demand) so the
+    /// Encoder can interleave text draws with the other pools per layer; the
+    /// shaping pass below stays **global**, so a line is shaped exactly once
+    /// no matter how many layers the frame has. Pass a single `0..len` range
+    /// for the ordinary single-layer frame.
+    ///
     /// ## Three-pass borrow pattern
     ///
     /// Rust's field-split borrowing cannot reason across a Vec of structs when
@@ -253,9 +282,14 @@ impl TextGlyphPipeline {
     ///    `self.font_system` to grow the cache and re-shape dirty buffers.
     /// 2. **Collection pass** — immutably borrows `self.cache` to build a
     ///    `Vec<TextArea<'_>>` holding `&entry.buffer` references.
-    /// 3. **Prepare pass** — borrows `self.renderer`, `self.font_system`,
+    /// 3. **Prepare pass** — borrows `self.renderers`, `self.font_system`,
     ///    `self.atlas`, `self.viewport`, `self.swash_cache` — all distinct
     ///    from `self.cache`, which is already borrowed by `text_areas`.
+    ///
+    /// Passes 2–3 run once per layer over that layer's subrange; every
+    /// renderer is re-prepared each call (an empty range clears its layer's
+    /// previous glyph buffer — required, or a text line that moved layers
+    /// would ghost in both).
     ///
     /// # Errors
     ///
@@ -271,6 +305,7 @@ impl TextGlyphPipeline {
         viewport_dirty: bool,
         clips: &[crate::frame::ClipRect],
         text_clips: &[Option<u16>],
+        layer_ranges: &[std::ops::Range<usize>],
     ) -> Result<(), ByardError> {
         // ── Pass 1: grow cache and re-shape dirty lines ───────────────────────
         //
@@ -338,104 +373,184 @@ impl TextGlyphPipeline {
                 .shape_until_scroll(&mut self.font_system, false);
         }
 
-        // ── Pass 2: collect immutable TextArea refs ───────────────────────────
-        let text_areas: Vec<TextArea<'_>> = text_lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let [r, g, b, a] = line.color;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let default_color = Color::rgba(
-                    (r.clamp(0.0, 1.0) * 255.0) as u8,
-                    (g.clamp(0.0, 1.0) * 255.0) as u8,
-                    (b.clamp(0.0, 1.0) * 255.0) as u8,
-                    (a.clamp(0.0, 1.0) * 255.0) as u8,
-                );
-                TextArea {
-                    buffer: &self.cache[i].buffer,
-                    // glyphon's Viewport/Resolution is configured in PHYSICAL
-                    // pixels (see EncoderSubsystem::update_viewport), but
-                    // TextLine.x/y are authored in logical pixels like every
-                    // other public coordinate in this crate. cosmic-text's
-                    // glyph positioning does not rescale this offset — only
-                    // the buffer's own shaped glyph extents are scaled by
-                    // `scale` — so `left`/`top` must already be physical
-                    // pixels or text lands at `logical / scale_factor`,
-                    // visibly drifting toward the origin on HiDPI displays.
-                    left: line.x * scale_factor,
-                    top: line.y * scale_factor,
-                    scale: scale_factor,
-                    // Content clip (RFC-0005 `ScrollView`): a line inside a scroll
-                    // viewport is clipped to it via glyphon's own `TextBounds`
-                    // (physical px) — the clean, per-area way to clip text without
-                    // a render-pass scissor. Unclipped lines stay unbounded.
-                    bounds: text_clips
-                        .get(i)
-                        .copied()
-                        .flatten()
-                        .and_then(|idx| clips.get(idx as usize))
-                        .map_or(
-                            TextBounds {
-                                left: 0,
-                                top: 0,
-                                right: i32::MAX,
-                                bottom: i32::MAX,
-                            },
-                            |c| clip_to_text_bounds(c.rect, scale_factor),
-                        ),
-                    default_color,
-                    custom_glyphs: &[],
-                }
-            })
-            .collect();
-
-        // ── Pass 3: glyphon prepare (with draw-order depth) ───────────────────
+        // ── Grow/shrink the per-layer renderer pool ───────────────────────────
         //
-        // Borrows: renderer, font_system, atlas, viewport, swash_cache.
-        // These are all distinct fields from `cache` (borrowed by text_areas).
-        //
-        // `metadata_to_depth` maps each glyph's metadata (its line index, set in
-        // pass 1) to that line's draw-order NDC-z, so text is depth-sorted
-        // against solids/decorated/textures instead of always painting on top
-        // (RFC-0011 cross-pass paint order). A missing/out-of-range depth falls
-        // back to the far plane.
-        self.renderer
-            .prepare_with_depth(
-                device,
-                queue,
-                &mut self.font_system,
+        // One `TextRenderer` per z-layer, all sharing the atlas/viewport/font
+        // stack. Growth is rare (a new overlay depth appears); truncation
+        // drops a vanished layer's glyph vertex buffer instead of leaking it.
+        let layer_count = layer_ranges.len().max(1);
+        while self.renderers.len() < layer_count {
+            self.renderers.push(TextRenderer::new(
                 &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-                |meta| {
-                    depths
-                        .get(meta)
-                        .copied()
-                        .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR)
-                },
-            )
-            .map_err(|e| ByardError::TextPrepare(e.to_string()))
+                device,
+                MultisampleState::default(),
+                Some(super::draw_depth_stencil()),
+            ));
+        }
+        self.renderers.truncate(layer_count);
+
+        // A missing/empty partition means "everything is layer 0" — the
+        // ordinary frame — expressed as one full-slice range.
+        let full_range = 0..text_lines.len();
+        let ranges: &[std::ops::Range<usize>] = if layer_ranges.is_empty() {
+            std::slice::from_ref(&full_range)
+        } else {
+            layer_ranges
+        };
+
+        // ── Passes 2 + 3, once per layer ──────────────────────────────────────
+        for (renderer, range) in self.renderers.iter_mut().zip(ranges) {
+            // Clamp defensively: a malformed range must never panic the
+            // render thread — worst case a line draws in the wrong layer.
+            let start = range.start.min(text_lines.len());
+            let end = range.end.clamp(start, text_lines.len());
+
+            // ── Pass 2: collect immutable TextArea refs for this layer ────────
+            //
+            // A free function over `&self.cache` (not a `&self` method) so the
+            // returned borrow is of the `cache` field alone — a method would
+            // freeze all of `self` and collide with the `&mut` field borrows
+            // pass 3 needs.
+            let text_areas = collect_layer_text_areas(
+                &self.cache,
+                text_lines,
+                start..end,
+                scale_factor,
+                clips,
+                text_clips,
+            );
+
+            // ── Pass 3: glyphon prepare (with draw-order depth) ───────────────
+            //
+            // Borrows: this layer's renderer (from `self.renderers`),
+            // font_system, atlas, viewport, swash_cache. All distinct fields
+            // from `cache` (borrowed by text_areas).
+            //
+            // `metadata_to_depth` maps each glyph's metadata (its *global* line
+            // index, set in pass 1) to that line's draw-order NDC-z, so text is
+            // depth-sorted against solids/decorated/textures instead of always
+            // painting on top (RFC-0011 cross-pass paint order). A missing/
+            // out-of-range depth falls back to the far plane. An empty layer
+            // still prepares — that is what clears its renderer's previous
+            // glyph buffer.
+            renderer
+                .prepare_with_depth(
+                    device,
+                    queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    text_areas,
+                    &mut self.swash_cache,
+                    |meta| {
+                        depths
+                            .get(meta)
+                            .copied()
+                            .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR)
+                    },
+                )
+                .map_err(|e| ByardError::TextPrepare(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    /// Records text draw commands into the active render pass.
+    /// Records **one z-layer's** text draw commands into the active render
+    /// pass (RFC-0017 layered draw batches).
     ///
-    /// Must be called **after** `SolidBox` draw calls inside the same
-    /// `wgpu::RenderPass`. On TBDR architectures (Apple Silicon), keeping both
-    /// in one pass eliminates a tile-buffer flush.
+    /// Must be called after that layer's box/texture/vector draws, inside the
+    /// same `wgpu::RenderPass`. On TBDR architectures (Apple Silicon), keeping
+    /// every layer in one pass eliminates a tile-buffer flush. A `layer` with
+    /// no renderer (out of range — e.g. the frame carries more layer marks
+    /// than the last `prepare` saw) is a no-op rather than an error, so a
+    /// racing layer-count change can never crash the render thread.
     ///
     /// # Errors
     ///
     /// Returns [`ByardError::TextRender`] if glyphon's `render` fails (e.g.
     /// atlas overflow — rare after a successful `prepare`).
-    pub fn render<'pass>(
+    pub fn render_layer<'pass>(
         &'pass self,
         render_pass: &mut wgpu::RenderPass<'pass>,
+        layer: usize,
     ) -> Result<(), ByardError> {
-        self.renderer
+        let Some(renderer) = self.renderers.get(layer) else {
+            return Ok(());
+        };
+        renderer
             .render(&self.atlas, &self.viewport, render_pass)
             .map_err(|e| ByardError::TextRender(e.to_string()))
     }
+}
+
+/// Pass 2 of [`TextGlyphPipeline::prepare`]: builds one z-layer's
+/// `TextArea`s — the `range` subslice of `text_lines`, each referencing its
+/// *globally* cached shaped buffer (index-aligned with the full slice, like
+/// `clips`/`text_clips`).
+///
+/// A free function over the `cache` slice rather than a `&self` method: the
+/// returned `TextArea`s must borrow **only** the `cache` field, so pass 3 can
+/// still take `&mut` borrows of the pipeline's other fields (the module's
+/// field-split borrow pattern). `range` is pre-clamped by the caller.
+fn collect_layer_text_areas<'cache>(
+    cache: &'cache [CachedLine],
+    text_lines: &[TextLine],
+    range: std::ops::Range<usize>,
+    scale_factor: f32,
+    clips: &[crate::frame::ClipRect],
+    text_clips: &[Option<u16>],
+) -> Vec<TextArea<'cache>> {
+    let start = range.start;
+    text_lines[range]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let global = start + offset; // global line index (cache/clips/depths)
+            let [red, green, blue, alpha] = line.color;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let default_color = Color::rgba(
+                (red.clamp(0.0, 1.0) * 255.0) as u8,
+                (green.clamp(0.0, 1.0) * 255.0) as u8,
+                (blue.clamp(0.0, 1.0) * 255.0) as u8,
+                (alpha.clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            TextArea {
+                buffer: &cache[global].buffer,
+                // glyphon's Viewport/Resolution is configured in PHYSICAL
+                // pixels (see EncoderSubsystem::update_viewport), but
+                // TextLine.x/y are authored in logical pixels like every
+                // other public coordinate in this crate. cosmic-text's
+                // glyph positioning does not rescale this offset — only
+                // the buffer's own shaped glyph extents are scaled by
+                // `scale` — so `left`/`top` must already be physical
+                // pixels or text lands at `logical / scale_factor`,
+                // visibly drifting toward the origin on HiDPI displays.
+                left: line.x * scale_factor,
+                top: line.y * scale_factor,
+                scale: scale_factor,
+                // Content clip (RFC-0005 `ScrollView`): a line inside a
+                // scroll viewport is clipped to it via glyphon's own
+                // `TextBounds` (physical px) — the clean, per-area way to
+                // clip text without a render-pass scissor. Unclipped
+                // lines stay unbounded.
+                bounds: text_clips
+                    .get(global)
+                    .copied()
+                    .flatten()
+                    .and_then(|idx| clips.get(idx as usize))
+                    .map_or(
+                        TextBounds {
+                            left: 0,
+                            top: 0,
+                            right: i32::MAX,
+                            bottom: i32::MAX,
+                        },
+                        |c| clip_to_text_bounds(c.rect, scale_factor),
+                    ),
+                default_color,
+                custom_glyphs: &[],
+            }
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
