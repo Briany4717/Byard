@@ -166,28 +166,22 @@ pub async fn build_pipeline(
 /// Draws every [`DecoratedBox`], scissored to its content clip (RFC-0005). The
 /// active GPU scissor bounds which pixels are actually touched.
 ///
-/// Boxes are drawn in two groups by opacity (RFC-0017 overlay fix):
-///
-/// - **Opaque** (`opacity >= 1`, e.g. borders and shadows) use `pipeline_write`,
-///   which writes draw-order depth exactly as before — their cross-pass paint
-///   order (border-over-children, GPU-verified) is unchanged.
-/// - **Translucent** (`opacity < 1`, e.g. a modal scrim or a see-through fill)
-///   use `pipeline_no_write`, which still *tests* depth (so a nearer opaque
-///   surface still occludes it) but does **not** *write* it. A translucent box
-///   blends over whatever is already drawn; writing its nearer depth would
-///   otherwise cull every earlier-emitted (farther) primitive drawn in a later
-///   pass — most visibly all the app text beneath an overlay scrim, which would
-///   simply vanish.
-///
-/// Each group keeps its own emission order and per-instance clip, so the split
-/// changes only whether depth is written, never the painter's order within a
-/// group.
+/// The whole decorated pass is **transparent geometry** — shadows (blurred, a
+/// transparent fill), borders (a stroked ring over a transparent interior), and
+/// translucent fills (`opacity < 1`). Its pipeline therefore *tests* the
+/// draw-order depth buffer (so a nearer opaque surface still occludes a border
+/// or a scrim) but never *writes* to it. That is the standard opaque/transparent
+/// split: only opaque geometry (the `SolidBox`/`TextureSampler`/`VectorMSDF`
+/// passes) writes depth. Writing depth here would make a translucent box stamp a
+/// nearer z across its whole rect and cull every earlier-emitted primitive drawn
+/// in a later pass — most visibly all the app text beneath an overlay scrim or a
+/// shadow's halo, which would simply vanish (RFC-0017). Opaque fills never reach
+/// this pass; the compiler routes them to `SolidBox`, which occludes correctly.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     render_pass: &mut wgpu::RenderPass<'_>,
     device: &wgpu::Device,
-    pipeline_write: &wgpu::RenderPipeline,
-    pipeline_no_write: &wgpu::RenderPipeline,
+    pipeline: &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
     quad_buffer: &wgpu::Buffer,
     boxes: &[DecoratedBox],
@@ -198,53 +192,33 @@ pub fn draw(
     if boxes.is_empty() {
         return;
     }
+    // Stamp each instance's draw-order depth into `misc.y` (the shader reads it
+    // as NDC-z). `depths` is parallel to `boxes`; a short/empty slice falls back
+    // to the far plane so a missing depth can't push a box in front of others.
+    let instances: Vec<DecoratedInstance> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let mut inst = DecoratedInstance::from(b);
+            inst.misc[1] = depths
+                .get(i)
+                .copied()
+                .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR);
+            inst
+        })
+        .collect();
+    let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ByardCore - DecoratedBox Instance Buffer"),
+        contents: bytemuck::cast_slice(&instances),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
 
-    // Partition into opaque (depth-writing) and translucent (depth-testing only)
-    // groups, preserving each group's relative emission order and its clip.
-    let mut opaque: Vec<DecoratedInstance> = Vec::new();
-    let mut opaque_clips: Vec<Option<u16>> = Vec::new();
-    let mut translucent: Vec<DecoratedInstance> = Vec::new();
-    let mut translucent_clips: Vec<Option<u16>> = Vec::new();
-    for (i, b) in boxes.iter().enumerate() {
-        let mut inst = DecoratedInstance::from(b);
-        // Stamp the draw-order depth into `misc.y` (the shader reads it as NDC-z).
-        // A short/empty `depths` slice falls back to the far plane.
-        inst.misc[1] = depths
-            .get(i)
-            .copied()
-            .unwrap_or(crate::frame::DRAW_DEPTH_CLEAR);
-        let clip = clip_slice.get(i).copied().flatten();
-        if b.opacity < 1.0 {
-            translucent.push(inst);
-            translucent_clips.push(clip);
-        } else {
-            opaque.push(inst);
-            opaque_clips.push(clip);
-        }
-    }
-
+    render_pass.set_pipeline(pipeline);
     render_pass.set_bind_group(0, bind_group, &[]);
     render_pass.set_vertex_buffer(0, quad_buffer.slice(..));
-
-    // Opaque group first (writes depth), then the translucent group blended on
-    // top without writing depth.
-    for (pipeline, group, clips) in [
-        (pipeline_write, &opaque, &opaque_clips),
-        (pipeline_no_write, &translucent, &translucent_clips),
-    ] {
-        if group.is_empty() {
-            continue;
-        }
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ByardCore - DecoratedBox Instance Buffer"),
-            contents: bytemuck::cast_slice(group),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
-        // Content-clip runs (RFC-0005): scissor each run to its ScrollView viewport.
-        super::for_each_clip_run(render_pass, group.len(), clips, ctx, |p, s, e| {
-            p.draw(0..4, s..e);
-        });
-    }
+    render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+    // Content-clip runs (RFC-0005): scissor each run to its ScrollView viewport.
+    super::for_each_clip_run(render_pass, instances.len(), clip_slice, ctx, |p, s, e| {
+        p.draw(0..4, s..e);
+    });
 }
