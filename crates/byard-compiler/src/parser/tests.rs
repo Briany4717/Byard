@@ -567,3 +567,118 @@ fn style_value_captures_base_attrs_and_state_blocks() {
     assert_eq!(states[0].state, StyleStateKind::Hover);
     assert_eq!(states[1].state, StyleStateKind::Pressed);
 }
+
+// ---------------------------------------------------------------------------
+// Binary arithmetic (`+ - * /`) — the minimal surface RFC-0020's reactive
+// shape parameters need (`sweep: percent * 3.6`).
+// ---------------------------------------------------------------------------
+
+/// Parses `View V() { let x = <src> }` and returns the initializer.
+fn init_expr(src: &str) -> Expr {
+    let view = one_view(&format!("View V() {{ let x = {src} }}"));
+    let Member::Let { init, .. } = &view.body[0] else {
+        panic!("expected a let binding, got {:?}", view.body[0]);
+    };
+    init.clone()
+}
+
+#[test]
+fn multiplication_binds_tighter_than_addition() {
+    // `a + b * c` groups as `a + (b * c)`.
+    let e = init_expr("a + b * c");
+    let Expr::Binary {
+        op: BinOp::Add,
+        rhs,
+        ..
+    } = &e
+    else {
+        panic!("expected top-level Add, got {e:?}");
+    };
+    assert!(
+        matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Mul, .. }),
+        "rhs must be the product, got {rhs:?}"
+    );
+}
+
+#[test]
+fn same_precedence_is_left_associative() {
+    // `a - b + c` groups as `(a - b) + c`; `a / b * c` as `(a / b) * c`.
+    let e = init_expr("a - b + c");
+    let Expr::Binary {
+        op: BinOp::Add,
+        lhs,
+        ..
+    } = &e
+    else {
+        panic!("expected top-level Add, got {e:?}");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Sub, .. }));
+
+    let e = init_expr("a / b * c");
+    let Expr::Binary {
+        op: BinOp::Mul,
+        lhs,
+        ..
+    } = &e
+    else {
+        panic!("expected top-level Mul, got {e:?}");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Div, .. }));
+}
+
+#[test]
+fn arithmetic_groups_below_with_and_inside_ternary() {
+    // `p * 360 with anim.spring()` animates the whole product (RFC-0010).
+    let e = init_expr("p * 360 with anim.spring()");
+    let Expr::Animated { value, .. } = &e else {
+        panic!("expected Animated, got {e:?}");
+    };
+    assert!(matches!(
+        value.as_ref(),
+        Expr::Binary { op: BinOp::Mul, .. }
+    ));
+
+    // Arithmetic is available inside ternary branches.
+    let e = init_expr("cond ? a + 1 : b * 2");
+    let Expr::Ternary { then, els, .. } = &e else {
+        panic!("expected Ternary, got {e:?}");
+    };
+    assert!(matches!(then.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    assert!(matches!(els.as_ref(), Expr::Binary { op: BinOp::Mul, .. }));
+}
+
+#[test]
+fn unary_minus_still_parses_and_binary_minus_needs_a_left_operand() {
+    // The numeric-sign form is untouched: `(-8, 0)` is a tuple of literals.
+    let view = one_view("View V() { Box #[translate: (-8, 0)] {} }");
+    let el = as_element(&view.body[0]);
+    let AttrKind::Prop { value } = &el.attrs[0].kind else {
+        panic!("expected a prop");
+    };
+    let Expr::Tuple(items, _) = value else {
+        panic!("expected a tuple, got {value:?}");
+    };
+    assert!(matches!(items[0].value, Expr::IntLit(-8, _)));
+
+    // With a left operand the same token is subtraction.
+    let e = init_expr("a - 8");
+    assert!(matches!(e, Expr::Binary { op: BinOp::Sub, .. }));
+}
+
+#[test]
+fn shape_command_args_accept_arithmetic() {
+    // The RFC-0020 headline: a reactive sweep expression inside a shape
+    // command's argument list parses as ordinary named args.
+    let view = one_view(
+        "View V() { Canvas #[width: 48, height: 48] { \
+           arc(cx: 24, cy: 24, r: 20, sweep: percent * 3.6, stroke: 0xFFFFFF) } }",
+    );
+    let canvas = as_element(&view.body[0]);
+    let arc = as_element(&canvas.children[0]);
+    let sweep = arc
+        .content
+        .iter()
+        .find(|a| a.name.as_ref().is_some_and(|n| n.as_str() == "sweep"))
+        .expect("sweep arg");
+    assert!(matches!(sweep.value, Expr::Binary { op: BinOp::Mul, .. }));
+}

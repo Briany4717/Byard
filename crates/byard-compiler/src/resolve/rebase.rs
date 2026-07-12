@@ -242,6 +242,11 @@ fn shift_expr(expr: &mut Expr, delta: u32) {
             shift(span, delta);
             shift_expr(target, delta);
         }
+        Expr::Binary { lhs, rhs, span, .. } => {
+            shift(span, delta);
+            shift_expr(lhs, delta);
+            shift_expr(rhs, delta);
+        }
         Expr::Ternary {
             cond,
             then,
