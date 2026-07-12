@@ -2068,7 +2068,7 @@ mod motion_tests {
         let c = f.begin_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
         f.push_canvas_shape(CanvasShape {
             kind: CANVAS_SHAPE_ARC,
-            params: [24.0, 24.0, 20.0, 0.0, 3.14, 0.0, 0.0, 0.0],
+            params: [24.0, 24.0, 20.0, 0.0, std::f32::consts::PI, 0.0, 0.0, 0.0],
             ..CanvasShape::default()
         });
         f.end_clip();

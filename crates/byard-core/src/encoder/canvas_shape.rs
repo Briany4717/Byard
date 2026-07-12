@@ -375,9 +375,17 @@ mod tests {
             dirty: true,
         };
         let inst = CanvasShapeInstance::new(&s, 0.5);
-        // misc = [opacity, depth, kind (ARC = 0), cap (ROUND = 1)].
-        assert_eq!(inst.misc, [0.8, 0.5, 0.0, 1.0]);
-        assert_eq!(inst.stroke_dash, [4.0, 6.0, 4.0, 2.0]);
+        // misc = [opacity, depth, kind (ARC = 0), cap (ROUND = 1)]. The
+        // packing copies these fields verbatim — no arithmetic — so *bitwise*
+        // equality is precisely the claim (and satisfies `float_cmp`).
+        assert_eq!(
+            inst.misc.map(f32::to_bits),
+            [0.8f32, 0.5, 0.0, 1.0].map(f32::to_bits)
+        );
+        assert_eq!(
+            inst.stroke_dash.map(f32::to_bits),
+            [4.0f32, 6.0, 4.0, 2.0].map(f32::to_bits)
+        );
         // The quad covers the circle plus the stroke margin.
         assert!(inst.rect[0] <= 0.0 && inst.rect[1] <= 0.0);
         assert!(inst.rect[2] >= 48.0 && inst.rect[3] >= 48.0);

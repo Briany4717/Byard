@@ -686,14 +686,12 @@ const SHAPE_PAINT_PARAMS: &[(&str, PropType)] = &[
     ("opacity", PropType::Float),
 ];
 
+/// A static table of shape-parameter `(name, type)` pairs.
+type ShapeParams = &'static [(&'static str, PropType)];
+
 /// Geometry parameters per shape command: `(required, optional)` name/type
 /// pairs, not counting the shared [`SHAPE_PAINT_PARAMS`].
-fn shape_geometry(
-    name: &str,
-) -> (
-    &'static [(&'static str, PropType)],
-    &'static [(&'static str, PropType)],
-) {
+fn shape_geometry(name: &str) -> (ShapeParams, ShapeParams) {
     match name {
         "arc" => (
             &[
@@ -866,57 +864,55 @@ pub fn validate_shape(el: &ElementNode) -> Vec<CompileError> {
     let mut positional_seen = 0usize;
 
     for arg in &el.content {
-        match &arg.name {
-            Some(name) => {
-                let pname = name.as_str();
-                let known = param_type(pname).is_some_and(|_| {
-                    paint_allowed || !SHAPE_PAINT_PARAMS.iter().any(|(k, _)| *k == pname)
+        // A positional arg only spends the shape's positional budget
+        // (`bezier`'s 8 coordinates, canvas `text`'s content string).
+        let Some(name) = &arg.name else {
+            positional_seen += 1;
+            if positional_seen > positional_budget {
+                errs.push(CompileError::UnknownShapeParam {
+                    span: arg.value.span(),
+                    shape: shape.to_string(),
+                    name: "<positional>".to_string(),
+                    hint: None,
                 });
-                if !known {
-                    let candidates =
-                        required
-                            .iter()
-                            .chain(optional)
-                            .map(|(k, _)| *k)
-                            .chain(if paint_allowed {
-                                SHAPE_PAINT_PARAMS
-                                    .iter()
-                                    .map(|(k, _)| *k)
-                                    .collect::<Vec<_>>()
-                            } else {
-                                Vec::new()
-                            });
-                    errs.push(CompileError::UnknownShapeParam {
-                        span: arg.value.span(),
-                        shape: shape.to_string(),
-                        name: pname.to_string(),
-                        hint: closest_match(pname, candidates).map(str::to_string),
-                    });
-                } else if let Some(ty) = param_type(pname) {
-                    // Same literal-level check as attribute values, including
-                    // the RFC-0010 `with` animation chain walk.
-                    let mut target = &arg.value;
-                    while let Expr::Animated { value, anim, .. } = target {
-                        if let Err(err) = crate::interp::anim::resolve_curve(anim) {
-                            errs.push(err);
-                        }
-                        target = value;
-                    }
-                    if let Some(err) = check_value_type(ty, target) {
-                        errs.push(err);
-                    }
-                }
             }
-            None => {
-                positional_seen += 1;
-                if positional_seen > positional_budget {
-                    errs.push(CompileError::UnknownShapeParam {
-                        span: arg.value.span(),
-                        shape: shape.to_string(),
-                        name: "<positional>".to_string(),
-                        hint: None,
+            continue;
+        };
+        let pname = name.as_str();
+        let known = param_type(pname)
+            .is_some_and(|_| paint_allowed || !SHAPE_PAINT_PARAMS.iter().any(|(k, _)| *k == pname));
+        if !known {
+            let candidates =
+                required
+                    .iter()
+                    .chain(optional)
+                    .map(|(k, _)| *k)
+                    .chain(if paint_allowed {
+                        SHAPE_PAINT_PARAMS
+                            .iter()
+                            .map(|(k, _)| *k)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
                     });
+            errs.push(CompileError::UnknownShapeParam {
+                span: arg.value.span(),
+                shape: shape.to_string(),
+                name: pname.to_string(),
+                hint: closest_match(pname, candidates).map(str::to_string),
+            });
+        } else if let Some(ty) = param_type(pname) {
+            // Same literal-level check as attribute values, including the
+            // RFC-0010 `with` animation chain walk.
+            let mut target = &arg.value;
+            while let Expr::Animated { value, anim, .. } = target {
+                if let Err(err) = crate::interp::anim::resolve_curve(anim) {
+                    errs.push(err);
                 }
+                target = value;
+            }
+            if let Some(err) = check_value_type(ty, target) {
+                errs.push(err);
             }
         }
     }

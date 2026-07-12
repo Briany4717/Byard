@@ -147,6 +147,7 @@ fn render(
 
 /// A stroked circle paints its ring and leaves its interior untouched.
 #[test]
+#[allow(clippy::many_single_char_names)]
 fn circle_stroke_paints_the_ring_and_not_the_interior() {
     let Some((device, queue)) = try_device() else {
         eprintln!("no GPU adapter — skipping canvas-shape readback");
@@ -182,6 +183,7 @@ fn circle_stroke_paints_the_ring_and_not_the_interior() {
 /// A 90° arc covers its swept quadrant and leaves the opposite one empty; a
 /// filled rect covers its interior.
 #[test]
+#[allow(clippy::many_single_char_names)]
 fn arc_sweep_and_rect_fill_cover_exactly_their_regions() {
     let Some((device, queue)) = try_device() else {
         eprintln!("no GPU adapter — skipping canvas-shape readback");
