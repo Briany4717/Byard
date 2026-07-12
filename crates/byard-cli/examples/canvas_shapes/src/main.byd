@@ -1,0 +1,83 @@
+// RFC-0020 — Canvas & path/shape primitives.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/canvas_shapes
+//   cargo run -p byard-cli -- dev
+//
+// Drag the slider: the progress ring's sweep, its centre label, and the
+// gauge needle are all *reactive shape parameters* — no re-tessellation,
+// no atlas churn, just new per-instance data on the analytic-SDF pipeline.
+//
+// What to verify visually:
+//   1. The purple progress arc grows clockwise from 12 o'clock as the
+//      slider moves; the lavender track ring stays complete beneath it.
+//   2. The centre percentage label tracks the slider value.
+//   3. The gauge (right) sweeps its needle across a dashed 270° dial.
+//   4. The bezier wave and the dashed circle render crisp at any DPI —
+//      strokes stay anti-aliased, caps are round where declared.
+//   5. The red heart is a `path(d: …)` fill — Tier 2, rasterized through
+//      the MSDF pipeline at icon quality.
+View Main() {
+    var percent: Float = 65.0
+
+    Column #[bg: 0x14141C, p: 32, gap: 24, width: 560] {
+        Text("Canvas — path & shape primitives") #[color: 0xE6E1E5, size: 20]
+
+        Row #[gap: 32, align: center] {
+            // ── Determinate progress ring ─────────────────────────────────
+            Canvas #[width: 120, height: 120] {
+                // Track: the full lavender ring beneath the progress arc.
+                arc(cx: 60, cy: 60, r: 48,
+                    stroke: 0x49454F, stroke_width: 8)
+                // Progress: sweep bound to the slider, from 12 o'clock.
+                arc(cx: 60, cy: 60, r: 48,
+                    start: -90, sweep: percent * 3.6,
+                    stroke: 0xD0BCFF, stroke_width: 8, cap: round)
+                text("{percent}%", x: 60, y: 60,
+                     color: 0xE6E1E5, size: 18, align: center)
+            }
+
+            // ── 270° gauge with a dashed dial and a needle ────────────────
+            Canvas #[width: 120, height: 120] {
+                arc(cx: 60, cy: 60, r: 46,
+                    start: 135, sweep: 270,
+                    stroke: 0x49454F, stroke_width: 6,
+                    dash: (4, 6), cap: round)
+                arc(cx: 60, cy: 60, r: 46,
+                    start: 135, sweep: percent * 2.7,
+                    stroke: 0x7DD3A8, stroke_width: 6, cap: round)
+                circle(cx: 60, cy: 60, r: 5, fill: 0xE6E1E5)
+                text("gauge", x: 60, y: 100,
+                     color: 0x938F99, size: 11, align: center)
+            }
+
+            // ── Tier 2: an SVG path fill (MSDF-rasterized) ────────────────
+            Canvas #[width: 120, height: 120] {
+                circle(cx: 60, cy: 60, r: 52, fill: 0x1F1B24)
+                path(d: "M60 90 C30 70 22 48 34 38 C44 30 56 36 60 46 C64 36 76 30 86 38 C98 48 90 70 60 90 Z",
+                     fill: 0xF2B8B5)
+            }
+        }
+
+        // ── Strokes, caps, dashes, and a flattened bezier wave ────────────
+        Canvas #[width: 496, height: 120, bg: 0x1C1B22] {
+            line(x1: 24, y1: 24, x2: 200, y2: 24,
+                 stroke: 0xCAC4D0, stroke_width: 10)
+            line(x1: 24, y1: 48, x2: 200, y2: 48,
+                 stroke: 0xCAC4D0, stroke_width: 10, cap: round)
+            line(x1: 24, y1: 72, x2: 200, y2: 72,
+                 stroke: 0xCAC4D0, stroke_width: 10, cap: square)
+            line(x1: 24, y1: 96, x2: 200, y2: 96,
+                 stroke: 0x938F99, stroke_width: 4,
+                 dash: (12, 8), dash_offset: percent)
+            rect(x: 232, y: 24, w: 72, h: 72, radius: 12,
+                 fill: 0x381E72, stroke: 0xD0BCFF, stroke_width: 2)
+            bezier(x1: 328, y1: 96, cx1: 372, cy1: 8, cx2: 416, cy2: 152, x2: 472, y2: 32,
+                   stroke: 0x7DD3A8, stroke_width: 3)
+        }
+
+        Slider #[bind: percent, min: 0.0, max: 100.0, step: 1.0, width: 496, height: 26]
+        Text("drag to drive sweep, label, needle, and dash phase")
+            #[color: 0x938F99, size: 12]
+    }
+}
