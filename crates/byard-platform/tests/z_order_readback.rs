@@ -432,3 +432,57 @@ fn scrim_in_a_later_layer_dims_text_beneath_it() {
          ({r} !< {pure_r}); the scrim had no effect"
     );
 }
+
+/// RFC-0018 text wrap: a line pushed with a wrap width shapes onto multiple
+/// lines, so glyph pixels appear well below the first line's baseline. The same
+/// text without a wrap width stays on one line, so that lower band is empty.
+#[test]
+fn wrapped_text_renders_multiple_lines() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("no GPU adapter — skipping z-order readback");
+        return;
+    };
+
+    let (w, h) = (240.0_f32, 200.0_f32);
+    let line = || TextLine {
+        x: 10.0,
+        y: 20.0,
+        text: "the quick brown fox jumps over the lazy dog".to_string(),
+        font_size: 22.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        dirty: true,
+    };
+    // A pixel band well below the first line (line height ≈ 22*1.2 ≈ 26, so the
+    // first line ends by y≈46). Anything red at y≥70 is a wrapped second/third line.
+    let has_red_below = |rb: &Readback| {
+        let mut ly = 70.0_f32;
+        while ly < 150.0 {
+            let mut lx = 10.0_f32;
+            while lx < 220.0 {
+                let (b, g, r, _) = rb.at(lx, ly);
+                if i32::from(r) - i32::from(b).max(i32::from(g)) > 30 {
+                    return true;
+                }
+                lx += 2.0;
+            }
+            ly += 2.0;
+        }
+        false
+    };
+
+    // Natural single line: nothing in the lower band.
+    let mut natural = RenderFrame::new();
+    natural.push_text(line());
+    assert!(
+        !has_red_below(&render(&device, &queue, &natural, w, h)),
+        "unwrapped text must stay on one line (no glyphs in the lower band)"
+    );
+
+    // Wrapped to 120px: the text spills onto further lines in the lower band.
+    let mut wrapped = RenderFrame::new();
+    wrapped.push_text_wrapped(line(), Some(120.0));
+    assert!(
+        has_red_below(&render(&device, &queue, &wrapped, w, h)),
+        "wrapped text must render additional lines below the first"
+    );
+}

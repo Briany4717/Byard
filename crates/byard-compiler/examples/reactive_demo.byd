@@ -1,0 +1,49 @@
+// reactive_demo.byd — RFC-0018 structural reactivity + text wrap.
+//
+// Everything here reacts to a `var` at *runtime* (no hot-reload): tapping a
+// button flips a `var`, and the very next frame re-derives the structure:
+//
+//   • `when cond { … } else { … }`  — mounts/unmounts a subtree live.
+//   • `for item in list { … }`      — renders one row per element; growing or
+//                                      shrinking the list adds/removes rows live.
+//   • `Text(..) #[wrap: true, width: N]` — wraps a long line onto several.
+//
+// Run with:
+//   cargo run -p byard-cli -- dev crates/byard-compiler/examples/reactive_demo.byd
+
+View Main() {
+    var showList: Bool = true
+    var names: List = ["Ada", "Alan"]
+
+    Column #[bg: 0x14141C, p: 32, gap: 16, width: 640, height: 520] {
+        Text("RFC-0018 · Structural reactivity") #[color: 0xECE6F0, size: 24, weight: bold]
+
+        // ── Text wrap: a long paragraph bounded to a width wraps onto lines. ──
+        Text("This paragraph is shaped to a fixed width, so it wraps onto as many lines as it needs instead of overflowing its column.")
+            #[color: 0x9A94A4, size: 15, wrap: true, width: 560]
+
+        // ── Live `when`: the button flips `showList`, mounting/unmounting the
+        //    list subtree on the next frame. ──
+        Row #[gap: 12] {
+            Button("Toggle list") #[bg: 0x3C3C52, radius: 10, p: (vertical: 10, horizontal: 16),
+                                    color: 0xECE6F0] => showList = showList ? false : true
+            Button("Add Grace") #[bg: 0x6750A4, radius: 10, p: (vertical: 10, horizontal: 16),
+                                  color: 0xFFFFFF] => names = ["Ada", "Alan", "Grace", "Katherine"]
+        }
+
+        when showList {
+            // ── Live `for`: one card per name. Tapping "Add Grace" grows the
+            //    list and two more cards appear on the next frame. ──
+            Column #[bg: 0x1E1E2A, radius: 16, p: 16, gap: 8] {
+                Text("Team") #[color: 0xECE6F0, size: 16, weight: medium]
+                for name in names {
+                    Row #[bg: 0x2A2A3A, radius: 10, p: (vertical: 10, horizontal: 14)] {
+                        Text("{name}") #[color: 0xC9C9D4, size: 15]
+                    }
+                }
+            }
+        } else {
+            Text("List hidden - tap Toggle list to show it.") #[color: 0x6A6A78, size: 14]
+        }
+    }
+}

@@ -108,13 +108,16 @@ struct CachedLine {
 /// **Debug-only.** This function does not exist in `--release` builds —
 /// see the module documentation for the trust-the-upstream-flag rationale.
 #[cfg(debug_assertions)]
-fn content_hash(text: &str, font_size: f32, color: [f32; 4]) -> u64 {
+fn content_hash(text: &str, font_size: f32, color: [f32; 4], wrap: Option<f32>) -> u64 {
     let mut h = FxHasher::default();
     h.write(text.as_bytes());
     h.write_u32(font_size.to_bits());
     for c in color {
         h.write_u32(c.to_bits());
     }
+    // RFC-0018: the wrap width changes the shaped glyph run (line breaks), so a
+    // wrap-only change must invalidate the cached buffer.
+    h.write_u32(wrap.map_or(u32::MAX, f32::to_bits));
     h.finish()
 }
 
@@ -305,6 +308,7 @@ impl TextGlyphPipeline {
         viewport_dirty: bool,
         clips: &[crate::frame::ClipRect],
         text_clips: &[Option<u16>],
+        wraps: &[Option<f32>],
         layer_ranges: &[std::ops::Range<usize>],
     ) -> Result<(), ByardError> {
         // ── Pass 1: grow cache and re-shape dirty lines ───────────────────────
@@ -336,7 +340,12 @@ impl TextGlyphPipeline {
 
             #[cfg(debug_assertions)]
             {
-                let hash = content_hash(&line.text, line.font_size, line.color);
+                let hash = content_hash(
+                    &line.text,
+                    line.font_size,
+                    line.color,
+                    wraps.get(i).copied().flatten(),
+                );
                 if !is_new {
                     assert_dirty_flag_consistency(hash != entry.content_hash, line.dirty);
                 }
@@ -349,11 +358,11 @@ impl TextGlyphPipeline {
 
             let metrics = Metrics::new(line.font_size, line.font_size * 1.2);
             entry.buffer.set_metrics(&mut self.font_system, metrics);
-            entry.buffer.set_size(
-                &mut self.font_system,
-                None, // unbounded width
-                None, // unbounded height
-            );
+            // RFC-0018 text wrap: a `Some(w)` bound shapes the line onto multiple
+            // lines within `w` logical pixels; `None` keeps the natural single-
+            // line width. Height stays unbounded so every wrapped line is shaped.
+            let wrap_w = wraps.get(i).copied().flatten();
+            entry.buffer.set_size(&mut self.font_system, wrap_w, None);
 
             // Color is applied per-TextArea in pass 2 (default_color field).
             // Here we only need to shape the text; color does not affect layout.
@@ -622,16 +631,25 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn content_hash_is_stable_for_identical_input() {
-        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
-        let b = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0], None);
+        let b = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0], None);
         assert_eq!(a, b);
     }
 
     #[test]
     #[cfg(debug_assertions)]
     fn content_hash_changes_with_text() {
-        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0]);
-        let b = content_hash("world", 14.0, [1.0, 1.0, 1.0, 1.0]);
+        let a = content_hash("hello", 14.0, [1.0, 1.0, 1.0, 1.0], None);
+        let b = content_hash("world", 14.0, [1.0, 1.0, 1.0, 1.0], None);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn content_hash_changes_with_wrap_width() {
+        // RFC-0018: a wrap-only change must invalidate the shaped buffer.
+        let a = content_hash("hello world", 14.0, [1.0; 4], None);
+        let b = content_hash("hello world", 14.0, [1.0; 4], Some(40.0));
         assert_ne!(a, b);
     }
 

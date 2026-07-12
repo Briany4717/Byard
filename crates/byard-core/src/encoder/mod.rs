@@ -789,6 +789,7 @@ impl EncoderSubsystem {
                 viewport_dirty,
                 clips.table,
                 clips.text,
+                clips.text_wrap,
                 &text_ranges,
             )?;
         }
@@ -1094,6 +1095,11 @@ pub struct FrameClips<'a> {
     pub text: &'a [Option<u16>],
     /// Parallel to `VectorInstance`s.
     pub vector: &'a [Option<u16>],
+    /// Per-`TextLine` wrap width in logical px (RFC-0018 text wrap); `Some(w)`
+    /// shapes that line bounded to `w` so it wraps. Carried alongside the clip
+    /// slices because it is another per-text-line parallel slice consumed by the
+    /// same text `prepare` call.
+    pub text_wrap: &'a [Option<f32>],
 }
 
 /// Bundles a frame's clip table and per-pool clip slices into a [`FrameClips`].
@@ -1105,6 +1111,7 @@ fn frame_clips(frame: &RenderFrame) -> FrameClips<'_> {
         texture: frame.texture_clips(),
         text: frame.text_clips(),
         vector: frame.vector_clips(),
+        text_wrap: frame.text_wraps(),
     }
 }
 

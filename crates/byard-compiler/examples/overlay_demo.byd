@@ -79,19 +79,21 @@ View Main() {
     // ══ MODAL DIALOG ═══════════════════════════════════════════════════════
     // `modal: true` (the default) captures all input behind a scrim. The scrim
     // is the first child — a translucent full-viewport box. `dismiss => …` fires
-    // on an outside tap or Escape, flipping the guard `var` to unmount.
+    // on an outside tap or Escape, flipping the guard `var`. With RFC-0018
+    // structural reactivity the `when` now unmounts the overlay *live* on that
+    // flip — tap the scrim (or press Escape) and the dialog vanishes at runtime.
     when dialogOpen {
         Overlay #[modal: true, dismiss => dialogOpen = false] {
             // Scrim: a dim, semi-transparent sheet filling the viewport (grow).
             Box #[bg: 0x000000, opacity: 0.45, grow: 1] {}
 
-            // Dialog surface, centred (Material-ish). One short line per `Text`
-            // (line wrap is a separate, unbuilt feature), sized to the surface.
+            // Dialog surface, centred (Material-ish). The body is a wrapped
+            // paragraph (RFC-0018 text wrap) bounded to the surface width.
             Column #[anchor: center, bg: 0xECE6F0, radius: 28, shadow: "lg",
                      p: 24, gap: 12, width: 380] {
                 Text("Delete this file?") #[color: 0x1D1B20, size: 22, weight: medium]
-                Text("This action can't be undone.") #[color: 0x49454F, size: 14]
-                Text("The modal blocks the app behind it.") #[color: 0x49454F, size: 14]
+                Text("This action can't be undone. The modal blocks the app behind it until you choose.")
+                    #[color: 0x49454F, size: 14, wrap: true, width: 332]
                 Row #[gap: 8, justify: end] {
                     Button("Cancel") #[bg: 0xE7E0EC, radius: 20,
                                        p: (vertical: 10, horizontal: 18), color: 0x6750A4]

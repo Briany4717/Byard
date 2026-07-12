@@ -158,6 +158,78 @@ pub enum RenderNode {
         /// scope the overlay was instantiated in. Empty at the top level.
         env_snapshot: Vec<(Symbol, super::env::Value)>,
     },
+    /// A reactive `when cond { … } else { … }` (RFC-0018 structural reactivity).
+    /// The driver re-reads `cond` every frame and expands the taken branch, so a
+    /// `var` flip mounts/unmounts the subtree with no re-lowering. Each branch is
+    /// lowered **lazily** on first selection and cached (see [`WhenPool`]) — so a
+    /// guarded recursion (`when done { … } else { Recurse() }`) only lowers the
+    /// recursive branch when the guard actually reaches it, terminating finitely.
+    When {
+        /// The reactive predicate, re-read each frame.
+        cond: ScopeId,
+        /// Index into the interpreter's `when_pools`.
+        pool: usize,
+    },
+    /// A reactive `for item in list { … }` (RFC-0018 structural reactivity).
+    /// Coarse, positional reconciliation (RFC-0002 D7): the driver reads `list`
+    /// each frame and renders one pooled body per element. Bodies are lowered
+    /// lazily into a reusable pool (grown to the high-water length, never
+    /// re-lowered per frame), each reading its element from a per-slot signal the
+    /// driver updates — so list growth/shrink/value changes are reactive without
+    /// re-lowering or churning scopes.
+    For {
+        /// Index into the interpreter's `for_pools`.
+        pool: usize,
+        /// The reactive list projection, re-read each frame.
+        list: ScopeId,
+    },
+}
+
+/// A borrowed view of both structural-reactivity caches (RFC-0018), passed
+/// through the read-only build/paint phase so `when`/`for` expand consistently.
+#[derive(Clone, Copy)]
+struct Pools<'a> {
+    fors: &'a [ForPool],
+    whens: &'a [WhenPool],
+}
+
+/// A `when`'s lazily-lowered branch cache (RFC-0018). Each branch's AST is kept
+/// and lowered only the first time the condition selects it, then reused — so an
+/// untaken (possibly recursive) branch costs nothing until it is actually shown.
+struct WhenPool {
+    /// The `then` branch AST.
+    then_ast: Vec<Member>,
+    /// The `else` branch AST (empty when there is no `else`).
+    els_ast: Vec<Member>,
+    /// User-view names in scope at lower time.
+    known_views: Vec<String>,
+    /// Instance env captured at lower time (RFC-0019), restored when lowering.
+    env_snapshot: Vec<(Symbol, super::env::Value)>,
+    /// The lowered `then` branch, once first taken.
+    then: Option<Vec<RenderNode>>,
+    /// The lowered `else` branch, once first taken.
+    els: Option<Vec<RenderNode>>,
+}
+
+/// A `for`'s reusable body pool (RFC-0018). Bodies are lowered once per slot and
+/// reused across frames; each slot's element value lives in `item_slots[i]`,
+/// which the driver rewrites from the current list before painting.
+struct ForPool {
+    /// The loop variable name, bound to each slot's signal when lowering a body.
+    item_var: Symbol,
+    /// The loop body AST, re-lowered only when the pool grows to a new index.
+    body: Vec<Member>,
+    /// User-view names in scope at lower time (for lowering new bodies).
+    known_views: Vec<String>,
+    /// The instance env captured at lower time (RFC-0019), restored when lowering
+    /// a new body so it resolves against the scope the `for` was written in.
+    env_snapshot: Vec<(Symbol, super::env::Value)>,
+    /// One signal per pooled index, holding that slot's current element value.
+    item_slots: Vec<super::env::SignalId>,
+    /// One lowered body per pooled index (parallel to `item_slots`).
+    bodies: Vec<Vec<RenderNode>>,
+    /// How many bodies are live (painted) this frame — the current list length.
+    len: usize,
 }
 
 /// A lowered reactive computation (see the module docs).
@@ -329,6 +401,15 @@ pub struct Interpreter {
     /// pre-lowered in the *caller* scope so a `content` element reference inside
     /// the callee body splices nodes that capture the caller's environment.
     slot_stack: Vec<Vec<RenderNode>>,
+    /// Reactive `for` body pools (RFC-0018), indexed by [`RenderNode::For::pool`].
+    /// Grows as `for` loops are lowered; each pool holds that loop's reusable
+    /// per-slot bodies and element signals. Reconciled once per frame before the
+    /// layout/paint walk.
+    for_pools: Vec<ForPool>,
+    /// Reactive `when` branch caches (RFC-0018), indexed by
+    /// [`RenderNode::When::pool`]. Each branch is lowered lazily on first
+    /// selection so an untaken (recursive) branch never lowers until shown.
+    when_pools: Vec<WhenPool>,
     /// Current engine time (ms since the runner's epoch), set once per frame by
     /// the runner via [`set_now_ms`](Self::set_now_ms). Drives `with`
     /// animations (RFC-0010).
@@ -511,9 +592,33 @@ impl Interpreter {
     /// Glyph-accurate `(width, height)` of `text` at `font_size`, lazily
     /// initializing the font system on first use.
     fn measure_text(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        self.measure_text_wrapped(text, font_size, None)
+    }
+
+    /// Measures `text`, wrapping to `max_width` logical pixels when `Some`
+    /// (RFC-0018 text wrap). Returns the wrapped `(width, height)`.
+    fn measure_text_wrapped(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+    ) -> (f32, f32) {
         self.text_measurer
             .get_or_insert_with(byard_core::text::TextMeasurer::new)
-            .measure(text, font_size)
+            .measure_wrapped(text, font_size, max_width)
+    }
+
+    /// The wrap width of a `Text` (RFC-0018): `Some(width)` when `wrap: true` and
+    /// a `width` is set, else `None` (natural single-line). Wrapping needs an
+    /// explicit width — there is no containing-block width to wrap against in the
+    /// leaf-measured layout model.
+    fn text_wrap_width(&mut self, attrs: &[Attr]) -> Option<f32> {
+        if self.eval_bool_prop(attrs, "wrap") == Some(true) {
+            #[allow(clippy::cast_precision_loss)]
+            self.eval_int_prop(attrs, "width").map(|w| w as f32)
+        } else {
+            None
+        }
     }
 
     // ── declarations ────────────────────────────────────────────────────
@@ -1457,38 +1562,52 @@ impl Interpreter {
             Member::Element(e) => {
                 out.push(self.lower_element(e, known_views));
             }
+            // RFC-0018 reactive `when`: bind the condition and register a branch
+            // cache. Branches are lowered lazily on first selection (see
+            // [`WhenPool`]) so an untaken recursive branch never lowers; the
+            // driver re-reads the condition each frame and expands the taken one.
             Member::When {
                 cond, then, els, ..
             } => {
-                let val = self.eval_pure(cond);
-                let body = if val.as_bool().unwrap_or(false) {
-                    then.as_slice()
-                } else {
-                    match els {
-                        Some(els) => els.as_slice(),
-                        None => return,
-                    }
-                };
-                for m in body {
-                    self.lower_member_into(m, known_views, out);
-                }
+                let cond_scope = self.bind_value(cond);
+                let pool = self.when_pools.len();
+                let env_snapshot = self.capture_env_snapshot();
+                self.when_pools.push(WhenPool {
+                    then_ast: then.clone(),
+                    els_ast: els.clone().unwrap_or_default(),
+                    known_views: known_views.iter().map(|s| (*s).to_string()).collect(),
+                    env_snapshot,
+                    then: None,
+                    els: None,
+                });
+                out.push(RenderNode::When {
+                    cond: cond_scope,
+                    pool,
+                });
             }
+            // RFC-0018 reactive `for`: bind the list as a reactive projection and
+            // register a body pool. Bodies are lowered lazily per slot during
+            // reconciliation (never per frame); the driver renders one pooled body
+            // per current element.
             Member::For {
                 var, iter, body, ..
             } => {
-                let list = self.eval_pure(iter);
-                if let Value::List(items) = list {
-                    for item in items {
-                        let snapshot = self.env.len();
-                        // Create a one-tick signal to hold the item value.
-                        let item_sig = self.ctx.create_signal(item);
-                        self.env.push(var.clone(), Value::Signal(item_sig));
-                        for m in body.as_slice() {
-                            self.lower_member_into(m, known_views, out);
-                        }
-                        self.env.truncate(snapshot);
-                    }
-                }
+                let list_scope = self.bind_value(iter);
+                let pool = self.for_pools.len();
+                let env_snapshot = self.capture_env_snapshot();
+                self.for_pools.push(ForPool {
+                    item_var: var.clone(),
+                    body: body.clone(),
+                    known_views: known_views.iter().map(|s| (*s).to_string()).collect(),
+                    env_snapshot,
+                    item_slots: Vec::new(),
+                    bodies: Vec::new(),
+                    len: 0,
+                });
+                out.push(RenderNode::For {
+                    pool,
+                    list: list_scope,
+                });
             }
             _ => {}
         }
@@ -1524,14 +1643,34 @@ impl Interpreter {
         for upload in self.vector_jit.drain_ready() {
             frame.push_atlas_upload(upload);
         }
-        let mut flat_ids = Vec::new();
-
-        let mut root_children = Vec::new();
-        for node in tree {
-            if let Ok(id) = self.build_layout_tree(node, &mut flat_ids) {
-                root_children.push(id);
-            }
+        // RFC-0018 structural reactivity, phase A: reconcile the `for` pools
+        // (grow to the current list lengths, rewrite element slots) so the tree's
+        // reactive structure reflects this frame's state. If anything changed,
+        // re-pull so the freshly-mounted/updated bindings project before paint.
+        // Iterate to a fixpoint: a branch/body lowered *this* pass creates fresh
+        // bindings (its own `when` condition, its `for` list) that are not
+        // projected until the next pull, so a newly-mounted nested `when`/`for`
+        // would otherwise read stale (false/empty) for a frame. Re-pull and
+        // re-reconcile until nothing new mounts. Bounded by the reconcile depth
+        // guard, so a runaway recursion still terminates (with a diagnostic).
+        let mut passes = 0;
+        while self.reconcile_structure(tree, 0) && passes <= MAX_INSTANCE_DEPTH {
+            let epoch = self.ctx.begin_tick();
+            self.ctx.pull(epoch);
+            passes += 1;
         }
+        // Phase B is read-only over the pools: take them out so `&mut self`
+        // (atlas, router, …) stays free while build/paint borrow them.
+        let for_pools = std::mem::take(&mut self.for_pools);
+        let when_pools = std::mem::take(&mut self.when_pools);
+        let pools = Pools {
+            fors: &for_pools,
+            whens: &when_pools,
+        };
+
+        let mut flat_ids = Vec::new();
+        // Expand reactive `when`/`for` at the root, then build each concrete node.
+        let root_children = self.build_children(tree, pools, &mut flat_ids);
 
         // RFC-0017: collect every mounted `Overlay` (pre-order = declaration =
         // mount order) and build each into the *same* atlas as an absolutely
@@ -1539,12 +1678,10 @@ impl Interpreter {
         // no overlay is mounted, so the overlay path is truly zero-cost — the
         // render root stays the plain main container it always was.
         let mut overlays: Vec<&RenderNode> = Vec::new();
-        for node in tree {
-            collect_overlays(node, &mut overlays);
-        }
+        self.collect_overlays(tree, pools, &mut overlays);
         let mut overlay_layouts: Vec<OverlayLayout<'_>> = Vec::new();
         for ov in overlays {
-            if let Some(layout) = self.build_overlay_layout(ov) {
+            if let Some(layout) = self.build_overlay_layout(ov, pools) {
                 overlay_layouts.push(layout);
             }
         }
@@ -1581,6 +1718,10 @@ impl Interpreter {
         };
 
         let Some(root_id) = root_id else {
+            // Nothing to lay out (an empty tree). Still restore the pools taken
+            // out above, or the next frame would see them empty (RFC-0018).
+            self.for_pools = for_pools;
+            self.when_pools = when_pools;
             return;
         };
         self.atlas.set_root(root_id).unwrap();
@@ -1589,11 +1730,13 @@ impl Interpreter {
 
         let parent_rect = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
 
-        // Emit the main tree (below every overlay in painter's order).
+        // Emit the main tree (below every overlay in painter's order). Iterate
+        // the same expanded concrete node sequence `build_children` laid out, so
+        // the flat-id cursor stays in lockstep (RFC-0018).
         if main_id.is_some() {
             let mut flat_idx = 0;
-            for (i, node) in tree.iter().enumerate() {
-                let node_id = root_children[i];
+            for node in self.expand_concrete(tree, pools) {
+                let node_id = flat_ids[flat_idx];
                 self.render_node_with_atlas(
                     node,
                     node_id,
@@ -1605,6 +1748,7 @@ impl Interpreter {
                     byard_core::frame::Transform::IDENTITY,
                     None,
                     None,
+                    pools,
                 );
             }
         }
@@ -1624,7 +1768,264 @@ impl Interpreter {
         // renders through the exact single-layer draw stream.
         for ol in &overlay_layouts {
             frame.begin_layer();
-            self.emit_overlay(ol, frame, width, height);
+            self.emit_overlay(ol, frame, width, height, pools);
+        }
+
+        // RFC-0018: return the (possibly grown) pools taken out for the read-only
+        // build/paint phase.
+        self.for_pools = for_pools;
+        self.when_pools = when_pools;
+    }
+
+    /// Flattens a node slice into the concrete nodes to lay out/paint this frame
+    /// (RFC-0018 structural reactivity): a `When` expands to its taken branch
+    /// (condition re-read live), a `For` to its live pooled bodies, recursively.
+    /// A concrete node (`Box`/`Text`/…) passes through unchanged — its *own*
+    /// children are expanded when it is built/walked, not here. Build, paint,
+    /// `flat_len`, and overlay collection all funnel through this one function, so
+    /// they agree on the exact node sequence and the flat-id cursor stays aligned.
+    fn expand_concrete<'a>(
+        &self,
+        nodes: &'a [RenderNode],
+        pools: Pools<'a>,
+    ) -> Vec<&'a RenderNode> {
+        let mut out = Vec::new();
+        for n in nodes {
+            match n {
+                RenderNode::When { cond, pool } => {
+                    let take = self
+                        .binding_value(*cond)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // The taken branch was lowered by `reconcile_structure`; an
+                    // as-yet-unselected branch is `None` and expands to nothing.
+                    if let Some(p) = pools.whens.get(*pool) {
+                        let branch = if take {
+                            p.then.as_ref()
+                        } else {
+                            p.els.as_ref()
+                        };
+                        if let Some(branch) = branch {
+                            out.extend(self.expand_concrete(branch, pools));
+                        }
+                    }
+                }
+                RenderNode::For { pool, .. } => {
+                    if let Some(p) = pools.fors.get(*pool) {
+                        for body in p.bodies.iter().take(p.len) {
+                            out.extend(self.expand_concrete(body, pools));
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Reconciles the reactive `for` pools before the paint walk (RFC-0018,
+    /// coarse D7): reads each live `for`'s list, grows its pool to the list length
+    /// (lowering a body the first time an index is needed), rewrites each slot's
+    /// element signal, and records the live count. Returns `true` if any slot or
+    /// pool changed, so the caller re-pulls to project the new values. Descends
+    /// through `when` (taken branch) and `for` (live bodies) so nested loops
+    /// reconcile too.
+    fn reconcile_structure(&mut self, nodes: &[RenderNode], depth: u32) -> bool {
+        // Bound the reconcile recursion: a guarded recursion whose guard never
+        // terminates (`when go { Recurse() }` with `go` always true) lowers a new
+        // level each descent, so cap it here — the same role `instance_depth`
+        // plays at lower time (RFC-0007 §4), but for the reconcile-time expansion.
+        // Truncate with a diagnostic rather than overflow the stack (D4: never a
+        // silent failure); dedup so a re-render doesn't spam the error list.
+        if depth >= MAX_INSTANCE_DEPTH {
+            let already = self
+                .errors
+                .iter()
+                .any(|e| matches!(e, CompileError::RecursiveView { .. }));
+            if !already {
+                self.errors.push(CompileError::RecursiveView {
+                    span: crate::diagnostics::Span::new(0, 0),
+                    path: format!(
+                        "(reactive `when`/`for` recursion exceeded {MAX_INSTANCE_DEPTH})"
+                    ),
+                });
+            }
+            return false;
+        }
+        let mut dirtied = false;
+        for n in nodes {
+            match n {
+                RenderNode::When { cond, pool } => {
+                    let take = self
+                        .binding_value(*cond)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // Lazily lower the taken branch on first selection (so an
+                    // untaken recursive branch never lowers), then descend into it
+                    // to reconcile any nested `when`/`for`.
+                    let already = if take {
+                        self.when_pools[*pool].then.is_some()
+                    } else {
+                        self.when_pools[*pool].els.is_some()
+                    };
+                    if !already {
+                        let ast = if take {
+                            self.when_pools[*pool].then_ast.clone()
+                        } else {
+                            self.when_pools[*pool].els_ast.clone()
+                        };
+                        let known: Vec<String> = self.when_pools[*pool].known_views.clone();
+                        let env_snap = self.when_pools[*pool].env_snapshot.clone();
+                        let env_base = self.env.len();
+                        for (k, v) in &env_snap {
+                            self.env.push(k.clone(), v.clone());
+                        }
+                        let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+                        let nodes = self.lower_members(&ast, &known_refs);
+                        self.env.truncate(env_base);
+                        if take {
+                            self.when_pools[*pool].then = Some(nodes);
+                        } else {
+                            self.when_pools[*pool].els = Some(nodes);
+                        }
+                        dirtied = true;
+                    }
+                    // Descend into the (now-lowered) taken branch. Take it out to
+                    // avoid aliasing `self.when_pools` during nested reconcile.
+                    let branch = if take {
+                        self.when_pools[*pool].then.take()
+                    } else {
+                        self.when_pools[*pool].els.take()
+                    };
+                    if let Some(branch) = branch {
+                        dirtied |= self.reconcile_structure(&branch, depth + 1);
+                        if take {
+                            self.when_pools[*pool].then = Some(branch);
+                        } else {
+                            self.when_pools[*pool].els = Some(branch);
+                        }
+                    }
+                }
+                RenderNode::For { pool, list } => {
+                    let items = match self.binding_value(*list) {
+                        Some(Value::List(items)) => items,
+                        _ => Vec::new(),
+                    };
+                    let new_len = items.len();
+                    // Grow the pool: lower one body per newly-needed index, each
+                    // reading its element from a fresh per-slot signal.
+                    while self.for_pools[*pool].bodies.len() < new_len {
+                        let slot = self.ctx.create_signal(Value::Unit);
+                        // Clone the lowering inputs out first so the borrow on
+                        // `self.for_pools` is released before `lower_members`
+                        // (which may append *nested* pools to `self.for_pools`).
+                        let item_var = self.for_pools[*pool].item_var.clone();
+                        let body_ast = self.for_pools[*pool].body.clone();
+                        let known: Vec<String> = self.for_pools[*pool].known_views.clone();
+                        let env_snap = self.for_pools[*pool].env_snapshot.clone();
+                        let env_base = self.env.len();
+                        for (k, v) in &env_snap {
+                            self.env.push(k.clone(), v.clone());
+                        }
+                        self.env.push(item_var, Value::Signal(slot));
+                        let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+                        let body_nodes = self.lower_members(&body_ast, &known_refs);
+                        self.env.truncate(env_base);
+                        // Index `*pool` is still valid (nested lowering only
+                        // appended higher indices).
+                        self.for_pools[*pool].item_slots.push(slot);
+                        self.for_pools[*pool].bodies.push(body_nodes);
+                        dirtied = true;
+                    }
+                    // Update each live slot's element value (value-deduped).
+                    for (i, item) in items.iter().enumerate() {
+                        let slot = self.for_pools[*pool].item_slots[i];
+                        if self.ctx.peek_signal(slot) != *item {
+                            self.ctx.write_signal(slot, item.clone());
+                            dirtied = true;
+                        }
+                    }
+                    self.for_pools[*pool].len = new_len;
+                    // Reconcile nested loops inside the live bodies. Take the
+                    // bodies out so nested growth (which mutates `self.for_pools`)
+                    // can't alias this pool's own vector.
+                    let bodies = std::mem::take(&mut self.for_pools[*pool].bodies);
+                    for body in bodies.iter().take(new_len) {
+                        dirtied |= self.reconcile_structure(body, depth + 1);
+                    }
+                    self.for_pools[*pool].bodies = bodies;
+                }
+                RenderNode::Box { children, .. } | RenderNode::Overlay { children, .. } => {
+                    dirtied |= self.reconcile_structure(children, depth + 1);
+                }
+                _ => {}
+            }
+        }
+        dirtied
+    }
+
+    /// Builds the atlas layout for a node slice, expanding reactive `when`/`for`
+    /// (RFC-0018) into their concrete children first. Returns the child atlas ids
+    /// in paint order, appending each subtree's flat-id list to `flat_ids`.
+    fn build_children(
+        &mut self,
+        nodes: &[RenderNode],
+        pools: Pools<'_>,
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Vec<byard_core::atlas::layout::AtlasNodeId> {
+        // The expansion refs borrow `nodes`/`pools`, never `self`, so `&mut self`
+        // stays free for `build_layout_tree` below.
+        let concrete = self.expand_concrete(nodes, pools);
+        let mut ids = Vec::with_capacity(concrete.len());
+        for node in concrete {
+            if let Ok(id) = self.build_layout_tree(node, pools, flat_ids) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The number of flattened layout nodes a concrete [`RenderNode`] subtree
+    /// contributes, mirroring [`build_children`](Self::build_children)/
+    /// [`build_layout_tree`](Self::build_layout_tree) exactly (one entry plus its
+    /// expanded children). Used to advance the flat-id cursor past a culled
+    /// `ScrollView` child without walking it (RFC-0005). `when`/`for` are
+    /// expanded, so their live subtree is counted (RFC-0018).
+    fn flat_len(&self, node: &RenderNode, pools: Pools<'_>) -> usize {
+        match node {
+            RenderNode::Box { children, .. } => {
+                1 + self
+                    .expand_concrete(children, pools)
+                    .iter()
+                    .map(|c| self.flat_len(c, pools))
+                    .sum::<usize>()
+            }
+            _ => 1,
+        }
+    }
+
+    /// Collects every mounted `Overlay` in `nodes` in pre-order (RFC-0017 mount =
+    /// declaration order), expanding reactive `when`/`for` (RFC-0018) so an
+    /// overlay inside a live branch/body is found. Recurses through `Box` and an
+    /// overlay's own children, so a nested overlay is collected as its own later
+    /// — hence higher — stack entry.
+    fn collect_overlays<'a>(
+        &self,
+        nodes: &'a [RenderNode],
+        pools: Pools<'a>,
+        out: &mut Vec<&'a RenderNode>,
+    ) {
+        for node in self.expand_concrete(nodes, pools) {
+            match node {
+                RenderNode::Overlay { children, .. } => {
+                    out.push(node);
+                    self.collect_overlays(children, pools, out);
+                }
+                RenderNode::Box { children, .. } => {
+                    self.collect_overlays(children, pools, out);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1634,15 +2035,22 @@ impl Interpreter {
     /// viewport. All the anchor wrappers hang off one absolute overlay wrapper.
     /// Returns the wrapper id and per-child emission slots. `None` if `ov` is not
     /// an `Overlay` or the atlas rejects the nodes.
-    fn build_overlay_layout<'a>(&mut self, ov: &'a RenderNode) -> Option<OverlayLayout<'a>> {
+    fn build_overlay_layout<'a>(
+        &mut self,
+        ov: &'a RenderNode,
+        pools: Pools<'a>,
+    ) -> Option<OverlayLayout<'a>> {
         let RenderNode::Overlay { children, .. } = ov else {
             return None;
         };
-        let mut anchor_ids = Vec::with_capacity(children.len());
-        let mut slots = Vec::with_capacity(children.len());
-        for child in children {
+        // RFC-0018: an overlay's direct children may be reactive `when`/`for`;
+        // expand them to concrete anchor targets before laying each out.
+        let concrete = self.expand_concrete(children, pools);
+        let mut anchor_ids = Vec::with_capacity(concrete.len());
+        let mut slots = Vec::with_capacity(concrete.len());
+        for child in concrete {
             let mut cflat = Vec::new();
-            let Ok(cid) = self.build_layout_tree(child, &mut cflat) else {
+            let Ok(cid) = self.build_layout_tree(child, pools, &mut cflat) else {
                 continue;
             };
             let anchor = self.anchor_token(child);
@@ -1686,6 +2094,7 @@ impl Interpreter {
         frame: &mut byard_core::frame::RenderFrame,
         width: f32,
         height: f32,
+        pools: Pools<'_>,
     ) {
         let RenderNode::Overlay {
             attrs,
@@ -1740,6 +2149,7 @@ impl Interpreter {
                 byard_core::frame::Transform::IDENTITY,
                 None,
                 None,
+                pools,
             );
         }
 
@@ -1765,10 +2175,17 @@ impl Interpreter {
     fn build_layout_tree(
         &mut self,
         node: &RenderNode,
+        pools: Pools<'_>,
         flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
     ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
         use byard_core::atlas::layout::LeafSize;
         match node {
+            // Reactive `when`/`for` are expanded to their concrete children by
+            // `build_children` before reaching here (RFC-0018), so they never
+            // arrive as a single layout node.
+            RenderNode::When { .. } | RenderNode::For { .. } => {
+                unreachable!("when/for are expanded by build_children before build_layout_tree")
+            }
             RenderNode::Spacer => {
                 let id = self.atlas.add_leaf(LeafSize::new(0.0, 12.0))?;
                 flat_ids.push(id);
@@ -1809,7 +2226,15 @@ impl Interpreter {
                     .eval_int_prop(attrs, "size")
                     .or(typo_size)
                     .unwrap_or(self.theme.font_size as i64) as f32;
-                let (w, h) = self.measure_text(&text, font_size);
+                // RFC-0018 text wrap: when `wrap: true` with a `width`, measure
+                // bounded to that width so the leaf is `width` wide and as tall as
+                // the wrapped line count; otherwise the natural single-line size.
+                let wrap_w = self.text_wrap_width(attrs);
+                let (measured_w, h) = self.measure_text_wrapped(&text, font_size, wrap_w);
+                // A wrapped leaf reserves the full requested width (the wrap
+                // bound), even when the widest laid-out line is narrower; an
+                // unwrapped leaf takes its natural measured width.
+                let w = wrap_w.unwrap_or(measured_w);
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
                 flat_ids.push(id);
                 Ok(id)
@@ -1854,18 +2279,23 @@ impl Interpreter {
                         RenderNode::Box {
                             name: list_name,
                             attrs: list_attrs,
-                            children: rows,
+                            children: rows_raw,
                             ..
                         },
                     ] = children.as_slice()
                     {
+                        // RFC-0018: expand a reactive `for` (or literal rows) to
+                        // the concrete row nodes, then window over them — so
+                        // virtualization still lays out only the visible slice.
+                        let rows = self.expand_concrete(rows_raw, pools);
                         if let Some(win) = self.scroll_window(attrs, rows.len()) {
                             let mut temp_flat = Vec::new();
                             let list_id = self.build_windowed_list(
                                 list_name,
                                 list_attrs,
-                                rows,
+                                &rows,
                                 win,
+                                pools,
                                 &mut temp_flat,
                             )?;
                             let style = self.eval_container_style(name.as_str(), attrs);
@@ -1876,12 +2306,9 @@ impl Interpreter {
                         }
                     }
                 }
-                let mut child_ids = Vec::with_capacity(children.len());
                 let mut temp_flat = Vec::new();
-                for child in children {
-                    let child_id = self.build_layout_tree(child, &mut temp_flat)?;
-                    child_ids.push(child_id);
-                }
+                // RFC-0018: expand reactive `when`/`for` children before layout.
+                let child_ids = self.build_children(children, pools, &mut temp_flat);
                 let style = self.eval_container_style(name.as_str(), attrs);
                 let id = self.atlas.add_container(style, &child_ids)?;
                 flat_ids.push(id);
@@ -1903,8 +2330,9 @@ impl Interpreter {
         &mut self,
         list_name: &Symbol,
         list_attrs: &[Attr],
-        rows: &[RenderNode],
+        rows: &[&RenderNode],
         win: WindowSpec,
+        pools: Pools<'_>,
         flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
     ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
         use byard_core::atlas::layout::LeafSize;
@@ -1918,8 +2346,8 @@ impl Interpreter {
         let top = self.atlas.add_leaf(LeafSize::new(0.0, top_h))?;
         temp.push(top);
         child_ids.push(top);
-        for row in &rows[win.start..win.end] {
-            let id = self.build_layout_tree(row, &mut temp)?;
+        for &row in &rows[win.start..win.end] {
+            let id = self.build_layout_tree(row, pools, &mut temp)?;
             child_ids.push(id);
         }
         let bottom = self.atlas.add_leaf(LeafSize::new(0.0, bottom_h))?;
@@ -1967,11 +2395,18 @@ impl Interpreter {
         // spacer leaves the build pass emitted, so the flat-id cursor stays
         // aligned. `None` everywhere else — the ordinary full child walk.
         window: Option<WindowSpec>,
+        // RFC-0018: the reactive `for` pools, for expanding `when`/`for` children.
+        pools: Pools<'_>,
     ) {
         debug_assert_eq!(flat_ids[*flat_idx], atlas_node);
         *flat_idx += 1;
 
         match node {
+            // Reactive `when`/`for` are expanded to concrete children before the
+            // walk reaches them (RFC-0018), so they never arrive as a paint node.
+            RenderNode::When { .. } | RenderNode::For { .. } => {
+                unreachable!("when/for are expanded before render_node_with_atlas")
+            }
             // A `Spacer` is layout-only. An `Overlay` renders nothing in the main
             // flow — its 0×0 leaf holds a slot in the flat-id cursor (already
             // advanced above) while its children are emitted separately in the
@@ -2017,14 +2452,23 @@ impl Interpreter {
                     // primitives (shader-applied) — a documented limitation.
                     let anchor = inherited_transform.apply_point([rect.x, rect.y]);
                     let scaled_size = size * inherited_transform.uniform_scale();
-                    frame.push_text(byard_core::TextLine {
-                        x: anchor[0],
-                        y: anchor[1],
-                        text,
-                        font_size: scaled_size,
-                        color: rgba,
-                        dirty: true,
-                    });
+                    // RFC-0018 text wrap: shape the run bounded to the wrap width
+                    // (scaled by any ancestor scale, since the run's glyphs scale
+                    // about the pivot). `None` keeps the natural single-line run.
+                    let wrap_w = self
+                        .text_wrap_width(attrs)
+                        .map(|w| w * inherited_transform.uniform_scale());
+                    frame.push_text_wrapped(
+                        byard_core::TextLine {
+                            x: anchor[0],
+                            y: anchor[1],
+                            text,
+                            font_size: scaled_size,
+                            color: rgba,
+                            dirty: true,
+                        },
+                        wrap_w,
+                    );
 
                     let has_events = attrs
                         .iter()
@@ -2354,7 +2798,10 @@ impl Interpreter {
                 let child_window = if name.as_str() == "ScrollView" {
                     match children.as_slice() {
                         [RenderNode::Box { children: rows, .. }] => {
-                            self.scroll_window(attrs, rows.len())
+                            // RFC-0018: count the expanded rows (a reactive `for`
+                            // is one node that expands to N), mirroring the build.
+                            let n = self.expand_concrete(rows, pools).len();
+                            self.scroll_window(attrs, n)
                         }
                         _ => None,
                     }
@@ -2373,7 +2820,7 @@ impl Interpreter {
                     // remaining children stay aligned.
                     if let Some(clip) = child_clip {
                         if this.child_fully_clipped(child_id, child_transform, clip) {
-                            *flat_idx += flat_len(child);
+                            *flat_idx += this.flat_len(child, pools);
                             return;
                         }
                     }
@@ -2388,6 +2835,7 @@ impl Interpreter {
                         child_transform,
                         child_clip,
                         child_window,
+                        pools,
                     );
                 };
                 if let Some(win) = window {
@@ -2396,12 +2844,17 @@ impl Interpreter {
                     // the leading spacer, render only rows `start..end`, then the
                     // trailing spacer — keeping the flat-id cursor in lockstep.
                     *flat_idx += 1;
-                    for row in &children[win.start..win.end] {
+                    // RFC-0018: expand a reactive `for` (or literal rows) and
+                    // paint only the windowed slice, mirroring the build pass.
+                    let rows = self.expand_concrete(children, pools);
+                    for &row in &rows[win.start..win.end] {
                         render_child(self, row, frame, flat_idx);
                     }
                     *flat_idx += 1;
                 } else {
-                    for child in children {
+                    // RFC-0018: expand reactive `when`/`for` into concrete children
+                    // in the same order the layout pass did.
+                    for child in self.expand_concrete(children, pools) {
                         render_child(self, child, frame, flat_idx);
                     }
                 }
@@ -3833,6 +4286,10 @@ impl Interpreter {
     /// names), then lowers its top-level elements into a render tree, handling
     /// `when`/`for` structural members (M20).
     pub fn lower_view(&mut self, view: &ViewDecl, known_views: &[&str]) -> Vec<RenderNode> {
+        // RFC-0018: a fresh tree gets fresh `when`/`for` pools; the previous
+        // tree's pool ids are discarded with it (hot-reload re-lowers the tree).
+        self.for_pools.clear();
+        self.when_pools.clear();
         self.eval_view_decls(view);
         // A view that declares a `content` slot (RFC-0007 D-A) may reference it in
         // its body. When the view is lowered *standalone* — e.g. `byard check`
@@ -4571,17 +5028,6 @@ impl Interpreter {
     }
 }
 
-/// The number of flattened layout nodes a [`RenderNode`] subtree contributes,
-/// mirroring [`Interpreter::build_layout_tree`] exactly (each node is one entry
-/// plus its children; value widgets are leaves). Used to advance the flat-id
-/// cursor past a culled `ScrollView` child without walking it (RFC-0005).
-fn flat_len(node: &RenderNode) -> usize {
-    match node {
-        RenderNode::Box { children, .. } => 1 + children.iter().map(flat_len).sum::<usize>(),
-        _ => 1,
-    }
-}
-
 /// One `Overlay`'s built layout (RFC-0017): its absolute wrapper node plus a
 /// per-child emission slot. Holds borrows into the frozen render tree, so its
 /// lifetime is scoped to a single [`Interpreter::render`] call.
@@ -4601,28 +5047,6 @@ struct OverlayChildSlot<'a> {
     node: &'a RenderNode,
     id: byard_core::atlas::layout::AtlasNodeId,
     flat_ids: Vec<byard_core::atlas::layout::AtlasNodeId>,
-}
-
-/// Collects every mounted `Overlay` under `node` in pre-order (RFC-0017 mount =
-/// declaration order). Recurses through `Box` children *and* through an
-/// overlay's own children, so a nested overlay (an overlay mounted inside an
-/// overlay's content) is collected as its own later — hence higher — stack
-/// entry, matching the RFC's flat-stack nesting model.
-fn collect_overlays<'a>(node: &'a RenderNode, out: &mut Vec<&'a RenderNode>) {
-    match node {
-        RenderNode::Overlay { children, .. } => {
-            out.push(node);
-            for c in children {
-                collect_overlays(c, out);
-            }
-        }
-        RenderNode::Box { children, .. } => {
-            for c in children {
-                collect_overlays(c, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// The absolute, inset-0 anchor wrapper style for an overlay child (RFC-0017
@@ -5259,19 +5683,24 @@ mod tests {
 
     #[test]
     fn guarded_recursion_that_terminates_is_legal() {
-        // `Tree` recurses only in the `else` of a guard that is true at lower
-        // time, so it renders to a finite depth with no diagnostic.
+        // RFC-0018: `Tree` recurses only in the `else` of a guard that is true, so
+        // the recursive branch is never lowered (lazy `when`) — it renders to a
+        // finite depth with no diagnostic.
         let (mut interp, tree) = lower_named(
             "View Tree() { var leaf = true\n when leaf { Text(\"x\") } else { Tree() } }\n\
              View App() { Tree() }",
             "App",
         );
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
         assert!(
             interp.errors().is_empty(),
             "guarded terminating recursion is legal: {:?}",
             interp.errors()
         );
-        assert_eq!(text_value(&mut interp, &tree[0]), "x");
+        assert_eq!(frame.texts().len(), 1);
+        assert_eq!(frame.texts()[0].text, "x");
     }
 
     #[test]
@@ -5296,13 +5725,28 @@ mod tests {
             .iter()
             .find(|v| v.name.as_str() == "App")
             .unwrap();
-        let _tree = interp.lower_view(app, &known); // must return, not overflow
-        assert!(
-            interp
+        let tree = interp.lower_view(app, &known); // lazy: no recursion at lower
+        // RFC-0018: the recursion now unrolls at render (reconcile) time — one
+        // level per frame (a freshly-lowered `go` reads false until the next
+        // pull), so each render is finite (no stack overflow). Over enough frames
+        // the reconcile depth bound stops it with a diagnostic.
+        let mut hit = false;
+        for _ in 0..(MAX_INSTANCE_DEPTH + 8) {
+            interp.tick();
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0); // must not overflow
+            if interp
                 .errors()
                 .iter()
-                .any(|e| matches!(e, CompileError::RecursiveView { .. })),
-            "expected a depth-bound RecursiveView diagnostic"
+                .any(|e| matches!(e, CompileError::RecursiveView { .. }))
+            {
+                hit = true;
+                break;
+            }
+        }
+        assert!(
+            hit,
+            "the reconcile depth bound must stop the runaway recursion"
         );
     }
 
@@ -7626,38 +8070,116 @@ mod tests {
 
     #[test]
     fn when_true_includes_then_branch() {
+        // RFC-0018: `when` lowers to one reactive `When` node; its taken branch is
+        // expanded at paint time. With the condition true, the branch paints.
         let parsed = parse("View C() {\n var show = true\n when show { Text(\"visible\") }\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        let view = &parsed.views[0];
         let mut interp = Interpreter::new();
-        let tree = interp.lower_view(view, &[]);
+        let tree = interp.lower_view(&parsed.views[0], &[]);
         assert!(interp.errors().is_empty(), "{:?}", interp.errors());
-        // `when true { ... }` → one Text node in the tree
-        assert_eq!(tree.len(), 1, "when=true emits one node");
-        assert!(matches!(tree[0], RenderNode::Text { .. }));
+        assert_eq!(tree.len(), 1);
+        assert!(
+            matches!(tree[0], RenderNode::When { .. }),
+            "when → When node"
+        );
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(frame.texts().len(), 1, "then-branch paints when true");
+        assert_eq!(frame.texts()[0].text, "visible");
     }
 
     #[test]
     fn when_false_emits_nothing_without_else() {
         let parsed = parse("View C() {\n var hide = false\n when hide { Text(\"hidden\") }\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        let view = &parsed.views[0];
         let mut interp = Interpreter::new();
-        let tree = interp.lower_view(view, &[]);
+        let tree = interp.lower_view(&parsed.views[0], &[]);
         assert!(interp.errors().is_empty(), "{:?}", interp.errors());
-        assert!(tree.is_empty(), "when=false emits no nodes");
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(frame.texts().is_empty(), "false, no else → nothing paints");
+    }
+
+    #[test]
+    fn when_reacts_to_a_var_flip_at_runtime() {
+        // RFC-0018: the whole point — flipping the guard `var` mounts/unmounts the
+        // subtree at runtime, with no re-lowering.
+        let parsed = parse(
+            "View C() {\n var show = false\n when show { Text(\"hi\") } else { Text(\"bye\") }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        let show = interp
+            .var_signal(&crate::symbol::Symbol::intern("show"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(frame.texts()[0].text, "bye", "else branch first");
+
+        interp.write_var(show, Value::Bool(true));
+        interp.tick();
+        let mut frame2 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame2, 400.0, 300.0);
+        assert_eq!(frame2.texts()[0].text, "hi", "then branch after flip");
     }
 
     #[test]
     fn for_loop_emits_one_node_per_item() {
+        // RFC-0018: `for` lowers to one reactive `For` node; the driver renders one
+        // pooled body per element at paint time.
         let parsed =
             parse("View C() {\n var items = [1, 2, 3]\n for item in items { Text(\"{item}\") }\n}");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        let view = &parsed.views[0];
         let mut interp = Interpreter::new();
-        let tree = interp.lower_view(view, &[]);
+        let tree = interp.lower_view(&parsed.views[0], &[]);
         assert!(interp.errors().is_empty(), "{:?}", interp.errors());
-        assert_eq!(tree.len(), 3, "for over 3 items emits 3 nodes");
+        assert!(matches!(tree[0], RenderNode::For { .. }), "for → For node");
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let texts: Vec<&str> = frame.texts().iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["1", "2", "3"], "one node per item, in order");
+    }
+
+    #[test]
+    fn for_reacts_to_list_growth_and_element_change() {
+        // RFC-0018: growing the list mounts more rows; changing an element updates
+        // its row — all without re-lowering.
+        let parsed = parse("View C() {\n var xs = [10, 20]\n for x in xs { Text(\"{x}\") }\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        let xs = interp
+            .var_signal(&crate::symbol::Symbol::intern("xs"))
+            .unwrap();
+        interp.tick();
+        let mut f = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f, 400.0, 300.0);
+        let t: Vec<&str> = f.texts().iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(t, ["10", "20"]);
+
+        // Grow + change: [10, 20] → [10, 99, 30].
+        interp.write_var(
+            xs,
+            Value::List(vec![Value::Int(10), Value::Int(99), Value::Int(30)]),
+        );
+        interp.tick();
+        let mut f2 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f2, 400.0, 300.0);
+        let t2: Vec<&str> = f2.texts().iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(t2, ["10", "99", "30"], "grew to 3 rows, element updated");
+
+        // Shrink: [10, 99, 30] → [7].
+        interp.write_var(xs, Value::List(vec![Value::Int(7)]));
+        interp.tick();
+        let mut f3 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f3, 400.0, 300.0);
+        let t3: Vec<&str> = f3.texts().iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(t3, ["7"], "shrank to 1 row");
     }
 
     // ── M23: Controller boundary ─────────────────────────────────────────
@@ -8160,6 +8682,105 @@ mod tests {
         assert_eq!(frame.decorated().len(), 0);
     }
 
+    // ── RFC-0018: text wrap ──────────────────────────────────────────────
+
+    #[test]
+    fn wrapped_text_emits_a_wrap_width_and_a_taller_leaf() {
+        let long = "the quick brown fox jumps over the lazy dog again and again";
+        // Same text, once natural and once wrapped to width 120.
+        let src = format!(
+            "View C() {{\n Text(\"{long}\")\n Text(\"{long}\") #[wrap: true, width: 120]\n}}"
+        );
+        let parsed = parse(&src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Two text lines: the first natural (no wrap), the second wrapped to 120.
+        assert_eq!(frame.texts().len(), 2);
+        assert_eq!(frame.text_wraps().len(), 2, "wrap slice parallel to texts");
+        assert_eq!(frame.text_wraps()[0], None, "natural line: no wrap");
+        assert_eq!(
+            frame.text_wraps()[1],
+            Some(120.0),
+            "wrapped line carries its wrap width"
+        );
+
+        // The wrapped leaf is 120 wide and taller than the natural single line.
+        let nat = frame.rects()[1]; // C root is rects[0]; first Text is rects[1]
+        let wrapped = frame.rects()[2];
+        assert!(
+            (wrapped.width - 120.0).abs() < 1.0,
+            "wrapped leaf is its wrap width, got {}",
+            wrapped.width
+        );
+        assert!(
+            wrapped.height > nat.height,
+            "wrapped leaf is taller (multi-line): {} vs {}",
+            wrapped.height,
+            nat.height
+        );
+    }
+
+    #[test]
+    fn reactive_demo_example_reacts_live() {
+        // Ties the shipped RFC-0018 example to the suite: `when` toggles a subtree
+        // and `for` grows a list, both at runtime.
+        let src = include_str!("../../examples/reactive_demo.byd");
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let known: Vec<&str> = parsed.views.iter().map(|v| v.name.as_str()).collect();
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &known);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let show = interp
+            .var_signal(&crate::symbol::Symbol::intern("showList"))
+            .unwrap();
+        let names = interp
+            .var_signal(&crate::symbol::Symbol::intern("names"))
+            .unwrap();
+        let render = |interp: &mut Interpreter| {
+            interp.tick();
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 640.0, 520.0);
+            f.texts().iter().map(|t| t.text.clone()).collect::<Vec<_>>()
+        };
+
+        // Initially: list shown → both names present.
+        let t0 = render(&mut interp);
+        assert!(t0.contains(&"Ada".to_string()) && t0.contains(&"Alan".to_string()));
+        assert!(!t0.iter().any(|s| s.starts_with("List hidden")));
+
+        // Hide the list live.
+        interp.write_var(show, Value::Bool(false));
+        let t1 = render(&mut interp);
+        assert!(!t1.contains(&"Ada".to_string()), "list unmounted live");
+        assert!(
+            t1.iter().any(|s| s.starts_with("List hidden")),
+            "else branch"
+        );
+
+        // Show again + grow the list live → four rows.
+        interp.write_var(show, Value::Bool(true));
+        interp.write_var(
+            names,
+            Value::List(vec![
+                Value::Str("Ada".into()),
+                Value::Str("Alan".into()),
+                Value::Str("Grace".into()),
+                Value::Str("Katherine".into()),
+            ]),
+        );
+        let t2 = render(&mut interp);
+        for n in ["Ada", "Alan", "Grace", "Katherine"] {
+            assert!(t2.contains(&n.to_string()), "{n} row mounted after growth");
+        }
+    }
+
     // ── RFC-0017: Overlay & z-layer system ───────────────────────────────
 
     /// Finds the emitted solid box closest to the given colour channels.
@@ -8442,6 +9063,63 @@ mod tests {
     }
 
     #[test]
+    fn when_gated_overlay_unmounts_live_on_dismiss() {
+        // RFC-0018 × RFC-0017: a `when`-gated modal overlay now dismisses at
+        // runtime — tapping the scrim flips the guard `var`, and the very next
+        // render unmounts the overlay (no hot-reload needed). This is the headline
+        // reactivity win: overlays are live.
+        let src = "View C() {\n \
+            var open = true\n \
+            when open {\n \
+                Overlay #[modal: true, dismiss => open = false] {\n \
+                    Box #[bg: 0x000000, opacity: 0.4, grow: 1] {}\n \
+                    Column #[anchor: center, bg: 0xFFFFFF, width: 100, height: 60] {}\n \
+                }\n \
+            }\n\
+        }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // The overlay is mounted: the white dialog surface is present.
+        assert!(
+            frame.instances().iter().any(|b| b.color[0] > 0.95),
+            "overlay mounted initially"
+        );
+
+        // Tap the scrim (top-left, outside the centred content).
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 20,
+            },
+        ]);
+        interp.tick();
+        let mut frame2 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame2, 400.0, 300.0);
+        // `open` flipped false → the `when` unmounts the overlay entirely.
+        assert!(
+            !frame2.instances().iter().any(|b| b.color[0] > 0.95),
+            "overlay unmounted live after dismiss"
+        );
+        assert!(frame2.instances().is_empty(), "nothing left on screen");
+    }
+
+    #[test]
     fn non_modal_overlay_lets_taps_fall_through() {
         // A non-modal overlay (a snackbar-style surface) must not block the main
         // tree: a tap on the button behind still fires.
@@ -8532,10 +9210,12 @@ mod tests {
         let mut measurer = byard_core::text::TextMeasurer::new();
         let surf_left = dialog_box.rect[0];
         let surf_right = dialog_box.rect[0] + dialog_box.rect[2];
-        for line in frame.texts() {
+        for (line, wrap) in frame.texts().iter().zip(frame.text_wraps()) {
             let inside = line.x >= surf_left && line.x < surf_right && line.color[0] < 0.5;
             if inside {
-                let (w, _) = measurer.measure(&line.text, line.font_size);
+                // Honour the wrap width (RFC-0018): a wrapped label's laid-out
+                // width is bounded to it, not the full one-line measurement.
+                let (w, _) = measurer.measure_wrapped(&line.text, line.font_size, *wrap);
                 assert!(
                     line.x + w <= surf_right + 0.5,
                     "dialog text {:?} overflows the surface: {} + {} > {}",

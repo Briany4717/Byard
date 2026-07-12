@@ -875,6 +875,14 @@ pub struct RenderFrame {
     text_clips: Vec<Option<u16>>,
     vector_clips: Vec<Option<u16>>,
 
+    /// Per-text-line wrap width in logical pixels, parallel to `texts` (kept off
+    /// the `TextLine` struct like the depth/clip vecs, so its 19 construction
+    /// sites stay untouched). `Some(w)` shapes that line bounded to `w` so it
+    /// wraps onto multiple lines; `None` is the natural single-line width.
+    /// Populated by [`push_text_wrapped`](Self::push_text_wrapped); the plain
+    /// [`push_text`](Self::push_text) records `None`.
+    text_wrap: Vec<Option<f32>>,
+
     /// Running global emission counter, mapped to a depth by [`draw_depth`].
     /// Reset each [`clear`](Self::clear); advanced by every `push_*` drawable.
     draw_seq: u32,
@@ -1004,6 +1012,7 @@ impl RenderFrame {
         self.texture_clips.clear();
         self.text_clips.clear();
         self.vector_clips.clear();
+        self.text_wrap.clear();
         self.layer_marks.clear();
         self.draw_seq = 0;
         self.version = 0;
@@ -1084,13 +1093,21 @@ impl RenderFrame {
         self.texture_clips.push(c);
     }
 
-    /// Appends a [`TextLine`] to the frame.
+    /// Appends a [`TextLine`] to the frame (natural single-line width).
     pub fn push_text(&mut self, text: TextLine) {
+        self.push_text_wrapped(text, None);
+    }
+
+    /// Appends a [`TextLine`] shaped to an optional wrap width (RFC-0018 text
+    /// wrap). `Some(w)` wraps the line onto multiple lines bounded to `w`
+    /// logical pixels; `None` behaves exactly like [`push_text`](Self::push_text).
+    pub fn push_text_wrapped(&mut self, text: TextLine, wrap_width: Option<f32>) {
         let d = self.next_depth();
         let c = self.active_clip();
         self.texts.push(text);
         self.text_depths.push(d);
         self.text_clips.push(c);
+        self.text_wrap.push(wrap_width);
     }
 
     /// Appends a [`VectorInstance`] (MSDF glyph) to the frame (RFC-0009 §1).
@@ -1173,7 +1190,13 @@ impl RenderFrame {
         &self.textures
     }
 
-    /// Returns the text lines in this frame.
+    /// Returns the per-line wrap widths, parallel to [`texts`](Self::texts).
+    #[must_use]
+    pub fn text_wraps(&self) -> &[Option<f32>] {
+        &self.text_wrap
+    }
+
+    /// Returns the text lines pushed to the frame.
     #[must_use]
     pub fn texts(&self) -> &[TextLine] {
         &self.texts
