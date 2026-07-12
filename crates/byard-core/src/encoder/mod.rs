@@ -24,6 +24,7 @@
 //! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
 
+pub mod canvas_shape;
 pub mod decorated_box;
 pub mod gpu_timer;
 pub mod text_glyph;
@@ -33,11 +34,12 @@ pub mod vector_msdf;
 pub use gpu_timer::GpuTimer;
 
 /// Name of the single GPU pass this codebase currently times (RFC-0013 §"GPU
-/// timing"): `SolidBox`, `DecoratedBox`, `TextureSampler`, and `TextGlyph` all
-/// draw within one `wgpu::RenderPass` (see [`draw_ui_pass`]), so — unlike the
-/// RFC's four-pipeline illustration — there is exactly one pass boundary to
-/// time today. Per-pipeline GPU timing needs the encoder to split that pass
-/// first; tracked as a follow-up, not attempted here.
+/// timing"): `SolidBox`, `DecoratedBox`, `TextureSampler`, `VectorMSDF`,
+/// `CanvasShape`, and `TextGlyph` all draw within one `wgpu::RenderPass` (see
+/// [`draw_ui_pass`]), so — unlike the RFC's four-pipeline illustration —
+/// there is exactly one pass boundary to time today. Per-pipeline GPU timing
+/// needs the encoder to split that pass first; tracked as a follow-up, not
+/// attempted here.
 pub const GPU_UI_PASS_SCOPE: &str = "gpu.ui_pass";
 
 use std::sync::Arc;
@@ -187,6 +189,11 @@ pub struct EncoderSubsystem {
     /// `VectorMSDF` pipeline (RFC-0009 §1, the fifth pipeline) — samples
     /// [`vector_atlas`](Self::vector_atlas) to draw crisp monochrome icons.
     vector_pipeline: wgpu::RenderPipeline,
+    /// `CanvasShape` pipeline (RFC-0020, the sixth pipeline) — analytic-SDF
+    /// arcs/circles/lines/rects from `Canvas` shape commands. Shares the
+    /// viewport bind group (group 0); transparent geometry, so it tests but
+    /// never writes the draw-order depth buffer (RFC-0017 split).
+    canvas_pipeline: wgpu::RenderPipeline,
     /// The MSDF atlas: an array texture uploaded to by the JIT/AOT paths via
     /// [`RenderFrame::atlas_uploads`] (RFC-0009 §2-C, INV-8 — this is the only
     /// place `Queue::write_texture` is called for it).
@@ -288,6 +295,10 @@ pub struct EncoderSubsystem {
     /// Per-`DecoratedBox` bounding boxes from the previous call (M27), aligned
     /// with that call's `decorated` slice. Same shrink/move-safety contract.
     last_decorated_bounds: Vec<Rect>,
+    /// Previous-frame bounds of every `CanvasShape` (RFC-0020), for the
+    /// incremental dirty-scissor union — same contract as
+    /// [`last_decorated_bounds`](Self::last_decorated_bounds).
+    last_canvas_bounds: Vec<Rect>,
     /// Per-`TextureSampler` bounding boxes from the previous call (M27),
     /// aligned with that call's `textures` slice.
     last_texture_bounds: Vec<Rect>,
@@ -462,6 +473,26 @@ impl EncoderSubsystem {
             surface_format,
         )
         .await?;
+        // `CanvasShape` pipeline (RFC-0020, the sixth pipeline). Transparent
+        // geometry (AA strokes/fills), so it uses the no-write depth state —
+        // the same opaque/transparent split as `DecoratedBox` (RFC-0017).
+        let canvas_pipeline = canvas_shape::build_pipeline(
+            &device,
+            &bind_group_layout,
+            wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            surface_format,
+            draw_depth_stencil_no_write(),
+        )
+        .await?;
+
         // The atlas is an *array* texture (`vector_msdf::ATLAS_LAYERS` layers):
         // it must be a real `GL_TEXTURE_2D_ARRAY` on the GL backend, so a single
         // layer is not an option — see `ATLAS_LAYERS`. The dev allocator (M48)
@@ -495,6 +526,7 @@ impl EncoderSubsystem {
             image_sampler,
             texture_cache: texture_sampler::TextureCache::default(),
             vector_pipeline,
+            canvas_pipeline,
             vector_atlas,
             vector_ack_tx: None,
             io: None,
@@ -514,6 +546,7 @@ impl EncoderSubsystem {
             last_text_bounds: Vec::new(),
             last_box_bounds: Vec::new(),
             last_decorated_bounds: Vec::new(),
+            last_canvas_bounds: Vec::new(),
             last_texture_bounds: Vec::new(),
             last_relay_version: 0,
             gpu_timer,
@@ -680,6 +713,7 @@ impl EncoderSubsystem {
             &[],
             &[],
             &[],
+            &[],
             DrawDepths::default(),
             FrameClips::default(),
             &[],
@@ -698,6 +732,7 @@ impl EncoderSubsystem {
         decorated: &[crate::frame::DecoratedBox],
         textures: &[crate::frame::TextureSampler],
         vectors: &[VectorInstance],
+        canvas_shapes: &[crate::frame::CanvasShape],
         atlas_uploads: &[AtlasUpload],
         depths: DrawDepths<'_>,
         clips: FrameClips<'_>,
@@ -757,6 +792,8 @@ impl EncoderSubsystem {
                     prev_decorated: &self.last_decorated_bounds,
                     textures,
                     prev_textures: &self.last_texture_bounds,
+                    canvas_shapes,
+                    prev_canvas: &self.last_canvas_bounds,
                 },
                 self.scale_factor,
                 self.phys_w,
@@ -814,6 +851,7 @@ impl EncoderSubsystem {
                     decorated: &self.decorated_pipeline,
                     texture: &self.texture_pipeline,
                     vector: &self.vector_pipeline,
+                    canvas: &self.canvas_pipeline,
                 },
                 &self.viewport_bind_group,
                 &self.quad_buffer,
@@ -829,9 +867,11 @@ impl EncoderSubsystem {
                     texture_cache: &self.texture_cache,
                     vectors,
                     vector_atlas: &self.vector_atlas,
+                    canvas_shapes,
                     solid_depths: depths.solid,
                     decorated_depths: depths.decorated,
                     texture_depths: depths.texture,
+                    canvas_depths: depths.canvas,
                     clips,
                     layers,
                 },
@@ -872,7 +912,7 @@ impl EncoderSubsystem {
             },
         );
 
-        update_frame_bookkeeping(self, instances, texts, decorated, textures);
+        update_frame_bookkeeping(self, instances, texts, decorated, textures, canvas_shapes);
 
         Ok(encoder.finish())
     }
@@ -923,6 +963,7 @@ impl EncoderSubsystem {
                 frame.decorated(),
                 frame.textures(),
                 frame.vector_instances(),
+                frame.canvas_shapes(),
                 frame.atlas_uploads(),
                 frame_draw_depths(frame),
                 frame_clips(frame),
@@ -938,6 +979,7 @@ impl EncoderSubsystem {
             frame.decorated(),
             frame.textures(),
             frame.vector_instances(),
+            frame.canvas_shapes(),
             frame.atlas_uploads(),
             frame_draw_depths(frame),
             frame_clips(frame),
@@ -1027,6 +1069,7 @@ fn update_frame_bookkeeping(
     texts: &[TextLine],
     decorated: &[crate::frame::DecoratedBox],
     textures: &[crate::frame::TextureSampler],
+    canvas_shapes: &[crate::frame::CanvasShape],
 ) {
     state.needs_full_redraw = false;
     state.last_instance_count = instances.len();
@@ -1038,6 +1081,10 @@ fn update_frame_bookkeeping(
     state.last_text_bounds = texts.iter().map(text_line_bounds).collect();
     state.last_box_bounds = instances.iter().map(|b| rect_of(b.rect)).collect();
     state.last_decorated_bounds = decorated.iter().map(|d| rect_of(d.base.rect)).collect();
+    state.last_canvas_bounds = canvas_shapes
+        .iter()
+        .map(crate::frame::CanvasShape::bounds)
+        .collect();
     state.last_texture_bounds = textures.iter().map(|t| rect_of(t.rect)).collect();
 }
 
@@ -1061,6 +1108,7 @@ struct DrawPipelines<'a> {
     decorated: &'a wgpu::RenderPipeline,
     texture: &'a wgpu::RenderPipeline,
     vector: &'a wgpu::RenderPipeline,
+    canvas: &'a wgpu::RenderPipeline,
 }
 
 /// Draw-order depth slices for one frame (RFC-0011 cross-pass paint order),
@@ -1077,6 +1125,8 @@ pub struct DrawDepths<'a> {
     pub texture: &'a [f32],
     /// Parallel to `TextLine`s (applied via glyphon per-glyph metadata).
     pub text: &'a [f32],
+    /// Parallel to `CanvasShape`s (RFC-0020).
+    pub canvas: &'a [f32],
 }
 
 /// A frame's content-clip table plus the parallel per-pool clip slices
@@ -1095,6 +1145,8 @@ pub struct FrameClips<'a> {
     pub text: &'a [Option<u16>],
     /// Parallel to `VectorInstance`s.
     pub vector: &'a [Option<u16>],
+    /// Parallel to `CanvasShape`s (RFC-0020).
+    pub canvas: &'a [Option<u16>],
     /// Per-`TextLine` wrap width in logical px (RFC-0018 text wrap); `Some(w)`
     /// shapes that line bounded to `w` so it wraps. Carried alongside the clip
     /// slices because it is another per-text-line parallel slice consumed by the
@@ -1111,6 +1163,7 @@ fn frame_clips(frame: &RenderFrame) -> FrameClips<'_> {
         texture: frame.texture_clips(),
         text: frame.text_clips(),
         vector: frame.vector_clips(),
+        canvas: frame.canvas_clips(),
         text_wrap: frame.text_wraps(),
     }
 }
@@ -1122,6 +1175,7 @@ fn frame_draw_depths(frame: &RenderFrame) -> DrawDepths<'_> {
         decorated: frame.decorated_depths(),
         texture: frame.texture_depths(),
         text: frame.text_depths(),
+        canvas: frame.canvas_depths(),
     }
 }
 
@@ -1137,6 +1191,8 @@ struct DrawPrimitives<'a> {
     vectors: &'a [VectorInstance],
     /// The MSDF atlas these `vectors` sample; not drawn without one.
     vector_atlas: &'a VectorAtlas,
+    /// `Canvas` shape primitives (RFC-0020, the sixth pipeline).
+    canvas_shapes: &'a [crate::frame::CanvasShape],
     /// Draw-order depths, parallel to `instances`/`decorated`/`textures`
     /// respectively (RFC-0011 cross-pass paint order). `texts` depth is applied
     /// inside `TextGlyphPipeline::prepare` via glyphon's per-glyph metadata;
@@ -1145,6 +1201,7 @@ struct DrawPrimitives<'a> {
     solid_depths: &'a [f32],
     decorated_depths: &'a [f32],
     texture_depths: &'a [f32],
+    canvas_depths: &'a [f32],
     /// Content-clip table + per-pool clip slices (RFC-0005 `ScrollView`).
     clips: FrameClips<'a>,
     /// Z-layer boundaries (RFC-0017 layered draw batches): pool cursors at
@@ -1203,6 +1260,7 @@ fn draw_ui_pass(
         decorated: decorated_pipeline,
         texture: texture_pipeline,
         vector: vector_pipeline,
+        canvas: canvas_pipeline,
     } = *pipelines;
     let DrawPrimitives {
         instances,
@@ -1212,9 +1270,11 @@ fn draw_ui_pass(
         texture_cache,
         vectors,
         vector_atlas,
+        canvas_shapes,
         solid_depths,
         decorated_depths,
         texture_depths,
+        canvas_depths,
         clips,
         layers,
     } = *primitives;
@@ -1304,6 +1364,7 @@ fn draw_ui_pass(
     let texture_ranges = layer_pool_ranges(layers, textures.len(), |m| m.texture);
     let vector_ranges = layer_pool_ranges(layers, vectors.len(), |m| m.vector);
     let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
+    let canvas_ranges = layer_pool_ranges(layers, canvas_shapes.len(), |m| m.canvas);
 
     let layer_count = layers.len() + 1;
     for layer in 0..layer_count {
@@ -1312,6 +1373,7 @@ fn draw_ui_pass(
         let tr = &texture_ranges[layer];
         let vr = &vector_ranges[layer];
         let xr = &text_ranges[layer];
+        let cr = &canvas_ranges[layer];
 
         // Drawn on every call to this function, not just a full redraw — the
         // clear quad above can wipe a box's area on an incremental frame, so
@@ -1347,6 +1409,20 @@ fn draw_ui_pass(
             &decorated[dr.clone()],
             sub_slice(decorated_depths, dr),
             sub_slice(clips.decorated, dr),
+            clip_ctx,
+        );
+        // RFC-0020: programmatic `Canvas` shapes (arcs/circles/lines/rects),
+        // analytic SDF. Transparent geometry like the decorated pass — tests
+        // the draw-order depth buffer, never writes it.
+        canvas_shape::draw(
+            &mut render_pass,
+            device,
+            canvas_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            &canvas_shapes[cr.clone()],
+            sub_slice(canvas_depths, cr),
+            sub_slice(clips.canvas, cr),
             clip_ctx,
         );
         texture_sampler::draw(
@@ -1585,6 +1661,15 @@ fn dirty_decorated_bounds(
     )
 }
 
+/// `dirty_text_bounds` for the `CanvasShape` pipeline (RFC-0020); dirtiness
+/// comes from each shape's own
+/// [`CanvasShape::dirty`](crate::frame::CanvasShape::dirty) bit and its bounds
+/// from [`CanvasShape::bounds`](crate::frame::CanvasShape::bounds) (stroke and
+/// caps included), so an animated arc repaints without a full redraw.
+fn dirty_canvas_bounds(shapes: &[crate::frame::CanvasShape], previous: &[Rect]) -> Option<Rect> {
+    union_dirty_rects(shapes.iter().map(|s| (s.bounds(), s.dirty)), previous)
+}
+
 /// `dirty_text_bounds` for the `TextureSampler` pipeline (M27); dirtiness comes
 /// from each sampler's own [`TextureSampler::dirty`](crate::frame::TextureSampler::dirty)
 /// bit.
@@ -1624,6 +1709,8 @@ struct ScissorInputs<'a> {
     prev_decorated: &'a [Rect],
     textures: &'a [crate::frame::TextureSampler],
     prev_textures: &'a [Rect],
+    canvas_shapes: &'a [crate::frame::CanvasShape],
+    prev_canvas: &'a [Rect],
 }
 
 #[cfg(test)]
@@ -1642,6 +1729,8 @@ impl<'a> ScissorInputs<'a> {
             prev_decorated: &[],
             textures: &[],
             prev_textures: &[],
+            canvas_shapes: &[],
+            prev_canvas: &[],
         }
     }
 }
@@ -1738,13 +1827,16 @@ fn compute_scissor(
 ) -> Option<(Rect, u32, u32, u32, u32)> {
     let bounds = union_opt(
         union_opt(
-            dirty_text_bounds(inputs.texts, inputs.prev_texts),
-            dirty_box_bounds(inputs.instances, inputs.instances_dirty, inputs.prev_boxes),
+            union_opt(
+                dirty_text_bounds(inputs.texts, inputs.prev_texts),
+                dirty_box_bounds(inputs.instances, inputs.instances_dirty, inputs.prev_boxes),
+            ),
+            union_opt(
+                dirty_decorated_bounds(inputs.decorated, inputs.prev_decorated),
+                dirty_texture_bounds(inputs.textures, inputs.prev_textures),
+            ),
         ),
-        union_opt(
-            dirty_decorated_bounds(inputs.decorated, inputs.prev_decorated),
-            dirty_texture_bounds(inputs.textures, inputs.prev_textures),
-        ),
+        dirty_canvas_bounds(inputs.canvas_shapes, inputs.prev_canvas),
     )?;
     let (x, y, w, h) = logical_rect_to_physical_scissor(bounds, scale, max_w, max_h);
     if w > 0 && h > 0 {
@@ -2121,7 +2213,7 @@ mod tests {
 
     // ── Z-layer pool partitioning (RFC-0017 layered draw batches) ──────────────
 
-    /// Shorthand: a [`crate::frame::LayerMark`] whose five cursors are all `n`.
+    /// Shorthand: a [`crate::frame::LayerMark`] whose pool cursors are all `n`.
     fn mark(n: u32) -> crate::frame::LayerMark {
         crate::frame::LayerMark {
             solid: n,
@@ -2129,6 +2221,7 @@ mod tests {
             texture: n,
             vector: n,
             text: n,
+            canvas: n,
         }
     }
 
@@ -2188,6 +2281,7 @@ mod tests {
         let forbidden_call = ["LayoutAtlas", "::", "compute"].concat();
         for (name, src) in [
             ("mod.rs", include_str!("mod.rs")),
+            ("canvas_shape.rs", include_str!("canvas_shape.rs")),
             ("decorated_box.rs", include_str!("decorated_box.rs")),
             ("gpu_timer.rs", include_str!("gpu_timer.rs")),
             ("text_glyph.rs", include_str!("text_glyph.rs")),

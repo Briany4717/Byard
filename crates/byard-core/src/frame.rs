@@ -631,6 +631,122 @@ impl Default for DecoratedBox {
     }
 }
 
+/// Shape-kind discriminant for a [`CanvasShape`] (RFC-0020 §2, Tier 1): a
+/// circular arc. `params = [cx, cy, r, start_rad, sweep_rad, 0, 0, 0]`.
+pub const CANVAS_SHAPE_ARC: u32 = 0;
+/// [`CanvasShape`] kind: a full circle. `params = [cx, cy, r, 0, 0, 0, 0, 0]`.
+pub const CANVAS_SHAPE_CIRCLE: u32 = 1;
+/// [`CanvasShape`] kind: a line segment. `params = [x1, y1, x2, y2, 0, 0, 0, 0]`.
+pub const CANVAS_SHAPE_LINE: u32 = 2;
+/// [`CanvasShape`] kind: a (rounded) rectangle.
+/// `params = [x, y, w, h, radius, 0, 0, 0]`.
+pub const CANVAS_SHAPE_RECT: u32 = 3;
+
+/// [`CanvasShape`] line-cap style (RFC-0020 §"Stroke and fill"): flat end
+/// exactly at the path endpoint.
+pub const CANVAS_CAP_BUTT: u32 = 0;
+/// [`CanvasShape`] line-cap style: semicircular end centred on the endpoint.
+pub const CANVAS_CAP_ROUND: u32 = 1;
+/// [`CanvasShape`] line-cap style: square end extending half the stroke width
+/// past the endpoint.
+pub const CANVAS_CAP_SQUARE: u32 = 2;
+
+/// A programmatic 2-D shape (RFC-0020): one `Canvas` shape command lowered to
+/// a GPU primitive for the `CanvasShape` analytic-SDF pipeline (Tier 1 —
+/// arcs, circles, lines, rects). Coordinates in `params` are **absolute
+/// logical pixels** (the evaluator has already offset the shape by its
+/// `Canvas`'s resolved origin).
+///
+/// Complex `path(d: …)` commands do not use this type — they rasterize
+/// through the `VectorMSDF` pipeline (RFC-0020 §2 Tier 2) as a
+/// [`VectorInstance`]; `text(…)` commands lower to [`TextLine`]s.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasShape {
+    /// Shape kind: one of [`CANVAS_SHAPE_ARC`], [`CANVAS_SHAPE_CIRCLE`],
+    /// [`CANVAS_SHAPE_LINE`], [`CANVAS_SHAPE_RECT`].
+    pub kind: u32,
+    /// Shape-specific geometry (see each kind constant's doc for the layout).
+    /// Angles are radians; `start` is measured from the positive X axis,
+    /// increasing clockwise in screen space (positive Y is down).
+    pub params: [f32; 8],
+    /// Stroke colour `[r, g, b, a]`; `a == 0` disables the stroke.
+    pub stroke_color: [f32; 4],
+    /// Fill colour `[r, g, b, a]`; `a == 0` disables the fill. A filled arc
+    /// paints the circular sector (pie wedge) swept by `start..start+sweep`.
+    pub fill_color: [f32; 4],
+    /// Stroke width in logical pixels.
+    pub stroke_width: f32,
+    /// Line-cap style: [`CANVAS_CAP_BUTT`], [`CANVAS_CAP_ROUND`], or
+    /// [`CANVAS_CAP_SQUARE`].
+    pub cap: u32,
+    /// Dash pattern `(dash_length, gap_length)` in logical pixels along the
+    /// path; a non-positive dash length renders a solid stroke.
+    pub dash: [f32; 2],
+    /// Dash phase offset in logical pixels (animatable — RFC-0020 §"Animation").
+    pub dash_offset: f32,
+    /// Shape opacity `0.0–1.0` (already multiplied by the canvas/inherited
+    /// opacity by the lowering).
+    pub opacity: f32,
+    /// Paint-time transform (RFC-0011), inherited from the `Canvas` element's
+    /// ancestors. `transform.opacity` is **not** consulted — `opacity` above
+    /// is authoritative, mirroring [`DecoratedBox`]'s contract.
+    pub transform: Transform,
+    /// Whether this shape changed since the last tick — the [`CanvasShape`]
+    /// analogue of [`TextLine::dirty`] (RFC-0001 §3.3), consumed by the
+    /// Encoder's incremental scissor union.
+    pub dirty: bool,
+}
+
+impl Default for CanvasShape {
+    fn default() -> Self {
+        Self {
+            kind: CANVAS_SHAPE_CIRCLE,
+            params: [0.0; 8],
+            stroke_color: [0.0; 4],
+            fill_color: [0.0; 4],
+            stroke_width: 1.0,
+            cap: CANVAS_CAP_BUTT,
+            dash: [0.0; 2],
+            dash_offset: 0.0,
+            opacity: 1.0,
+            transform: Transform::IDENTITY,
+            dirty: false,
+        }
+    }
+}
+
+impl CanvasShape {
+    /// Conservative bounding box of this shape in logical pixels, including
+    /// the stroke extent and cap overhang. Used by the Encoder both to size
+    /// the instance quad and for the incremental dirty-scissor union
+    /// (RFC-0001 §3.3). Over-estimating costs a few wasted fragments;
+    /// under-estimating would visibly clip the shape, so every branch here
+    /// leans generous.
+    #[must_use]
+    pub fn bounds(&self) -> Rect {
+        // Round/square caps overhang endpoints by half the stroke width; the
+        // stroke body itself extends half the width to each side. A full
+        // stroke width of margin covers both plus the AA fringe.
+        let m = self.stroke_width.max(1.0);
+        let [p0, p1, p2, p3, ..] = self.params;
+        match self.kind {
+            CANVAS_SHAPE_LINE => {
+                let (x0, x1) = (p0.min(p2), p0.max(p2));
+                let (y0, y1) = (p1.min(p3), p1.max(p3));
+                Rect::new(x0 - m, y0 - m, (x1 - x0) + m * 2.0, (y1 - y0) + m * 2.0)
+            }
+            CANVAS_SHAPE_RECT => Rect::new(p0 - m, p1 - m, p2 + m * 2.0, p3 + m * 2.0),
+            // Arc and circle: the full circle's box. An arc's true box is a
+            // subset, but sweep-dependent tightening is not worth the CPU per
+            // frame — the quad is still tiny.
+            _ => {
+                let r = p2.max(0.0) + m;
+                Rect::new(p0 - r, p1 - r, r * 2.0, r * 2.0)
+            }
+        }
+    }
+}
+
 /// A texture-sampled rectangle: `Image` intrinsic lowered to a GPU primitive
 /// (M21 pipeline). Texture data is identified by a host-opaque `texture_id`
 /// (registered outside the engine boundary via the controller boundary, M23).
@@ -829,6 +945,10 @@ pub struct RenderFrame {
     /// MSDF vector-glyph instances (RFC-0009 §1, the fifth pipeline).
     vector_instances: Vec<VectorInstance>,
 
+    /// Programmatic 2-D shapes (RFC-0020): `Canvas` shape commands lowered to
+    /// the `CanvasShape` analytic-SDF pipeline (the sixth pipeline).
+    canvas_shapes: Vec<CanvasShape>,
+
     /// Pending MSDF-atlas uploads recorded by the logic thread this tick
     /// (RFC-0009 §2-C / INV-8). Applied by the render thread via a single
     /// `Queue::write_texture` each, during frame application, before the draw.
@@ -852,6 +972,7 @@ pub struct RenderFrame {
     decorated_depths: Vec<f32>,
     texture_depths: Vec<f32>,
     text_depths: Vec<f32>,
+    canvas_depths: Vec<f32>,
 
     /// Content-clip rectangles (RFC-0005 `ScrollView`, §3.3 scissor). A
     /// [`ScrollView`] wraps its children in [`begin_clip`](Self::begin_clip) /
@@ -874,6 +995,7 @@ pub struct RenderFrame {
     texture_clips: Vec<Option<u16>>,
     text_clips: Vec<Option<u16>>,
     vector_clips: Vec<Option<u16>>,
+    canvas_clips: Vec<Option<u16>>,
 
     /// Per-text-line wrap width in logical pixels, parallel to `texts` (kept off
     /// the `TextLine` struct like the depth/clip vecs, so its 19 construction
@@ -957,6 +1079,8 @@ pub struct LayerMark {
     pub vector: u32,
     /// `texts` length at the boundary.
     pub text: u32,
+    /// `canvas_shapes` length at the boundary (RFC-0020).
+    pub canvas: u32,
 }
 
 /// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
@@ -1000,11 +1124,13 @@ impl RenderFrame {
         self.textures.clear();
         self.texts.clear();
         self.vector_instances.clear();
+        self.canvas_shapes.clear();
         self.atlas_uploads.clear();
         self.solid_depths.clear();
         self.decorated_depths.clear();
         self.texture_depths.clear();
         self.text_depths.clear();
+        self.canvas_depths.clear();
         self.clips.clear();
         self.clip_stack.clear();
         self.solid_clips.clear();
@@ -1012,6 +1138,7 @@ impl RenderFrame {
         self.texture_clips.clear();
         self.text_clips.clear();
         self.vector_clips.clear();
+        self.canvas_clips.clear();
         self.text_wrap.clear();
         self.layer_marks.clear();
         self.draw_seq = 0;
@@ -1118,6 +1245,15 @@ impl RenderFrame {
         self.vector_clips.push(c);
     }
 
+    /// Appends a [`CanvasShape`] (RFC-0020 Tier-1 shape command) to the frame.
+    pub fn push_canvas_shape(&mut self, s: CanvasShape) {
+        let d = self.next_depth();
+        let c = self.active_clip();
+        self.canvas_shapes.push(s);
+        self.canvas_depths.push(d);
+        self.canvas_clips.push(c);
+    }
+
     /// Records a pending [`AtlasUpload`] for the render thread to apply before
     /// drawing this frame (RFC-0009 §2-C / INV-8).
     pub fn push_atlas_upload(&mut self, upload: AtlasUpload) {
@@ -1141,6 +1277,7 @@ impl RenderFrame {
             texture: u32::try_from(self.textures.len()).unwrap_or(u32::MAX),
             vector: u32::try_from(self.vector_instances.len()).unwrap_or(u32::MAX),
             text: u32::try_from(self.texts.len()).unwrap_or(u32::MAX),
+            canvas: u32::try_from(self.canvas_shapes.len()).unwrap_or(u32::MAX),
         };
         if self.layer_marks.last() == Some(&mark) {
             return; // empty layer — dedup, an overlay that emitted nothing is free
@@ -1208,6 +1345,12 @@ impl RenderFrame {
         &self.vector_instances
     }
 
+    /// Returns the `Canvas` shape primitives in this frame (RFC-0020).
+    #[must_use]
+    pub fn canvas_shapes(&self) -> &[CanvasShape] {
+        &self.canvas_shapes
+    }
+
     /// Returns the pending atlas uploads recorded this frame (RFC-0009 §2-C).
     #[must_use]
     pub fn atlas_uploads(&self) -> &[AtlasUpload] {
@@ -1236,6 +1379,12 @@ impl RenderFrame {
     #[must_use]
     pub fn text_depths(&self) -> &[f32] {
         &self.text_depths
+    }
+
+    /// Draw-order depths parallel to [`canvas_shapes`](Self::canvas_shapes).
+    #[must_use]
+    pub fn canvas_depths(&self) -> &[f32] {
+        &self.canvas_depths
     }
 
     /// The content-clip table (RFC-0005 `ScrollView`); a primitive's
@@ -1268,6 +1417,11 @@ impl RenderFrame {
     #[must_use]
     pub fn vector_clips(&self) -> &[Option<u16>] {
         &self.vector_clips
+    }
+    /// Per-`CanvasShape` clip index (parallel to [`canvas_shapes`](Self::canvas_shapes)).
+    #[must_use]
+    pub fn canvas_clips(&self) -> &[Option<u16>] {
+        &self.canvas_clips
     }
 
     /// Returns the monotonic version counter for this frame.
@@ -1901,8 +2055,62 @@ mod motion_tests {
                 texture: 0,
                 vector: 0,
                 text: 1,
+                canvas: 0,
             }]
         );
+    }
+
+    // ── Canvas shape pool (RFC-0020) ────────────────────────────────────────
+
+    #[test]
+    fn push_canvas_shape_stamps_depth_clip_and_layer_cursor() {
+        let mut f = RenderFrame::new();
+        let c = f.begin_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+        f.push_canvas_shape(CanvasShape {
+            kind: CANVAS_SHAPE_ARC,
+            params: [24.0, 24.0, 20.0, 0.0, 3.14, 0.0, 0.0, 0.0],
+            ..CanvasShape::default()
+        });
+        f.end_clip();
+        assert_eq!(f.canvas_shapes().len(), 1);
+        assert_eq!(f.canvas_depths().len(), 1);
+        assert_eq!(f.canvas_clips(), &[Some(c)]);
+        // The shape advanced the global emission counter: its depth is nearer
+        // than the cleared far plane.
+        assert!(f.canvas_depths()[0] < DRAW_DEPTH_CLEAR);
+        f.begin_layer();
+        assert_eq!(f.layer_marks()[0].canvas, 1);
+        f.clear();
+        assert!(f.canvas_shapes().is_empty());
+        assert!(f.canvas_depths().is_empty());
+        assert!(f.canvas_clips().is_empty());
+    }
+
+    #[test]
+    fn canvas_shape_bounds_cover_stroke_and_caps() {
+        // Circle r=20 at (24,24), stroke 4 → box must reach at least ±22 from
+        // the centre on every side.
+        let s = CanvasShape {
+            kind: CANVAS_SHAPE_CIRCLE,
+            params: [24.0, 24.0, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            stroke_width: 4.0,
+            ..CanvasShape::default()
+        };
+        let b = s.bounds();
+        assert!(b.x <= 24.0 - 22.0 && b.y <= 24.0 - 22.0);
+        assert!(b.x + b.width >= 24.0 + 22.0 && b.y + b.height >= 24.0 + 22.0);
+
+        // Line with round caps: endpoints overhang by half the stroke width.
+        let l = CanvasShape {
+            kind: CANVAS_SHAPE_LINE,
+            params: [10.0, 10.0, 90.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+            stroke_width: 6.0,
+            cap: CANVAS_CAP_ROUND,
+            ..CanvasShape::default()
+        };
+        let lb = l.bounds();
+        assert!(lb.x <= 7.0 && lb.x + lb.width >= 93.0);
+        assert!(lb.y <= 7.0 && lb.y + lb.height >= 13.0);
     }
 
     #[test]
