@@ -24,7 +24,7 @@ use super::intrinsics::validate_element;
 use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
-    Arg, AssignOp, Attr, AttrKind, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
+    Arg, AssignOp, Attr, AttrKind, BinOp, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
     StrPart, StyleStateKind, Type, ViewDecl,
 };
 use crate::symbol::Symbol;
@@ -141,6 +141,29 @@ pub enum RenderNode {
         attrs: Vec<Attr>,
         /// The reactive scope evaluating to the asset handle (a `Str` path).
         src: ScopeId,
+    },
+    /// A `Canvas` — the RFC-0020 programmatic drawing surface. A fixed-size
+    /// leaf whose children are *shape commands*, not views: each render tick
+    /// re-evaluates every shape's parameter expressions (so a reactive
+    /// `sweep: percent * 3.6` animates for free) and lowers Tier-1 shapes to
+    /// the `CanvasShape` pipeline, `path` commands to `VectorMSDF` (Tier 2),
+    /// and `text` commands to `TextLine`s.
+    Canvas {
+        /// Styling attributes (`width`/`height`, `bg`, `opacity`, `style`).
+        attrs: Vec<Attr>,
+        /// `on <state> { … }` blocks (RFC-0016) overlaid at render time.
+        state_blocks: Vec<StateBlock>,
+        /// The validated shape-command elements, in declaration order. Kept
+        /// as AST elements — their named args are ordinary `Expr`s evaluated
+        /// per tick through `eval_pure`, which is what makes every parameter
+        /// reactive and `with`-animatable (RFC-0010) without extra plumbing.
+        shapes: Vec<ElementNode>,
+        /// The `=> action` tap shorthand.
+        action: Option<Expr>,
+        /// The instance environment captured at lower time (RFC-0019 §2), so
+        /// shape parameters and event actions referencing instance vars
+        /// resolve against the scope the canvas was instantiated in.
+        env_snapshot: Vec<(Symbol, super::env::Value)>,
     },
     /// An `Overlay` — the RFC-0017 escape-hatch. Its children leave the normal
     /// layout flow and render in the overlay layer, above all main content and
@@ -1300,6 +1323,33 @@ impl Interpreter {
                     src,
                 }
             }
+            // RFC-0020: the `Canvas` drawing surface. Its children are shape
+            // commands, validated here (never silently ignored) and carried as
+            // AST elements — the render walk re-evaluates their parameter
+            // expressions every tick, which is what makes them reactive.
+            "Canvas" => {
+                self.errors
+                    .extend(super::intrinsics::validate_canvas(el, &to_validate));
+                let shapes = el
+                    .children
+                    .iter()
+                    .filter_map(|m| match m {
+                        Member::Element(c)
+                            if super::intrinsics::is_shape_command(c.name.as_str()) =>
+                        {
+                            Some(c.clone())
+                        }
+                        _ => None, // rejected by validate_canvas above
+                    })
+                    .collect();
+                RenderNode::Canvas {
+                    attrs,
+                    state_blocks,
+                    shapes,
+                    action: el.action.clone(),
+                    env_snapshot: self.capture_env_snapshot(),
+                }
+            }
             // RFC-0017: the `Overlay` escape-hatch. Its children are lowered
             // normally, but the node itself carries them out of the parent flow
             // — the render walk defers them to the overlay layer.
@@ -2172,6 +2222,375 @@ impl Interpreter {
         None
     }
 
+    // ── Canvas shape lowering (RFC-0020) ────────────────────────────────────
+
+    /// The named argument `name` of a shape command, if present.
+    fn shape_arg<'e>(el: &'e ElementNode, name: &str) -> Option<&'e Expr> {
+        el.content
+            .iter()
+            .find(|a| a.name.as_ref().is_some_and(|n| n.as_str() == name))
+            .map(|a| &a.value)
+    }
+
+    /// Evaluates a numeric shape parameter (reactive + `with`-animatable via
+    /// `eval_pure`'s animation chokepoint, RFC-0010).
+    fn shape_num(&mut self, el: &ElementNode, name: &str) -> Option<f32> {
+        Self::shape_arg(el, name).map(|e| {
+            let e = e.clone();
+            self.eval_num(&e)
+        })
+    }
+
+    /// Evaluates a shape color parameter. The alpha byte is auto-detected:
+    /// values above `0xFFFFFF` are `0xAARRGGBB`, else `0xRRGGBB` at full
+    /// alpha — matching how shadow colors already read (RFC-0011).
+    fn shape_color(&mut self, el: &ElementNode, name: &str) -> Option<[f32; 4]> {
+        let e = Self::shape_arg(el, name)?.clone();
+        let packed = self.eval_pure(&e).as_int()?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let has_alpha = (packed as u64) > 0x00FF_FFFF;
+        Some(super::intrinsics::color_to_rgba(packed, has_alpha))
+    }
+
+    /// Evaluates a `(a, b)` shape parameter (the `dash` pattern).
+    fn shape_vec2(&mut self, el: &ElementNode, name: &str) -> Option<[f32; 2]> {
+        let e = Self::shape_arg(el, name)?.clone();
+        match self.eval_pure(&e) {
+            Value::Tuple(items) if items.len() == 2 => {
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let f = |v: &Value| match v {
+                    Value::Int(n) => *n as f32,
+                    Value::Float(x) => *x as f32,
+                    _ => 0.0,
+                };
+                Some([f(&items[0].1), f(&items[1].1)])
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads a bare-token shape parameter (`cap: round`) — an enum token is a
+    /// syntactic identifier, never an env lookup, mirroring how `align:` and
+    /// `fit:` tokens read elsewhere.
+    fn shape_token(el: &ElementNode, name: &str) -> Option<String> {
+        match Self::shape_arg(el, name)? {
+            Expr::Ident(sym, _) | Expr::ClassRef(sym, _) => Some(sym.as_str().to_string()),
+            _ => None,
+        }
+    }
+
+    /// Evaluates a string shape parameter (`path`'s `d`).
+    fn shape_string(&mut self, el: &ElementNode, name: &str) -> Option<String> {
+        let e = Self::shape_arg(el, name)?.clone();
+        match self.eval_pure(&e) {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Emits one shape command into the frame (RFC-0020). `canvas` is the
+    /// canvas's resolved rect: shape coordinates are canvas-local and offset
+    /// by its origin here. Tier 1 (`arc`/`circle`/`line`/`rect`, plus
+    /// `bezier` flattened to line segments) goes to the `CanvasShape`
+    /// pipeline; `path` rasterizes through `VectorMSDF` (Tier 2); `text`
+    /// lowers to a `TextLine`.
+    fn emit_canvas_shape(
+        &mut self,
+        el: &ElementNode,
+        canvas: crate::interp::intrinsics::Rect,
+        opacity: f32,
+        transform: byard_core::frame::Transform,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        use byard_core::frame::{
+            CANVAS_CAP_BUTT, CANVAS_CAP_ROUND, CANVAS_CAP_SQUARE, CANVAS_SHAPE_ARC,
+            CANVAS_SHAPE_CIRCLE, CANVAS_SHAPE_LINE, CANVAS_SHAPE_RECT, CanvasShape,
+        };
+
+        let name = el.name.as_str();
+        if name == "text" {
+            self.emit_canvas_text(el, canvas, opacity, transform, frame);
+            return;
+        }
+        if name == "path" {
+            self.emit_canvas_path(el, canvas, opacity, transform, frame);
+            return;
+        }
+
+        // Shared paint parameters (RFC-0020 §"Stroke and fill"). A shape with
+        // neither stroke nor fill paints nothing — skip it entirely.
+        let stroke_color = self.shape_color(el, "stroke").unwrap_or([0.0; 4]);
+        let fill_color = self.shape_color(el, "fill").unwrap_or([0.0; 4]);
+        if stroke_color[3] <= 0.0 && fill_color[3] <= 0.0 {
+            return;
+        }
+        let stroke_width = self.shape_num(el, "stroke_width").unwrap_or(1.0);
+        let cap = match Self::shape_token(el, "cap").as_deref() {
+            Some("round") => CANVAS_CAP_ROUND,
+            Some("square") => CANVAS_CAP_SQUARE,
+            _ => CANVAS_CAP_BUTT,
+        };
+        let dash = self.shape_vec2(el, "dash").unwrap_or([0.0, 0.0]);
+        let dash_offset = self.shape_num(el, "dash_offset").unwrap_or(0.0);
+        let shape_opacity = opacity * self.shape_num(el, "opacity").unwrap_or(1.0);
+        let (ox, oy) = (canvas.x, canvas.y);
+
+        let base = CanvasShape {
+            kind: CANVAS_SHAPE_CIRCLE,
+            params: [0.0; 8],
+            stroke_color,
+            fill_color,
+            stroke_width,
+            cap,
+            dash,
+            dash_offset,
+            opacity: shape_opacity,
+            transform,
+            dirty: true,
+        };
+
+        match name {
+            "arc" | "circle" => {
+                let cx = ox + self.shape_num(el, "cx").unwrap_or(0.0);
+                let cy = oy + self.shape_num(el, "cy").unwrap_or(0.0);
+                let r = self.shape_num(el, "r").unwrap_or(0.0);
+                // Angles are authored in degrees (RFC-0020 examples:
+                // `start: -90, sweep: 270`); the GPU wants radians. An
+                // unswept `arc` defaults to a full circle — `circle` is the
+                // explicit sugar for exactly that (RFC-0020 §"Shape commands").
+                let start = self.shape_num(el, "start").unwrap_or(0.0);
+                let sweep = if name == "circle" {
+                    360.0
+                } else {
+                    self.shape_num(el, "sweep").unwrap_or(360.0)
+                };
+                let full = sweep.abs() >= 360.0;
+                frame.push_canvas_shape(CanvasShape {
+                    kind: if full {
+                        CANVAS_SHAPE_CIRCLE
+                    } else {
+                        CANVAS_SHAPE_ARC
+                    },
+                    params: [
+                        cx,
+                        cy,
+                        r,
+                        start.to_radians(),
+                        sweep.to_radians(),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    ..base
+                });
+            }
+            "line" => {
+                frame.push_canvas_shape(CanvasShape {
+                    kind: CANVAS_SHAPE_LINE,
+                    params: [
+                        ox + self.shape_num(el, "x1").unwrap_or(0.0),
+                        oy + self.shape_num(el, "y1").unwrap_or(0.0),
+                        ox + self.shape_num(el, "x2").unwrap_or(0.0),
+                        oy + self.shape_num(el, "y2").unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    ..base
+                });
+            }
+            "rect" => {
+                frame.push_canvas_shape(CanvasShape {
+                    kind: CANVAS_SHAPE_RECT,
+                    params: [
+                        ox + self.shape_num(el, "x").unwrap_or(0.0),
+                        oy + self.shape_num(el, "y").unwrap_or(0.0),
+                        self.shape_num(el, "w").unwrap_or(0.0),
+                        self.shape_num(el, "h").unwrap_or(0.0),
+                        self.shape_num(el, "radius").unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    ..base
+                });
+            }
+            "bezier" => {
+                // Flattened CPU-side into round-capped line segments on the
+                // same Tier-1 pipeline — cheaper and *fully animatable*,
+                // unlike an MSDF re-rasterization (see the RFC-0020 notes in
+                // the design record). Round caps hide the joints; the curve
+                // has no fill.
+                if let Some(c) = self.bezier_coords(el) {
+                    let p = |t: f32| -> [f32; 2] {
+                        let u = 1.0 - t;
+                        let b0 = u * u * u;
+                        let b1 = 3.0 * u * u * t;
+                        let b2 = 3.0 * u * t * t;
+                        let b3 = t * t * t;
+                        [
+                            ox + b0 * c[0] + b1 * c[2] + b2 * c[4] + b3 * c[6],
+                            oy + b0 * c[1] + b1 * c[3] + b2 * c[5] + b3 * c[7],
+                        ]
+                    };
+                    // Segment count scales with the control polygon's length:
+                    // ~one segment per 6 logical px, clamped to [8, 48].
+                    let poly_len = ((c[2] - c[0]).hypot(c[3] - c[1])
+                        + (c[4] - c[2]).hypot(c[5] - c[3])
+                        + (c[6] - c[4]).hypot(c[7] - c[5]))
+                    .max(1.0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let segments = ((poly_len / 6.0) as usize).clamp(8, 48);
+                    let mut prev = p(0.0);
+                    #[allow(clippy::cast_precision_loss)]
+                    for i in 1..=segments {
+                        let next = p(i as f32 / segments as f32);
+                        frame.push_canvas_shape(CanvasShape {
+                            kind: CANVAS_SHAPE_LINE,
+                            params: [prev[0], prev[1], next[0], next[1], 0.0, 0.0, 0.0, 0.0],
+                            cap: CANVAS_CAP_ROUND,
+                            fill_color: [0.0; 4],
+                            ..base.clone()
+                        });
+                        prev = next;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The 8 cubic-bezier coordinates, from either the terse positional form
+    /// (`bezier(10, 90, 40, 10, …)`) or the named form (`x1:`, `cy2:`, …).
+    fn bezier_coords(&mut self, el: &ElementNode) -> Option<[f32; 8]> {
+        const NAMES: [&str; 8] = ["x1", "y1", "cx1", "cy1", "cx2", "cy2", "x2", "y2"];
+        let positional: Vec<Expr> = el
+            .content
+            .iter()
+            .filter(|a| a.name.is_none())
+            .map(|a| a.value.clone())
+            .collect();
+        let mut out = [0.0f32; 8];
+        if positional.len() == 8 {
+            for (slot, expr) in out.iter_mut().zip(&positional) {
+                *slot = self.eval_num(expr);
+            }
+            return Some(out);
+        }
+        for (slot, name) in out.iter_mut().zip(NAMES) {
+            *slot = self.shape_num(el, name)?;
+        }
+        Some(out)
+    }
+
+    /// RFC-0020 §2 Tier 2: a `path(d: …)` command rasterized through the
+    /// MSDF pipeline. The synthetic SVG's viewBox equals the canvas size, so
+    /// `d` coordinates are canvas-local 1:1; the resulting glyph is drawn
+    /// over the whole canvas rect and tinted by `fill`. Content-keyed, so a
+    /// re-render of an unchanged path is a pure cache hit; only a genuinely
+    /// new `d` (or canvas size) dispatches a generation.
+    fn emit_canvas_path(
+        &mut self,
+        el: &ElementNode,
+        canvas: crate::interp::intrinsics::Rect,
+        opacity: f32,
+        transform: byard_core::frame::Transform,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let Some(fill) = self.shape_color(el, "fill") else {
+            return; // no fill → nothing to rasterize (stroke is rejected upstream)
+        };
+        let Some(d) = self.shape_string(el, "d") else {
+            return;
+        };
+        let shape_opacity = opacity * self.shape_num(el, "opacity").unwrap_or(1.0);
+        let (w, h) = (canvas.w.max(1.0), canvas.h.max(1.0));
+
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            d.hash(&mut hasher);
+            w.to_bits().hash(&mut hasher);
+            h.to_bits().hash(&mut hasher);
+            format!("canvas-path:{:016x}", hasher.finish())
+        };
+        let glyph = self.vector_jit.lookup_or_dispatch_svg(&key, || {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}"><path d="{d}" fill="#000000"/></svg>"##
+            )
+            .into_bytes()
+        });
+        // Cache miss: skip this tick (INV-9 — the frame ships without
+        // stalling); the generated field lands via the ordinary JIT drain.
+        let Some(glyph) = glyph else { return };
+
+        // A `VectorInstance` carries no transform: bake translate/scale into
+        // the rect like `Image` does (rotation stays a box-primitive feature).
+        let tl = transform.apply_point([canvas.x, canvas.y]);
+        let rgb = [fill[0], fill[1], fill[2], fill[3] * shape_opacity];
+        frame.push_vector(byard_core::frame::VectorInstance::new(
+            byard_core::frame::Rect::new(
+                tl[0],
+                tl[1],
+                canvas.w * transform.scale[0],
+                canvas.h * transform.scale[1],
+            ),
+            glyph.uv_rect,
+            rgb,
+            glyph.px_range,
+            glyph.layer,
+        ));
+    }
+
+    /// A canvas `text(…)` command: a `TextLine` anchored at `(x, y)` with
+    /// optional `align` (start/center/end around `x`) — `y` is the vertical
+    /// center of the run, matching the RFC's centred-label example.
+    fn emit_canvas_text(
+        &mut self,
+        el: &ElementNode,
+        canvas: crate::interp::intrinsics::Rect,
+        opacity: f32,
+        transform: byard_core::frame::Transform,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let Some(content) = el.content.iter().find(|a| a.name.is_none()) else {
+            return;
+        };
+        let expr = content.value.clone();
+        let text = match self.eval_pure(&expr) {
+            Value::Str(s) => s,
+            other => format!("{other:?}"),
+        };
+        if text.is_empty() {
+            return;
+        }
+        let size = self.shape_num(el, "size").unwrap_or(self.theme.font_size);
+        let color = self
+            .shape_color(el, "color")
+            .unwrap_or_else(|| super::intrinsics::color_to_rgba(self.theme.on_surface(), false));
+        let x = canvas.x + self.shape_num(el, "x").unwrap_or(0.0);
+        let y = canvas.y + self.shape_num(el, "y").unwrap_or(0.0);
+        let measured = self.measure_text(&text, size).0;
+        let tx = match Self::shape_token(el, "align").as_deref() {
+            Some("center") => x - measured / 2.0,
+            Some("end") => x - measured,
+            _ => x,
+        };
+        // Anchor `y` at the run's vertical center (≈0.6em above the top of
+        // the em box reads optically centred for Latin text).
+        let ty = y - size * 0.6;
+        let anchor = transform.apply_point([tx, ty]);
+        frame.push_text(byard_core::TextLine {
+            x: anchor[0],
+            y: anchor[1],
+            text,
+            font_size: size * transform.uniform_scale(),
+            color: dim_alpha(color, opacity),
+            dirty: true,
+        });
+    }
+
     fn build_layout_tree(
         &mut self,
         node: &RenderNode,
@@ -2203,6 +2622,17 @@ impl Interpreter {
             RenderNode::Image { attrs, .. } => {
                 let w = self.eval_int_prop(attrs, "width").unwrap_or(100) as f32;
                 let h = self.eval_int_prop(attrs, "height").unwrap_or(100) as f32;
+                let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                flat_ids.push(id);
+                Ok(id)
+            }
+            // A `Canvas` is a fixed-size drawing surface (RFC-0020 §1): both
+            // dimensions are required (enforced by `validate_canvas`); the 0
+            // fallback keeps a mis-declared canvas laid out (collapsed) rather
+            // than aborting the whole tree.
+            RenderNode::Canvas { attrs, .. } => {
+                let w = self.eval_int_prop(attrs, "width").unwrap_or(0) as f32;
+                let h = self.eval_int_prop(attrs, "height").unwrap_or(0) as f32;
                 let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
                 flat_ids.push(id);
                 Ok(id)
@@ -2956,6 +3386,105 @@ impl Interpreter {
                         px_range,
                         layer,
                     ));
+                }
+            }
+            // RFC-0020: the `Canvas` drawing surface. Shape parameters are
+            // re-evaluated every tick through `eval_pure`, so a reactive or
+            // `with`-animated `sweep`/`dash_offset`/color animates with zero
+            // extra plumbing (RFC-0010's single evaluation chokepoint).
+            RenderNode::Canvas {
+                attrs,
+                state_blocks,
+                shapes,
+                action,
+                env_snapshot,
+            } => {
+                if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
+                    let elem_idx = self.atlas.node_index(atlas_node);
+                    // RFC-0016: overlay active `on <state>` blocks before
+                    // reading paint properties.
+                    let state = elem_idx
+                        .map_or_else(crate::interp::events::StyleState::empty, |i| {
+                            self.router.style_state(i)
+                        });
+                    let paint_attrs = resolve_state_attrs(attrs, state_blocks, state);
+                    let paint_attrs = paint_attrs.as_ref();
+
+                    // RFC-0019 §2: restore the instance environment so shape
+                    // parameter expressions and event actions resolve against
+                    // the scope the canvas was instantiated in.
+                    let env_base = self.env.len();
+                    for (k, v) in env_snapshot {
+                        self.env.push(k.clone(), v.clone());
+                    }
+
+                    let opacity = inherited_opacity
+                        * self
+                            .eval_float_prop(paint_attrs, "opacity")
+                            .map_or(1.0, |v| v as f32);
+                    let canvas_rect = crate::interp::intrinsics::Rect::new(
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                    );
+
+                    // Background fill: a plain solid behind every shape.
+                    if let Some(bg) = self.eval_color_prop(paint_attrs, "bg") {
+                        frame.push_instance(byard_core::BoxInstance {
+                            rect: [rect.x, rect.y, rect.width, rect.height],
+                            color: dim_alpha(super::intrinsics::color_to_rgba(bg, false), opacity),
+                            radii: [0.0; 4],
+                            transform: inherited_transform,
+                        });
+                    }
+
+                    // Shape commands, in declaration order (painter's order —
+                    // each `push_canvas_shape` advances the global emission
+                    // depth, RFC-0011).
+                    for shape in shapes {
+                        self.emit_canvas_shape(
+                            shape,
+                            canvas_rect,
+                            opacity,
+                            inherited_transform,
+                            frame,
+                        );
+                    }
+
+                    // Events: the canvas rect only — individual shapes are not
+                    // hit-testable (RFC-0020 resolved question).
+                    let hit_rect =
+                        crate::interp::intrinsics::inflate_hit_rect(canvas_rect, parent_rect);
+                    // RFC-0016: an `on hover`/`on pressed` block with no handler
+                    // still needs pointer tracking, mirroring the Box path.
+                    if let Some(idx) = elem_idx {
+                        if state_blocks.iter().any(|sb| {
+                            matches!(sb.state, StyleStateKind::Hover | StyleStateKind::Pressed)
+                        }) {
+                            self.router.track_region(idx, hit_rect);
+                        }
+                    }
+                    let has_events = attrs
+                        .iter()
+                        .any(|a| matches!(a.kind, AttrKind::Event { .. }))
+                        || action.is_some();
+                    if has_events {
+                        self.register_event_attrs(attrs, hit_rect, elem_idx);
+                        if let Some(action_expr) = action {
+                            if let Ok(closure) = self.lower_action(action_expr, None) {
+                                if let Some(idx) = elem_idx {
+                                    self.router.on(
+                                        idx,
+                                        hit_rect,
+                                        crate::interp::events::EventKind::Tap,
+                                        closure,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.env.truncate(env_base);
                 }
             }
         }
@@ -4381,6 +4910,18 @@ impl Interpreter {
                     }
                 })
             }
+            // Binary arithmetic (`+ - * /`, RFC-0020 enabler). Numeric
+            // promotion: Int∘Int stays Int (division truncates, like Rust);
+            // any Float operand promotes the result to Float. Division by
+            // zero yields 0 — the logic thread never panics on user input
+            // (INV-4 spirit); a non-numeric operand yields `Unit`, which
+            // downstream prop readers treat as "unset".
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let op = *op;
+                let mut lc = self.lower_expr(lhs, payload_name);
+                let mut rc = self.lower_expr(rhs, payload_name);
+                Box::new(move |ctx| eval_binary(op, lc(ctx), rc(ctx)))
+            }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args, payload_name),
             Expr::ClassRef(class, _) => {
                 let s = format!(".{class}");
@@ -5167,6 +5708,49 @@ fn resolve_state_attrs<'a>(
 /// Multiplies a colour's alpha by `opacity` — folds an element's effective
 /// opacity into the widget/text primitives it emits so a translucent control
 /// dims as a whole, not just its background (RFC-0011 T4 approximation).
+/// Evaluates one binary arithmetic operation (`+ - * /`, RFC-0020 enabler)
+/// with numeric promotion: Int∘Int → Int (division truncates), any Float
+/// operand → Float. Division by zero yields the zero of the promoted type and
+/// a non-numeric operand yields [`Value::Unit`] — the logic thread never
+/// panics on user expressions. Pure and unit-testable.
+fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Value {
+    match (lhs, rhs) {
+        (Value::Int(a), Value::Int(b)) => Value::Int(match op {
+            BinOp::Add => a.wrapping_add(b),
+            BinOp::Sub => a.wrapping_sub(b),
+            BinOp::Mul => a.wrapping_mul(b),
+            BinOp::Div => {
+                if b == 0 {
+                    0
+                } else {
+                    a.wrapping_div(b)
+                }
+            }
+        }),
+        (Value::Int(a), Value::Float(b)) => eval_binary_f(op, a as f64, b),
+        (Value::Float(a), Value::Int(b)) => eval_binary_f(op, a, b as f64),
+        (Value::Float(a), Value::Float(b)) => eval_binary_f(op, a, b),
+        _ => Value::Unit,
+    }
+}
+
+/// The Float leg of [`eval_binary`]. `x / 0.0` yields `0.0`, not an
+/// IEEE infinity/NaN — a NaN sweep or width would poison layout and paint.
+fn eval_binary_f(op: BinOp, a: f64, b: f64) -> Value {
+    Value::Float(match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => {
+            if b == 0.0 {
+                0.0
+            } else {
+                a / b
+            }
+        }
+    })
+}
+
 fn dim_alpha(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
     color[3] *= opacity;
     color
@@ -5380,6 +5964,208 @@ mod tests {
         assert!(
             (inst.color[0] - 1.0).abs() < f32::EPSILON,
             "color: 0xFFFFFF tints white"
+        );
+    }
+
+    // ── Binary arithmetic (`+ - * /`, RFC-0020 enabler) ─────────────
+
+    #[test]
+    fn eval_binary_promotes_and_never_panics() {
+        // Int ∘ Int stays Int; division truncates.
+        assert_eq!(
+            eval_binary(BinOp::Add, Value::Int(2), Value::Int(3)),
+            Value::Int(5)
+        );
+        assert_eq!(
+            eval_binary(BinOp::Div, Value::Int(7), Value::Int(2)),
+            Value::Int(3)
+        );
+        // Any Float operand promotes.
+        assert_eq!(
+            eval_binary(BinOp::Mul, Value::Int(25), Value::Float(3.6)),
+            Value::Float(90.0)
+        );
+        // Division by zero is 0, not a panic or an IEEE infinity.
+        assert_eq!(
+            eval_binary(BinOp::Div, Value::Int(1), Value::Int(0)),
+            Value::Int(0)
+        );
+        assert_eq!(
+            eval_binary(BinOp::Div, Value::Float(1.0), Value::Float(0.0)),
+            Value::Float(0.0)
+        );
+        // Non-numeric operands degrade to Unit.
+        assert_eq!(
+            eval_binary(BinOp::Add, Value::Str("a".into()), Value::Int(1)),
+            Value::Unit
+        );
+    }
+
+    #[test]
+    fn arithmetic_expressions_evaluate_through_bindings() {
+        // `let` chains with arithmetic reach paint properties: a Box whose
+        // width is `base * 2 + 10`.
+        let (mut interp, tree) = lower_named(
+            "View App() { let base = 45 let w = base * 2 + 10 \
+               Box #[width: w, height: 20, bg: 0xFF0000] {} }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let inst = frame.instances()[0];
+        assert!(
+            (inst.rect[2] - 100.0).abs() < 0.5,
+            "width = 45 * 2 + 10 = 100, got {}",
+            inst.rect[2]
+        );
+    }
+
+    // ── Canvas & shape commands (RFC-0020) ──────────────────────────
+
+    #[test]
+    fn canvas_lowers_to_a_canvas_node_carrying_its_shapes() {
+        let (interp, tree) = lower_named(
+            "View App() { Canvas #[width: 48, height: 48] { \
+               arc(cx: 24, cy: 24, r: 20, start: -90, sweep: 270, \
+                   stroke: 0x6750A4, stroke_width: 4, cap: round) \
+               circle(cx: 24, cy: 24, r: 8, fill: 0xE8DEF8) } }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let RenderNode::Canvas { shapes, .. } = &tree[0] else {
+            panic!("Canvas lowers to RenderNode::Canvas, got {:?}", tree[0]);
+        };
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(shapes[0].name.as_str(), "arc");
+        assert_eq!(shapes[1].name.as_str(), "circle");
+    }
+
+    #[test]
+    fn canvas_shapes_render_into_the_canvas_pool_with_evaluated_params() {
+        // The sweep is an expression over a view binding — proving shape
+        // params run through the ordinary evaluator, so they are reactive.
+        let (mut interp, tree) = lower_named(
+            "View App() { let p = 0.5 \
+               Canvas #[width: 100, height: 100] { \
+                 arc(cx: 50, cy: 50, r: 40, start: 0, sweep: p * 360, \
+                     stroke: 0xFF0000, stroke_width: 4) \
+                 line(x1: 0, y1: 0, x2: 100, y2: 100, stroke: 0x00FF00) \
+                 rect(x: 10, y: 10, w: 30, h: 20, radius: 4, fill: 0x0000FF) \
+                 text(\"hi\", x: 50, y: 50, align: center, color: 0xFFFFFF) } }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let shapes = frame.canvas_shapes();
+        assert_eq!(shapes.len(), 3, "arc + line + rect on the CanvasShape pool");
+        // `p * 360` with p = 0.5 → a 180° sweep, stored in radians.
+        let arc = &shapes[0];
+        assert_eq!(arc.kind, byard_core::frame::CANVAS_SHAPE_ARC);
+        assert!(
+            (arc.params[4] - std::f32::consts::PI).abs() < 1e-3,
+            "sweep 180° → π rad, got {}",
+            arc.params[4]
+        );
+        assert!(
+            (arc.stroke_color[0] - 1.0).abs() < 1e-6 && arc.stroke_color[3] > 0.99,
+            "stroke: 0xFF0000 is opaque red"
+        );
+        // Shape coordinates are canvas-local + canvas origin (canvas at 0,0
+        // in this single-child layout).
+        assert!((arc.params[0] - 50.0).abs() < 0.5);
+        // The `text(…)` command lowers to an ordinary TextLine, centred
+        // around x=50 (its left edge sits before the anchor).
+        assert_eq!(frame.texts().len(), 1);
+        assert!(frame.texts()[0].x < 50.0);
+        // Depths are parallel and strictly ordered (later = nearer).
+        let d = frame.canvas_depths();
+        assert_eq!(d.len(), 3);
+        assert!(d[0] > d[1] && d[1] > d[2]);
+    }
+
+    #[test]
+    fn full_sweep_arcs_collapse_to_the_cheaper_circle_kind() {
+        let (mut interp, tree) = lower_named(
+            "View App() { Canvas #[width: 48, height: 48] { \
+               arc(cx: 24, cy: 24, r: 20, start: 0, sweep: 360, stroke: 0xFFFFFF) } }",
+            "App",
+        );
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert_eq!(
+            frame.canvas_shapes()[0].kind,
+            byard_core::frame::CANVAS_SHAPE_CIRCLE
+        );
+    }
+
+    #[test]
+    fn bezier_flattens_to_a_contiguous_round_capped_polyline() {
+        let (mut interp, tree) = lower_named(
+            "View App() { Canvas #[width: 100, height: 100] { \
+               bezier(x1: 0, y1: 80, cx1: 30, cy1: 0, cx2: 70, cy2: 0, x2: 100, y2: 80, \
+                      stroke: 0xFFFFFF, stroke_width: 2) } }",
+            "App",
+        );
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let shapes = frame.canvas_shapes();
+        assert!(shapes.len() >= 8, "flattening yields several segments");
+        for s in shapes {
+            assert_eq!(s.kind, byard_core::frame::CANVAS_SHAPE_LINE);
+            assert_eq!(s.cap, byard_core::frame::CANVAS_CAP_ROUND);
+        }
+        // Endpoints chain: each segment starts where the previous ended, and
+        // the whole polyline spans the curve's anchors.
+        for pair in shapes.windows(2) {
+            assert!((pair[0].params[2] - pair[1].params[0]).abs() < 1e-4);
+            assert!((pair[0].params[3] - pair[1].params[1]).abs() < 1e-4);
+        }
+        assert!((shapes[0].params[0] - 0.0).abs() < 0.5);
+        assert!((shapes[shapes.len() - 1].params[2] - 100.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_shapeless_paintless_command_emits_nothing() {
+        // No stroke and no fill → invisible → skipped entirely.
+        let (mut interp, tree) = lower_named(
+            "View App() { Canvas #[width: 48, height: 48] { circle(cx: 24, cy: 24, r: 20) } }",
+            "App",
+        );
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(frame.canvas_shapes().is_empty());
+    }
+
+    #[test]
+    fn canvas_validation_errors_surface_through_lowering() {
+        let (interp, _tree) = lower_named(
+            "View App() { Canvas #[width: 48] { arc(cx: 1, cy: 1) Text(\"no\") } }",
+            "App",
+        );
+        let errs = interp.errors();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::CanvasMissingSize { .. })),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::MissingShapeParam { .. })),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, CompileError::UnknownShapeCommand { .. })),
+            "{errs:?}"
         );
     }
 

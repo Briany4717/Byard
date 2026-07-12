@@ -189,6 +189,44 @@ impl VectorJit {
         None
     }
 
+    /// RFC-0020 §2 Tier 2: like [`lookup_or_dispatch`](Self::lookup_or_dispatch),
+    /// but for a **synthetic** asset whose SVG bytes are supplied by the
+    /// caller — a `Canvas` `path(d: …)` command — instead of read from disk.
+    /// `handle` must be a stable content key (derived from the path data and
+    /// canvas size), so an unchanged path re-rendered every tick is a pure
+    /// cache hit and only a genuinely new `d` string dispatches a generation.
+    /// `svg` is invoked only on that first miss.
+    ///
+    /// Everything downstream — dedup, the free-cell allocator, LRU eviction,
+    /// re-emitted uploads until ack — is shared with the file-backed path.
+    pub fn lookup_or_dispatch_svg(
+        &mut self,
+        handle: &str,
+        svg: impl FnOnce() -> Vec<u8>,
+    ) -> Option<ResidentGlyph> {
+        if handle.is_empty() {
+            return None;
+        }
+        match self.entries.get_mut(handle) {
+            Some(CacheEntry::Resident {
+                glyph,
+                last_used_tick,
+                ..
+            }) => {
+                *last_used_tick = self.tick;
+                return Some(*glyph);
+            }
+            Some(CacheEntry::Regenerating { glyph }) => {
+                return Some(*glyph);
+            }
+            Some(CacheEntry::Pending | CacheEntry::Failed) => return None,
+            None => {}
+        }
+        self.entries.insert(handle.to_string(), CacheEntry::Pending);
+        self.dispatch_bytes(handle.to_string(), svg());
+        None
+    }
+
     /// Invalidates one asset by handle (its source path string) on hot-reload
     /// (RFC-0009 §3, M47). A resident asset re-dispatches generation while
     /// keeping its atlas cell — [`drain_ready`](Self::drain_ready) then reuses
@@ -258,6 +296,26 @@ impl VectorJit {
                     )
                     .map_err(|e| e.headline())
                 });
+            let _ = tx.send(JitMessage { handle, result });
+        });
+    }
+
+    /// [`dispatch`](Self::dispatch) for caller-supplied SVG bytes (RFC-0020
+    /// Tier 2) — same worker-thread + channel discipline (INV-9), same
+    /// persistent field cache (the disk key hashes the bytes, so a synthetic
+    /// path caches exactly like a file-backed icon).
+    fn dispatch_bytes(&self, handle: String, bytes: Vec<u8>) {
+        let tx = self.sender.clone();
+        let cache_dir = self.cache_dir.clone();
+        std::thread::spawn(move || {
+            let result = super::cache::generate_cached(
+                &bytes,
+                GRID_SIZE,
+                PX_RANGE,
+                Span::new(0, 0),
+                cache_dir.as_deref(),
+            )
+            .map_err(|e| e.headline());
             let _ = tx.send(JitMessage { handle, result });
         });
     }
