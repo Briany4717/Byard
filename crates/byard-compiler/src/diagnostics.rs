@@ -174,6 +174,60 @@ pub enum CompileError {
         /// The intrinsic name.
         name: String,
     },
+    /// A shape command (`arc`, `circle`, `line`, `rect`, `path`, `bezier`,
+    /// canvas `text`) was used outside a `Canvas` body (RFC-0020 §3).
+    ShapeOutsideCanvas {
+        /// Source range of the shape command.
+        span: Span,
+        /// The shape command name.
+        name: String,
+    },
+    /// A `Canvas` child is not a recognized shape command (RFC-0020 §1:
+    /// `Canvas` children are shape commands only — intrinsics, user views,
+    /// declarations, and control flow are all rejected).
+    UnknownShapeCommand {
+        /// Source range of the offending child.
+        span: Span,
+        /// The child's name (or a description for a non-element member).
+        name: String,
+        /// The closest shape-command name, if any.
+        hint: Option<String>,
+    },
+    /// A shape command did not recognize a parameter name (RFC-0020, same
+    /// never-silent contract as RFC-0002 D4 for attributes).
+    UnknownShapeParam {
+        /// Source range of the parameter.
+        span: Span,
+        /// The shape command name.
+        shape: String,
+        /// The unknown parameter name.
+        name: String,
+        /// The closest recognized parameter, if any.
+        hint: Option<String>,
+    },
+    /// A shape command is missing a required geometry parameter (RFC-0020 §
+    /// "Shape commands", e.g. an `arc` without `r`).
+    MissingShapeParam {
+        /// Source range of the shape command.
+        span: Span,
+        /// The shape command name.
+        shape: String,
+        /// The missing parameter name.
+        name: String,
+    },
+    /// A `Canvas` was declared without the required `width`/`height` props
+    /// (RFC-0020 §1: a canvas is a fixed-size drawing surface).
+    CanvasMissingSize {
+        /// Source range of the `Canvas` element.
+        span: Span,
+    },
+    /// A `path(d: …)` command carried stroke properties (RFC-0020 §2: Tier-2
+    /// MSDF rasterization is fill-only in v1; stroke a path by using the
+    /// Tier-1 commands or an outlined `d`).
+    PathStrokeUnsupported {
+        /// Source range of the `path` command.
+        span: Span,
+    },
     /// A `style { }` block read a `var`; Phase 2 styles are static (RFC-0002
     /// D5/D8).
     DynamicStyleForbidden {
@@ -446,6 +500,12 @@ impl CompileError {
             | Self::ArityMismatch { span, .. }
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
+            | Self::ShapeOutsideCanvas { span, .. }
+            | Self::UnknownShapeCommand { span, .. }
+            | Self::UnknownShapeParam { span, .. }
+            | Self::MissingShapeParam { span, .. }
+            | Self::CanvasMissingSize { span }
+            | Self::PathStrokeUnsupported { span }
             | Self::DynamicStyleForbidden { span }
             | Self::ConflictingSpacingField { span, .. }
             | Self::ViewArityMismatch { span, .. }
@@ -497,6 +557,12 @@ impl CompileError {
             | Self::ArityMismatch { span, .. }
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
+            | Self::ShapeOutsideCanvas { span, .. }
+            | Self::UnknownShapeCommand { span, .. }
+            | Self::UnknownShapeParam { span, .. }
+            | Self::MissingShapeParam { span, .. }
+            | Self::CanvasMissingSize { span }
+            | Self::PathStrokeUnsupported { span }
             | Self::DynamicStyleForbidden { span }
             | Self::ConflictingSpacingField { span, .. }
             | Self::ViewArityMismatch { span, .. }
@@ -550,6 +616,12 @@ impl CompileError {
             Self::ArityMismatch { .. } => "ArityMismatch",
             Self::AttributeTypeMismatch { .. } => "AttributeTypeMismatch",
             Self::UnexpectedChildren { .. } => "UnexpectedChildren",
+            Self::ShapeOutsideCanvas { .. } => "ShapeOutsideCanvas",
+            Self::UnknownShapeCommand { .. } => "UnknownShapeCommand",
+            Self::UnknownShapeParam { .. } => "UnknownShapeParam",
+            Self::MissingShapeParam { .. } => "MissingShapeParam",
+            Self::CanvasMissingSize { .. } => "CanvasMissingSize",
+            Self::PathStrokeUnsupported { .. } => "PathStrokeUnsupported",
             Self::DynamicStyleForbidden { .. } => "DynamicStyleForbidden",
             Self::ConflictingSpacingField { .. } => "ConflictingSpacingField",
             Self::ViewArityMismatch { .. } => "ViewArityMismatch",
@@ -636,6 +708,32 @@ impl CompileError {
             }
             Self::UnexpectedChildren { name, .. } => {
                 format!("`{name}` takes no children")
+            }
+            Self::ShapeOutsideCanvas { name, .. } => {
+                format!("shape command `{name}` is only valid inside a `Canvas` body")
+            }
+            Self::UnknownShapeCommand { name, hint, .. } => with_hint(
+                format!(
+                    "`{name}` is not a shape command; `Canvas` children are shape commands only"
+                ),
+                hint.as_deref(),
+            ),
+            Self::UnknownShapeParam {
+                shape, name, hint, ..
+            } => with_hint(
+                format!("`{shape}` does not recognize parameter `{name}`"),
+                hint.as_deref(),
+            ),
+            Self::MissingShapeParam { shape, name, .. } => {
+                format!("`{shape}` is missing its required `{name}` parameter")
+            }
+            Self::CanvasMissingSize { .. } => {
+                "`Canvas` requires explicit `width` and `height` props".to_string()
+            }
+            Self::PathStrokeUnsupported { .. } => {
+                "`path` renders fills only; stroke it with `arc`/`line`/`bezier` \
+                 or outline the `d` data"
+                    .to_string()
             }
             Self::DynamicStyleForbidden { .. } => {
                 "a `style` block cannot read a `var` (styles are static in Phase 2)".to_string()

@@ -330,6 +330,20 @@ pub struct Arg {
     pub value: Expr,
 }
 
+/// Binary arithmetic operators (`+ - * /`) — the minimal arithmetic surface
+/// required by RFC-0020's reactive shape parameters (`sweep: percent * 3.6`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+}
+
 /// Assignment operators (`= += -=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
@@ -439,6 +453,20 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A binary arithmetic expression `lhs op rhs` (`+ - * /`). Standard
+    /// precedence (`* /` over `+ -`), left-associative, both tighter than the
+    /// ternary/`with`/`merge` band — so `p * 360 with anim.spring()` animates
+    /// the product (RFC-0010 × RFC-0020).
+    Binary {
+        /// The operator.
+        op: BinOp,
+        /// Left operand.
+        lhs: Box<Expr>,
+        /// Right operand.
+        rhs: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// A ternary `cond ? then : els`.
     Ternary {
         /// The condition.
@@ -509,6 +537,7 @@ impl Expr {
             | Self::Block(_, span)
             | Self::Assign { span, .. }
             | Self::Postfix { span, .. }
+            | Self::Binary { span, .. }
             | Self::Ternary { span, .. }
             | Self::Animated { span, .. }
             | Self::StyleValue { span, .. }

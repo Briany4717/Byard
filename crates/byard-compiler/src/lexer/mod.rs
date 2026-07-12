@@ -212,11 +212,25 @@ pub enum Token {
     /// `?` (ternary)
     #[token("?")]
     Question,
-    /// `-` (sign of a negative numeric literal). Byld has no binary arithmetic
-    /// operators, so a lone `-` only ever prefixes a number (e.g. `translate:
-    /// (-8, 0)`). Longest-match keeps `->`, `-=` and `--` as their own tokens.
+    /// `-` — the sign of a negative numeric literal (`translate: (-8, 0)`)
+    /// *or* binary subtraction (part of the minimal arithmetic surface, see
+    /// [`Token::Star`]). Longest-match keeps `->`, `-=` and `--` as their own
+    /// tokens.
     #[token("-")]
     Minus,
+    /// `+` — binary addition. Part of the minimal arithmetic surface
+    /// (`+ - * /`) required by RFC-0020's reactive shape parameters
+    /// (`sweep: percent * 3.6`). Longest-match keeps `+=` and `++` as their
+    /// own tokens.
+    #[token("+")]
+    Plus,
+    /// `*` — binary multiplication (see [`Token::Plus`]).
+    #[token("*")]
+    Star,
+    /// `/` — binary division (see [`Token::Plus`]). A `//` comment still wins
+    /// over two `/` tokens through the skip rule's longest match.
+    #[token("/")]
+    Slash,
 }
 
 /// State of the two-state string-scanning stack.

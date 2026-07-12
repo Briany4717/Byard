@@ -1,0 +1,3 @@
+[project]
+name = "canvas_shapes"
+entry = "src/main.byd"

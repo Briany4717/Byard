@@ -110,6 +110,9 @@ fn reads_var(expr: &Expr, vars: &[Symbol]) -> Option<crate::diagnostics::Span> {
         } => reads_var(cond, vars)
             .or_else(|| reads_var(then, vars))
             .or_else(|| reads_var(els, vars)),
+        // Binary arithmetic (RFC-0020 enabler): `width: n * 2` reads `n` just
+        // as directly as `width: n` — recurse both operands.
+        Expr::Binary { lhs, rhs, .. } => reads_var(lhs, vars).or_else(|| reads_var(rhs, vars)),
         _ => None,
     }
 }

@@ -1,5 +1,6 @@
-//! The twelve intrinsics (eleven Phase-2 + `VectorIcon`, RFC-0009) and the
-//! RFC-0005 §5 attribute contract.
+//! The intrinsic catalog (eleven Phase-2 + `VectorIcon` RFC-0009 + `Overlay`
+//! RFC-0017 + `Canvas` RFC-0020) and the RFC-0005 §5 attribute contract, plus
+//! the RFC-0020 shape-command contract (`validate_canvas`/`validate_shape`).
 //!
 //! A closed table maps each reserved intrinsic name to its content arity,
 //! accepted property/event vocabulary, focusability, and children policy.
@@ -11,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::CompileError;
-use crate::parser::ast::{Attr, AttrKind, ElementNode, Expr};
+use crate::parser::ast::{Attr, AttrKind, ElementNode, Expr, Member};
 use crate::util::closest_match;
 
 /// The closed set of intrinsic names (RFC-0005 §4).
@@ -29,6 +30,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "ScrollView",
     "VectorIcon",
     "Overlay",
+    "Canvas",
 ];
 
 /// The scalar type an attribute value must have (RFC-0005 §1).
@@ -389,6 +391,33 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
                 events: events_from(false, &[]),
             }
         }
+        // RFC-0020: a fixed-size programmatic drawing surface. Content: none.
+        // Children: shape commands only (`arc`, `circle`, `line`, `rect`,
+        // `path`, `bezier`, `text`) — validated by [`validate_canvas`], not the
+        // generic children rule. Props: `width`/`height` (required — a canvas
+        // never sizes to content), `bg` (background fill), `grow`, margins,
+        // `opacity`, universal `style`. Events: all pointer events, hit-tested
+        // against the canvas rect only (individual shapes are not hit-testable;
+        // RFC-0020 resolved question).
+        "Canvas" => {
+            let mut props: HashMap<&'static str, PropType> = HashMap::new();
+            props.insert("width", PropType::Int);
+            props.insert("height", PropType::Int);
+            props.insert("bg", PropType::Color);
+            props.insert("grow", PropType::Int);
+            props.insert("m", PropType::Len);
+            props.insert("opacity", PropType::Float);
+            props.insert("style", PropType::Class);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: true,
+                focusable: false,
+                interactive: true,
+                props,
+                events: events_from(false, &[]),
+            }
+        }
         // RFC-0017: the overlay escape-hatch. Content: none. Children: the
         // overlay's floating subtree, laid out against the viewport rather than
         // the parent's flow. Props: `modal` (default true — captures all input
@@ -430,6 +459,16 @@ pub fn validate_element(
     // Rule 1 — name resolution.
     let Some(info) = lookup(name) else {
         if !known_views.contains(&name) {
+            // A shape command reached the ordinary element path — it was
+            // written outside a `Canvas` body (RFC-0020 §3). More precise
+            // than the generic unknown-view diagnostic.
+            if is_shape_command(name) {
+                errs.push(CompileError::ShapeOutsideCanvas {
+                    span: el.span,
+                    name: name.to_string(),
+                });
+                return errs;
+            }
             let hint = closest_match(
                 name,
                 INTRINSIC_NAMES
@@ -612,6 +651,321 @@ fn check_value_type(ty: PropType, value: &Expr) -> Option<CompileError> {
         }
         _ => None,
     }
+}
+
+// ── Canvas shape commands (RFC-0020) ─────────────────────────────────────────
+
+/// The closed set of shape-command names valid inside a `Canvas` body
+/// (RFC-0020 §"Shape commands").
+pub const SHAPE_COMMAND_NAMES: &[&str] =
+    &["arc", "circle", "line", "rect", "path", "bezier", "text"];
+
+/// Whether `name` is one of the RFC-0020 shape commands.
+#[must_use]
+pub fn is_shape_command(name: &str) -> bool {
+    SHAPE_COMMAND_NAMES.contains(&name)
+}
+
+/// Line-cap tokens (RFC-0020 §"Stroke and fill").
+const CAP: &[&str] = &["butt", "round", "square"];
+/// Line-join tokens. Accepted for forward-compatibility; v1's shape set has
+/// no polyline joints (`rect` corners are exact SDF, `bezier` flattens to
+/// round-capped segments), so the value does not yet change rendering.
+const JOIN: &[&str] = &["miter", "round", "bevel"];
+
+/// The stroke/fill/paint parameters every geometric shape accepts
+/// (RFC-0020 §"Stroke and fill").
+const SHAPE_PAINT_PARAMS: &[(&str, PropType)] = &[
+    ("stroke", PropType::Color),
+    ("stroke_width", PropType::Float),
+    ("cap", PropType::Enum(CAP)),
+    ("join", PropType::Enum(JOIN)),
+    ("fill", PropType::Color),
+    ("dash", PropType::Vec2),
+    ("dash_offset", PropType::Float),
+    ("opacity", PropType::Float),
+];
+
+/// A static table of shape-parameter `(name, type)` pairs.
+type ShapeParams = &'static [(&'static str, PropType)];
+
+/// Geometry parameters per shape command: `(required, optional)` name/type
+/// pairs, not counting the shared [`SHAPE_PAINT_PARAMS`].
+fn shape_geometry(name: &str) -> (ShapeParams, ShapeParams) {
+    match name {
+        "arc" => (
+            &[
+                ("cx", PropType::Float),
+                ("cy", PropType::Float),
+                ("r", PropType::Float),
+            ],
+            // `start`/`sweep` default to 0°/360° — an unswept arc is a circle.
+            &[("start", PropType::Float), ("sweep", PropType::Float)],
+        ),
+        "circle" => (
+            &[
+                ("cx", PropType::Float),
+                ("cy", PropType::Float),
+                ("r", PropType::Float),
+            ],
+            &[],
+        ),
+        "line" => (
+            &[
+                ("x1", PropType::Float),
+                ("y1", PropType::Float),
+                ("x2", PropType::Float),
+                ("y2", PropType::Float),
+            ],
+            &[],
+        ),
+        "rect" => (
+            &[
+                ("x", PropType::Float),
+                ("y", PropType::Float),
+                ("w", PropType::Float),
+                ("h", PropType::Float),
+            ],
+            &[("radius", PropType::Float)],
+        ),
+        "path" => (&[("d", PropType::Str)], &[]),
+        "bezier" => (
+            &[
+                ("x1", PropType::Float),
+                ("y1", PropType::Float),
+                ("cx1", PropType::Float),
+                ("cy1", PropType::Float),
+                ("cx2", PropType::Float),
+                ("cy2", PropType::Float),
+                ("x2", PropType::Float),
+                ("y2", PropType::Float),
+            ],
+            &[],
+        ),
+        // Canvas `text`: positional content (the string) is handled by the
+        // caller; these are its named parameters.
+        "text" => (
+            &[("x", PropType::Float), ("y", PropType::Float)],
+            &[
+                ("color", PropType::Color),
+                ("size", PropType::Float),
+                ("align", PropType::Enum(&["start", "center", "end"])),
+            ],
+        ),
+        _ => (&[], &[]),
+    }
+}
+
+/// Validates a `Canvas` element (RFC-0020 §1): required `width`/`height`
+/// props, and a body of shape commands only — each checked against its
+/// geometry/paint parameter contract with the same precision as RFC-0005 §5's
+/// attribute rules. Call alongside [`validate_element`] (which covers the
+/// canvas's own attrs/events through the ordinary intrinsic contract).
+#[must_use]
+pub fn validate_canvas(el: &ElementNode, attrs: &[Attr]) -> Vec<CompileError> {
+    let mut errs = Vec::new();
+
+    // A canvas is a fixed-size surface: it never sizes to content, so both
+    // dimensions are required up front.
+    let has_prop = |name: &str| {
+        attrs
+            .iter()
+            .any(|a| a.name.as_str() == name && matches!(a.kind, AttrKind::Prop { .. }))
+    };
+    if !has_prop("width") || !has_prop("height") {
+        errs.push(CompileError::CanvasMissingSize { span: el.span });
+    }
+
+    for member in &el.children {
+        match member {
+            Member::Element(child) if is_shape_command(child.name.as_str()) => {
+                errs.extend(validate_shape(child));
+            }
+            Member::Element(child) => {
+                let name = child.name.as_str();
+                errs.push(CompileError::UnknownShapeCommand {
+                    span: child.span,
+                    name: name.to_string(),
+                    hint: closest_match(name, SHAPE_COMMAND_NAMES.iter().copied())
+                        .map(str::to_string),
+                });
+            }
+            // Declarations, control flow, and style blocks are not shape
+            // commands (RFC-0020 §1). Reported with the member keyword so the
+            // message reads naturally.
+            Member::Var { span, .. } => push_non_shape(&mut errs, *span, "var"),
+            Member::Let { span, .. } => push_non_shape(&mut errs, *span, "let"),
+            Member::Fn { span, .. } => push_non_shape(&mut errs, *span, "fn"),
+            Member::Inject { span, .. } => push_non_shape(&mut errs, *span, "inject"),
+            Member::For { span, .. } => push_non_shape(&mut errs, *span, "for"),
+            Member::When { span, .. } => push_non_shape(&mut errs, *span, "when"),
+            Member::Style { span, .. } => push_non_shape(&mut errs, *span, "style"),
+            Member::Expr(e) => push_non_shape(&mut errs, e.span(), "an expression"),
+        }
+    }
+    errs
+}
+
+/// Helper for [`validate_canvas`]: a non-element member inside a `Canvas`.
+fn push_non_shape(errs: &mut Vec<CompileError>, span: crate::diagnostics::Span, what: &str) {
+    errs.push(CompileError::UnknownShapeCommand {
+        span,
+        name: what.to_string(),
+        hint: None,
+    });
+}
+
+/// Validates one shape command against its parameter contract (RFC-0020):
+/// unknown parameters (with a Levenshtein hint), missing required geometry,
+/// scalar-literal type mismatches, no attribute block, no children — and the
+/// `path`-is-fill-only rule ([`CompileError::PathStrokeUnsupported`]).
+#[must_use]
+pub fn validate_shape(el: &ElementNode) -> Vec<CompileError> {
+    let mut errs = Vec::new();
+    let shape = el.name.as_str();
+    let (required, optional) = shape_geometry(shape);
+
+    // Shape commands carry everything in their `(...)` argument list: an
+    // attribute block or a children block has no meaning on one.
+    for attr in &el.attrs {
+        errs.push(CompileError::UnknownShapeParam {
+            span: attr.span,
+            shape: shape.to_string(),
+            name: attr.name.as_str().to_string(),
+            hint: None,
+        });
+    }
+    if !el.children.is_empty() {
+        errs.push(CompileError::UnexpectedChildren {
+            span: el.span,
+            name: shape.to_string(),
+        });
+    }
+
+    let param_type = |name: &str| -> Option<PropType> {
+        required
+            .iter()
+            .chain(optional)
+            .chain(SHAPE_PAINT_PARAMS)
+            .find(|(k, _)| *k == name)
+            .map(|(_, t)| *t)
+    };
+    // `text` is fill-rendered glyphs, not a stroked path: it takes only its
+    // own geometry/typography params, never the paint set.
+    let paint_allowed = shape != "text";
+
+    // `bezier` accepts the terse positional form (8 numbers, RFC-0020 table)
+    // as well as the named form; `text` takes its content string positionally.
+    let positional_budget = match shape {
+        "bezier" => required.len(),
+        "text" => 1,
+        _ => 0,
+    };
+    let mut positional_seen = 0usize;
+
+    for arg in &el.content {
+        // A positional arg only spends the shape's positional budget
+        // (`bezier`'s 8 coordinates, canvas `text`'s content string).
+        let Some(name) = &arg.name else {
+            positional_seen += 1;
+            if positional_seen > positional_budget {
+                errs.push(CompileError::UnknownShapeParam {
+                    span: arg.value.span(),
+                    shape: shape.to_string(),
+                    name: "<positional>".to_string(),
+                    hint: None,
+                });
+            }
+            continue;
+        };
+        let pname = name.as_str();
+        let known = param_type(pname)
+            .is_some_and(|_| paint_allowed || !SHAPE_PAINT_PARAMS.iter().any(|(k, _)| *k == pname));
+        if !known {
+            let candidates =
+                required
+                    .iter()
+                    .chain(optional)
+                    .map(|(k, _)| *k)
+                    .chain(if paint_allowed {
+                        SHAPE_PAINT_PARAMS
+                            .iter()
+                            .map(|(k, _)| *k)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    });
+            errs.push(CompileError::UnknownShapeParam {
+                span: arg.value.span(),
+                shape: shape.to_string(),
+                name: pname.to_string(),
+                hint: closest_match(pname, candidates).map(str::to_string),
+            });
+        } else if let Some(ty) = param_type(pname) {
+            // Same literal-level check as attribute values, including the
+            // RFC-0010 `with` animation chain walk.
+            let mut target = &arg.value;
+            while let Expr::Animated { value, anim, .. } = target {
+                if let Err(err) = crate::interp::anim::resolve_curve(anim) {
+                    errs.push(err);
+                }
+                target = value;
+            }
+            if let Some(err) = check_value_type(ty, target) {
+                errs.push(err);
+            }
+        }
+    }
+
+    // Required geometry. A fully-positional `bezier` (all 8 coordinates in
+    // order) satisfies its required set; canvas `text`'s positional content
+    // string is checked separately below.
+    let named_has = |name: &str| {
+        el.content
+            .iter()
+            .any(|a| a.name.as_ref().is_some_and(|n| n.as_str() == name))
+    };
+    let bezier_positional = shape == "bezier" && positional_seen == required.len();
+    if !bezier_positional {
+        for (name, _) in required {
+            if !named_has(name) {
+                errs.push(CompileError::MissingShapeParam {
+                    span: el.span,
+                    shape: shape.to_string(),
+                    name: (*name).to_string(),
+                });
+            }
+        }
+    }
+    if shape == "text" && positional_seen == 0 {
+        errs.push(CompileError::MissingShapeParam {
+            span: el.span,
+            shape: shape.to_string(),
+            name: "content".to_string(),
+        });
+    }
+
+    // RFC-0020 §2 Tier 2 is fill-only in v1: stroking a `path` is rejected
+    // rather than silently ignored (never-silent, RFC-0002 D4 spirit).
+    if shape == "path" {
+        let strokes = [
+            "stroke",
+            "stroke_width",
+            "cap",
+            "join",
+            "dash",
+            "dash_offset",
+        ];
+        if el.content.iter().any(|a| {
+            a.name
+                .as_ref()
+                .is_some_and(|n| strokes.contains(&n.as_str()))
+        }) {
+            errs.push(CompileError::PathStrokeUnsupported { span: el.span });
+        }
+    }
+
+    errs
 }
 
 /// An axis-aligned rectangle in logical pixels.
@@ -988,5 +1342,135 @@ mod tests {
         assert!(green[0] < 0.01 && green[1] > 0.99 && green[2] < 0.01 && green[3] > 0.99);
         let c = color_to_rgba(0x80_00_00_00, true);
         assert!((c[3] - 0.5019).abs() < 0.01, "alpha-first 0x80… ≈ 0.5");
+    }
+
+    // ── Canvas & shape commands (RFC-0020) ─────────────────────────────────────
+
+    /// `validate_element` + `validate_canvas` on the first element of `src` —
+    /// the exact pair the evaluator's `Canvas` lowering runs.
+    fn canvas_errs(src: &str) -> Vec<CompileError> {
+        let el = first_element(src);
+        let mut e = validate_element(&el, &el.attrs, &[]);
+        e.extend(validate_canvas(&el, &el.attrs));
+        e
+    }
+
+    #[test]
+    fn valid_canvas_with_shapes_passes() {
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 48, height: 48, bg: 0x1E1E2A] { \
+               arc(cx: 24, cy: 24, r: 20, start: -90, sweep: 270, \
+                   stroke: 0x6750A4, stroke_width: 4, cap: round) \
+               circle(cx: 24, cy: 24, r: 8, fill: 0xE8DEF8) \
+               line(x1: 0, y1: 0, x2: 48, y2: 48, stroke: 0xFFFFFF, dash: (4, 4)) \
+               rect(x: 4, y: 4, w: 12, h: 8, radius: 2, fill: 0x334155) \
+               bezier(x1: 0, y1: 40, cx1: 16, cy1: 0, cx2: 32, cy2: 0, x2: 48, y2: 40, \
+                      stroke: 0x00FF00) \
+               path(d: \"M4 4 L20 4 L20 20 Z\", fill: 0xFF0000) \
+               text(\"75%\", x: 24, y: 24, align: center, size: 12) } }",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn canvas_requires_width_and_height() {
+        let e = canvas_errs("View V() { Canvas #[width: 48] { circle(cx: 1, cy: 1, r: 1) } }");
+        assert!(
+            e.iter()
+                .any(|x| matches!(x, CompileError::CanvasMissingSize { .. })),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn shape_command_outside_canvas_is_a_precise_error() {
+        let e = errs("View V() { arc(cx: 24, cy: 24, r: 20) }");
+        assert!(
+            matches!(&e[0], CompileError::ShapeOutsideCanvas { name, .. } if name == "arc"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn non_shape_children_inside_canvas_are_rejected() {
+        // An intrinsic view child is not a shape command…
+        let e = canvas_errs("View V() { Canvas #[width: 10, height: 10] { Text(\"no\") } }");
+        assert!(
+            e.iter().any(
+                |x| matches!(x, CompileError::UnknownShapeCommand { name, .. } if name == "Text")
+            ),
+            "{e:?}"
+        );
+        // …and neither is control flow.
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 10, height: 10] { when x { circle(cx: 1, cy: 1, r: 1) } } }",
+        );
+        assert!(
+            e.iter().any(
+                |x| matches!(x, CompileError::UnknownShapeCommand { name, .. } if name == "when")
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_shape_param_gets_a_levenshtein_hint() {
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 10, height: 10] { \
+               arc(cx: 1, cy: 1, r: 5, stroke_widht: 2) } }",
+        );
+        assert!(
+            e.iter().any(|x| matches!(
+                x,
+                CompileError::UnknownShapeParam { name, hint: Some(h), .. }
+                    if name == "stroke_widht" && h == "stroke_width"
+            )),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_geometry_is_reported() {
+        let e = canvas_errs("View V() { Canvas #[width: 10, height: 10] { arc(cx: 1, cy: 1) } }");
+        assert!(
+            e.iter()
+                .any(|x| matches!(x, CompileError::MissingShapeParam { name, .. } if name == "r")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn stroking_a_path_is_rejected_in_v1() {
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 10, height: 10] { \
+               path(d: \"M0 0 L5 5\", stroke: 0xFF0000) } }",
+        );
+        assert!(
+            e.iter()
+                .any(|x| matches!(x, CompileError::PathStrokeUnsupported { .. })),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn bezier_accepts_the_terse_positional_form() {
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 10, height: 10] { \
+               bezier(0, 40, 16, 0, 32, 0, 48, 40, stroke: 0xFFFFFF) } }",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn bad_cap_token_is_flagged_with_a_hint() {
+        let e = canvas_errs(
+            "View V() { Canvas #[width: 10, height: 10] { \
+               circle(cx: 1, cy: 1, r: 1, stroke: 0xFFFFFF, cap: rounded) } }",
+        );
+        assert!(
+            e.iter()
+                .any(|x| matches!(x, CompileError::AttributeTypeMismatch { .. })),
+            "{e:?}"
+        );
     }
 }

@@ -8,7 +8,7 @@
 //! `r_bp < l_bp`.
 
 use super::Parser;
-use super::ast::{Arg, AssignOp, Expr, PostfixOp, StrPart};
+use super::ast::{Arg, AssignOp, BinOp, Expr, PostfixOp, StrPart};
 use crate::diagnostics::Span;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
@@ -210,6 +210,12 @@ impl Parser<'_> {
                 left: 18,
                 right: 19,
             }),
+            // Binary arithmetic (RFC-0020 enabler): standard precedence —
+            // `* /` over `+ -`, both left-associative (`right = left + 1`),
+            // and both above the `merge`/ternary/`with`/assignment band so
+            // `p * 360 with anim.spring()` animates the product.
+            Token::Star | Token::Slash => Some(Bp { left: 9, right: 10 }),
+            Token::Plus | Token::Minus => Some(Bp { left: 7, right: 8 }),
             // Ternary (right-assoc). `right: 4` (not 3) so the else-branch is
             // parsed one power *above* the `with` operator (left: 3) below — this
             // is what makes `a ? b : c with k` group as `(a ? b : c) with k`
@@ -265,6 +271,25 @@ impl Parser<'_> {
                 Expr::Postfix {
                     target: Box::new(lhs),
                     op,
+                    span: self.span_from(start),
+                }
+            }
+            // Binary arithmetic (RFC-0020 enabler). A `-` reaching `led` is
+            // always subtraction — the numeric-sign form is consumed by
+            // `parse_negative` in `nud`, before any left operand exists.
+            Some(tok @ (Token::Plus | Token::Minus | Token::Star | Token::Slash)) => {
+                let op = match tok {
+                    Token::Plus => BinOp::Add,
+                    Token::Minus => BinOp::Sub,
+                    Token::Star => BinOp::Mul,
+                    _ => BinOp::Div,
+                };
+                self.advance();
+                let rhs = Box::new(self.parse_expr(right_bp));
+                Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs,
                     span: self.span_from(start),
                 }
             }

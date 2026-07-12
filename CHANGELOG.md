@@ -12,6 +12,20 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Binary arithmetic in `byld` (`+ - * /`).** Expressions can now compute:
+  `width: base * 2 + 10`, `sweep: percent * 3.6 with anim.spring()`. Standard
+  precedence, left-associative, Int/Float promotion; required by RFC-0020's
+  reactive shape parameters and useful everywhere a prop is derived.
+- **RFC-0020 `Canvas` intrinsic & path/shape primitives.** A fixed-size
+  drawing surface whose children are declarative shape commands — `arc`,
+  `circle`, `line`, `rect`, `bezier`, `path(d: …)`, and `text` — rendered by
+  a new analytic-SDF GPU pipeline: resolution-independent anti-aliasing,
+  stroke caps (`butt`/`round`/`square`), dash patterns with an animatable
+  `dash_offset`, fills (including arc sectors), and per-parameter reactivity
+  (`sweep: percent * 3.6` animates with no re-tessellation, no atlas churn).
+  Complex SVG `path` data rasterizes through the existing MSDF pipeline at
+  icon quality. Unblocks circular progress indicators, spinners, gauges, and
+  custom decorations; see `crates/byard-cli/examples/canvas_shapes`.
 - **RFC-0009 `VectorIcon` renders live in `byard dev`.** The `VectorMSDF`
   pipeline is now actually wired into the render loop (atlas + pipeline built
   at startup, drawn every frame) and participates in cross-pipeline paint
