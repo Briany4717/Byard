@@ -2842,6 +2842,10 @@ impl Interpreter {
                 if name.as_str() == "Grid" {
                     return self.build_grid(attrs, children, pools, flat_ids);
                 }
+                // RFC-0018 `ZStack`: overlapping children — a single-cell grid.
+                if name.as_str() == "ZStack" {
+                    return self.build_zstack(attrs, children, pools, flat_ids);
+                }
                 let mut temp_flat = Vec::new();
                 // RFC-0018: expand reactive `when`/`for` children before layout.
                 let child_ids = self.build_children(children, pools, &mut temp_flat);
@@ -2983,6 +2987,64 @@ impl Interpreter {
             .eval_int_prop(attrs, "row_gap")
             .map_or(gap, |n| n as f32);
         (col_gap, row_gap)
+    }
+
+    /// Builds the atlas subtree for a `ZStack` (RFC-0018): a single-cell grid in
+    /// which every child overlaps. Emitted in the same parent-then-children
+    /// `flat_ids` order as the generic container path so the render walk's cursor
+    /// stays aligned, and rendered through the ordinary Box paint path (bg +
+    /// children in declaration order, last on top).
+    fn build_zstack(
+        &mut self,
+        attrs: &[Attr],
+        children: &[RenderNode],
+        pools: Pools<'_>,
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
+        let concrete = self.expand_concrete(children, pools);
+        let mut child_ids = Vec::with_capacity(concrete.len());
+        let mut temp_flat = Vec::new();
+        for child in concrete {
+            if let Ok(cid) = self.build_layout_tree(child, pools, &mut temp_flat) {
+                child_ids.push(cid);
+            }
+        }
+        let base = self.eval_container_style("ZStack", attrs);
+        let align = self.eval_stack_align(attrs);
+        let id = self.atlas.add_stack_container(base, align, &child_ids)?;
+        flat_ids.push(id);
+        flat_ids.extend(temp_flat);
+        Ok(id)
+    }
+
+    /// Resolves a `ZStack`'s `alignment` prop to a [`StackAlign`], default
+    /// `Center`.
+    ///
+    /// [`StackAlign`]: byard_core::atlas::StackAlign
+    fn eval_stack_align(&mut self, attrs: &[Attr]) -> byard_core::atlas::StackAlign {
+        use byard_core::atlas::StackAlign;
+        for attr in attrs {
+            if attr.name.as_str() != "alignment" {
+                continue;
+            }
+            let AttrKind::Prop { value } = &attr.kind else {
+                continue;
+            };
+            if let Value::Str(s) = self.eval_pure(value) {
+                return match s.as_str() {
+                    "top_start" => StackAlign::TopStart,
+                    "top_end" => StackAlign::TopEnd,
+                    "bottom_start" => StackAlign::BottomStart,
+                    "bottom_end" => StackAlign::BottomEnd,
+                    "top" => StackAlign::Top,
+                    "bottom" => StackAlign::Bottom,
+                    "start" => StackAlign::Start,
+                    "end" => StackAlign::End,
+                    _ => StackAlign::Center,
+                };
+            }
+        }
+        StackAlign::Center
     }
 
     /// Builds the atlas subtree for a windowed `ScrollView`'s list child
@@ -9519,6 +9581,50 @@ mod tests {
         );
         // Non-fatal: the grid still lays out (falls back to a single auto column).
         assert_eq!(frame.instances().len(), 1, "the child still renders");
+    }
+
+    // ── RFC-0018: ZStack ──────────────────────────────────────────────────
+
+    #[test]
+    fn zstack_overlaps_children_at_the_same_origin() {
+        // Two children with bg: the small one centres over the big one (they
+        // overlap), unlike a Column which would stack them vertically.
+        let frame = checkbox_frame(
+            "View C() {\n ZStack #[width: 100, height: 100] {\n \
+               Box #[bg: 0xFF0000, width: 100, height: 100] {}\n \
+               Box #[bg: 0x00FF00, width: 40, height: 40] {}\n \
+             }\n}",
+        );
+        assert_eq!(frame.instances().len(), 2, "two child fills");
+        // Declaration order: big first (bottom), small second (on top).
+        let big = frame.instances()[0].rect;
+        let small = frame.instances()[1].rect;
+        assert!(
+            big[0] < 5.0 && big[1] < 5.0,
+            "big child at origin, got {big:?}"
+        );
+        // Small (40) centred in the 100 stack → (100 − 40) / 2 = 30.
+        assert!(
+            (small[0] - 30.0).abs() < 5.0 && (small[1] - 30.0).abs() < 5.0,
+            "small child centred, got {small:?}"
+        );
+    }
+
+    #[test]
+    fn zstack_alignment_pins_child_to_corner() {
+        // `bottom_end` puts the small child at the bottom-right corner.
+        let frame = checkbox_frame(
+            "View C() {\n ZStack #[width: 100, height: 100, alignment: bottom_end] {\n \
+               Box #[bg: 0xFF0000, width: 100, height: 100] {}\n \
+               Box #[bg: 0x00FF00, width: 20, height: 20] {}\n \
+             }\n}",
+        );
+        assert_eq!(frame.instances().len(), 2);
+        let small = frame.instances()[1].rect;
+        assert!(
+            (small[0] - 80.0).abs() < 5.0 && (small[1] - 80.0).abs() < 5.0,
+            "small child at bottom-right (80,80), got {small:?}"
+        );
     }
 
     #[test]

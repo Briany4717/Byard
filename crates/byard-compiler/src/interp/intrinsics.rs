@@ -34,6 +34,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "Overlay",
     "Canvas",
     "Grid",
+    "ZStack",
 ];
 
 /// The scalar type an attribute value must have (RFC-0005 §1).
@@ -78,6 +79,20 @@ const AXIS: &[&str] = &["vertical", "horizontal", "both"];
 /// `relative(ref)` anchoring are deferred (RFC-0017 Future possibilities) —
 /// coordinate-passing covers the gap in the interim.
 const ANCHOR: &[&str] = &["center", "top", "bottom", "start", "end"];
+/// RFC-0018 `ZStack` `alignment`: how children smaller than the stack are
+/// positioned within it. Two-word tokens are `<block>_<inline>`; single-word
+/// tokens centre on the other axis.
+const ALIGN2D: &[&str] = &[
+    "center",
+    "top_start",
+    "top_end",
+    "bottom_start",
+    "bottom_end",
+    "top",
+    "bottom",
+    "start",
+    "end",
+];
 
 const LAYOUT: &[(&str, PropType)] = &[
     ("width", PropType::Int),
@@ -570,6 +585,32 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("rows", PropType::Str);
             props.insert("col_gap", PropType::Int);
             props.insert("row_gap", PropType::Int);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: true,
+                focusable: false,
+                interactive: true,
+                props,
+                events: events_from(false, &[]),
+            }
+        }
+        // RFC-0018: `ZStack` — overlapping children within the layout tree.
+        // Content: none. Children: any (all occupy the same rect; last on top).
+        // Props: Layout + Decoration + Transform + `alignment: Align2D` (how
+        // children smaller than the stack are positioned; default `center`).
+        // Pipeline: the generic `DecoratedBox` background, same as `Box`.
+        "ZStack" => {
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
+            props.insert("anchor", PropType::Enum(ANCHOR));
+            // A ZStack can itself be a grid child.
+            props.insert("col", PropType::Int);
+            props.insert("row", PropType::Int);
+            props.insert("col_span", PropType::Int);
+            props.insert("row_span", PropType::Int);
+            props.insert("alignment", PropType::Enum(ALIGN2D));
             Intrinsic {
                 arity: 0,
                 content: None,
@@ -1601,6 +1642,28 @@ mod tests {
         assert_eq!(parse_grid_template(""), None);
         assert_eq!(parse_grid_template("1fr bogus"), None);
         assert_eq!(parse_grid_template("repeat(0, 1fr)"), None);
+    }
+
+    #[test]
+    fn zstack_validates_as_a_childful_container() {
+        // Valid: an alignment token and overlapping children.
+        assert!(errs("View V() { ZStack #[alignment: top_end] { Box {} Box {} } }").is_empty());
+        assert!(errs("View V() { ZStack { Box {} } }").is_empty());
+        // Content args are rejected (arity 0).
+        assert!(
+            errs("View V() { ZStack(\"x\") { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 0, .. }))
+        );
+        // An unknown alignment token is a type mismatch.
+        let e = errs("View V() { ZStack #[alignment: middle] {} }");
+        assert!(matches!(&e[0], CompileError::AttributeTypeMismatch { .. }));
+        // A stray prop → UnknownAttribute.
+        assert!(
+            errs("View V() { ZStack #[foo: 1] {} }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
     }
 
     #[test]
