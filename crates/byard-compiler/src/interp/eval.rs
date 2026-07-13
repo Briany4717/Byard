@@ -315,6 +315,36 @@ struct ShadowSpec {
 /// own `color`.
 const DEFAULT_SHADOW_COLOR: i64 = 0x5500_0000;
 
+/// Pushes a single rounded stroke quad from `a` to `b` of thickness `t`,
+/// rotated to the segment angle about its midpoint and composed under
+/// `transform` (so an element/group transform carries the mark with it). Backs
+/// the RFC-0018 `Checkbox` checkmark; a reusable primitive-stroke helper.
+fn push_stroke_quad(
+    frame: &mut byard_core::frame::RenderFrame,
+    a: [f32; 2],
+    b: [f32; 2],
+    t: f32,
+    color: [f32; 4],
+    transform: byard_core::frame::Transform,
+) {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let len = (dx * dx + dy * dy).sqrt();
+    let cx = (a[0] + b[0]) * 0.5;
+    let cy = (a[1] + b[1]) * 0.5;
+    let seg = byard_core::frame::Transform {
+        rotate: dy.atan2(dx),
+        origin: [cx, cy],
+        ..byard_core::frame::Transform::IDENTITY
+    };
+    frame.push_instance(byard_core::BoxInstance {
+        rect: [cx - len / 2.0, cy - t / 2.0, len, t],
+        color,
+        radii: [t / 2.0; 4],
+        transform: transform.compose(&seg),
+    });
+}
+
 /// A shadow-only [`DecoratedBox`](byard_core::frame::DecoratedBox): the box's
 /// geometry (rect/radii/transform) with a transparent fill and no border, so it
 /// casts `sh` beneath the surface. Emitted per shadow (RFC-0011 layered shadows).
@@ -1362,7 +1392,9 @@ impl Interpreter {
                 }
             }
             // Value widgets: resolve bound signal and keep as leaf nodes (M16/M19).
-            "Toggle" | "Slider" | "TextField" => {
+            // `Checkbox` (RFC-0018) joins them: a `bind: Bool` leaf that owns its
+            // square-plus-checkmark visual and flips on tap/Space.
+            "Toggle" | "Slider" | "TextField" | "Checkbox" => {
                 let bound_sig = self.resolve_bind_sig(&attrs);
                 RenderNode::Box {
                     name: el.name.clone(),
@@ -2691,6 +2723,16 @@ impl Interpreter {
                         flat_ids.push(id);
                         return Ok(id);
                     }
+                    // RFC-0018 Checkbox: an 18×18 square by default; `width`/
+                    // `height` override. Sized square unless overridden so the
+                    // container and checkmark geometry stay proportional.
+                    "Checkbox" => {
+                        let w = self.eval_int_prop(attrs, "width").unwrap_or(18) as f32;
+                        let h = self.eval_int_prop(attrs, "height").unwrap_or(18) as f32;
+                        let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                        flat_ids.push(id);
+                        return Ok(id);
+                    }
                     "TextField" => {
                         let w = self.eval_int_prop(attrs, "width").unwrap_or(200) as f32;
                         let h = self.eval_int_prop(attrs, "height").unwrap_or(36) as f32;
@@ -3019,7 +3061,7 @@ impl Interpreter {
                     // `Toggle`/`Slider` own their visuals (track/fill/thumb) and
                     // treat `bg` as the *accent* colour, not a full-rect fill —
                     // painting the rect here would draw a slab behind the control.
-                    let owns_visuals = matches!(name.as_str(), "Toggle" | "Slider");
+                    let owns_visuals = matches!(name.as_str(), "Toggle" | "Slider" | "Checkbox");
                     if let (false, Some(color)) = (owns_visuals, bg) {
                         let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
@@ -3116,6 +3158,18 @@ impl Interpreter {
                                 frame,
                             );
                         }
+                        "Checkbox" => {
+                            self.render_checkbox(
+                                *bound_sig,
+                                attrs,
+                                current_rect,
+                                hit_rect,
+                                elem_idx,
+                                transform,
+                                opacity,
+                                frame,
+                            );
+                        }
                         "TextField" => {
                             self.render_text_field(
                                 *bound_sig,
@@ -3158,9 +3212,10 @@ impl Interpreter {
                     }
 
                     // ── `focused:` reflected prop → register as focusable (M16/M18) ──
-                    // TextFields register their own focusable inside render_text_field
-                    // to avoid double-registration.
-                    if element_name != "TextField" {
+                    // TextField and Checkbox register their own focusable inside
+                    // their render fns (they are focusable *by default*, RFC-0018),
+                    // so exclude them here to avoid double-registration.
+                    if !matches!(element_name, "TextField" | "Checkbox") {
                         self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
@@ -3550,6 +3605,135 @@ impl Interpreter {
             });
             self.router
                 .on(idx, hit_rect, super::events::EventKind::Tap, flip);
+        }
+    }
+
+    /// Renders a `Checkbox` widget (RFC-0018): a rounded square that fills with
+    /// the accent colour and shows an engine-drawn checkmark when checked, a
+    /// muted filled slot when unchecked, and a horizontal dash for the
+    /// `indeterminate` mixed state — all borderless SolidBoxes (a 2px ring reads
+    /// as a heavy dark outline at control sizes). Registers Tap + Space (KeyDown)
+    /// to flip the bound bool, a `change` write-back (RFC-0003 E1), and a focus
+    /// target so Tab and click reach it. Like `Toggle`, it owns its visuals —
+    /// `bg` is the checked accent, never a full-rect slab.
+    ///
+    /// The checkmark is drawn as two rounded stroke quads rotated to each
+    /// segment's angle through the paint-transform system, so it stays crisp at
+    /// any size/DPI and needs no atlas asset for the leaf mark. (RFC-0018's
+    /// resolved MSDF-baked checkmark is a rendering refinement tracked for the
+    /// vector subsystem; the geometry and interaction contract here are final.)
+    #[allow(clippy::too_many_arguments)]
+    fn render_checkbox(
+        &mut self,
+        bound_sig: Option<super::env::SignalId>,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
+        opacity: f32,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let is_on = bound_sig.is_some_and(|s| self.ctx.peek_signal(s).as_bool().unwrap_or(false));
+        let indeterminate = self.eval_bool_prop(attrs, "indeterminate").unwrap_or(false);
+        // A checkbox is square: use the smaller side so a non-square rect still
+        // yields crisp, proportional geometry, centred in the laid-out box.
+        let side = rect.w.min(rect.h);
+        let ox = rect.x + (rect.w - side) / 2.0;
+        let oy = rect.y + (rect.h - side) / 2.0;
+        let radius = (side * 0.18).max(2.0);
+        let filled = is_on || indeterminate;
+
+        // `bg` is the checked accent (default: theme primary); unchecked shows a
+        // muted filled slot. Everything is a rounded SolidBox with NO border — a
+        // 2px ring reads as a heavy dark outline at control sizes — and the
+        // container is pushed *before* the mark on the same solid pipeline, so
+        // the white check lands on top (a decorated fill would paint after every
+        // solid and hide it). The muted slot reuses `Toggle`'s OFF tint for a
+        // consistent "off" colour across the two controls.
+        let accent = self
+            .eval_color_prop(attrs, "bg")
+            .unwrap_or(self.theme.primary());
+        let accent_rgba = super::intrinsics::color_to_rgba(accent, false);
+        let fill = if filled {
+            dim_alpha(accent_rgba, opacity)
+        } else {
+            dim_alpha([0.40, 0.42, 0.48, 1.0], opacity)
+        };
+        frame.push_instance(byard_core::BoxInstance {
+            rect: [ox, oy, side, side],
+            color: fill,
+            radii: [radius; 4],
+            transform,
+        });
+
+        // The mark, in white, on the filled square.
+        let mark = dim_alpha([1.0, 1.0, 1.0, 1.0], opacity);
+        if indeterminate {
+            // Mixed state: a single horizontal bar (checked overrides mixed only
+            // in the container fill; the dash renders whenever `indeterminate`).
+            let bar_w = side * 0.5;
+            let bar_h = (side * 0.12).max(2.0);
+            frame.push_instance(byard_core::BoxInstance {
+                rect: [
+                    ox + (side - bar_w) / 2.0,
+                    oy + (side - bar_h) / 2.0,
+                    bar_w,
+                    bar_h,
+                ],
+                color: mark,
+                radii: [bar_h / 2.0; 4],
+                transform,
+            });
+        } else if is_on {
+            // A two-stroke checkmark: canonical vertices in the unit square,
+            // each segment a rounded quad rotated to its angle.
+            let t = (side * 0.13).max(2.0);
+            let pts = [
+                [ox + side * 0.26, oy + side * 0.52], // short-stroke start
+                [ox + side * 0.44, oy + side * 0.70], // bottom vertex
+                [ox + side * 0.76, oy + side * 0.32], // long-stroke end
+                [ox + side * 0.41, oy + side * 0.70], // long-stroke start
+            ];
+            for (a, b) in [(pts[0], pts[1]), (pts[3], pts[2])] {
+                push_stroke_quad(frame, a, b, t, mark, transform);
+            }
+        }
+
+        // Handlers: Tap + Space flip the bool; `change` write-back; focusable.
+        if let (Some(sig), Some(idx)) = (bound_sig, elem_idx) {
+            let flip: super::events::Action = Box::new(move |ctx, _| {
+                let cur = ctx.peek_signal(sig).as_bool().unwrap_or(false);
+                ctx.write_signal(sig, Value::Bool(!cur));
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::Tap, flip);
+
+            // Space toggles when focused (WAI-ARIA checkbox keyboard pattern).
+            let key_flip: super::events::Action = Box::new(move |ctx, payload| {
+                if let Some(Value::Str(key)) = payload {
+                    if matches!(key.as_str(), " " | "Space" | "Spacebar") {
+                        let cur = ctx.peek_signal(sig).as_bool().unwrap_or(false);
+                        ctx.write_signal(sig, Value::Bool(!cur));
+                    }
+                }
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::KeyDown, key_flip);
+
+            // Change write-back from the platform (RFC-0003 E1).
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::Change,
+                super::events::write_back_action(sig),
+            );
+
+            // Focus target so Tab and click reach the box. Uses the element's own
+            // `focused:` var when given, else a private signal for the registry.
+            let focused_sig = self.resolve_focused_sig(attrs);
+            let fsig = focused_sig.unwrap_or_else(|| self.ctx.create_signal(Value::Bool(false)));
+            self.router.focusable(idx, hit_rect, fsig);
         }
     }
 
@@ -8548,6 +8732,171 @@ mod tests {
         ]);
         interp.tick();
         assert_eq!(interp.peek(sig), Value::Bool(false), "toggle flipped back");
+    }
+
+    // ── RFC-0018: Checkbox ────────────────────────────────────────────────
+
+    /// Renders `src`'s first view and returns `(instances, decorated)` counts,
+    /// plus the first decorated box, for the Checkbox visual tests.
+    fn checkbox_frame(src: &str) -> byard_core::frame::RenderFrame {
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        frame
+    }
+
+    #[test]
+    fn unchecked_checkbox_is_a_single_borderless_slot() {
+        // Unchecked: exactly one rounded SolidBox slot, no checkmark quads, and
+        // NO decorated box — no border (a 2px ring looks like a heavy dark
+        // outline at control sizes).
+        let frame = checkbox_frame("View C() {\n var c = false\n Checkbox #[bind: c]\n}");
+        assert_eq!(frame.instances().len(), 1, "just the muted slot, no mark");
+        assert_eq!(frame.decorated().len(), 0, "no bordered/decorated box");
+        assert!(
+            frame.instances()[0].color[3] > 0.0,
+            "the slot has an opaque muted fill"
+        );
+    }
+
+    #[test]
+    fn checked_checkbox_fills_and_draws_a_two_stroke_check() {
+        // Checked: a filled accent square (solid) + exactly two checkmark stroke
+        // quads on top — three solids, no decorated box.
+        let frame = checkbox_frame("View C() {\n var c = true\n Checkbox #[bind: c]\n}");
+        assert_eq!(frame.decorated().len(), 0, "no decorated box / border");
+        assert_eq!(
+            frame.instances().len(),
+            3,
+            "filled square + two rotated stroke quads"
+        );
+        // The square is pushed first; the two marks paint on top (solid pipeline,
+        // in order) — so the check is never hidden behind the fill.
+        assert!(
+            frame.instances()[0].color[3] > 0.0,
+            "the checked square has an opaque accent fill"
+        );
+        // The two strokes rotate in opposite senses about their midpoints, so
+        // their composed transforms carry different rotations — proof the mark
+        // is drawn as angled geometry, not two axis-aligned bars.
+        let r1 = frame.instances()[1].transform.rotate;
+        let r2 = frame.instances()[2].transform.rotate;
+        assert!(
+            (r1 - r2).abs() > 0.1,
+            "the two strokes are at different angles"
+        );
+    }
+
+    #[test]
+    fn indeterminate_checkbox_fills_and_draws_a_single_dash() {
+        // Mixed state: filled square + one horizontal bar, no checkmark, no
+        // decorated box.
+        let frame = checkbox_frame(
+            "View C() {\n var c = false\n Checkbox #[bind: c, indeterminate: true]\n}",
+        );
+        assert_eq!(frame.decorated().len(), 0, "no decorated box / border");
+        assert_eq!(frame.instances().len(), 2, "filled square + one dash");
+        assert!(frame.instances()[0].color[3] > 0.0, "filled accent square");
+    }
+
+    #[test]
+    fn checkbox_bg_is_the_accent_not_a_full_rect_slab() {
+        // Regression parity with Toggle/Slider: `bg` on a Checkbox is the checked
+        // accent (the box fill), never a background slab — a checked box is the
+        // filled square plus the two mark strokes, nothing more.
+        let frame = checkbox_frame(
+            "View C() {\n var c = true\n Checkbox #[bind: c, bg: 0x10B981, width: 24, height: 24]\n}",
+        );
+        assert_eq!(frame.decorated().len(), 0, "no slab, no decorated box");
+        assert_eq!(
+            frame.instances().len(),
+            3,
+            "filled square + the two checkmark strokes"
+        );
+        let fill = frame.instances()[0].color;
+        let accent = crate::interp::intrinsics::color_to_rgba(0x0010_B981, false);
+        assert!(
+            (fill[0] - accent[0]).abs() < 0.01 && (fill[1] - accent[1]).abs() < 0.01,
+            "the filled square carries the `bg` accent"
+        );
+    }
+
+    #[test]
+    fn checkbox_tap_flips_bound_var() {
+        let parsed = parse("View C() {\n var c = false\n Checkbox #[bind: c]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("c"))
+            .unwrap();
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Bool(false));
+
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 50,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Bool(true), "tap checked the box");
+    }
+
+    #[test]
+    fn checkbox_space_key_toggles_when_focused() {
+        let parsed = parse("View C() {\n var c = false\n Checkbox #[bind: c]\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("c"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // Click to focus the box, then press Space.
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::KeyDown,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(" ".to_string())),
+                time_ms: 10,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(sig),
+            Value::Bool(true),
+            "Space toggled the focused checkbox"
+        );
     }
 
     #[test]
