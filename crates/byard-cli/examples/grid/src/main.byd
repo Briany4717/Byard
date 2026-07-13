@@ -37,6 +37,6 @@ View Main() {
         }
 
         Text("3 columns (1fr each); wide cards use col_span, Notes is pinned to row 3.")
-            #[color: 0x938F99, size: 12]
+            #[color: 0x938F99, size: 12, wrap: true, width: 472]
     }
 }

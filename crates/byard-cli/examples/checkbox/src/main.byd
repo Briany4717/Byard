@@ -44,10 +44,10 @@ View Main() {
         // Reactive status: a live `when` re-derives the line each frame.
         when wifi {
             Text("Wi-Fi is ON — tap the green box to turn it off")
-                #[color: 0x7DD3A8, size: 13]
+                #[color: 0x7DD3A8, size: 13, wrap: true, width: 316]
         } else {
             Text("Wi-Fi is OFF — tap the green box to turn it on")
-                #[color: 0x938F99, size: 13]
+                #[color: 0x938F99, size: 13, wrap: true, width: 316]
         }
     }
 }

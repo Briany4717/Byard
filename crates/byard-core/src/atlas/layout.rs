@@ -130,6 +130,51 @@ pub struct GridItemPlacement {
     pub row_span: u16,
 }
 
+/// 2-D alignment of a `ZStack`'s children within the stack rect (RFC-0018
+/// `Align2D`). The first word is the block (vertical) edge, the second the
+/// inline (horizontal) edge; the single-edge tokens centre on the other axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StackAlign {
+    /// Centre on both axes (the default).
+    #[default]
+    Center,
+    /// Top-left.
+    TopStart,
+    /// Top-right.
+    TopEnd,
+    /// Bottom-left.
+    BottomStart,
+    /// Bottom-right.
+    BottomEnd,
+    /// Top-centre.
+    Top,
+    /// Bottom-centre.
+    Bottom,
+    /// Left-centre.
+    Start,
+    /// Right-centre.
+    End,
+}
+
+impl StackAlign {
+    /// Maps to `(justify_items, align_items)` — the inline (x) and block (y)
+    /// grid-item alignment within the single stacking cell.
+    fn to_items(self) -> (AlignItems, AlignItems) {
+        use taffy::AlignItems::{Center, End, Start};
+        match self {
+            Self::Center => (Center, Center),
+            Self::TopStart => (Start, Start),
+            Self::TopEnd => (End, Start),
+            Self::BottomStart => (Start, End),
+            Self::BottomEnd => (End, End),
+            Self::Top => (Center, Start),
+            Self::Bottom => (Center, End),
+            Self::Start => (Start, Center),
+            Self::End => (End, Center),
+        }
+    }
+}
+
 /// Main-axis direction of a flex container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlexDir {
@@ -818,6 +863,77 @@ impl LayoutAtlas {
             .set_style(node.node_id, style)
             .map_err(|e| AtlasError::from_taffy(&e))?;
         Ok(())
+    }
+
+    /// Adds a **stacking** container (RFC-0018 `ZStack`): a single-cell CSS grid
+    /// in which every child is placed in the same cell, so they overlap. The
+    /// lone `auto` track sizes the stack to its largest child, and `align`/`justify` position smaller children within it
+    /// (default centred). Children paint in declaration order (last on top) via
+    /// the ordinary container paint path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if the backend refuses the node, or
+    /// [`AtlasError::ForeignNode`] if any child came from another atlas.
+    pub fn add_stack_container(
+        &mut self,
+        style: ContainerStyle,
+        align: StackAlign,
+        children: &[AtlasNodeId],
+    ) -> Result<AtlasNodeId, AtlasError> {
+        self.assert_building("add_stack_container");
+        for &child in children {
+            self.validate_node(child)?;
+        }
+
+        let (justify, align_items) = align.to_items();
+        let mut taffy_style = style.to_taffy();
+        taffy_style.display = Display::Grid;
+        // A single auto column and row: the cell sizes to the largest child.
+        taffy_style.grid_template_columns = core::iter::once(GridTemplateComponent::AUTO).collect();
+        taffy_style.grid_template_rows = core::iter::once(GridTemplateComponent::AUTO).collect();
+        // Position children within the cell rather than stretching them to fill
+        // it (the ZStack keeps each child at its natural size).
+        taffy_style.justify_items = Some(justify);
+        taffy_style.align_items = Some(align_items);
+
+        self.children_scratch.clear();
+        self.children_scratch
+            .extend(children.iter().map(|c| c.node_id));
+        let next_index = self.next_target_index();
+        let node = self
+            .tree
+            .new_with_children(taffy_style, &self.children_scratch)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        for &child in children {
+            self.parents.insert(child.node_id, node);
+        }
+        self.tree
+            .set_node_context(node, Some(next_index))
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+
+        // Pin every child to the same cell (line 1, span 1 on both axes) so they
+        // overlap — otherwise grid auto-placement would flow them into implicit
+        // rows and stack them vertically instead.
+        let cell = GridItemPlacement {
+            col_start: Some(1),
+            col_span: 1,
+            row_start: Some(1),
+            row_span: 1,
+        };
+        let id = AtlasNodeId {
+            node_id: node,
+            atlas_id: self.instance_id,
+        };
+        self.nodes_by_index.push(id);
+        for &child in children {
+            self.set_grid_item(child, cell)?;
+        }
+        Ok(id)
     }
 
     /// Sets the root node for layout computation.
@@ -1647,6 +1763,51 @@ mod tests {
 
         let a_rect = atlas.resolved_rect(a).unwrap().unwrap();
         assert_f32_eq(a_rect.x, 100.0);
+    }
+
+    #[test]
+    fn zstack_overlaps_children_and_sizes_to_largest() {
+        // RFC-0018: a ZStack sizes to its largest child (100×100) and centres a
+        // smaller child (20×20) within it (offset 40,40); both share the same
+        // stacking cell, so they overlap.
+        let mut atlas = LayoutAtlas::new();
+        let big = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        let small = atlas.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
+        let stack = atlas
+            .add_stack_container(ContainerStyle::default(), StackAlign::Center, &[big, small])
+            .unwrap();
+        atlas.set_root(stack).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let s_rect = atlas.resolved_rect(stack).unwrap().unwrap();
+        assert_f32_eq(s_rect.width, 100.0);
+        assert_f32_eq(s_rect.height, 100.0);
+
+        let big_rect = atlas.resolved_rect(big).unwrap().unwrap();
+        let small_rect = atlas.resolved_rect(small).unwrap().unwrap();
+        assert_f32_eq(big_rect.x, 0.0);
+        assert_f32_eq(big_rect.y, 0.0);
+        assert_f32_eq(small_rect.x, 40.0);
+        assert_f32_eq(small_rect.y, 40.0);
+        // The small child sits fully inside the big one — they overlap.
+        assert!(small_rect.x >= big_rect.x && small_rect.y >= big_rect.y);
+    }
+
+    #[test]
+    fn zstack_alignment_pins_a_small_child_to_a_corner() {
+        // `TopEnd` puts the small child at the top-right of the stack.
+        let mut atlas = LayoutAtlas::new();
+        let big = atlas.add_leaf(LeafSize::new(100.0, 100.0)).unwrap();
+        let small = atlas.add_leaf(LeafSize::new(20.0, 20.0)).unwrap();
+        let stack = atlas
+            .add_stack_container(ContainerStyle::default(), StackAlign::TopEnd, &[big, small])
+            .unwrap();
+        atlas.set_root(stack).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let small_rect = atlas.resolved_rect(small).unwrap().unwrap();
+        assert_f32_eq(small_rect.x, 80.0); // right edge: 100 − 20
+        assert_f32_eq(small_rect.y, 0.0); // top
     }
 
     #[test]
