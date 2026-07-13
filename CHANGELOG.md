@@ -21,6 +21,15 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0018 `Grid` intrinsic.** A CSS-grid container backed by Taffy's grid
+  mode. `columns`/`rows` take a template string (`"1fr 2fr 100"`,
+  `"repeat(3, 1fr)"`, `auto`) parsed into engine tracks — a malformed template
+  is a `CompileError::InvalidGridTemplate`. `gap`, plus per-axis `col_gap`/
+  `row_gap`, space the cells. Children auto-place left-to-right, top-to-bottom by
+  default, or place explicitly with the child props `col`/`row` (1-based grid
+  lines) and `col_span`/`row_span`. Replaces the nested-`Row`/`Column` "wrapper
+  hell" for two-dimensional layouts (dashboards, galleries, label+field forms);
+  see `crates/byard-cli/examples/grid`.
 - **RFC-0018 `RadioButton` intrinsic.** Single-selection within a group: each
   button carries a `value: Str` identity and a `bind: Str` to the shared group
   `var`, and is selected when `bind == value`. Tapping a button writes its

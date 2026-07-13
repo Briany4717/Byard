@@ -1,0 +1,42 @@
+// RFC-0018 — the `Grid` intrinsic (CSS-grid layout via Taffy).
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/grid
+//   cargo run -p byard-cli -- dev
+//
+// What to verify visually:
+//   1. A 3-column dashboard: the cards flow left-to-right, top-to-bottom into
+//      the tracks (auto-placement) with even 12px gaps between cells.
+//   2. The "Revenue" and "Latency" cards each span two columns (`col_span: 2`);
+//      the others take one column.
+//   3. The lower "Notes" card is pinned explicitly to row 3, spanning all three
+//      columns (`row: 3, col_span: 3`).
+//   4. Resizing the window keeps the columns proportional (1fr each), because
+//      grid tracks are fractional, not fixed.
+View Main() {
+    Column #[bg: 0x14141C, p: 24, gap: 16, width: 520] {
+        Text("Grid — RFC-0018") #[color: 0xE6E1E5, size: 20]
+
+        Grid #[columns: "1fr 1fr 1fr", gap: 12, width: 472, height: 300] {
+            Box #[bg: 0x381E72, radius: 12, col_span: 2, p: 16] {
+                Text("Revenue") #[color: 0xE8DEF8, size: 16]
+            }
+            Box #[bg: 0x4A4458, radius: 12, p: 16] {
+                Text("Users") #[color: 0xE6E1E5, size: 16]
+            }
+            Box #[bg: 0x633B48, radius: 12, p: 16] {
+                Text("Orders") #[color: 0xFFD8E4, size: 16]
+            }
+            Box #[bg: 0x1F3A34, radius: 12, col_span: 2, p: 16] {
+                Text("Latency") #[color: 0xB8F0D8, size: 16]
+            }
+            // Explicitly placed: third row, spanning all three columns.
+            Box #[bg: 0x2A2A3A, radius: 12, row: 3, col_span: 3, p: 16] {
+                Text("Notes") #[color: 0xCAC4D0, size: 16]
+            }
+        }
+
+        Text("3 columns (1fr each); wide cards use col_span, Notes is pinned to row 3.")
+            #[color: 0x938F99, size: 12]
+    }
+}
