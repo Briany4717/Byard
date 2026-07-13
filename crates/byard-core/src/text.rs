@@ -32,6 +32,23 @@ impl Default for TextMeasurer {
     }
 }
 
+/// A text-measurement sink the layout atlas calls back into during layout so a
+/// `Text` leaf can size itself to the width its parent offers (RFC-0005 default
+/// wrap): given a candidate `max_width`, it returns the shaped `(width, height)`.
+/// Decouples the atlas from the concrete shaper (`TextMeasurer`) and keeps
+/// measurement cached and single-sourced.
+pub trait TextSizer {
+    /// Shaped `(width, height)` of `text` at `font_size`, wrapped to `max_width`
+    /// logical px when `Some` (`None` = natural single line).
+    fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32);
+}
+
+impl TextSizer for TextMeasurer {
+    fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
+        self.measure_wrapped(text, font_size, max_width)
+    }
+}
+
 impl TextMeasurer {
     /// Creates a measurer with a fresh font system (loads system fonts once).
     #[must_use]
