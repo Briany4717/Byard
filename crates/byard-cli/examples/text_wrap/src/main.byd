@@ -1,0 +1,31 @@
+// RFC-0005 — default text wrap.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/text_wrap
+//   cargo run -p byard-cli -- dev
+//
+// What to verify visually:
+//   1. The long paragraph has NO `wrap` flag and NO `width`, yet it wraps to
+//      fill the column — text reflows to the width its parent offers, like a
+//      block of text in a browser.
+//   2. The same kind of text inside the narrower 200px card wraps sooner,
+//      because its parent is narrower.
+//   3. The `wrap: false` line stays on a single line and overflows on purpose
+//      (opt-out).
+//   4. Resize the window: the top paragraph re-wraps to the new width.
+View Main() {
+    Column #[bg: 0x14141C, p: 32, gap: 16, width: 360] {
+        Text("Default text wrap") #[color: 0xE6E1E5, size: 20]
+
+        Text("This paragraph has no width and no wrap flag, yet it wraps to fill the column: text reflows to the width its parent offers. Resize the window and it re-wraps to match.")
+            #[color: 0xCAC4D0, size: 15]
+
+        Column #[bg: 0x1E1E2A, radius: 12, p: 16, width: 220] {
+            Text("Inside a 220px card, the same kind of text wraps sooner because its parent is narrower.")
+                #[color: 0x938F99, size: 13]
+        }
+
+        Text("This line opts out with wrap: false and overflows on purpose.")
+            #[color: 0x6A6A78, size: 13, wrap: false]
+    }
+}
