@@ -2836,6 +2836,12 @@ impl Interpreter {
                         }
                     }
                 }
+                // RFC-0018 `Grid`: a CSS-grid container. Built via its own path so
+                // the parent gets grid tracks/gaps and each child can carry an
+                // explicit placement.
+                if name.as_str() == "Grid" {
+                    return self.build_grid(attrs, children, pools, flat_ids);
+                }
                 let mut temp_flat = Vec::new();
                 // RFC-0018: expand reactive `when`/`for` children before layout.
                 let child_ids = self.build_children(children, pools, &mut temp_flat);
@@ -2846,6 +2852,137 @@ impl Interpreter {
                 Ok(id)
             }
         }
+    }
+
+    /// Builds the atlas subtree for a `Grid` (RFC-0018). Children are expanded
+    /// (reactive `when`/`for` first), each built and — if it carries `col`/`row`/
+    /// `col_span`/`row_span` — placed explicitly; the rest auto-place. The
+    /// container is emitted in the same parent-then-children `flat_ids` order the
+    /// generic container path uses, so the render walk's parallel cursor stays
+    /// aligned.
+    fn build_grid(
+        &mut self,
+        attrs: &[Attr],
+        children: &[RenderNode],
+        pools: Pools<'_>,
+        flat_ids: &mut Vec<byard_core::atlas::layout::AtlasNodeId>,
+    ) -> Result<byard_core::atlas::layout::AtlasNodeId, byard_core::atlas::AtlasError> {
+        let concrete = self.expand_concrete(children, pools);
+        let mut child_ids = Vec::with_capacity(concrete.len());
+        let mut placements: Vec<(
+            byard_core::atlas::layout::AtlasNodeId,
+            byard_core::atlas::GridItemPlacement,
+        )> = Vec::new();
+        let mut temp_flat = Vec::new();
+        for child in concrete {
+            if let Ok(cid) = self.build_layout_tree(child, pools, &mut temp_flat) {
+                if let Some(p) = self.grid_child_placement(child) {
+                    placements.push((cid, p));
+                }
+                child_ids.push(cid);
+            }
+        }
+        let base = self.eval_container_style("Grid", attrs);
+        let (cols, rows) = self.eval_grid_templates(attrs);
+        let (col_gap, row_gap) = self.eval_grid_gaps(attrs);
+        let id = self
+            .atlas
+            .add_grid_container(base, &cols, &rows, col_gap, row_gap, &child_ids)?;
+        for (cid, p) in placements {
+            // A rejected placement (e.g. a foreign node) is non-fatal — the child
+            // simply auto-places — so it never aborts the frame.
+            let _ = self.atlas.set_grid_item(cid, p);
+        }
+        flat_ids.push(id);
+        flat_ids.extend(temp_flat);
+        Ok(id)
+    }
+
+    /// Reads a grid child's explicit placement (`col`/`row`/`col_span`/
+    /// `row_span`) from its attrs, or `None` if it carries none (→ auto-placed).
+    /// Only `Box`-family children (Box/Column/Row/Grid/…) carry placement.
+    fn grid_child_placement(
+        &mut self,
+        child: &RenderNode,
+    ) -> Option<byard_core::atlas::GridItemPlacement> {
+        let RenderNode::Box { attrs, .. } = child else {
+            return None;
+        };
+        let col = self.eval_int_prop(attrs, "col");
+        let row = self.eval_int_prop(attrs, "row");
+        let col_span = self.eval_int_prop(attrs, "col_span");
+        let row_span = self.eval_int_prop(attrs, "row_span");
+        if col.is_none() && row.is_none() && col_span.is_none() && row_span.is_none() {
+            return None;
+        }
+        Some(byard_core::atlas::GridItemPlacement {
+            col_start: col.and_then(|n| i16::try_from(n).ok()),
+            col_span: col_span
+                .and_then(|n| u16::try_from(n.max(1)).ok())
+                .unwrap_or(1),
+            row_start: row.and_then(|n| i16::try_from(n).ok()),
+            row_span: row_span
+                .and_then(|n| u16::try_from(n.max(1)).ok())
+                .unwrap_or(1),
+        })
+    }
+
+    /// Parses a `Grid`'s `columns:`/`rows:` templates (RFC-0018). A missing or
+    /// malformed `columns` defaults to a single `auto` track (one column);
+    /// missing `rows` leaves rows implicit (Taffy auto-creates them). A malformed
+    /// template also pushes a [`CompileError::InvalidGridTemplate`].
+    ///
+    /// [`CompileError::InvalidGridTemplate`]: crate::diagnostics::CompileError::InvalidGridTemplate
+    fn eval_grid_templates(
+        &mut self,
+        attrs: &[Attr],
+    ) -> (
+        Vec<byard_core::atlas::GridTrack>,
+        Vec<byard_core::atlas::GridTrack>,
+    ) {
+        let cols = self
+            .eval_grid_axis(attrs, "columns")
+            .unwrap_or_else(|| vec![byard_core::atlas::GridTrack::Auto]);
+        let rows = self.eval_grid_axis(attrs, "rows").unwrap_or_default();
+        (cols, rows)
+    }
+
+    /// Resolves one grid-template axis attribute to tracks, pushing an
+    /// `InvalidGridTemplate` diagnostic on a malformed string. `None` = the
+    /// attribute is absent (or not a string).
+    fn eval_grid_axis(
+        &mut self,
+        attrs: &[Attr],
+        name: &str,
+    ) -> Option<Vec<byard_core::atlas::GridTrack>> {
+        let attr = attrs.iter().find(|a| a.name.as_str() == name)?;
+        let AttrKind::Prop { value } = &attr.kind else {
+            return None;
+        };
+        let Value::Str(s) = self.eval_pure(value) else {
+            return None;
+        };
+        let parsed = super::intrinsics::parse_grid_template(&s);
+        if parsed.is_none() {
+            self.errors.push(CompileError::InvalidGridTemplate {
+                span: attr.span,
+                template: s,
+            });
+        }
+        parsed
+    }
+
+    /// Resolves a `Grid`'s per-axis gaps: `col_gap`/`row_gap` each fall back to
+    /// the shared `gap` (default 0). Returns `(col_gap, row_gap)`.
+    fn eval_grid_gaps(&mut self, attrs: &[Attr]) -> (f32, f32) {
+        let gap = self.eval_int_prop(attrs, "gap").map_or(0.0, |n| n as f32);
+        let col_gap = self
+            .eval_int_prop(attrs, "col_gap")
+            .map_or(gap, |n| n as f32);
+        let row_gap = self
+            .eval_int_prop(attrs, "row_gap")
+            .map_or(gap, |n| n as f32);
+        (col_gap, row_gap)
     }
 
     /// Builds the atlas subtree for a windowed `ScrollView`'s list child
@@ -9299,6 +9436,89 @@ mod tests {
             "other",
             "home → other (backward wrap)"
         );
+    }
+
+    // ── RFC-0018: Grid ────────────────────────────────────────────────────
+
+    #[test]
+    fn grid_auto_places_children_into_columns() {
+        // Two 1fr columns in a 200px-wide grid → 100px each; two auto-flowed
+        // children land one per column (x≈0 and x≈100).
+        let frame = checkbox_frame(
+            "View C() {\n Grid #[columns: \"1fr 1fr\", width: 200, height: 100] {\n \
+               Box #[bg: 0xFF0000, height: 40] {}\n \
+               Box #[bg: 0x00FF00, height: 40] {}\n \
+             }\n}",
+        );
+        assert_eq!(frame.instances().len(), 2, "two child fills");
+        let mut xs: Vec<f32> = frame.instances().iter().map(|i| i.rect[0]).collect();
+        xs.sort_by(f32::total_cmp);
+        assert!(xs[0] < 5.0, "first column near x=0, got {xs:?}");
+        assert!(
+            (xs[1] - 100.0).abs() < 5.0,
+            "second column near x=100, got {xs:?}"
+        );
+    }
+
+    #[test]
+    fn grid_explicit_col_placement_pins_a_child() {
+        // A lone child pinned to column 2 sits in the right column (x≈100),
+        // proving `set_grid_item` wires `col:` through to Taffy.
+        let frame = checkbox_frame(
+            "View C() {\n Grid #[columns: \"1fr 1fr\", width: 200, height: 100] {\n \
+               Box #[bg: 0xFF0000, height: 40, col: 2] {}\n \
+             }\n}",
+        );
+        assert_eq!(frame.instances().len(), 1, "one child fill");
+        assert!(
+            (frame.instances()[0].rect[0] - 100.0).abs() < 5.0,
+            "pinned to column 2 (x≈100), got {:?}",
+            frame.instances()[0].rect
+        );
+    }
+
+    #[test]
+    fn grid_row_gap_offsets_the_second_row() {
+        // One 1fr column, two explicit 40px rows, row_gap 20 → the second row
+        // starts at y = 40 + 20 = 60. (Explicit row tracks so the assertion is
+        // independent of grid `align-content`, which stretches *auto* rows to
+        // fill a fixed-height container.)
+        let frame = checkbox_frame(
+            "View C() {\n Grid #[columns: \"1fr\", rows: \"40 40\", row_gap: 20, width: 100] {\n \
+               Box #[bg: 0xFF0000] {}\n \
+               Box #[bg: 0x00FF00] {}\n \
+             }\n}",
+        );
+        assert_eq!(frame.instances().len(), 2);
+        let mut ys: Vec<f32> = frame.instances().iter().map(|i| i.rect[1]).collect();
+        ys.sort_by(f32::total_cmp);
+        assert!(ys[0] < 5.0, "first row at top, got {ys:?}");
+        assert!(
+            (ys[1] - 60.0).abs() < 5.0,
+            "second row after 40px row + 20px gap, got {ys:?}"
+        );
+    }
+
+    #[test]
+    fn grid_invalid_template_reports_a_diagnostic_and_still_renders() {
+        let parsed =
+            parse("View C() {\n Grid #[columns: \"1fr bogus\"] { Box #[bg: 0xFF0000] {} }\n}");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            interp
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompileError::InvalidGridTemplate { .. })),
+            "expected InvalidGridTemplate, got {:?}",
+            interp.errors()
+        );
+        // Non-fatal: the grid still lays out (falls back to a single auto column).
+        assert_eq!(frame.instances().len(), 1, "the child still renders");
     }
 
     #[test]

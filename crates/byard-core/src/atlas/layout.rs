@@ -8,11 +8,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::frame::{Rect, RenderFrame, TargetId, TargetKind, Viewport};
-use taffy::prelude::FromLength;
+use taffy::style_helpers::{FromFr, FromLength, TaffyAuto, TaffyGridLine, TaffyGridSpan};
 use taffy::{
-    AlignItems, AvailableSpace, Dimension, FlexDirection, JustifyContent, LengthPercentage,
-    LengthPercentageAuto, NodeId, Overflow, Point, Position, Rect as TaffyRect, Size, Style,
-    TaffyError, TaffyTree,
+    AlignItems, AvailableSpace, Dimension, Display, FlexDirection, GridPlacement,
+    GridTemplateComponent, JustifyContent, LengthPercentage, LengthPercentageAuto, Line, NodeId,
+    Overflow, Point, Position, Rect as TaffyRect, Size, Style, TaffyError, TaffyTree,
 };
 
 use super::spatial::SpatialGrid;
@@ -100,6 +100,34 @@ impl Spacing {
             left: horizontal,
         }
     }
+}
+
+/// One track in a `Grid` template (RFC-0018): a flexible fraction (`1fr`), a
+/// fixed length in logical px (`100`), or an auto-sized track (`auto`). Maps to
+/// a Taffy `GridTemplateComponent`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridTrack {
+    /// A flexible fraction of the leftover space (`Nfr`).
+    Fr(f32),
+    /// A fixed length in logical pixels.
+    Px(f32),
+    /// An auto-sized track (fits its content).
+    Auto,
+}
+
+/// Where a grid child sits in the grid (RFC-0018). `col_start`/`row_start` are
+/// 1-based grid lines (CSS convention; negative counts from the end); `None`
+/// leaves the axis to Taffy's auto-placement. Spans default to 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GridItemPlacement {
+    /// 1-based column line to start at, or `None` for auto-placement.
+    pub col_start: Option<i16>,
+    /// Number of columns to span (≥ 1).
+    pub col_span: u16,
+    /// 1-based row line to start at, or `None` for auto-placement.
+    pub row_start: Option<i16>,
+    /// Number of rows to span (≥ 1).
+    pub row_span: u16,
 }
 
 /// Main-axis direction of a flex container.
@@ -652,6 +680,144 @@ impl LayoutAtlas {
         };
         self.nodes_by_index.push(id);
         Ok(id)
+    }
+
+    /// Adds a **CSS-grid** container (RFC-0018 `Grid`) wrapping `children`.
+    ///
+    /// The `style` supplies the shared box properties (size, padding, margin,
+    /// grow, alignment); this method overrides the display mode to grid and sets
+    /// the column/row track templates and the per-axis gaps. Children are
+    /// auto-placed left-to-right, top-to-bottom by default; call
+    /// [`set_grid_item`](Self::set_grid_item) on a child to place it explicitly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if the backend refuses the node, or
+    /// [`AtlasError::ForeignNode`] if any child came from another atlas.
+    pub fn add_grid_container(
+        &mut self,
+        style: ContainerStyle,
+        columns: &[GridTrack],
+        rows: &[GridTrack],
+        col_gap: f32,
+        row_gap: f32,
+        children: &[AtlasNodeId],
+    ) -> Result<AtlasNodeId, AtlasError> {
+        self.assert_building("add_grid_container");
+
+        for &child in children {
+            self.validate_node(child)?;
+        }
+
+        let mut taffy_style = style.to_taffy();
+        taffy_style.display = Display::Grid;
+        // Inline the track mapping at each `collect` so the destination field's
+        // type constrains `GridTemplateComponent`'s string generic (a shared
+        // closure couldn't infer it).
+        taffy_style.grid_template_columns = columns
+            .iter()
+            .map(|t| match t {
+                GridTrack::Fr(f) => GridTemplateComponent::from_fr(*f),
+                GridTrack::Px(p) => GridTemplateComponent::from_length(*p),
+                GridTrack::Auto => GridTemplateComponent::AUTO,
+            })
+            .collect();
+        taffy_style.grid_template_rows = rows
+            .iter()
+            .map(|t| match t {
+                GridTrack::Fr(f) => GridTemplateComponent::from_fr(*f),
+                GridTrack::Px(p) => GridTemplateComponent::from_length(*p),
+                GridTrack::Auto => GridTemplateComponent::AUTO,
+            })
+            .collect();
+        // Grid gaps are per-axis: `gap.width` is the column gap, `gap.height` the
+        // row gap (Taffy/CSS convention).
+        taffy_style.gap = Size {
+            width: LengthPercentage::from_length(col_gap),
+            height: LengthPercentage::from_length(row_gap),
+        };
+
+        self.children_scratch.clear();
+        self.children_scratch
+            .extend(children.iter().map(|c| c.node_id));
+        let next_index = self.next_target_index();
+        let node = self
+            .tree
+            .new_with_children(taffy_style, &self.children_scratch)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        for &child in children {
+            self.parents.insert(child.node_id, node);
+        }
+        self.tree
+            .set_node_context(node, Some(next_index))
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        let id = AtlasNodeId {
+            node_id: node,
+            atlas_id: self.instance_id,
+        };
+        self.nodes_by_index.push(id);
+        Ok(id)
+    }
+
+    /// Places an already-created grid child explicitly (RFC-0018): sets its
+    /// `grid_column`/`grid_row` from `placement`. A `None` start leaves that
+    /// axis to auto-placement; the span (≥ 1) always applies. A no-op-equivalent
+    /// placement (auto start, span 1) still resolves to the same auto flow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::ForeignNode`] if `node` came from another atlas, or
+    /// [`AtlasError::Backend`] if the backend rejects the restyle.
+    pub fn set_grid_item(
+        &mut self,
+        node: AtlasNodeId,
+        placement: GridItemPlacement,
+    ) -> Result<(), AtlasError> {
+        self.assert_building("set_grid_item");
+        self.validate_node(node)?;
+
+        let mut style = self
+            .tree
+            .style(node.node_id)
+            .map_err(|e| AtlasError::from_taffy(&e))?
+            .clone();
+        // Assigned directly onto the `Line<GridPlacement<S>>` fields so the field
+        // type constrains the string generic `S` (a shared helper couldn't infer
+        // it). A `None` start stays auto; the span (≥ 1) always applies.
+        let col_span = placement.col_span.max(1);
+        style.grid_column = match placement.col_start {
+            Some(s) => Line {
+                start: GridPlacement::from_line_index(s),
+                end: GridPlacement::from_span(col_span),
+            },
+            None => Line {
+                start: GridPlacement::Auto,
+                end: GridPlacement::from_span(col_span),
+            },
+        };
+        let row_span = placement.row_span.max(1);
+        style.grid_row = match placement.row_start {
+            Some(s) => Line {
+                start: GridPlacement::from_line_index(s),
+                end: GridPlacement::from_span(row_span),
+            },
+            None => Line {
+                start: GridPlacement::Auto,
+                end: GridPlacement::from_span(row_span),
+            },
+        };
+        self.tree
+            .set_style(node.node_id, style)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        Ok(())
     }
 
     /// Sets the root node for layout computation.
@@ -1419,6 +1585,68 @@ mod tests {
         assert_f32_eq(b_rect.y, 0.0);
         assert_f32_eq(b_rect.width, 50.0);
         assert_f32_eq(b_rect.height, 50.0);
+    }
+
+    #[test]
+    fn grid_two_columns_positions_children_side_by_side() {
+        // RFC-0018: a 200×100 grid with two `1fr` columns (100px each) and two
+        // auto-placed children lays them one per column — A at x=0, B at x=100.
+        let mut atlas = LayoutAtlas::new();
+        let a = atlas.add_leaf(LeafSize::new(0.0, 40.0)).unwrap();
+        let b = atlas.add_leaf(LeafSize::new(0.0, 40.0)).unwrap();
+        let grid = atlas
+            .add_grid_container(
+                ContainerStyle::new(Some(200.0), Some(100.0)),
+                &[GridTrack::Fr(1.0), GridTrack::Fr(1.0)],
+                &[],
+                0.0,
+                0.0,
+                &[a, b],
+            )
+            .unwrap();
+        atlas.set_root(grid).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let a_rect = atlas.resolved_rect(a).unwrap().unwrap();
+        let b_rect = atlas.resolved_rect(b).unwrap().unwrap();
+        let mut xs = [a_rect.x, b_rect.x];
+        xs.sort_by(f32::total_cmp);
+        assert_f32_eq(xs[0], 0.0);
+        assert_f32_eq(xs[1], 100.0);
+    }
+
+    #[test]
+    fn grid_explicit_placement_pins_child_to_second_column() {
+        // RFC-0018: `set_grid_item` with `col_start = 2` pins the child to the
+        // second 1fr column (x = 100) even though it is the only/first child.
+        let mut atlas = LayoutAtlas::new();
+        let a = atlas.add_leaf(LeafSize::new(0.0, 40.0)).unwrap();
+        let grid = atlas
+            .add_grid_container(
+                ContainerStyle::new(Some(200.0), Some(100.0)),
+                &[GridTrack::Fr(1.0), GridTrack::Fr(1.0)],
+                &[],
+                0.0,
+                0.0,
+                &[a],
+            )
+            .unwrap();
+        atlas
+            .set_grid_item(
+                a,
+                GridItemPlacement {
+                    col_start: Some(2),
+                    col_span: 1,
+                    row_start: None,
+                    row_span: 1,
+                },
+            )
+            .unwrap();
+        atlas.set_root(grid).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+
+        let a_rect = atlas.resolved_rect(a).unwrap().unwrap();
+        assert_f32_eq(a_rect.x, 100.0);
     }
 
     #[test]

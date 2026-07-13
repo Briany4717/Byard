@@ -182,6 +182,15 @@ pub enum CompileError {
         /// The shape command name.
         name: String,
     },
+    /// A `Grid` `columns:`/`rows:` template string could not be parsed
+    /// (RFC-0018). Accepted tracks are `Nfr` (flexible), a bare number (fixed
+    /// px), `auto`, and `repeat(N, <track>)`.
+    InvalidGridTemplate {
+        /// Source range of the template attribute.
+        span: Span,
+        /// The offending template string.
+        template: String,
+    },
     /// A `Canvas` child is not a recognized shape command (RFC-0020 §1:
     /// `Canvas` children are shape commands only — intrinsics, user views,
     /// declarations, and control flow are all rejected).
@@ -501,6 +510,7 @@ impl CompileError {
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
             | Self::ShapeOutsideCanvas { span, .. }
+            | Self::InvalidGridTemplate { span, .. }
             | Self::UnknownShapeCommand { span, .. }
             | Self::UnknownShapeParam { span, .. }
             | Self::MissingShapeParam { span, .. }
@@ -558,6 +568,7 @@ impl CompileError {
             | Self::AttributeTypeMismatch { span, .. }
             | Self::UnexpectedChildren { span, .. }
             | Self::ShapeOutsideCanvas { span, .. }
+            | Self::InvalidGridTemplate { span, .. }
             | Self::UnknownShapeCommand { span, .. }
             | Self::UnknownShapeParam { span, .. }
             | Self::MissingShapeParam { span, .. }
@@ -617,6 +628,7 @@ impl CompileError {
             Self::AttributeTypeMismatch { .. } => "AttributeTypeMismatch",
             Self::UnexpectedChildren { .. } => "UnexpectedChildren",
             Self::ShapeOutsideCanvas { .. } => "ShapeOutsideCanvas",
+            Self::InvalidGridTemplate { .. } => "InvalidGridTemplate",
             Self::UnknownShapeCommand { .. } => "UnknownShapeCommand",
             Self::UnknownShapeParam { .. } => "UnknownShapeParam",
             Self::MissingShapeParam { .. } => "MissingShapeParam",
@@ -711,6 +723,12 @@ impl CompileError {
             }
             Self::ShapeOutsideCanvas { name, .. } => {
                 format!("shape command `{name}` is only valid inside a `Canvas` body")
+            }
+            Self::InvalidGridTemplate { template, .. } => {
+                format!(
+                    "`{template}` is not a valid grid template; use `Nfr`, a number \
+                     (px), `auto`, or `repeat(N, <track>)` separated by spaces"
+                )
             }
             Self::UnknownShapeCommand { name, hint, .. } => with_hint(
                 format!(
