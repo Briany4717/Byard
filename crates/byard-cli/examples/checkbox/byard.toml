@@ -1,0 +1,3 @@
+[project]
+name = "checkbox"
+entry = "src/main.byd"

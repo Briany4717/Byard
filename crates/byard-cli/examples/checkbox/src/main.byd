@@ -1,0 +1,53 @@
+// RFC-0018 — the `Checkbox` intrinsic.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/checkbox
+//   cargo run -p byard-cli -- dev
+//
+// What to verify visually:
+//   1. Each row's box is a rounded square: an empty 2px ring when unchecked,
+//      a filled accent square with a crisp white checkmark when checked.
+//   2. Click a box (or Tab to it and press Space) — it flips, and the live
+//      status line below reacts (Mark-and-Pull), with no manual wiring.
+//   3. The top box is a standalone sample of the `indeterminate` mixed state:
+//      a filled square with a single horizontal dash instead of a check.
+//   4. The `bg:` on the Wi-Fi row is the *checked* colour, not a slab painted
+//      behind the box (parity with Toggle/Slider).
+View Main() {
+    var wifi = true
+    var bluetooth = false
+    var location = false
+
+    Column #[bg: 0x14141C, p: 32, gap: 18, width: 380] {
+        Text("Checkbox — RFC-0018") #[color: 0xE6E1E5, size: 20]
+
+        // A standalone sample of the mixed ("indeterminate") visual state.
+        // No `bind:`, so it is a display sample rather than a control.
+        Row #[gap: 12, align: center] {
+            Checkbox #[indeterminate: true, bg: 0xD0BCFF, width: 22, height: 22]
+            Text("Mixed state (sample)") #[color: 0x938F99, size: 14]
+        }
+
+        Row #[gap: 12, align: center] {
+            Checkbox #[bind: wifi, bg: 0x7DD3A8, width: 22, height: 22]
+            Text("Wi-Fi") #[color: 0xCAC4D0, size: 16]
+        }
+        Row #[gap: 12, align: center] {
+            Checkbox #[bind: bluetooth, width: 22, height: 22]
+            Text("Bluetooth") #[color: 0xCAC4D0, size: 16]
+        }
+        Row #[gap: 12, align: center] {
+            Checkbox #[bind: location, width: 22, height: 22]
+            Text("Location") #[color: 0xCAC4D0, size: 16]
+        }
+
+        // Reactive status: a live `when` re-derives the line each frame.
+        when wifi {
+            Text("Wi-Fi is ON — tap the green box to turn it off")
+                #[color: 0x7DD3A8, size: 13]
+        } else {
+            Text("Wi-Fi is OFF — tap the green box to turn it on")
+                #[color: 0x938F99, size: 13]
+        }
+    }
+}
