@@ -26,6 +26,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "TextField",
     "Toggle",
     "Slider",
+    "Checkbox",
     "Image",
     "ScrollView",
     "VectorIcon",
@@ -317,6 +318,29 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
             props.insert("value", PropType::Float);
             props.insert("bind", PropType::Float);
+            props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: false,
+                focusable: true,
+                interactive: true,
+                props,
+                events: events_from(true, &["change"]),
+            }
+        }
+        // RFC-0018: `Checkbox` — a boolean toggle with a distinct square
+        // identity from `Toggle`. Reflected two-way `value: Bool` (or `bind:`);
+        // `true` = checked. `indeterminate: Bool` renders the mixed-state dash.
+        // Focusable by default (Space toggles). Fires `change` on flip. Owns its
+        // visuals (square container + engine-drawn checkmark), so `bg` is the
+        // checked accent, not a full-rect slab — mirrors `Toggle`'s model.
+        "Checkbox" => {
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            props.insert("value", PropType::Bool);
+            props.insert("bind", PropType::Bool);
+            props.insert("indeterminate", PropType::Bool);
             props.insert("focused", PropType::Bool);
             props.insert("disabled", PropType::Bool);
             Intrinsic {
@@ -1323,6 +1347,45 @@ mod tests {
         // `dismiss` with `:` instead of `=>` is a separator error (it's an event).
         assert!(
             errs("View V() { Overlay #[dismiss: 1] { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
+        );
+    }
+
+    #[test]
+    fn checkbox_validates_as_a_focusable_bool_widget() {
+        // Valid: `value` (Bool) with the mixed-state flag and a `change` event.
+        assert!(errs("View V() { Checkbox #[value: false, indeterminate: true] }").is_empty());
+        assert!(errs("View V() { Checkbox #[value: true, change => f()] }").is_empty());
+        // Focusable by default → key events are in-vocabulary.
+        assert!(errs("View V() { Checkbox #[value: false, key_down => f()] }").is_empty());
+        // `value` must be a Bool: a string is a type mismatch.
+        assert!(
+            errs("View V() { Checkbox #[value: \"x\"] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::AttributeTypeMismatch { .. }))
+        );
+        // Content args are rejected (arity 0).
+        assert!(
+            errs("View V() { Checkbox(\"x\") }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 0, .. }))
+        );
+        // Children are rejected (childless).
+        assert!(
+            errs("View V() { Checkbox { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnexpectedChildren { .. }))
+        );
+        // A stray prop → UnknownAttribute.
+        assert!(
+            errs("View V() { Checkbox #[selected: true] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
+        // `change` is an event, so `:` instead of `=>` is a separator error.
+        assert!(
+            errs("View V() { Checkbox #[change: 1] }")
                 .iter()
                 .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
         );
