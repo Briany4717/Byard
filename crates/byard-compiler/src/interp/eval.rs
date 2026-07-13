@@ -508,6 +508,16 @@ pub struct Interpreter {
     /// pointer press lands on inert `ScrollView` content; each move writes the
     /// offset so the content tracks the pointer; cleared on release.
     scroll_drag: Option<ScrollDrag>,
+    /// RFC-0018 `RadioButton` groups: the ordered `value`s of every radio sharing
+    /// a `bind:` group var, keyed by that var's [`SignalId`]. Rebuilt each render
+    /// (cleared at the top of [`render`](Self::render), appended as each radio is
+    /// painted, in declaration order). Each group's ordering is shared into that
+    /// group's radios' arrow-key handlers via a cheap `Rc` clone, so the handlers
+    /// — which fire *after* the full render has populated the vector — can move
+    /// selection to the next/previous value with wrap-around (WAI-ARIA radio
+    /// group pattern). `Rc`/`RefCell` are sound here: the interpreter and its
+    /// event closures are single-threaded logic-thread state (`!Send`).
+    radio_groups: std::collections::HashMap<SignalId, std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
 }
 
 /// One axis of a live [`ScrollDrag`]: the signal to write and its value at the
@@ -1180,6 +1190,28 @@ impl Interpreter {
         None
     }
 
+    /// Resolves *only* the `bind:` attribute of a `RadioButton` (RFC-0018) to the
+    /// group `var`'s `SignalId`. Unlike [`resolve_bind_sig`], it never inspects
+    /// `value:` — for a radio, `value` is the button's literal identity string,
+    /// not a signal binding. Returns `None` if `bind:` is absent or doesn't name
+    /// a `var`.
+    fn resolve_group_bind_sig(&self, attrs: &[Attr]) -> Option<super::env::SignalId> {
+        use crate::parser::ast::Expr;
+        for attr in attrs {
+            if attr.name.as_str() == "bind" {
+                if let AttrKind::Prop {
+                    value: Expr::Ident(name, _),
+                } = &attr.kind
+                {
+                    if let Some(super::env::Value::Signal(sig)) = self.env.lookup(name) {
+                        return Some(*sig);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The signals backing a `ScrollView`'s `offset.x` and `offset.y` (RFC-0005),
     /// each present when that tuple component is a writable `var` — e.g.
     /// `offset: (panX, scrollY)` yields both, `offset: (0, scrollY)` only the y.
@@ -1396,6 +1428,22 @@ impl Interpreter {
             // square-plus-checkmark visual and flips on tap/Space.
             "Toggle" | "Slider" | "TextField" | "Checkbox" => {
                 let bound_sig = self.resolve_bind_sig(&attrs);
+                RenderNode::Box {
+                    name: el.name.clone(),
+                    attrs,
+                    state_blocks,
+                    children: Vec::new(),
+                    action: el.action.clone(),
+                    bound_sig,
+                    env_snapshot: self.capture_env_snapshot(),
+                }
+            }
+            // RFC-0018 `RadioButton`: like the value widgets, but its `value:` is a
+            // literal identity (a `Str`), not a bound signal — only `bind:` names
+            // the shared group `var`. Resolve *just* `bind` to the group signal;
+            // `value` is read from the attrs at render time.
+            "RadioButton" => {
+                let bound_sig = self.resolve_group_bind_sig(&attrs);
                 RenderNode::Box {
                     name: el.name.clone(),
                     attrs,
@@ -1718,6 +1766,8 @@ impl Interpreter {
         // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
         // router's hit rects.
         self.scroll_targets.clear();
+        // RFC-0018 radio groups are rebuilt from the fresh layout each render.
+        self.radio_groups.clear();
 
         // Drain any MSDF generations that finished since the last tick,
         // before the tree walk below, so a freshly-resident glyph is visible
@@ -2733,6 +2783,14 @@ impl Interpreter {
                         flat_ids.push(id);
                         return Ok(id);
                     }
+                    // RFC-0018 RadioButton: a 20×20 circle by default.
+                    "RadioButton" => {
+                        let w = self.eval_int_prop(attrs, "width").unwrap_or(20) as f32;
+                        let h = self.eval_int_prop(attrs, "height").unwrap_or(20) as f32;
+                        let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                        flat_ids.push(id);
+                        return Ok(id);
+                    }
                     "TextField" => {
                         let w = self.eval_int_prop(attrs, "width").unwrap_or(200) as f32;
                         let h = self.eval_int_prop(attrs, "height").unwrap_or(36) as f32;
@@ -3061,7 +3119,10 @@ impl Interpreter {
                     // `Toggle`/`Slider` own their visuals (track/fill/thumb) and
                     // treat `bg` as the *accent* colour, not a full-rect fill —
                     // painting the rect here would draw a slab behind the control.
-                    let owns_visuals = matches!(name.as_str(), "Toggle" | "Slider" | "Checkbox");
+                    let owns_visuals = matches!(
+                        name.as_str(),
+                        "Toggle" | "Slider" | "Checkbox" | "RadioButton"
+                    );
                     if let (false, Some(color)) = (owns_visuals, bg) {
                         let base = byard_core::BoxInstance {
                             rect: [rect.x, rect.y, rect.width, rect.height],
@@ -3170,6 +3231,18 @@ impl Interpreter {
                                 frame,
                             );
                         }
+                        "RadioButton" => {
+                            self.render_radio(
+                                *bound_sig,
+                                attrs,
+                                current_rect,
+                                hit_rect,
+                                elem_idx,
+                                transform,
+                                opacity,
+                                frame,
+                            );
+                        }
                         "TextField" => {
                             self.render_text_field(
                                 *bound_sig,
@@ -3212,10 +3285,11 @@ impl Interpreter {
                     }
 
                     // ── `focused:` reflected prop → register as focusable (M16/M18) ──
-                    // TextField and Checkbox register their own focusable inside
-                    // their render fns (they are focusable *by default*, RFC-0018),
-                    // so exclude them here to avoid double-registration.
-                    if !matches!(element_name, "TextField" | "Checkbox") {
+                    // TextField, Checkbox, and RadioButton register their own
+                    // focusable inside their render fns (they are focusable *by
+                    // default*, RFC-0018), so exclude them here to avoid
+                    // double-registration.
+                    if !matches!(element_name, "TextField" | "Checkbox" | "RadioButton") {
                         self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
@@ -3731,6 +3805,148 @@ impl Interpreter {
 
             // Focus target so Tab and click reach the box. Uses the element's own
             // `focused:` var when given, else a private signal for the registry.
+            let focused_sig = self.resolve_focused_sig(attrs);
+            let fsig = focused_sig.unwrap_or_else(|| self.ctx.create_signal(Value::Bool(false)));
+            self.router.focusable(idx, hit_rect, fsig);
+        }
+    }
+
+    /// Renders a `RadioButton` widget (RFC-0018): an outer ring plus an inner
+    /// filled dot when selected. Selection is `bind == value`: the bound group
+    /// `var`'s current string equals this button's `value`. Tapping writes this
+    /// button's `value` to the group var, so the previously selected sibling
+    /// deselects reactively (automatic mutual exclusion — every radio in the
+    /// group reads the same var). Registers the group ordering for arrow-key
+    /// navigation, a Tap handler, arrow KeyDown handlers (move selection within
+    /// the group, wrapping), a `change` write-back (RFC-0003 E1), and a focus
+    /// target so Tab/click reach it. Owns its visuals — `bg` is the selected
+    /// accent. The ring is the radio's defining affordance (unlike `Checkbox`,
+    /// whose square border was dropped); its interior is transparent so the dot
+    /// shows through and it composes over any background.
+    #[allow(clippy::too_many_arguments)]
+    fn render_radio(
+        &mut self,
+        bound_sig: Option<super::env::SignalId>,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        hit_rect: crate::interp::intrinsics::Rect,
+        elem_idx: Option<u32>,
+        transform: byard_core::frame::Transform,
+        opacity: f32,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        let value = self.eval_str_prop(attrs, "value").unwrap_or_default();
+        let selected = bound_sig.is_some_and(|s| match self.ctx.peek_signal(s) {
+            Value::Str(v) => v == value,
+            _ => false,
+        });
+
+        // A radio is circular: use the smaller side, centred in the laid-out box.
+        let side = rect.w.min(rect.h);
+        let ox = rect.x + (rect.w - side) / 2.0;
+        let oy = rect.y + (rect.h - side) / 2.0;
+        let r = side / 2.0;
+
+        let accent = self
+            .eval_color_prop(attrs, "bg")
+            .unwrap_or(self.theme.primary());
+        let accent_rgba = super::intrinsics::color_to_rgba(accent, false);
+        let ring_color = if selected {
+            accent_rgba
+        } else {
+            [0.55, 0.57, 0.62, 1.0]
+        };
+
+        // Inner dot FIRST (solid pipeline) so it sits beneath the ring; the ring's
+        // interior is transparent, so the dot shows through regardless. Only drawn
+        // when selected.
+        if selected {
+            let dot = side * 0.5;
+            let inset = (side - dot) / 2.0;
+            frame.push_instance(byard_core::BoxInstance {
+                rect: [ox + inset, oy + inset, dot, dot],
+                color: dim_alpha(accent_rgba, opacity),
+                radii: [dot / 2.0; 4],
+                transform,
+            });
+        }
+
+        // Outer ring: a transparent-interior DecoratedBox with a full-radius
+        // border. Width scales with size so it reads as a ring, not a hairline.
+        let ring_w = (side * 0.12).max(2.0);
+        frame.push_decorated(byard_core::frame::DecoratedBox {
+            base: byard_core::BoxInstance {
+                rect: [ox, oy, side, side],
+                color: [0.0; 4],
+                radii: [r; 4],
+                transform,
+            },
+            border_width: ring_w,
+            border_color: dim_alpha(ring_color, opacity),
+            dirty: true,
+            ..Default::default()
+        });
+
+        // ── Group registration + handlers ────────────────────────────────────
+        if let (Some(sig), Some(idx)) = (bound_sig, elem_idx) {
+            // Record this button's value in its group's ordered list (shared via
+            // an Rc so the arrow handlers below see the whole group once the
+            // render has finished populating it).
+            let group = self.radio_groups.entry(sig).or_default().clone();
+            group.borrow_mut().push(value.clone());
+
+            // Tap → select this button (write its value to the group var).
+            let val = value.clone();
+            let select: super::events::Action = Box::new(move |ctx, _| {
+                ctx.write_signal(sig, Value::Str(val.clone()));
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::Tap, select);
+
+            // Arrow keys → move selection to the next/previous value in the group,
+            // wrapping at both ends (WAI-ARIA radio group). Down/Right advance;
+            // Up/Left retreat.
+            let grp = group.clone();
+            let arrows: super::events::Action = Box::new(move |ctx, payload| {
+                let Some(Value::Str(key)) = payload else {
+                    return;
+                };
+                let forward = match key.as_str() {
+                    "ArrowDown" | "ArrowRight" => true,
+                    "ArrowUp" | "ArrowLeft" => false,
+                    _ => return,
+                };
+                let vals = grp.borrow();
+                let n = vals.len();
+                if n == 0 {
+                    return;
+                }
+                let cur = match ctx.peek_signal(sig) {
+                    Value::Str(s) => s,
+                    _ => String::new(),
+                };
+                let here = vals.iter().position(|v| *v == cur).unwrap_or(0);
+                // Wrap-around in unsigned arithmetic (no signed casts): forward is
+                // `+1`, backward is `+ (n − 1)`, both mod `n`.
+                let next = if forward {
+                    (here + 1) % n
+                } else {
+                    (here + n - 1) % n
+                };
+                ctx.write_signal(sig, Value::Str(vals[next].clone()));
+            });
+            self.router
+                .on(idx, hit_rect, super::events::EventKind::KeyDown, arrows);
+
+            // Change write-back from the platform (RFC-0003 E1).
+            self.router.on(
+                idx,
+                hit_rect,
+                super::events::EventKind::Change,
+                super::events::write_back_action(sig),
+            );
+
+            // Focus target so Tab and click reach the button.
             let focused_sig = self.resolve_focused_sig(attrs);
             let fsig = focused_sig.unwrap_or_else(|| self.ctx.create_signal(Value::Bool(false)));
             self.router.focusable(idx, hit_rect, fsig);
@@ -8896,6 +9112,192 @@ mod tests {
             interp.peek(sig),
             Value::Bool(true),
             "Space toggled the focused checkbox"
+        );
+    }
+
+    // ── RFC-0018: RadioButton ─────────────────────────────────────────────
+
+    #[test]
+    fn unselected_radio_is_a_ring_only() {
+        // `choice != value` → the ring only, no inner dot.
+        let frame = checkbox_frame(
+            "View C() {\n var choice = \"work\"\n RadioButton #[value: \"home\", bind: choice]\n}",
+        );
+        assert_eq!(frame.instances().len(), 0, "no inner dot when unselected");
+        assert_eq!(frame.decorated().len(), 1, "just the outer ring");
+        assert!(
+            frame.decorated()[0].border_width > 0.0,
+            "the ring is a bordered decorated box"
+        );
+        assert_eq!(
+            frame.decorated()[0].base.color[3],
+            0.0,
+            "the ring interior is transparent"
+        );
+    }
+
+    #[test]
+    fn selected_radio_draws_ring_plus_inner_dot() {
+        // `choice == value` → the ring plus a filled inner dot.
+        let frame = checkbox_frame(
+            "View C() {\n var choice = \"home\"\n RadioButton #[value: \"home\", bind: choice]\n}",
+        );
+        assert_eq!(frame.decorated().len(), 1, "the outer ring");
+        assert_eq!(frame.instances().len(), 1, "the inner dot");
+        assert!(
+            frame.instances()[0].color[3] > 0.0,
+            "the dot has an opaque accent fill"
+        );
+    }
+
+    #[test]
+    fn radio_tap_selects_its_value() {
+        let parsed = parse(
+            "View C() {\n var choice = \"home\"\n RadioButton #[value: \"work\", bind: choice]\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("choice"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (5.0, 5.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 50,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(sig),
+            Value::Str("work".to_string()),
+            "tapping the radio wrote its value to the group var"
+        );
+    }
+
+    #[test]
+    fn radio_group_is_mutually_exclusive_via_the_shared_var() {
+        // Two radios on one `var`: tapping the second selects it, which
+        // deselects the first (they read the same var — no explicit exclusion).
+        let parsed = parse(
+            "View C() {\n var choice = \"home\"\n \
+             Column #[gap: 40] {\n \
+               RadioButton #[value: \"home\", bind: choice, width: 44, height: 44]\n \
+               RadioButton #[value: \"work\", bind: choice, width: 44, height: 44]\n \
+             }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("choice"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // Tap the SECOND radio (below the first, gap 40 keeps hit rects apart).
+        interp.dispatch_events(&[
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerDown,
+                pos: (20.0, 106.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 0,
+            },
+            byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::PointerUp,
+                pos: (20.0, 106.0),
+                delta: (0.0, 0.0),
+                payload: None,
+                time_ms: 50,
+            },
+        ]);
+        interp.tick();
+        assert_eq!(
+            interp.peek(sig),
+            Value::Str("work".to_string()),
+            "the group var now holds the second radio's value"
+        );
+    }
+
+    #[test]
+    fn radio_arrow_keys_move_selection_with_wrap() {
+        let parsed = parse(
+            "View C() {\n var choice = \"home\"\n \
+             Column #[gap: 40] {\n \
+               RadioButton #[value: \"home\", bind: choice, width: 44, height: 44]\n \
+               RadioButton #[value: \"work\", bind: choice, width: 44, height: 44]\n \
+               RadioButton #[value: \"other\", bind: choice, width: 44, height: 44]\n \
+             }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let sig = interp
+            .var_signal(&crate::symbol::Symbol::intern("choice"))
+            .unwrap();
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+
+        // Focus the FIRST radio with a press (no release → no tap, so `choice`
+        // stays "home").
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: byard_core::platform::EventKind::PointerDown,
+            pos: (20.0, 20.0),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        interp.tick();
+        assert_eq!(interp.peek(sig), Value::Str("home".to_string()));
+
+        // A helper: re-render (repopulates the group ordering + handlers), press
+        // the arrow, tick, and read back the group var.
+        let press = |interp: &mut Interpreter, key: &str| -> String {
+            let mut f = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut f, 400.0, 300.0);
+            interp.dispatch_events(&[byard_core::platform::InputEvent {
+                kind: byard_core::platform::EventKind::KeyDown,
+                pos: (0.0, 0.0),
+                delta: (0.0, 0.0),
+                payload: Some(byard_core::platform::InputPayload::Key(key.to_string())),
+                time_ms: 10,
+            }]);
+            interp.tick();
+            match interp.peek(sig) {
+                Value::Str(s) => s,
+                other => panic!("expected Str, got {other:?}"),
+            }
+        };
+
+        assert_eq!(press(&mut interp, "ArrowDown"), "work", "home → work");
+        assert_eq!(press(&mut interp, "ArrowDown"), "other", "work → other");
+        assert_eq!(
+            press(&mut interp, "ArrowDown"),
+            "home",
+            "other → home (forward wrap)"
+        );
+        assert_eq!(
+            press(&mut interp, "ArrowUp"),
+            "other",
+            "home → other (backward wrap)"
         );
     }
 

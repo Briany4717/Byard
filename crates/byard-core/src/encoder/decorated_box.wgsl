@@ -141,9 +141,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let edge_softness = max(length(vec2<f32>(dpdx(fdist), dpdy(fdist))), 1e-5);
     let fill_cov = smoothstep(edge_softness, 0.0, fdist);
 
+    // The border occupies the band `-border_width < fdist < 0` (inside the outer
+    // edge). Blend interior→border across the *inner* edge with the same
+    // screen-space `edge_softness` used for the outer edge, so both edges of the
+    // ring are SDF-anti-aliased — a hard `fdist > -border_width` test left the
+    // inner edge jagged (visible on thin rings like `RadioButton`).
     var surface = in.color;
-    if (border_width > 0.0 && fdist > -border_width) {
-        surface = in.border_color;
+    if (border_width > 0.0) {
+        let border_cov = smoothstep(
+            -border_width - edge_softness,
+            -border_width + edge_softness,
+            fdist,
+        );
+        surface = mix(in.color, in.border_color, border_cov);
     }
 
     let a_top = fill_cov * surface.a;

@@ -1,0 +1,39 @@
+// RFC-0018 — the `RadioButton` intrinsic.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/radio_button
+//   cargo run -p byard-cli -- dev
+//
+// What to verify visually:
+//   1. Each option is a ring; the selected one adds a filled inner dot in the
+//      accent colour. Exactly one option is selected at a time.
+//   2. Click a different option — it selects, the previous one deselects
+//      automatically (they all `bind:` the same `plan` var, so mutual exclusion
+//      is reactive, no manual wiring).
+//   3. Click a radio to focus it, then press the arrow keys — Down/Right move
+//      selection to the next option, Up/Left to the previous, wrapping at both
+//      ends (WAI-ARIA radio-group pattern).
+//   4. The "Selected: …" line tracks the choice reactively.
+//   5. The `bg:` on the Pro row is the selected accent (ring + dot), not a slab.
+View Main() {
+    var plan = "pro"
+
+    Column #[bg: 0x14141C, p: 32, gap: 16, width: 340] {
+        Text("Choose a plan") #[color: 0xE6E1E5, size: 20]
+
+        Row #[gap: 12, align: center] {
+            RadioButton #[value: "free", bind: plan, width: 22, height: 22]
+            Text("Free") #[color: 0xCAC4D0, size: 16]
+        }
+        Row #[gap: 12, align: center] {
+            RadioButton #[value: "pro", bind: plan, bg: 0xD0BCFF, width: 22, height: 22]
+            Text("Pro") #[color: 0xCAC4D0, size: 16]
+        }
+        Row #[gap: 12, align: center] {
+            RadioButton #[value: "team", bind: plan, width: 22, height: 22]
+            Text("Team") #[color: 0xCAC4D0, size: 16]
+        }
+
+        Text("Selected: {plan}") #[color: 0x938F99, size: 13]
+    }
+}
