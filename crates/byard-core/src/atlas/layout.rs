@@ -3,7 +3,7 @@
 //! See the module-level documentation in [`super`] for the design intent
 //! and lifecycle contract.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -128,6 +128,25 @@ pub struct GridItemPlacement {
     pub row_start: Option<i16>,
     /// Number of rows to span (≥ 1).
     pub row_span: u16,
+}
+
+/// A wrapping `Text` leaf (RFC-0005 default wrap). The atlas sizes it through a
+/// [`TextSizer`](crate::text::TextSizer) callback **during** layout, so it
+/// reflows to the width its parent offers instead of being pinned to a fixed
+/// size measured up front. `width` fixes the wrap width when the `Text` carries
+/// an explicit `width`; otherwise the leaf's width is `auto` and it wraps to the
+/// available width. `fallback` is the natural single-line size, used only when
+/// `compute` is called without a sizer (e.g. layout-only unit tests).
+#[derive(Debug, Clone)]
+pub struct TextLeaf {
+    /// The string to shape.
+    pub content: String,
+    /// Font size in logical pixels.
+    pub font_size: f32,
+    /// Fixed wrap width in logical px, or `None` to wrap to the available width.
+    pub width: Option<f32>,
+    /// Natural single-line `(width, height)` fallback.
+    pub fallback: (f32, f32),
 }
 
 /// 2-D alignment of a `ZStack`'s children within the stack rect (RFC-0018
@@ -572,6 +591,11 @@ pub struct LayoutAtlas {
     /// atlas produces so a foreign id can be rejected in `O(1)`.
     instance_id: u32,
     parents: rustc_hash::FxHashMap<NodeId, NodeId>,
+    /// Wrapping-`Text` leaves (RFC-0005 default wrap), keyed by their Taffy node.
+    /// The measure closure in [`compute`](Self::compute) looks a leaf up here to
+    /// shape it to the width the parent offers. Rebuilt each view (cleared on
+    /// [`clear()`](Self::clear)).
+    text_specs: HashMap<NodeId, TextLeaf>,
 }
 
 impl LayoutAtlas {
@@ -588,6 +612,7 @@ impl LayoutAtlas {
             current_generation: 0,
             instance_id: Self::next_instance_id(),
             parents: rustc_hash::FxHashMap::default(),
+            text_specs: HashMap::new(),
         }
     }
 
@@ -642,6 +667,7 @@ impl LayoutAtlas {
         self.grid.clear();
         self.nodes_by_index.clear();
         self.parents.clear();
+        self.text_specs.clear();
         self.current_generation = self.current_generation.wrapping_add(1);
     }
 
@@ -677,6 +703,44 @@ impl LayoutAtlas {
             node_id: node,
             atlas_id: self.instance_id,
         };
+        self.nodes_by_index.push(id);
+        Ok(id)
+    }
+
+    /// Adds a **wrapping `Text` leaf** (RFC-0005 default wrap): a leaf whose size
+    /// is resolved by the [`TextSizer`](crate::text::TextSizer) callback during
+    /// [`compute`](Self::compute), so it reflows to the width its parent offers.
+    /// A `spec.width` of `Some` fixes the wrap width (an explicit `Text` width);
+    /// `None` leaves the width `auto` and wraps to the available space.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is in the `Computed` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if the backend refuses the node.
+    pub fn add_text_leaf(&mut self, spec: TextLeaf) -> Result<AtlasNodeId, AtlasError> {
+        self.assert_building("add_text_leaf");
+
+        let style = Style {
+            size: Size {
+                width: spec.width.map_or(Dimension::auto(), Dimension::from_length),
+                height: Dimension::auto(),
+            },
+            ..Default::default()
+        };
+
+        let next_index = self.next_target_index();
+        let node = self
+            .tree
+            .new_leaf_with_context(style, next_index)
+            .map_err(|e| AtlasError::from_taffy(&e))?;
+        let id = AtlasNodeId {
+            node_id: node,
+            atlas_id: self.instance_id,
+        };
+        self.text_specs.insert(node, spec);
         self.nodes_by_index.push(id);
         Ok(id)
     }
@@ -1018,6 +1082,36 @@ impl LayoutAtlas {
     ///
     /// Returns [`AtlasError::Backend`] if layout computation fails.
     pub fn compute(&mut self, viewport: Viewport) -> Result<(), AtlasError> {
+        self.compute_inner(viewport, None)
+    }
+
+    /// Like [`compute`](Self::compute), but drives wrapping-`Text` leaves through
+    /// `sizer` so they reflow to the width their parent offers (RFC-0005 default
+    /// wrap). The interpreter passes its shared [`TextMeasurer`] here; the cache
+    /// on the measurer means an unchanged string re-shapes nothing across ticks.
+    ///
+    /// [`TextMeasurer`]: crate::text::TextMeasurer
+    ///
+    /// # Panics
+    ///
+    /// Panics if the atlas is not in the `Building` state, or has no root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtlasError::Backend`] if layout computation fails.
+    pub fn compute_with_text(
+        &mut self,
+        viewport: Viewport,
+        sizer: &mut dyn crate::text::TextSizer,
+    ) -> Result<(), AtlasError> {
+        self.compute_inner(viewport, Some(sizer))
+    }
+
+    fn compute_inner(
+        &mut self,
+        viewport: Viewport,
+        sizer: Option<&mut dyn crate::text::TextSizer>,
+    ) -> Result<(), AtlasError> {
         self.assert_building("compute");
 
         let root = self
@@ -1029,12 +1123,53 @@ impl LayoutAtlas {
             height: AvailableSpace::Definite(viewport.height),
         };
 
-        self.tree
-            .compute_layout(root.node_id, available)
-            .map_err(|e| AtlasError::from_taffy(&e))?;
+        self.run_layout(root.node_id, available, sizer)?;
         self.state = AtlasState::Computed;
         self.rebuild_grid();
         Ok(())
+    }
+
+    /// Runs Taffy layout, using the measure protocol only when there are
+    /// wrapping-`Text` leaves (the common no-text tree keeps the cheaper
+    /// `compute_layout` fast path). Shared by the initial and incremental passes.
+    fn run_layout(
+        &mut self,
+        root: NodeId,
+        available: Size<AvailableSpace>,
+        sizer: Option<&mut dyn crate::text::TextSizer>,
+    ) -> Result<(), AtlasError> {
+        if self.text_specs.is_empty() {
+            return self
+                .tree
+                .compute_layout(root, available)
+                .map_err(|e| AtlasError::from_taffy(&e));
+        }
+        // Split the borrow so the measure closure can read `text_specs` while
+        // Taffy holds `tree` mutably. The sizer is captured as a plain `&mut dyn`
+        // (reborrowed per call), not an `Option<&mut>`, whose invariance would
+        // make the reborrow escape the `FnMut` body.
+        let tree = &mut self.tree;
+        let specs = &self.text_specs;
+        match sizer {
+            Some(sizer) => tree
+                .compute_layout_with_measure(
+                    root,
+                    available,
+                    |known, avail, node_id, _ctx, _style| {
+                        measure_text_node(specs, Some(&mut *sizer), node_id, known, avail)
+                    },
+                )
+                .map_err(|e| AtlasError::from_taffy(&e)),
+            None => tree
+                .compute_layout_with_measure(
+                    root,
+                    available,
+                    |known, avail, node_id, _ctx, _style| {
+                        measure_text_node(specs, None, node_id, known, avail)
+                    },
+                )
+                .map_err(|e| AtlasError::from_taffy(&e)),
+        }
     }
 
     /// Returns the resolved rectangle for `node`.
@@ -1410,12 +1545,43 @@ impl LayoutAtlas {
             height: AvailableSpace::Definite(viewport.height),
         };
 
-        self.tree
-            .compute_layout(root.node_id, available)
-            .map_err(|e| AtlasError::from_taffy(&e))?;
+        // No sizer on the incremental path (the interpreter does its wrapping
+        // pass via `compute_with_text`); wrapping-`Text` leaves fall back to
+        // their natural single-line size here.
+        self.run_layout(root.node_id, available, None)?;
         self.rebuild_grid();
         Ok(())
     }
+}
+
+/// The Taffy measure callback for one leaf (RFC-0005 default wrap): a wrapping
+/// `Text` leaf shapes itself to the offered width, everything else reports its
+/// already-known size. `known.width` (a fixed/stretched width) wins; otherwise a
+/// `Definite` available width is the wrap target, `MaxContent` is the natural
+/// single line, and `MinContent` wraps as narrow as possible.
+fn measure_text_node(
+    specs: &HashMap<NodeId, TextLeaf>,
+    sizer: Option<&mut dyn crate::text::TextSizer>,
+    node_id: NodeId,
+    known: Size<Option<f32>>,
+    avail: Size<AvailableSpace>,
+) -> Size<f32> {
+    let Some(spec) = specs.get(&node_id) else {
+        return Size {
+            width: known.width.unwrap_or(0.0),
+            height: known.height.unwrap_or(0.0),
+        };
+    };
+    let wrap_w = known.width.or(match avail.width {
+        AvailableSpace::Definite(w) => Some(w),
+        AvailableSpace::MaxContent => None,
+        AvailableSpace::MinContent => Some(0.0),
+    });
+    let (width, height) = match sizer {
+        Some(s) => s.measure(&spec.content, spec.font_size, wrap_w),
+        None => spec.fallback,
+    };
+    Size { width, height }
 }
 
 impl Default for LayoutAtlas {
@@ -1808,6 +1974,81 @@ mod tests {
         let small_rect = atlas.resolved_rect(small).unwrap().unwrap();
         assert_f32_eq(small_rect.x, 80.0); // right edge: 100 − 20
         assert_f32_eq(small_rect.y, 0.0); // top
+    }
+
+    /// A deterministic stand-in for the real glyph shaper: width is
+    /// `chars × font_size/2`, wrapped to `max_width` by stacking whole "lines".
+    struct StubSizer;
+    impl crate::text::TextSizer for StubSizer {
+        fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
+            let line_h = font_size * 1.2;
+            #[allow(clippy::cast_precision_loss)]
+            let natural = text.chars().count() as f32 * font_size * 0.5;
+            match max_width {
+                Some(w) if w > 0.0 && natural > w => (w, (natural / w).ceil() * line_h),
+                _ => (natural, line_h),
+            }
+        }
+    }
+
+    #[test]
+    fn text_leaf_wraps_to_parent_width() {
+        // RFC-0005 default wrap: a text leaf with no explicit width reflows to the
+        // width its (100px) parent offers, growing taller instead of overflowing.
+        let mut atlas = LayoutAtlas::new();
+        let text = atlas
+            .add_text_leaf(TextLeaf {
+                content: "abcdefghijklmnopqrst".to_string(), // 20 chars → ~200px natural
+                font_size: 20.0,
+                width: None,
+                fallback: (200.0, 24.0),
+            })
+            .unwrap();
+        // A **column** (cross axis = width): align-items stretch constrains the
+        // text to the column width, so it wraps. (A row would leave width as the
+        // main axis and the text would take its natural width and overflow.)
+        let col = atlas
+            .add_container(
+                ContainerStyle::new(Some(100.0), Some(200.0)).with_direction(FlexDir::Column),
+                &[text],
+            )
+            .unwrap();
+        atlas.set_root(col).unwrap();
+        let mut sizer = StubSizer;
+        atlas
+            .compute_with_text(Viewport::new(800.0, 600.0), &mut sizer)
+            .unwrap();
+
+        let r = atlas.resolved_rect(text).unwrap().unwrap();
+        assert!(
+            r.width <= 100.5,
+            "wrapped to the column width, got {}",
+            r.width
+        );
+        assert!(
+            r.height > 24.0,
+            "wrapped onto multiple lines, got {}",
+            r.height
+        );
+    }
+
+    #[test]
+    fn text_leaf_without_sizer_uses_fallback() {
+        // `compute` (no sizer) falls back to the natural single-line size.
+        let mut atlas = LayoutAtlas::new();
+        let text = atlas
+            .add_text_leaf(TextLeaf {
+                content: "hello".to_string(),
+                font_size: 16.0,
+                width: None,
+                fallback: (42.0, 19.0),
+            })
+            .unwrap();
+        atlas.set_root(text).unwrap();
+        atlas.compute(Viewport::new(800.0, 600.0)).unwrap();
+        let r = atlas.resolved_rect(text).unwrap().unwrap();
+        assert_f32_eq(r.width, 42.0);
+        assert_f32_eq(r.height, 19.0);
     }
 
     #[test]
