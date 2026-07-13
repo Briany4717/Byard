@@ -10,6 +10,22 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Text now wraps to its parent's width by default (RFC-0005).** A `Text` with
+  no explicit `width` reflows to the width its container offers — like a block of
+  text in a browser — instead of overflowing on a single line. This is done
+  properly through Taffy's measure protocol: `Text` becomes a measured leaf that
+  the layout atlas sizes via the shared, cached `TextMeasurer` during layout
+  (`LayoutAtlas::add_text_leaf` + `compute_with_text`), so it re-wraps when its
+  container resizes with no per-`Text` bookkeeping. `wrap: false` opts out to a
+  single line; an explicit `width` still pins the wrap width. Previously wrapping
+  required both `wrap: true` and an explicit `width`, so unbounded text overflowed
+  — the catalog documented `wrap` as defaulting to `true`, but the leaf-measured
+  model couldn't honour it. New engine surface: `atlas::TextLeaf`,
+  `atlas::LayoutAtlas::{add_text_leaf, compute_with_text}`, and the
+  `text::TextSizer` trait.
+
 ### Fixed
 
 - **`DecoratedBox` inner border edge is now anti-aliased.** The rounded-rect
