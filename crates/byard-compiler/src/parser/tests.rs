@@ -564,8 +564,28 @@ fn style_value_captures_base_attrs_and_state_blocks() {
     };
     assert_eq!(attrs.len(), 1, "one base attribute");
     assert_eq!(states.len(), 2, "two state blocks");
-    assert_eq!(states[0].state, StyleStateKind::Hover);
-    assert_eq!(states[1].state, StyleStateKind::Pressed);
+    assert_eq!(states[0].states, vec![StyleStateKind::Hover]);
+    assert_eq!(states[1].states, vec![StyleStateKind::Pressed]);
+}
+
+#[test]
+fn style_value_parses_a_combined_state_selector() {
+    // RFC-0024: `on focused+hover { … }` parses into a two-state block.
+    let view = one_view(
+        "View V() {\n let b = style { bg: 1 on focused+hover { bg: 2 } on checked { bg: 3 } }\n}",
+    );
+    let Member::Let { init, .. } = &view.body[0] else {
+        panic!("expected a let binding, got {:?}", view.body[0]);
+    };
+    let Expr::StyleValue { states, .. } = init else {
+        panic!("expected a StyleValue, got {init:?}");
+    };
+    assert_eq!(states.len(), 2);
+    assert_eq!(
+        states[0].states,
+        vec![StyleStateKind::Focused, StyleStateKind::Hover]
+    );
+    assert_eq!(states[1].states, vec![StyleStateKind::Checked]);
 }
 
 // ---------------------------------------------------------------------------

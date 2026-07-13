@@ -249,10 +249,10 @@ pub enum AttrKind {
     },
 }
 
-/// One of the four engine-owned interaction states an `on <state> { }` block
-/// (RFC-0016) can target. The engine reports these via `StyleState` (RFC-0012);
-/// when several are active at once the highest-priority block wins, in the fixed
-/// order `Disabled > Pressed > Focused > Hover` (RFC-0016 §"Resolution order").
+/// One engine-owned interaction state an `on <state> { }` block (RFC-0016/
+/// RFC-0024) can target. The engine reports these via `StyleState`; several
+/// combined with `+` form a compound selector (RFC-0024), and matching blocks
+/// apply by specificity (state count) then declaration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StyleStateKind {
     /// The pointer is over the element.
@@ -263,11 +263,22 @@ pub enum StyleStateKind {
     Focused,
     /// The element is disabled (also gates event dispatch, RFC-0012 §S5).
     Disabled,
+    /// A value-widget's value is true (`Checkbox`/`Toggle`) — RFC-0024.
+    Checked,
+    /// The element is the active selection (`selected:`, or a `RadioButton`
+    /// whose `bind == value`) — RFC-0024.
+    Selected,
+    /// The element's `invalid:` prop is true (form validation) — RFC-0024.
+    Invalid,
+    /// A `Checkbox`'s `indeterminate:` mixed state — RFC-0024.
+    Indeterminate,
+    /// The element is being dragged past the drag threshold — RFC-0024.
+    Dragging,
 }
 
 impl StyleStateKind {
-    /// Parses a state name; `None` for anything not one of the four states (an
-    /// unknown name is a compile error, [`CompileError::UnknownStyleState`]).
+    /// Parses a state name; `None` for an unrecognized state (a compile error,
+    /// [`CompileError::UnknownStyleState`]).
     ///
     /// [`CompileError::UnknownStyleState`]: crate::diagnostics::CompileError::UnknownStyleState
     #[must_use]
@@ -277,6 +288,11 @@ impl StyleStateKind {
             "pressed" => Some(Self::Pressed),
             "focused" => Some(Self::Focused),
             "disabled" => Some(Self::Disabled),
+            "checked" => Some(Self::Checked),
+            "selected" => Some(Self::Selected),
+            "invalid" => Some(Self::Invalid),
+            "indeterminate" => Some(Self::Indeterminate),
+            "dragging" => Some(Self::Dragging),
             _ => None,
         }
     }
@@ -289,11 +305,26 @@ impl StyleStateKind {
             Self::Pressed => "pressed",
             Self::Focused => "focused",
             Self::Disabled => "disabled",
+            Self::Checked => "checked",
+            Self::Selected => "selected",
+            Self::Invalid => "invalid",
+            Self::Indeterminate => "indeterminate",
+            Self::Dragging => "dragging",
         }
     }
 
-    /// The four state names, for `closest_match` suggestions.
-    pub const NAMES: [&'static str; 4] = ["hover", "pressed", "focused", "disabled"];
+    /// Every state name, for `closest_match` suggestions.
+    pub const NAMES: [&'static str; 9] = [
+        "hover",
+        "pressed",
+        "focused",
+        "disabled",
+        "checked",
+        "selected",
+        "invalid",
+        "indeterminate",
+        "dragging",
+    ];
 }
 
 /// An `on <state> { attr* }` block inside a `style { }` value (RFC-0016): the
@@ -302,9 +333,11 @@ impl StyleStateKind {
 /// sanctioned dynamism in an otherwise-static style (D8).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StateBlock {
-    /// Which interaction state activates this block.
-    pub state: StyleStateKind,
-    /// The attributes overlaid onto the base while `state` is active.
+    /// The interaction states that must **all** be active for this block to
+    /// apply (RFC-0024 combined selectors: `on focused+hover { … }`). A single
+    /// state is the common case; the block's *specificity* is `states.len()`.
+    pub states: Vec<StyleStateKind>,
+    /// The attributes overlaid onto the base while every `states` entry is active.
     pub attrs: Vec<Attr>,
     /// Source span.
     pub span: Span,

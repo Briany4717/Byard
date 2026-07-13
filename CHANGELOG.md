@@ -37,6 +37,19 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0024 extended style states + combined selectors.** The style-state
+  system (RFC-0012/0016) gains five engine-managed pseudo-states — `checked`
+  (a value-widget's value is true), `selected` (the `selected:` prop, or a
+  `RadioButton` whose `bind == value`), `invalid` (the `invalid:` prop),
+  `indeterminate` (a `Checkbox`'s mixed prop), and `dragging` (the element being
+  dragged past an 8px threshold) — plus **combined selectors**: `on focused+hover
+  { … }` applies only when *all* its states are active. `selected`/`invalid` are
+  universal opt-in props on any element; `checked`/`indeterminate` are mutually
+  exclusive. Resolution is by specificity (a combined selector beats a
+  single-state one) then declaration order. This completes RFC-0012's remaining
+  states and lets `Checkbox`/`RadioButton`/`TextField` theme their states through
+  `on <state>` blocks instead of duplicating the element tree with `when/else`.
+  See `crates/byard-cli/examples/style_states`.
 - **RFC-0018 `ZStack` intrinsic.** Overlapping children within the layout tree:
   all children occupy the same rect (painted in declaration order, last on top),
   the stack sizes to its largest child (the SwiftUI model), and
@@ -69,12 +82,12 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`true` = checked), an `indeterminate` mixed state, focusable by default
   (Space toggles), and a `change` event with `bind:` write-back (RFC-0003 E1).
   It owns its visuals — a rounded square that fills with the `bg` accent and
-  shows an engine-drawn checkmark when checked, a muted filled slot when
-  unchecked, and a horizontal dash when indeterminate, all borderless so the
-  mark stays crisp at control sizes — so `bg` is the checked accent, not a
-  background slab (parity with `Toggle`/`Slider`). Replaces the Box+Text
-  approximation design systems used for selection controls; see
-  `crates/byard-cli/examples/checkbox`.
+  shows an engine-drawn checkmark when checked, an outlined box (or a muted
+  filled slot) when unchecked, and a horizontal dash when indeterminate. The
+  container is a `DecoratedBox`, so a style can give it a `border`/`on checked
+  { border }` (RFC-0024); `bg` is the checked accent, not a background slab
+  (parity with `Toggle`/`Slider`). Replaces the Box+Text approximation design
+  systems used for selection controls; see `crates/byard-cli/examples/checkbox`.
 - **Binary arithmetic in `byld` (`+ - * /`).** Expressions can now compute:
   `width: base * 2 + 10`, `sweep: percent * 3.6 with anim.spring()`. Standard
   precedence, left-associative, Int/Float promotion; required by RFC-0020's

@@ -1,0 +1,68 @@
+// RFC-0024 — extended style states (`checked`, `selected`, `invalid`,
+// `indeterminate`, `dragging`) and combined selectors (`on focused+hover`).
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/style_states
+//   cargo run -p byard-cli -- dev
+//
+// What to verify:
+//   1. `checked` — tap the checkbox: its fill switches to purple via
+//      `on checked`, with no `when/else` duplication of the element.
+//   2. `selected` — the first card is statically `selected: true` and styles
+//      itself via `on selected`; hovering any card adds the `on hover` tint.
+//   3. Combined `on focused+hover` — focus the field (click it) and hover it:
+//      the outline is brighter than focused-only or hovered-only.
+//   4. `invalid` — the second field has `invalid: true`, so `on invalid`
+//      paints an error outline and text colour.
+View Main() {
+    var accept = true
+    var texto = "Hi"
+
+    let check_style = style {
+        bg: 0xFEF7FF, border: 0x234135, border_width: 2
+        on checked  { bg: 0x6750A4, border: 0x6750A4 }
+        on hover    { border: 0x6750A4 }
+        on disabled { opacity: 0.38 }
+    }
+
+    // Spread onto a `Box`, so only Box/Decoration props here (no `color` — that
+    // belongs to the Text child).
+    let card_style = style {
+        bg: 0x1E1E2A, radius: 12, p: 16
+        on selected      { bg: 0x381E72 }
+        on hover         { bg: 0x2A2A3A }
+        on selected+hover { bg: 0x4A2E7A }
+    }
+
+    let field_style = style {
+        bg: 0x1E1E2A, radius: 10, p: 14, border: 0x49454F, border_width: 1, color: 0xE6E1E5
+        on hover         { border: 0x8A80B0 }
+        on focused       { border: 0x6750A4, border_width: 2 }
+        on focused+hover { border: 0xD0BCFF, border_width: 2 }
+        on invalid       { border: 0xB3261E, color: 0xF2B8B5 }
+    }
+
+    Column #[bg: 0x14141C, p: 32, gap: 18, width: 380] {
+        Text("Extended style states — RFC-0024") #[color: 0xE6E1E5, size: 18]
+
+        // `checked` (driven by the bound value).
+        Row #[gap: 12, align: center] {
+            Checkbox #[..check_style, bind: accept, width: 22, height: 22]
+            Text("Tap the box — the fill switches via `on checked`")
+                #[color: 0xCAC4D0, size: 14]
+        }
+
+        // `selected` (universal prop) + `on selected+hover`.
+        Box #[..card_style, selected: accept] {
+            Text("Selected card (on selected)") #[color: 0xD0BCFF, size: 14]
+        }
+        Box #[..card_style] {
+            Text("Unselected card (hover me)") #[color: 0x938F99, size: 14]
+        }
+
+        // Combined `on focused+hover`, plus `on invalid`.
+        TextField #[..field_style,bind: texto, placeholder: "focus AND hover me", width: 316]
+        TextField #[..field_style, placeholder: "this field is invalid",
+                    invalid: true, width: 316]
+    }
+}

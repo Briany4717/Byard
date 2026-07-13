@@ -122,27 +122,46 @@ impl Parser<'_> {
             && matches!(self.peek2(), Some(Token::Ident(_)))
     }
 
-    /// Parses `on <state> { attr* }` (RFC-0016). An unknown state name records
-    /// an [`UnknownStyleState`](crate::diagnostics::CompileError::UnknownStyleState)
+    /// Parses `on <state> ("+" <state>)* { attr* }` (RFC-0016, RFC-0024 combined
+    /// selectors). Each unknown state name records an
+    /// [`UnknownStyleState`](crate::diagnostics::CompileError::UnknownStyleState)
     /// but the block body is still consumed so parsing recovers cleanly.
     fn parse_state_block(&mut self) -> Option<super::ast::StateBlock> {
         use super::ast::StyleStateKind;
         let start = self.cur_span();
         self.advance(); // `on`
-        let name_span = self.cur_span();
-        let name = self.expect_ident("an interaction state (hover/pressed/focused/disabled)")?;
-        let kind = StyleStateKind::from_name(name.as_str());
-        if kind.is_none() {
-            let hint =
-                crate::util::closest_match(name.as_str(), StyleStateKind::NAMES.iter().copied())
-                    .map(str::to_string);
-            self.errors
-                .push(crate::diagnostics::CompileError::UnknownStyleState {
-                    span: name_span,
-                    name: name.as_str().to_string(),
-                    hint,
-                });
+
+        // The `+`-joined state list. Every state must be known for the block to
+        // apply; any unknown name is diagnosed (and the block dropped).
+        let mut states = Vec::new();
+        let mut all_known = true;
+        loop {
+            let name_span = self.cur_span();
+            let name = self.expect_ident("an interaction state (e.g. hover, focused, checked)")?;
+            if let Some(kind) = StyleStateKind::from_name(name.as_str()) {
+                states.push(kind);
+            } else {
+                all_known = false;
+                let hint = crate::util::closest_match(
+                    name.as_str(),
+                    StyleStateKind::NAMES.iter().copied(),
+                )
+                .map(str::to_string);
+                self.errors
+                    .push(crate::diagnostics::CompileError::UnknownStyleState {
+                        span: name_span,
+                        name: name.as_str().to_string(),
+                        hint,
+                    });
+            }
+            // A `+` continues the combined selector; anything else ends it.
+            if matches!(self.cur(), Some(Token::Plus)) {
+                self.advance();
+            } else {
+                break;
+            }
         }
+
         self.expect(&Token::LBrace, "'{' after the interaction state");
         let mut attrs = Vec::new();
         while !matches!(self.cur(), Some(Token::RBrace) | None) {
@@ -156,10 +175,13 @@ impl Parser<'_> {
             self.eat(&Token::Comma);
         }
         self.expect(&Token::RBrace, "'}' to close the state block");
-        // Only yield a block for a known state — an unknown one is dropped (the
-        // error is already recorded) rather than silently mis-applied.
+        // Only yield a block when every state parsed — an unknown one is dropped
+        // (the error is already recorded) rather than silently mis-applied.
+        if !all_known || states.is_empty() {
+            return None;
+        }
         Some(super::ast::StateBlock {
-            state: kind?,
+            states,
             attrs,
             span: self.span_from(start),
         })
