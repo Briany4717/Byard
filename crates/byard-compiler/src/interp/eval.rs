@@ -9346,7 +9346,10 @@ mod tests {
         assert_eq!(frame.instances().len(), 0, "no solid instances");
         assert_eq!(frame.decorated().len(), 1, "just the muted slot, no mark");
         let slot = frame.decorated()[0];
-        assert!(slot.base.color[3] > 0.0, "the slot has an opaque muted fill");
+        assert!(
+            slot.base.color[3] > 0.0,
+            "the slot has an opaque muted fill"
+        );
         assert_eq!(slot.border_width, 0.0, "no border when none is styled");
     }
 
