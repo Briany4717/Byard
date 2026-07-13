@@ -1,0 +1,3 @@
+[project]
+name = "style_states"
+entry = "src/main.byd"

@@ -37,6 +37,19 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0024 extended style states + combined selectors.** The style-state
+  system (RFC-0012/0016) gains five engine-managed pseudo-states — `checked`
+  (a value-widget's value is true), `selected` (the `selected:` prop, or a
+  `RadioButton` whose `bind == value`), `invalid` (the `invalid:` prop),
+  `indeterminate` (a `Checkbox`'s mixed prop), and `dragging` (the element being
+  dragged past an 8px threshold) — plus **combined selectors**: `on focused+hover
+  { … }` applies only when *all* its states are active. `selected`/`invalid` are
+  universal opt-in props on any element; `checked`/`indeterminate` are mutually
+  exclusive. Resolution is by specificity (a combined selector beats a
+  single-state one) then declaration order. This completes RFC-0012's remaining
+  states and lets `Checkbox`/`RadioButton`/`TextField` theme their states through
+  `on <state>` blocks instead of duplicating the element tree with `when/else`.
+  See `crates/byard-cli/examples/style_states`.
 - **RFC-0018 `ZStack` intrinsic.** Overlapping children within the layout tree:
   all children occupy the same rect (painted in declaration order, last on top),
   the stack sizes to its largest child (the SwiftUI model), and
