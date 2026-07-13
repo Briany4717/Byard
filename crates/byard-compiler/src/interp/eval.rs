@@ -671,19 +671,6 @@ impl Interpreter {
             .measure_wrapped(text, font_size, max_width)
     }
 
-    /// The wrap width of a `Text` (RFC-0018): `Some(width)` when `wrap: true` and
-    /// a `width` is set, else `None` (natural single-line). Wrapping needs an
-    /// explicit width — there is no containing-block width to wrap against in the
-    /// leaf-measured layout model.
-    fn text_wrap_width(&mut self, attrs: &[Attr]) -> Option<f32> {
-        if self.eval_bool_prop(attrs, "wrap") == Some(true) {
-            #[allow(clippy::cast_precision_loss)]
-            self.eval_int_prop(attrs, "width").map(|w| w as f32)
-        } else {
-            None
-        }
-    }
-
     // ── declarations ────────────────────────────────────────────────────
 
     /// Processes the declaration-level members of a `View` body (`var`/`let`/
@@ -1857,7 +1844,15 @@ impl Interpreter {
             return;
         };
         self.atlas.set_root(root_id).unwrap();
-        self.atlas.compute(Viewport::new(width, height)).unwrap();
+        // Drive layout with the shared text measurer so wrapping `Text` leaves
+        // reflow to their parent's width (RFC-0005 default wrap). Disjoint field
+        // borrows: `self.atlas` and `self.text_measurer`.
+        let measurer = self
+            .text_measurer
+            .get_or_insert_with(byard_core::text::TextMeasurer::new);
+        self.atlas
+            .compute_with_text(Viewport::new(width, height), measurer)
+            .unwrap();
         self.atlas.populate_frame(frame, &[]);
 
         let parent_rect = crate::interp::intrinsics::Rect::new(0.0, 0.0, width, height);
@@ -2738,16 +2733,27 @@ impl Interpreter {
                     .eval_int_prop(attrs, "size")
                     .or(typo_size)
                     .unwrap_or(self.theme.font_size as i64) as f32;
-                // RFC-0018 text wrap: when `wrap: true` with a `width`, measure
-                // bounded to that width so the leaf is `width` wide and as tall as
-                // the wrapped line count; otherwise the natural single-line size.
-                let wrap_w = self.text_wrap_width(attrs);
-                let (measured_w, h) = self.measure_text_wrapped(&text, font_size, wrap_w);
-                // A wrapped leaf reserves the full requested width (the wrap
-                // bound), even when the widest laid-out line is narrower; an
-                // unwrapped leaf takes its natural measured width.
-                let w = wrap_w.unwrap_or(measured_w);
-                let id = self.atlas.add_leaf(LeafSize::new(w, h))?;
+                // RFC-0005 default text wrap: `wrap` defaults to `true`. A
+                // wrapping `Text` becomes a measured leaf that the atlas sizes to
+                // the width its parent offers during layout (via the shared
+                // `TextMeasurer`), so it reflows without an explicit `width`. An
+                // explicit `width` fixes the wrap width; `wrap: false` opts out to
+                // a fixed natural single-line leaf (may overflow — the caller's
+                // choice). `fallback` is the natural size for the no-sizer path.
+                let (nat_w, nat_h) = self.measure_text_wrapped(&text, font_size, None);
+                if self.eval_bool_prop(attrs, "wrap") == Some(false) {
+                    let id = self.atlas.add_leaf(LeafSize::new(nat_w, nat_h))?;
+                    flat_ids.push(id);
+                    return Ok(id);
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let explicit_w = self.eval_int_prop(attrs, "width").map(|w| w as f32);
+                let id = self.atlas.add_text_leaf(byard_core::atlas::TextLeaf {
+                    content: text,
+                    font_size,
+                    width: explicit_w,
+                    fallback: (nat_w, nat_h),
+                })?;
                 flat_ids.push(id);
                 Ok(id)
             }
@@ -3181,12 +3187,17 @@ impl Interpreter {
                     // primitives (shader-applied) — a documented limitation.
                     let anchor = inherited_transform.apply_point([rect.x, rect.y]);
                     let scaled_size = size * inherited_transform.uniform_scale();
-                    // RFC-0018 text wrap: shape the run bounded to the wrap width
-                    // (scaled by any ancestor scale, since the run's glyphs scale
-                    // about the pivot). `None` keeps the natural single-line run.
-                    let wrap_w = self
-                        .text_wrap_width(attrs)
-                        .map(|w| w * inherited_transform.uniform_scale());
+                    // RFC-0005 default text wrap: shape the run to the width layout
+                    // resolved for this leaf (its parent-offered width), scaled by
+                    // any ancestor scale (the run's glyphs scale about the pivot).
+                    // `wrap: false` opts out to a single-line run. This mirrors the
+                    // atlas's measure pass, so the rendered line breaks match the
+                    // laid-out height.
+                    let wrap_w = if self.eval_bool_prop(attrs, "wrap") == Some(false) {
+                        None
+                    } else {
+                        Some(rect.width * inherited_transform.uniform_scale())
+                    };
                     frame.push_text_wrapped(
                         byard_core::TextLine {
                             x: anchor[0],
@@ -9627,6 +9638,57 @@ mod tests {
         );
     }
 
+    // ── RFC-0005: default text wrap ───────────────────────────────────────
+
+    #[test]
+    fn text_wraps_to_parent_width_by_default() {
+        // A long line in a narrow fixed-width column wraps with NO explicit
+        // `wrap`/`width` — default wrap reflows it to the column's width.
+        let parsed = parse(
+            "View C() {\n Column #[width: 120] {\n \
+               Text(\"This is a fairly long sentence that must wrap within a narrow column.\")\n \
+             }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.texts().len(), 1, "one text run");
+        let wrap = frame.text_wraps()[0];
+        assert!(wrap.is_some(), "default wrap is on");
+        assert!(
+            wrap.unwrap() <= 130.0,
+            "wrapped to ~the 120px column (not the natural width), got {wrap:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_false_opts_out_to_a_single_line() {
+        let parsed = parse(
+            "View C() {\n Column #[width: 120] {\n \
+               Text(\"A long unwrapped line that overflows the column.\") #[wrap: false]\n \
+             }\n}",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        assert_eq!(frame.texts().len(), 1);
+        assert!(
+            frame.text_wraps()[0].is_none(),
+            "wrap: false → single line (no wrap width), got {:?}",
+            frame.text_wraps()[0]
+        );
+    }
+
     #[test]
     fn slider_drag_sets_float_value() {
         let parsed = parse(
@@ -10545,15 +10607,14 @@ mod tests {
         assert_eq!(frame.decorated().len(), 0);
     }
 
-    // ── RFC-0018: text wrap ──────────────────────────────────────────────
+    // ── RFC-0005: default text wrap ──────────────────────────────────────
 
     #[test]
-    fn wrapped_text_emits_a_wrap_width_and_a_taller_leaf() {
+    fn explicit_width_pins_wrap_and_yields_a_taller_leaf() {
         let long = "the quick brown fox jumps over the lazy dog again and again";
-        // Same text, once natural and once wrapped to width 120.
-        let src = format!(
-            "View C() {{\n Text(\"{long}\")\n Text(\"{long}\") #[wrap: true, width: 120]\n}}"
-        );
+        // Same text: the first wraps to the 400px root by default, the second is
+        // pinned to width 120 (both wrap — wrap is default now).
+        let src = format!("View C() {{\n Text(\"{long}\")\n Text(\"{long}\") #[width: 120]\n}}");
         let parsed = parse(&src);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let mut interp = Interpreter::new();
@@ -10563,29 +10624,30 @@ mod tests {
         let mut frame = byard_core::frame::RenderFrame::new();
         interp.render(&tree, &mut frame, 400.0, 300.0);
 
-        // Two text lines: the first natural (no wrap), the second wrapped to 120.
         assert_eq!(frame.texts().len(), 2);
         assert_eq!(frame.text_wraps().len(), 2, "wrap slice parallel to texts");
-        assert_eq!(frame.text_wraps()[0], None, "natural line: no wrap");
-        assert_eq!(
-            frame.text_wraps()[1],
-            Some(120.0),
-            "wrapped line carries its wrap width"
+        let w0 = frame.text_wraps()[0].expect("default wrap on the first line");
+        let w1 = frame.text_wraps()[1].expect("explicit-width line still wraps");
+        assert!(w0 > 200.0, "first wraps to the wide root, got {w0}");
+        assert!(
+            (w1 - 120.0).abs() < 1.0,
+            "second wraps to its 120 width, got {w1}"
         );
 
-        // The wrapped leaf is 120 wide and taller than the natural single line.
-        let nat = frame.rects()[1]; // C root is rects[0]; first Text is rects[1]
-        let wrapped = frame.rects()[2];
+        // The 120-wide leaf is narrower and at least as tall (more lines) as the
+        // one that wrapped to the wide root.
+        let wide = frame.rects()[1]; // C root is rects[0]; first Text is rects[1]
+        let narrow = frame.rects()[2];
         assert!(
-            (wrapped.width - 120.0).abs() < 1.0,
-            "wrapped leaf is its wrap width, got {}",
-            wrapped.width
+            (narrow.width - 120.0).abs() < 1.0,
+            "the pinned leaf is 120 wide, got {}",
+            narrow.width
         );
         assert!(
-            wrapped.height > nat.height,
-            "wrapped leaf is taller (multi-line): {} vs {}",
-            wrapped.height,
-            nat.height
+            narrow.height >= wide.height,
+            "the narrower leaf wraps onto ≥ lines: {} vs {}",
+            narrow.height,
+            wide.height
         );
     }
 
