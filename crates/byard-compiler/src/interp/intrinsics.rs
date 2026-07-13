@@ -33,6 +33,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "VectorIcon",
     "Overlay",
     "Canvas",
+    "Grid",
 ];
 
 /// The scalar type an attribute value must have (RFC-0005 §1).
@@ -217,6 +218,59 @@ fn events_from(focusable: bool, extra: &[&'static str]) -> HashSet<&'static str>
     s
 }
 
+/// Parses a `Grid` `columns:`/`rows:` template string (RFC-0018) into engine
+/// grid tracks. Accepted, whitespace-separated: `Nfr` (flexible fraction), a
+/// bare number (fixed logical px), `auto`, and `repeat(N, <track>)` (expanded to
+/// `N` copies of a single inner track). Returns `None` on any malformed token or
+/// an empty template — the caller turns that into a
+/// [`CompileError::InvalidGridTemplate`].
+///
+/// [`CompileError::InvalidGridTemplate`]: crate::diagnostics::CompileError::InvalidGridTemplate
+#[must_use]
+pub fn parse_grid_template(s: &str) -> Option<Vec<byard_core::atlas::GridTrack>> {
+    let mut out = Vec::new();
+    let mut rest = s.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after) = rest.strip_prefix("repeat(") {
+            let close = after.find(')')?;
+            let inner = &after[..close];
+            rest = &after[close + 1..];
+            let (count_s, track_s) = inner.split_once(',')?;
+            let count: usize = count_s.trim().parse().ok()?;
+            if count == 0 {
+                return None;
+            }
+            let track = parse_grid_track(track_s.trim())?;
+            for _ in 0..count {
+                out.push(track);
+            }
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (tok, tail) = rest.split_at(end);
+            rest = tail;
+            out.push(parse_grid_track(tok)?);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Parses one grid track token (`1fr`, `100`, `auto`) — the leaf of
+/// [`parse_grid_template`].
+fn parse_grid_track(t: &str) -> Option<byard_core::atlas::GridTrack> {
+    use byard_core::atlas::GridTrack;
+    if t == "auto" {
+        return Some(GridTrack::Auto);
+    }
+    if let Some(fr) = t.strip_suffix("fr") {
+        return fr.trim().parse::<f32>().ok().map(GridTrack::Fr);
+    }
+    t.parse::<f32>().ok().map(GridTrack::Px)
+}
+
 /// Looks up the intrinsic named `name` (RFC-0005 §4 table).
 #[must_use]
 pub fn lookup(name: &str) -> Option<Intrinsic> {
@@ -231,6 +285,13 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         // within the viewport. Harmless outside an overlay (no-op in normal
         // flow), so it lives on every container rather than a special case.
         props.insert("anchor", PropType::Enum(ANCHOR));
+        // RFC-0018: grid child-placement props. Valid on any container child of a
+        // `Grid`; harmless (no-op) outside a grid, like `anchor` — so they live on
+        // every container rather than being special-cased.
+        props.insert("col", PropType::Int);
+        props.insert("row", PropType::Int);
+        props.insert("col_span", PropType::Int);
+        props.insert("row_span", PropType::Int);
         Intrinsic {
             arity: 0,
             content: None,
@@ -486,6 +547,37 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
                 interactive: true,
                 props,
                 events: events_from(false, &["dismiss"]),
+            }
+        }
+        // RFC-0018: `Grid` — a CSS-grid container. Content: none. Children: any
+        // (auto-placed into the tracks left-to-right, top-to-bottom, or placed
+        // explicitly via child `col`/`row`/`col_span`/`row_span`). Props: Layout +
+        // Decoration + Transform, plus `columns`/`rows` (GridTemplate strings) and
+        // per-axis `col_gap`/`row_gap` (override the shared `gap`). Pipeline: the
+        // generic `DecoratedBox` background, same as `Box`.
+        "Grid" => {
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
+            props.insert("anchor", PropType::Enum(ANCHOR));
+            // A Grid can itself be a grid child, so it carries the placement props.
+            props.insert("col", PropType::Int);
+            props.insert("row", PropType::Int);
+            props.insert("col_span", PropType::Int);
+            props.insert("row_span", PropType::Int);
+            // Grid-container props.
+            props.insert("columns", PropType::Str);
+            props.insert("rows", PropType::Str);
+            props.insert("col_gap", PropType::Int);
+            props.insert("row_gap", PropType::Int);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: true,
+                focusable: false,
+                interactive: true,
+                props,
+                events: events_from(false, &[]),
             }
         }
         _ => return None,
@@ -1457,6 +1549,58 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
         );
+    }
+
+    #[test]
+    fn grid_validates_as_a_childful_container() {
+        use byard_core::atlas::GridTrack;
+        // Valid: templates, gaps, and children.
+        assert!(
+            errs("View V() { Grid #[columns: \"1fr 1fr\", rows: \"auto\", gap: 8] { Box {} Box {} } }")
+                .is_empty()
+        );
+        // Child placement props are accepted on a grid child.
+        assert!(
+            errs("View V() { Grid #[columns: \"1fr 1fr\"] { Box #[col: 1, row: 2, col_span: 2] {} } }")
+                .is_empty()
+        );
+        // Content args are rejected (arity 0).
+        assert!(
+            errs("View V() { Grid(\"x\") { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 0, .. }))
+        );
+        // A stray prop → UnknownAttribute.
+        assert!(
+            errs("View V() { Grid #[cols: \"1fr\"] {} }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
+
+        // The template parser itself.
+        assert_eq!(
+            parse_grid_template("1fr 2fr 100"),
+            Some(vec![
+                GridTrack::Fr(1.0),
+                GridTrack::Fr(2.0),
+                GridTrack::Px(100.0)
+            ])
+        );
+        assert_eq!(
+            parse_grid_template("repeat(3, 1fr)"),
+            Some(vec![
+                GridTrack::Fr(1.0),
+                GridTrack::Fr(1.0),
+                GridTrack::Fr(1.0)
+            ])
+        );
+        assert_eq!(
+            parse_grid_template("auto 1fr"),
+            Some(vec![GridTrack::Auto, GridTrack::Fr(1.0)])
+        );
+        assert_eq!(parse_grid_template(""), None);
+        assert_eq!(parse_grid_template("1fr bogus"), None);
+        assert_eq!(parse_grid_template("repeat(0, 1fr)"), None);
     }
 
     #[test]
