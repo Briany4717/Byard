@@ -221,6 +221,11 @@ fn props_from(groups: &[&[(&'static str, PropType)]]) -> HashMap<&'static str, P
     }
     // Universal props.
     m.insert("style", PropType::Class);
+    // RFC-0024: `selected`/`invalid` are universal opt-in pseudo-state props —
+    // any element can drive the `selected`/`invalid` style states (nav items,
+    // tabs, chips, form fields).
+    m.insert("selected", PropType::Bool);
+    m.insert("invalid", PropType::Bool);
     m
 }
 
@@ -1534,9 +1539,10 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CompileError::UnexpectedChildren { .. }))
         );
-        // A stray prop → UnknownAttribute.
+        // A stray prop → UnknownAttribute (`selected`/`invalid` are now universal
+        // RFC-0024 props, so pick a genuinely-unknown name).
         assert!(
-            errs("View V() { Checkbox #[selected: true] }")
+            errs("View V() { Checkbox #[bogus: true] }")
                 .iter()
                 .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
         );
@@ -1578,9 +1584,10 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CompileError::UnexpectedChildren { .. }))
         );
-        // A stray prop → UnknownAttribute.
+        // A stray prop → UnknownAttribute (`selected`/`invalid` are now universal
+        // RFC-0024 props, so pick a genuinely-unknown name).
         assert!(
-            errs("View V() { RadioButton #[selected: true] }")
+            errs("View V() { RadioButton #[bogus: true] }")
                 .iter()
                 .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
         );

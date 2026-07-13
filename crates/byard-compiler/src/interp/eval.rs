@@ -1199,6 +1199,52 @@ impl Interpreter {
         None
     }
 
+    /// The prop/value-driven style states an element contributes (RFC-0024), on
+    /// top of the router's pointer/focus/drag states: `checked` (a value-widget's
+    /// bound value is true), `selected` (the `selected:` prop, or a `RadioButton`
+    /// whose `bind == value`), `invalid` (the `invalid:` prop), and
+    /// `indeterminate` (a `Checkbox`'s mixed prop). `checked` and `indeterminate`
+    /// are mutually exclusive — `indeterminate` clears `checked` (RFC-0024).
+    fn prop_style_state(
+        &mut self,
+        attrs: &[Attr],
+        bound_sig: Option<super::env::SignalId>,
+        name: &str,
+    ) -> crate::interp::events::StyleState {
+        use crate::interp::events::StyleState;
+        let mut s = StyleState::empty();
+        if self.eval_bool_prop(attrs, "selected") == Some(true) {
+            s = s.union(StyleState::SELECTED);
+        }
+        if self.eval_bool_prop(attrs, "invalid") == Some(true) {
+            s = s.union(StyleState::INVALID);
+        }
+        let indeterminate =
+            name == "Checkbox" && self.eval_bool_prop(attrs, "indeterminate") == Some(true);
+        if indeterminate {
+            s = s.union(StyleState::INDETERMINATE);
+        }
+        // `checked` from a value-widget's bound bool — suppressed while mixed.
+        if matches!(name, "Checkbox" | "Toggle") && !indeterminate {
+            let checked =
+                bound_sig.is_some_and(|sig| self.ctx.peek_signal(sig).as_bool().unwrap_or(false));
+            if checked {
+                s = s.union(StyleState::CHECKED);
+            }
+        }
+        // `selected` from a `RadioButton` whose group var equals its value.
+        if name == "RadioButton" {
+            let value = self.eval_str_prop(attrs, "value").unwrap_or_default();
+            let selected = bound_sig.is_some_and(
+                |sig| matches!(self.ctx.peek_signal(sig), Value::Str(v) if v == value),
+            );
+            if selected {
+                s = s.union(StyleState::SELECTED);
+            }
+        }
+        s
+    }
+
     /// The signals backing a `ScrollView`'s `offset.x` and `offset.y` (RFC-0005),
     /// each present when that tuple component is a writable `var` — e.g.
     /// `offset: (panX, scrollY)` yields both, `offset: (0, scrollY)` only the y.
@@ -3154,12 +3200,14 @@ impl Interpreter {
             } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     // RFC-0016: overlay any active `on <state>` block against the
-                    // live engine mask before reading paint properties.
+                    // live engine mask before reading paint properties. RFC-0024:
+                    // fold in the universal `selected:`/`invalid:` states.
                     let elem_idx = self.atlas.node_index(atlas_node);
                     let state = elem_idx
                         .map_or_else(crate::interp::events::StyleState::empty, |i| {
                             self.router.style_state(i)
-                        });
+                        })
+                        .union(self.prop_style_state(attrs, None, ""));
                     let attrs = resolve_state_attrs(attrs, state_blocks, state);
                     let attrs = attrs.as_ref();
                     let text = match self.binding_value(*content) {
@@ -3275,10 +3323,14 @@ impl Interpreter {
                     // *before* reading paint properties. Stateless boxes borrow
                     // `attrs` unchanged (no clone). The base `attrs` still drive
                     // event/handler registration below so hit targets are stable.
+                    // RFC-0024: fold the prop/value-driven states (checked,
+                    // selected, invalid, indeterminate) into the router's
+                    // pointer/focus/drag mask so `on checked { … }` etc. resolve.
                     let paint_state = elem_idx
                         .map_or_else(crate::interp::events::StyleState::empty, |i| {
                             self.router.style_state(i)
-                        });
+                        })
+                        .union(self.prop_style_state(attrs, *bound_sig, name.as_str()));
                     let paint_attrs = resolve_state_attrs(attrs, state_blocks, paint_state);
                     let paint_attrs = paint_attrs.as_ref();
                     // Resolve the paint-time transform once, up front, so it can
@@ -3397,7 +3449,9 @@ impl Interpreter {
                     // pointer over it, so register a bare hover/press hit region.
                     if let Some(idx) = elem_idx {
                         if state_blocks.iter().any(|sb| {
-                            matches!(sb.state, StyleStateKind::Hover | StyleStateKind::Pressed)
+                            sb.states.iter().any(|s| {
+                                matches!(s, StyleStateKind::Hover | StyleStateKind::Pressed)
+                            })
                         }) {
                             self.router.track_region(idx, hit_rect);
                         }
@@ -3408,7 +3462,7 @@ impl Interpreter {
                         "Toggle" => {
                             self.render_toggle(
                                 *bound_sig,
-                                attrs,
+                                paint_attrs,
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
@@ -3420,7 +3474,7 @@ impl Interpreter {
                         "Slider" => {
                             self.render_slider(
                                 *bound_sig,
-                                attrs,
+                                paint_attrs,
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
@@ -3432,7 +3486,7 @@ impl Interpreter {
                         "Checkbox" => {
                             self.render_checkbox(
                                 *bound_sig,
-                                attrs,
+                                paint_attrs,
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
@@ -3444,7 +3498,7 @@ impl Interpreter {
                         "RadioButton" => {
                             self.render_radio(
                                 *bound_sig,
-                                attrs,
+                                paint_attrs,
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
@@ -3456,7 +3510,7 @@ impl Interpreter {
                         "TextField" => {
                             self.render_text_field(
                                 *bound_sig,
-                                attrs,
+                                paint_attrs,
                                 current_rect,
                                 hit_rect,
                                 elem_idx,
@@ -3642,13 +3696,15 @@ impl Interpreter {
             } => {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     // RFC-0016: overlay active `on <state>` blocks before reading
-                    // paint properties (fit/radius/opacity).
+                    // paint properties (fit/radius/opacity). RFC-0024: fold in the
+                    // universal `selected:`/`invalid:` states.
                     let state = self
                         .atlas
                         .node_index(atlas_node)
                         .map_or_else(crate::interp::events::StyleState::empty, |i| {
                             self.router.style_state(i)
-                        });
+                        })
+                        .union(self.prop_style_state(attrs, None, ""));
                     let attrs = resolve_state_attrs(attrs, state_blocks, state);
                     let attrs = attrs.as_ref();
                     let src_val = self
@@ -3741,11 +3797,12 @@ impl Interpreter {
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     let elem_idx = self.atlas.node_index(atlas_node);
                     // RFC-0016: overlay active `on <state>` blocks before
-                    // reading paint properties.
+                    // reading paint properties. RFC-0024: fold in universal states.
                     let state = elem_idx
                         .map_or_else(crate::interp::events::StyleState::empty, |i| {
                             self.router.style_state(i)
-                        });
+                        })
+                        .union(self.prop_style_state(attrs, None, ""));
                     let paint_attrs = resolve_state_attrs(attrs, state_blocks, state);
                     let paint_attrs = paint_attrs.as_ref();
 
@@ -3799,7 +3856,9 @@ impl Interpreter {
                     // still needs pointer tracking, mirroring the Box path.
                     if let Some(idx) = elem_idx {
                         if state_blocks.iter().any(|sb| {
-                            matches!(sb.state, StyleStateKind::Hover | StyleStateKind::Pressed)
+                            sb.states.iter().any(|s| {
+                                matches!(s, StyleStateKind::Hover | StyleStateKind::Pressed)
+                            })
                         }) {
                             self.router.track_region(idx, hit_rect);
                         }
@@ -6270,11 +6329,38 @@ fn attrs_with_states(base: &[Attr], states: &[StateBlock]) -> Vec<Attr> {
     all
 }
 
+/// The `StyleState` bit a single [`StyleStateKind`] maps to (RFC-0024).
+fn state_bit(kind: StyleStateKind) -> crate::interp::events::StyleState {
+    use crate::interp::events::StyleState;
+    match kind {
+        StyleStateKind::Hover => StyleState::HOVER,
+        StyleStateKind::Pressed => StyleState::PRESSED,
+        StyleStateKind::Focused => StyleState::FOCUSED,
+        StyleStateKind::Disabled => StyleState::DISABLED,
+        StyleStateKind::Checked => StyleState::CHECKED,
+        StyleStateKind::Selected => StyleState::SELECTED,
+        StyleStateKind::Invalid => StyleState::INVALID,
+        StyleStateKind::Indeterminate => StyleState::INDETERMINATE,
+        StyleStateKind::Dragging => StyleState::DRAGGING,
+    }
+}
+
+/// The combined-selector mask a state block requires (RFC-0024): every state in
+/// `states` must be active for the block to apply.
+fn state_block_mask(sb: &StateBlock) -> crate::interp::events::StyleState {
+    sb.states
+        .iter()
+        .fold(crate::interp::events::StyleState::empty(), |m, &k| {
+            m.union(state_bit(k))
+        })
+}
+
 /// Resolves an element's effective attributes for the current interaction state
-/// (RFC-0016 §"Resolution order"): the base set overlaid, last-wins, with each
-/// active `on <state>` block in **ascending** priority so the highest-priority
-/// active state wins — `hover < focused < pressed < disabled`. Blocks of the
-/// same state apply in written order (this is how `merge`/spread layering wins).
+/// (RFC-0016 §"Resolution order", extended by RFC-0024 §2): a block applies when
+/// its required mask is a **subset** of the live `StyleState` (all its states are
+/// active). Matching blocks overlay the base last-wins, ordered by **specificity**
+/// (number of states — a combined `on focused+hover` beats a single `on hover`)
+/// then **declaration order** for equal specificity.
 ///
 /// The common stateless case (no blocks) borrows the base with no allocation.
 fn resolve_state_attrs<'a>(
@@ -6282,37 +6368,32 @@ fn resolve_state_attrs<'a>(
     state_blocks: &[StateBlock],
     active: crate::interp::events::StyleState,
 ) -> std::borrow::Cow<'a, [Attr]> {
-    use crate::interp::events::StyleState;
-    // Fixed ascending-priority order: a later state in this list overrides an
-    // earlier one when both are active (RFC-0012 S3 / RFC-0016).
-    const ORDER: [(StyleStateKind, StyleState); 4] = [
-        (StyleStateKind::Hover, StyleState::HOVER),
-        (StyleStateKind::Focused, StyleState::FOCUSED),
-        (StyleStateKind::Pressed, StyleState::PRESSED),
-        (StyleStateKind::Disabled, StyleState::DISABLED),
-    ];
     if state_blocks.is_empty() {
         return std::borrow::Cow::Borrowed(base);
     }
+    // Collect blocks whose full mask is active, tagged with (specificity, order).
+    let mut matching: Vec<(u32, usize)> = state_blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sb)| {
+            let required = state_block_mask(sb);
+            active.contains(required).then_some((required.count(), i))
+        })
+        .collect();
+    if matching.is_empty() {
+        return std::borrow::Cow::Borrowed(base);
+    }
+    // Apply lowest-specificity first, then declaration order, so a more specific
+    // (or later) block wins on conflicting properties — the `(spec, idx)` tuples
+    // sort lexicographically.
+    matching.sort_unstable();
     let mut resolved = base.to_vec();
-    let mut touched = false;
-    for (kind, bit) in ORDER {
-        if !active.contains(bit) {
-            continue;
-        }
-        for sb in state_blocks.iter().filter(|sb| sb.state == kind) {
-            for a in &sb.attrs {
-                override_attr(&mut resolved, a.clone());
-            }
-            touched = true;
+    for (_, idx) in matching {
+        for a in &state_blocks[idx].attrs {
+            override_attr(&mut resolved, a.clone());
         }
     }
-    if touched {
-        std::borrow::Cow::Owned(resolved)
-    } else {
-        // No active block matched — avoid handing back a needless clone.
-        std::borrow::Cow::Borrowed(base)
-    }
+    std::borrow::Cow::Owned(resolved)
 }
 
 /// Multiplies a colour's alpha by `opacity` — folds an element's effective
@@ -8811,8 +8892,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_state_attrs_applies_priority_disabled_wins() {
-        // RFC-0016 resolution order: `disabled > pressed > focused > hover`.
+    fn resolve_state_attrs_applies_specificity_then_declaration_order() {
+        // RFC-0024 §2: single-state blocks apply in declaration order (equal
+        // specificity → later wins); a combined `on hover+focused` (higher
+        // specificity) beats both single-state blocks.
         use crate::interp::events::StyleState;
         let sp = crate::diagnostics::Span::new(0, 0);
         let prop = |name: &str, v: i64| Attr {
@@ -8823,18 +8906,16 @@ mod tests {
             },
             span: sp,
         };
+        let block = |states: Vec<StyleStateKind>, v: i64| StateBlock {
+            states,
+            attrs: vec![prop("bg", v)],
+            span: sp,
+        };
         let base = vec![prop("bg", 1)];
         let blocks = vec![
-            StateBlock {
-                state: StyleStateKind::Hover,
-                attrs: vec![prop("bg", 2)],
-                span: sp,
-            },
-            StateBlock {
-                state: StyleStateKind::Disabled,
-                attrs: vec![prop("bg", 3)],
-                span: sp,
-            },
+            block(vec![StyleStateKind::Hover], 2),
+            block(vec![StyleStateKind::Disabled], 3),
+            block(vec![StyleStateKind::Hover, StyleStateKind::Focused], 4),
         ];
 
         // No state active → base survives, and the borrow is cheap (no clone).
@@ -8842,17 +8923,69 @@ mod tests {
         assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
         assert_eq!(find_int(&none, "bg"), Some(1));
 
-        // Hover alone → the hover block overlays.
+        // Hover alone → the hover block overlays (the combined block needs focus).
         let hov = resolve_state_attrs(&base, &blocks, StyleState::HOVER);
         assert_eq!(find_int(&hov, "bg"), Some(2));
 
-        // Hover *and* disabled → disabled wins (highest priority).
+        // Hover + disabled (equal specificity) → disabled wins by declaration
+        // order (declared after hover).
         let both = resolve_state_attrs(
             &base,
             &blocks,
             StyleState::HOVER.union(StyleState::DISABLED),
         );
         assert_eq!(find_int(&both, "bg"), Some(3));
+
+        // Hover + focused → the combined `hover+focused` block (specificity 2)
+        // beats the single-state `hover` block regardless of declaration order.
+        let combined =
+            resolve_state_attrs(&base, &blocks, StyleState::HOVER.union(StyleState::FOCUSED));
+        assert_eq!(find_int(&combined, "bg"), Some(4));
+    }
+
+    #[test]
+    fn checkbox_on_checked_state_recolours_the_accent() {
+        // RFC-0024: a checked value drives the `checked` state, so `on checked`
+        // overlays reach the checkbox's own filled-accent visual.
+        let src = "View C() {\n var c = true\n \
+                   let chk = style { bg: 0x111111 on checked { bg: 0x00FF00 } }\n \
+                   Checkbox #[..chk, bind: c, width: 20, height: 20]\n}";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // Filled square is the first solid; its accent is the `on checked` green.
+        let fill = frame.instances()[0].color;
+        assert!(
+            fill[1] > 0.9 && fill[0] < 0.1,
+            "checked accent is the `on checked` green, got {fill:?}"
+        );
+    }
+
+    #[test]
+    fn universal_selected_prop_drives_the_selected_state() {
+        // RFC-0024: `selected: true` on any element activates the `selected`
+        // state, so `on selected { bg }` recolours it.
+        let src = "View C() {\n \
+                   let s = style { bg: 0x111111 on selected { bg: 0x00FF00 } }\n \
+                   Box #[..s, selected: true, width: 20, height: 20] {}\n}";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let fill = frame.instances()[0].color;
+        assert!(
+            fill[1] > 0.9 && fill[0] < 0.1,
+            "selected box uses the `on selected` green, got {fill:?}"
+        );
     }
 
     fn find_int(attrs: &[Attr], name: &str) -> Option<i64> {
