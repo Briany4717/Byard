@@ -10,8 +10,27 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`DecoratedBox` inner border edge is now anti-aliased.** The rounded-rect
+  SDF shader smoothed only the *outer* edge; the transition from the border to
+  the (possibly transparent) interior used a hard threshold, leaving the inner
+  edge jagged. Most visible on thin rings such as `RadioButton`. The inner edge
+  now uses the same screen-space-derivative smoothstep as the outer edge, so
+  both edges of any border are crisp at every size and DPI.
+
 ### Added
 
+- **RFC-0018 `RadioButton` intrinsic.** Single-selection within a group: each
+  button carries a `value: Str` identity and a `bind: Str` to the shared group
+  `var`, and is selected when `bind == value`. Tapping a button writes its
+  `value` to the group var, so the previously selected sibling deselects
+  reactively — automatic mutual exclusion, no explicit coordination (the
+  standard group-var model). Focusable by default; arrow keys move selection
+  within the group (Down/Right next, Up/Left previous, wrapping at both ends).
+  Visual is an engine-owned outer ring plus an inner accent dot when selected;
+  `bg` is the selected accent. Fires `change` with `bind:` write-back
+  (RFC-0003 E1). See `crates/byard-cli/examples/radio_button`.
 - **RFC-0018 `Checkbox` intrinsic.** A first-class boolean control with a
   distinct square identity from `Toggle`: reflected two-way `value`/`bind: Bool`
   (`true` = checked), an `indeterminate` mixed state, focusable by default
