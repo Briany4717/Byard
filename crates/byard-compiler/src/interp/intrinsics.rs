@@ -27,6 +27,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "Toggle",
     "Slider",
     "Checkbox",
+    "RadioButton",
     "Image",
     "ScrollView",
     "VectorIcon",
@@ -341,6 +342,29 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("value", PropType::Bool);
             props.insert("bind", PropType::Bool);
             props.insert("indeterminate", PropType::Bool);
+            props.insert("focused", PropType::Bool);
+            props.insert("disabled", PropType::Bool);
+            Intrinsic {
+                arity: 0,
+                content: None,
+                children: false,
+                focusable: true,
+                interactive: true,
+                props,
+                events: events_from(true, &["change"]),
+            }
+        }
+        // RFC-0018: `RadioButton` — single selection within a group. `value: Str`
+        // is this button's own identity within the group; `bind: Str` is the
+        // shared group `var`. The button is selected when `bind == value`; tapping
+        // it writes its `value` to the group var, so the previously selected
+        // sibling deselects reactively (automatic mutual exclusion). Focusable by
+        // default; arrow keys move selection within the group (wrapping). Owns its
+        // visuals (outer ring + inner dot), so `bg` is the selected accent.
+        "RadioButton" => {
+            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            props.insert("value", PropType::Str);
+            props.insert("bind", PropType::Str);
             props.insert("focused", PropType::Bool);
             props.insert("disabled", PropType::Bool);
             Intrinsic {
@@ -1386,6 +1410,50 @@ mod tests {
         // `change` is an event, so `:` instead of `=>` is a separator error.
         assert!(
             errs("View V() { Checkbox #[change: 1] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
+        );
+    }
+
+    #[test]
+    fn radiobutton_validates_as_a_focusable_group_member() {
+        // Valid: a value + a group bind, and a `change` event.
+        assert!(errs("View V() { RadioButton #[value: \"home\", bind: \"home\"] }").is_empty());
+        assert!(
+            errs("View V() { RadioButton #[value: \"a\", bind: \"a\", change => f()] }").is_empty()
+        );
+        // Focusable by default → key events are in-vocabulary (arrow keys).
+        assert!(
+            errs("View V() { RadioButton #[value: \"a\", bind: \"a\", key_down => f()] }")
+                .is_empty()
+        );
+        // `value` must be a Str: an int is a type mismatch.
+        assert!(
+            errs("View V() { RadioButton #[value: 5, bind: \"a\"] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::AttributeTypeMismatch { .. }))
+        );
+        // Content args are rejected (arity 0).
+        assert!(
+            errs("View V() { RadioButton(\"x\") }")
+                .iter()
+                .any(|e| matches!(e, CompileError::ArityMismatch { expected: 0, .. }))
+        );
+        // Children are rejected (childless).
+        assert!(
+            errs("View V() { RadioButton { Box {} } }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnexpectedChildren { .. }))
+        );
+        // A stray prop → UnknownAttribute.
+        assert!(
+            errs("View V() { RadioButton #[selected: true] }")
+                .iter()
+                .any(|e| matches!(e, CompileError::UnknownAttribute { .. }))
+        );
+        // `change` is an event, so `:` instead of `=>` is a separator error.
+        assert!(
+            errs("View V() { RadioButton #[change: 1] }")
                 .iter()
                 .any(|e| matches!(e, CompileError::WrongAttributeSeparator { .. }))
         );
