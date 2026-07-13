@@ -1,0 +1,38 @@
+// RFC-0018 — the `ZStack` intrinsic (overlapping children in the layout tree).
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/zstack
+//   cargo run -p byard-cli -- dev
+//
+// What to verify visually:
+//   1. In each stack the children occupy the SAME rect and overlap — the later
+//      a child is declared, the higher it paints (last on top).
+//   2. The first stack uses the default `center` alignment: the lavender chip
+//      sits centered over the purple thumbnail.
+//   3. The second stack uses `alignment: bottom_end`: the pink badge is pinned
+//      to the bottom-right corner (with an 8px margin inset).
+//   4. Each stack sizes to its largest child (the thumbnail); the small children
+//      keep their own size rather than stretching to fill.
+View Main() {
+    Column #[bg: 0x14141C, p: 32, gap: 20, width: 340] {
+        Text("ZStack — RFC-0018") #[color: 0xE6E1E5, size: 20]
+
+        // Centered overlay (default alignment).
+        ZStack #[width: 260, height: 150] {
+            Box #[bg: 0x381E72, radius: 16, width: 260, height: 150] {}
+            Box #[bg: 0xD0BCFF, radius: 28, width: 56, height: 56] {}
+        }
+
+        // Corner overlay via alignment.
+        ZStack #[width: 260, height: 150, alignment: bottom_end] {
+            Box #[bg: 0x1F3A34, radius: 16, width: 260, height: 150] {}
+            Box #[bg: 0xF2B8B5, radius: 12, width: 44, height: 26, m: 8] {}
+        }
+
+        // The Column is 340 wide with 32px padding → 276px of content width;
+        // wrap the caption to it (text wrap is opt-in with an explicit width in
+        // the current leaf-measured layout model).
+        Text("Children share one rect; last is on top. Alignment places smaller children.")
+            #[color: 0x938F99, size: 12, wrap: true, width: 276]
+    }
+}

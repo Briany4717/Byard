@@ -21,6 +21,14 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0018 `ZStack` intrinsic.** Overlapping children within the layout tree:
+  all children occupy the same rect (painted in declaration order, last on top),
+  the stack sizes to its largest child (the SwiftUI model), and
+  `alignment: Align2D` (`center` default, plus the eight edge/corner tokens)
+  positions children smaller than the stack. Implemented as a single-cell CSS
+  grid, so it composes with the rest of the layout system; unblocks badges on
+  avatars, a play button over a thumbnail, and floating action buttons over
+  content. See `crates/byard-cli/examples/zstack`.
 - **RFC-0018 `Grid` intrinsic.** A CSS-grid container backed by Taffy's grid
   mode. `columns`/`rows` take a template string (`"1fr 2fr 100"`,
   `"repeat(3, 1fr)"`, `auto`) parsed into engine tracks — a malformed template
