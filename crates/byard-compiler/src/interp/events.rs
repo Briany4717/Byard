@@ -151,7 +151,7 @@ struct DownState {
 /// reported by [`EventRouter::style_state`]. A small bit set rather than four
 /// `bool`s so a whole state can be passed and matched at once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct StyleState(u8);
+pub struct StyleState(u16);
 
 impl StyleState {
     /// The pointer is over the element.
@@ -162,6 +162,20 @@ impl StyleState {
     pub const FOCUSED: StyleState = StyleState(1 << 2);
     /// The element's `disabled:` prop resolved true.
     pub const DISABLED: StyleState = StyleState(1 << 3);
+    // ── RFC-0024 extended states ──────────────────────────────────────────
+    /// A value-widget's `value` is true (`Checkbox`/`Toggle`), or `checked:`.
+    pub const CHECKED: StyleState = StyleState(1 << 4);
+    /// This element is the active selection (`selected:` prop, or a
+    /// `RadioButton` whose `bind == value`).
+    pub const SELECTED: StyleState = StyleState(1 << 5);
+    /// The element's `invalid:` prop resolved true (form validation).
+    pub const INVALID: StyleState = StyleState(1 << 6);
+    /// A `Checkbox`'s `indeterminate:` prop resolved true (tri-state). Mutually
+    /// exclusive with [`CHECKED`](Self::CHECKED).
+    pub const INDETERMINATE: StyleState = StyleState(1 << 7);
+    /// The element is being dragged (pointer moved past the drag threshold
+    /// after pressing it).
+    pub const DRAGGING: StyleState = StyleState(1 << 8);
 
     /// The empty state (no interaction flags).
     #[must_use]
@@ -183,11 +197,19 @@ impl StyleState {
 
     /// The raw bits (for a resolver's `(class, state)` keying).
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
-    fn insert(&mut self, other: StyleState) {
+    /// The number of active states — a combined selector's *specificity*
+    /// (RFC-0024 §2): a block with more required states wins over one with fewer.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Inserts every flag from `other`.
+    pub fn insert(&mut self, other: StyleState) {
         self.0 |= other.0;
     }
 }
@@ -199,6 +221,11 @@ pub struct EventRouter {
     focusables: Vec<Focusable>,
     down: Option<DownState>,
     focused: Option<u32>,
+    /// The element being dragged (RFC-0024 `dragging`): the press target, once
+    /// the pointer has moved past [`TAP_SLOP`] since pressing it. Set during a
+    /// held move, cleared on the next press/release. Persists across renders like
+    /// the rest of the gesture state.
+    dragging: Option<u32>,
     /// Element currently under the pointer (for enter/exit synthesis, M24).
     hovered: Option<u32>,
     /// Time and element of the most recent tap (for double-tap detection, M24).
@@ -310,6 +337,9 @@ impl EventRouter {
         if self.disabled.contains(&elem) {
             s.insert(StyleState::DISABLED);
         }
+        if self.dragging == Some(elem) {
+            s.insert(StyleState::DRAGGING);
+        }
         s
     }
 
@@ -420,6 +450,8 @@ impl EventRouter {
                     time_ms: ev.time_ms,
                     secondary,
                 });
+                // A fresh press starts a new gesture — not yet a drag (RFC-0024).
+                self.dragging = None;
                 if secondary {
                     self.fire(ctx, atlas, EventKind::Secondary, ev.pos, None);
                 } else {
@@ -433,6 +465,8 @@ impl EventRouter {
             EventKind::PointerUp => {
                 // E4 precedence: pointer_up fires before tap.
                 self.fire(ctx, atlas, EventKind::PointerUp, ev.pos, None);
+                // The gesture ends — clear the drag latch (RFC-0024).
+                self.dragging = None;
                 if let Some(down) = self.down.take() {
                     let up_elem = self.hit_any(atlas, ev.pos);
                     let dx = ev.pos.0 - down.pos.0;
@@ -476,7 +510,13 @@ impl EventRouter {
                 self.fire(ctx, atlas, ev.kind, ev.pos, None);
                 if ev.kind == EventKind::PointerMove {
                     // Synthesize PointerDrag when the button is held (M16: Slider).
-                    if self.down.is_some() {
+                    if let Some((dpos, elem)) = self.down.as_ref().map(|d| (d.pos, d.elem)) {
+                        // RFC-0024 `dragging`: latch once the pointer travels past
+                        // the drag threshold from the press point.
+                        let (dx, dy) = (ev.pos.0 - dpos.0, ev.pos.1 - dpos.1);
+                        if (dx * dx + dy * dy).sqrt() > TAP_SLOP {
+                            self.dragging = elem;
+                        }
                         self.fire(ctx, atlas, EventKind::PointerDrag, ev.pos, None);
                     } else {
                         // Enter / Exit / Hover (M24): compare new hovered elem to prev.
