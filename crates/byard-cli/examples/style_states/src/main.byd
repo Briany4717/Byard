@@ -16,9 +16,10 @@
 //      paints an error outline and text colour.
 View Main() {
     var accept = true
+    var texto = "Hi"
 
     let check_style = style {
-        bg: 0xFEF7FF, border: 0x79747E
+        bg: 0xFEF7FF, border: 0x234135, border_width: 2
         on checked  { bg: 0x6750A4, border: 0x6750A4 }
         on hover    { border: 0x6750A4 }
         on disabled { opacity: 0.38 }
@@ -52,7 +53,7 @@ View Main() {
         }
 
         // `selected` (universal prop) + `on selected+hover`.
-        Box #[..card_style, selected: true] {
+        Box #[..card_style, selected: accept] {
             Text("Selected card (on selected)") #[color: 0xD0BCFF, size: 14]
         }
         Box #[..card_style] {
@@ -60,7 +61,7 @@ View Main() {
         }
 
         // Combined `on focused+hover`, plus `on invalid`.
-        TextField #[..field_style, placeholder: "focus AND hover me", width: 316]
+        TextField #[..field_style,bind: texto, placeholder: "focus AND hover me", width: 316]
         TextField #[..field_style, placeholder: "this field is invalid",
                     invalid: true, width: 316]
     }

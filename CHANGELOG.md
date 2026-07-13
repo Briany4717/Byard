@@ -82,12 +82,12 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`true` = checked), an `indeterminate` mixed state, focusable by default
   (Space toggles), and a `change` event with `bind:` write-back (RFC-0003 E1).
   It owns its visuals — a rounded square that fills with the `bg` accent and
-  shows an engine-drawn checkmark when checked, a muted filled slot when
-  unchecked, and a horizontal dash when indeterminate, all borderless so the
-  mark stays crisp at control sizes — so `bg` is the checked accent, not a
-  background slab (parity with `Toggle`/`Slider`). Replaces the Box+Text
-  approximation design systems used for selection controls; see
-  `crates/byard-cli/examples/checkbox`.
+  shows an engine-drawn checkmark when checked, an outlined box (or a muted
+  filled slot) when unchecked, and a horizontal dash when indeterminate. The
+  container is a `DecoratedBox`, so a style can give it a `border`/`on checked
+  { border }` (RFC-0024); `bg` is the checked accent, not a background slab
+  (parity with `Toggle`/`Slider`). Replaces the Box+Text approximation design
+  systems used for selection controls; see `crates/byard-cli/examples/checkbox`.
 - **Binary arithmetic in `byld` (`+ - * /`).** Expressions can now compute:
   `width: base * 2 + 10`, `sweep: percent * 3.6 with anim.spring()`. Standard
   precedence, left-associative, Int/Float promotion; required by RFC-0020's

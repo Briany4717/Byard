@@ -318,7 +318,9 @@ const DEFAULT_SHADOW_COLOR: i64 = 0x5500_0000;
 /// Pushes a single rounded stroke quad from `a` to `b` of thickness `t`,
 /// rotated to the segment angle about its midpoint and composed under
 /// `transform` (so an element/group transform carries the mark with it). Backs
-/// the RFC-0018 `Checkbox` checkmark; a reusable primitive-stroke helper.
+/// the RFC-0018 `Checkbox` checkmark. Emitted on the **decorated** pipeline so it
+/// paints above the checkbox's decorated (bordered) container, which is pushed
+/// first.
 fn push_stroke_quad(
     frame: &mut byard_core::frame::RenderFrame,
     a: [f32; 2],
@@ -337,11 +339,15 @@ fn push_stroke_quad(
         origin: [cx, cy],
         ..byard_core::frame::Transform::IDENTITY
     };
-    frame.push_instance(byard_core::BoxInstance {
-        rect: [cx - len / 2.0, cy - t / 2.0, len, t],
-        color,
-        radii: [t / 2.0; 4],
-        transform: transform.compose(&seg),
+    frame.push_decorated(byard_core::frame::DecoratedBox {
+        base: byard_core::BoxInstance {
+            rect: [cx - len / 2.0, cy - t / 2.0, len, t],
+            color,
+            radii: [t / 2.0; 4],
+            transform: transform.compose(&seg),
+        },
+        dirty: true,
+        ..Default::default()
     });
 }
 
@@ -3987,46 +3993,67 @@ impl Interpreter {
         let radius = (side * 0.18).max(2.0);
         let filled = is_on || indeterminate;
 
-        // `bg` is the checked accent (default: theme primary); unchecked shows a
-        // muted filled slot. Everything is a rounded SolidBox with NO border — a
-        // 2px ring reads as a heavy dark outline at control sizes — and the
-        // container is pushed *before* the mark on the same solid pipeline, so
-        // the white check lands on top (a decorated fill would paint after every
-        // solid and hide it). The muted slot reuses `Toggle`'s OFF tint for a
-        // consistent "off" colour across the two controls.
-        let accent = self
-            .eval_color_prop(attrs, "bg")
-            .unwrap_or(self.theme.primary());
-        let accent_rgba = super::intrinsics::color_to_rgba(accent, false);
+        // The container is a rounded `DecoratedBox` so it can carry a `border`
+        // (RFC-0024 lets a style set `border`/`on checked { border }`). `bg` is
+        // the checked accent (default: theme primary); when unchecked, a styled
+        // `border` yields an outlined box with a transparent interior (the M3
+        // look), otherwise a muted filled slot (`Toggle`'s OFF tint). The
+        // container is pushed *before* the mark — both on the decorated pipeline —
+        // so the white mark lands on top.
+        let bg = self.eval_color_prop(attrs, "bg");
+        let border = self.eval_color_prop(attrs, "border");
+        let border_width = if border.is_some() {
+            self.eval_float_prop(attrs, "border_width")
+                .map_or(2.0, |v| v as f32)
+        } else {
+            0.0
+        };
+        let border_rgba = border.map_or([0.0; 4], |c| {
+            dim_alpha(super::intrinsics::color_to_rgba(c, false), opacity)
+        });
+        let accent = bg.unwrap_or(self.theme.primary());
         let fill = if filled {
-            dim_alpha(accent_rgba, opacity)
+            dim_alpha(super::intrinsics::color_to_rgba(accent, false), opacity)
+        } else if border.is_some() {
+            [0.0; 4]
         } else {
             dim_alpha([0.40, 0.42, 0.48, 1.0], opacity)
         };
-        frame.push_instance(byard_core::BoxInstance {
-            rect: [ox, oy, side, side],
-            color: fill,
-            radii: [radius; 4],
-            transform,
+        frame.push_decorated(byard_core::frame::DecoratedBox {
+            base: byard_core::BoxInstance {
+                rect: [ox, oy, side, side],
+                color: fill,
+                radii: [radius; 4],
+                transform,
+            },
+            border_width,
+            border_color: border_rgba,
+            dirty: true,
+            ..Default::default()
         });
 
-        // The mark, in white, on the filled square.
+        // The mark, in white, on the filled square (also decorated, so it paints
+        // above the container).
         let mark = dim_alpha([1.0, 1.0, 1.0, 1.0], opacity);
         if indeterminate {
             // Mixed state: a single horizontal bar (checked overrides mixed only
             // in the container fill; the dash renders whenever `indeterminate`).
             let bar_w = side * 0.5;
             let bar_h = (side * 0.12).max(2.0);
-            frame.push_instance(byard_core::BoxInstance {
-                rect: [
-                    ox + (side - bar_w) / 2.0,
-                    oy + (side - bar_h) / 2.0,
-                    bar_w,
-                    bar_h,
-                ],
-                color: mark,
-                radii: [bar_h / 2.0; 4],
-                transform,
+            frame.push_decorated(byard_core::frame::DecoratedBox {
+                base: byard_core::BoxInstance {
+                    rect: [
+                        ox + (side - bar_w) / 2.0,
+                        oy + (side - bar_h) / 2.0,
+                        bar_w,
+                        bar_h,
+                    ],
+                    color: mark,
+                    radii: [bar_h / 2.0; 4],
+                    transform,
+                },
+                dirty: true,
+                ..Default::default()
             });
         } else if is_on {
             // A two-stroke checkmark: canonical vertices in the unit square,
@@ -8958,8 +8985,9 @@ mod tests {
         interp.tick();
         let mut frame = byard_core::frame::RenderFrame::new();
         interp.render(&tree, &mut frame, 400.0, 300.0);
-        // Filled square is the first solid; its accent is the `on checked` green.
-        let fill = frame.instances()[0].color;
+        // The filled square is the first decorated box; its accent is the
+        // `on checked` green.
+        let fill = frame.decorated()[0].base.color;
         assert!(
             fill[1] > 0.9 && fill[0] < 0.1,
             "checked accent is the `on checked` green, got {fill:?}"
@@ -9311,40 +9339,37 @@ mod tests {
 
     #[test]
     fn unchecked_checkbox_is_a_single_borderless_slot() {
-        // Unchecked: exactly one rounded SolidBox slot, no checkmark quads, and
-        // NO decorated box — no border (a 2px ring looks like a heavy dark
-        // outline at control sizes).
+        // Unchecked with no styled border: one decorated slot, no mark. (The
+        // container is a DecoratedBox so it *can* carry a border when styled; with
+        // none, it's a borderless muted fill.)
         let frame = checkbox_frame("View C() {\n var c = false\n Checkbox #[bind: c]\n}");
-        assert_eq!(frame.instances().len(), 1, "just the muted slot, no mark");
-        assert_eq!(frame.decorated().len(), 0, "no bordered/decorated box");
-        assert!(
-            frame.instances()[0].color[3] > 0.0,
-            "the slot has an opaque muted fill"
-        );
+        assert_eq!(frame.instances().len(), 0, "no solid instances");
+        assert_eq!(frame.decorated().len(), 1, "just the muted slot, no mark");
+        let slot = frame.decorated()[0];
+        assert!(slot.base.color[3] > 0.0, "the slot has an opaque muted fill");
+        assert_eq!(slot.border_width, 0.0, "no border when none is styled");
     }
 
     #[test]
     fn checked_checkbox_fills_and_draws_a_two_stroke_check() {
-        // Checked: a filled accent square (solid) + exactly two checkmark stroke
-        // quads on top — three solids, no decorated box.
+        // Checked: a filled accent square + two checkmark stroke quads on top —
+        // three decorated boxes (all on the decorated pipeline, in push order, so
+        // the check is never hidden behind the fill).
         let frame = checkbox_frame("View C() {\n var c = true\n Checkbox #[bind: c]\n}");
-        assert_eq!(frame.decorated().len(), 0, "no decorated box / border");
+        assert_eq!(frame.instances().len(), 0, "no solid instances");
         assert_eq!(
-            frame.instances().len(),
+            frame.decorated().len(),
             3,
             "filled square + two rotated stroke quads"
         );
-        // The square is pushed first; the two marks paint on top (solid pipeline,
-        // in order) — so the check is never hidden behind the fill.
         assert!(
-            frame.instances()[0].color[3] > 0.0,
+            frame.decorated()[0].base.color[3] > 0.0,
             "the checked square has an opaque accent fill"
         );
-        // The two strokes rotate in opposite senses about their midpoints, so
-        // their composed transforms carry different rotations — proof the mark
-        // is drawn as angled geometry, not two axis-aligned bars.
-        let r1 = frame.instances()[1].transform.rotate;
-        let r2 = frame.instances()[2].transform.rotate;
+        // The two strokes rotate in opposite senses about their midpoints — proof
+        // the mark is angled geometry, not two axis-aligned bars.
+        let r1 = frame.decorated()[1].base.transform.rotate;
+        let r2 = frame.decorated()[2].base.transform.rotate;
         assert!(
             (r1 - r2).abs() > 0.1,
             "the two strokes are at different angles"
@@ -9353,14 +9378,16 @@ mod tests {
 
     #[test]
     fn indeterminate_checkbox_fills_and_draws_a_single_dash() {
-        // Mixed state: filled square + one horizontal bar, no checkmark, no
-        // decorated box.
+        // Mixed state: filled square + one horizontal bar, no checkmark.
         let frame = checkbox_frame(
             "View C() {\n var c = false\n Checkbox #[bind: c, indeterminate: true]\n}",
         );
-        assert_eq!(frame.decorated().len(), 0, "no decorated box / border");
-        assert_eq!(frame.instances().len(), 2, "filled square + one dash");
-        assert!(frame.instances()[0].color[3] > 0.0, "filled accent square");
+        assert_eq!(frame.instances().len(), 0, "no solid instances");
+        assert_eq!(frame.decorated().len(), 2, "filled square + one dash");
+        assert!(
+            frame.decorated()[0].base.color[3] > 0.0,
+            "filled accent square"
+        );
     }
 
     #[test]
@@ -9371,13 +9398,12 @@ mod tests {
         let frame = checkbox_frame(
             "View C() {\n var c = true\n Checkbox #[bind: c, bg: 0x10B981, width: 24, height: 24]\n}",
         );
-        assert_eq!(frame.decorated().len(), 0, "no slab, no decorated box");
         assert_eq!(
-            frame.instances().len(),
+            frame.decorated().len(),
             3,
             "filled square + the two checkmark strokes"
         );
-        let fill = frame.instances()[0].color;
+        let fill = frame.decorated()[0].base.color;
         let accent = crate::interp::intrinsics::color_to_rgba(0x0010_B981, false);
         assert!(
             (fill[0] - accent[0]).abs() < 0.01 && (fill[1] - accent[1]).abs() < 0.01,
