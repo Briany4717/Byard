@@ -10001,7 +10001,7 @@ mod tests {
         let tree = interp.lower_view(&parsed.views[0], &[]);
         interp.tick();
         let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
-        let header_rgba = crate::interp::intrinsics::color_to_rgba(0xAABBCC, false);
+        let header_rgba = crate::interp::intrinsics::color_to_rgba(0x00AA_BBCC, false);
         let content_rgba = crate::interp::intrinsics::color_to_rgba(0x0011_2233, false);
         // Scroll is applied as a paint-time translate, not baked into the layout
         // rect, so the painted y is `rect.y + transform.translate.y`.
@@ -10071,7 +10071,7 @@ mod tests {
         let frac = find_collapse_sig(&tree).expect("nested collapse header is detected");
         interp.tick();
         let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
-        let header_rgba = crate::interp::intrinsics::color_to_rgba(0xAABBCC, false);
+        let header_rgba = crate::interp::intrinsics::color_to_rgba(0x00AA_BBCC, false);
         let y_of = |frame: &byard_core::frame::RenderFrame| -> Option<f32> {
             frame
                 .instances()
