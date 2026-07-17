@@ -1,0 +1,60 @@
+// RFC-0021 — collapsing header.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/collapse_header
+//   cargo run -p byard-cli -- dev
+//
+// What to verify:
+//   Scroll the list down. The header (first child) stays pinned to the top while
+//   the list scrolls under it, and its subtitle fades out as it collapses — the
+//   implicit `scroll_fraction` binding (0 = expanded, 1 = collapsed) is available
+//   to the header's children and drives the fade. `collapse_min` sets how tall the
+//   header is once fully collapsed (so how far `scroll_fraction` reaches 1).
+View Main() {
+    var sx = 0.0
+    var sy = 0.0
+
+    Column #[bg: 0x14141C, width: 360] {
+        ScrollView #[collapse_header: true, collapse_min: 64, offset: (sx, sy),
+                     width: 360, height: 480] {
+            // The header — pinned to the top; its children read `scroll_fraction`.
+            Box #[bg: 0x381E72, width: 360, p: 20] {
+                Column #[gap: 6] {
+                    Text("Large title") #[color: 0xE8DEF8, size: 28]
+                    Box #[opacity: 1.0 - scroll_fraction] {
+                        Text("Scroll to collapse — this subtitle fades")
+                            #[color: 0xC7BFDE, size: 14]
+                    }
+                }
+            }
+
+            // The scrolling content.
+            Column #[p: 16, gap: 10] {
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 1") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 2") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 3") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 4") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 5") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 6") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 7") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 8") #[color: 0xCAC4D0, size: 16]
+                }
+            }
+        }
+    }
+}

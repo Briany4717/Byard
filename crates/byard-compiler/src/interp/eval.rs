@@ -1664,14 +1664,32 @@ impl Interpreter {
             }
             _ => {
                 // Box / Column / Row / ScrollView and any other container.
-                let children = self.lower_members(&el.children, known_views);
+                // RFC-0021 collapsing header: a `collapse_header` ScrollView mints
+                // a `scroll_fraction` signal (0 = expanded, 1 = collapsed) scoped to
+                // its *first* child (the header) — the header's descendants read it
+                // to interpolate their own size/opacity. The signal is carried on
+                // `bound_sig` (unused by a ScrollView) so `render` can drive it.
+                let collapse = el.name.as_str() == "ScrollView"
+                    && Self::enum_prop(&attrs, "collapse_header") == Some("true");
+                let (children, bound_sig) = if collapse && !el.children.is_empty() {
+                    let frac = self.ctx.create_signal(Value::Float(0.0));
+                    let snap = self.env.len();
+                    self.env
+                        .push(Symbol::intern("scroll_fraction"), Value::Signal(frac));
+                    let mut kids = self.lower_members(&el.children[..1], known_views);
+                    self.env.truncate(snap);
+                    kids.extend(self.lower_members(&el.children[1..], known_views));
+                    (kids, Some(frac))
+                } else {
+                    (self.lower_members(&el.children, known_views), None)
+                };
                 RenderNode::Box {
                     name: el.name.clone(),
                     attrs,
                     state_blocks,
                     children,
                     action: el.action.clone(),
-                    bound_sig: None,
+                    bound_sig,
                     env_snapshot: self.capture_env_snapshot(),
                 }
             }
@@ -3750,6 +3768,10 @@ impl Interpreter {
                         self.register_focusable(attrs, hit_rect, elem_idx);
                     }
                 }
+                // RFC-0021 collapsing header: when set, the first child is pinned
+                // to the viewport top by this many screen px (undoing the scroll
+                // translate), so it stays put while the content scrolls under it.
+                let mut header_pin: Option<f32> = None;
                 // RFC-0005 `ScrollView`: clip children to this viewport and
                 // translate the content by `−offset`. The overflow is scissored
                 // by the encoder (an off-viewport child costs no fragments), and
@@ -3783,6 +3805,35 @@ impl Interpreter {
                             .and_then(|e| self.refreshing_seen.get(&e).copied())
                             .unwrap_or(false);
                         Self::push_pull_indicator(frame, clip, gap_px, progress, active);
+                    }
+                    // RFC-0021 collapsing header: drive `scroll_fraction` (0 →
+                    // expanded, 1 → collapsed) from the vertical scroll over the
+                    // header's collapsible range (its natural height minus
+                    // `collapse_min`), and pin the header to the viewport top so it
+                    // stays while the content scrolls under it. The header keeps its
+                    // laid-out height; its descendants read `scroll_fraction` to
+                    // interpolate their own size/opacity (RFC-0021 §4 mechanism).
+                    if let Some(frac_sig) = *bound_sig {
+                        let h_max = self
+                            .atlas
+                            .children(atlas_node)
+                            .first()
+                            .and_then(|h| self.atlas.resolved_rect(*h).ok().flatten())
+                            .map_or(0.0, |r| r.height);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let c_min = self
+                            .eval_float_prop(attrs, "collapse_min")
+                            .map_or(56.0, |v| v as f32);
+                        let dist = (h_max - c_min).max(1.0);
+                        let frac = (oy / dist).clamp(0.0, 1.0);
+                        if !matches!(
+                            self.ctx.peek_signal(frac_sig),
+                            Value::Float(f) if (f - f64::from(frac)).abs() < 1e-4
+                        ) {
+                            self.ctx
+                                .write_signal(frac_sig, Value::Float(f64::from(frac)));
+                        }
+                        header_pin = Some(oy * inherited_transform.scale[1]);
                     }
                     // Record a wheel/drag scroll target for whichever of
                     // `offset.x`/`offset.y` is a writable signal (e.g.
@@ -3930,8 +3981,34 @@ impl Interpreter {
                 } else {
                     // RFC-0018: expand reactive `when`/`for` into concrete children
                     // in the same order the layout pass did.
-                    for child in self.expand_concrete(children, pools) {
-                        render_child(self, child, frame, flat_idx);
+                    for (i, child) in self
+                        .expand_concrete(children, pools)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        // RFC-0021 collapsing header: render the first child with the
+                        // scroll translate undone on Y, so it stays pinned to the
+                        // viewport top while the rest scrolls under it.
+                        if let (0, Some(pin)) = (i, header_pin) {
+                            let mut pin_tf = child_transform;
+                            pin_tf.translate[1] += pin;
+                            let child_id = flat_ids[*flat_idx];
+                            self.render_node_with_atlas(
+                                child,
+                                child_id,
+                                frame,
+                                flat_ids,
+                                flat_idx,
+                                current_rect,
+                                child_opacity,
+                                pin_tf,
+                                child_clip,
+                                child_window,
+                                pools,
+                            );
+                        } else {
+                            render_child(self, child, frame, flat_idx);
+                        }
                     }
                 }
                 if scroll_clip.is_some() {
@@ -9815,6 +9892,120 @@ mod tests {
             (peek_f(&interp) - 100.0).abs() < 1.0,
             "the fling projects forward to page 1 (100), got {}",
             peek_f(&interp)
+        );
+    }
+
+    /// Finds the first `collapse_header` `ScrollView`'s `scroll_fraction` signal
+    /// (carried on `bound_sig`) in a lowered tree.
+    fn find_collapse_sig(nodes: &[RenderNode]) -> Option<SignalId> {
+        for n in nodes {
+            if let RenderNode::Box {
+                name,
+                bound_sig,
+                children,
+                ..
+            } = n
+            {
+                if name.as_str() == "ScrollView" {
+                    if let Some(sig) = bound_sig {
+                        return Some(*sig);
+                    }
+                }
+                if let Some(s) = find_collapse_sig(children) {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+
+    /// RFC-0021 collapsing header: `scroll_fraction` runs 0 → 1 over the header's
+    /// collapsible range (natural height − `collapse_min`) and clamps past it.
+    #[test]
+    fn collapse_header_drives_scroll_fraction() {
+        let src = "View V() { var sx = 0.0 var sy = 0.0 \
+             ScrollView #[collapse_header: true, collapse_min: 40, offset: (sx, sy), \
+                          width: 200, height: 150] { \
+                 Box #[bg: 0xAABBCC, width: 200] { Box #[width: 200, height: 100] {} } \
+                 Column { Box #[bg: 0x112233, width: 200, height: 120] {} \
+                          Box #[bg: 0x223344, width: 200, height: 120] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        let frac = find_collapse_sig(&tree).expect("scroll_fraction signal exists");
+        let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        let read = |i: &Interpreter| match i.peek(frac) {
+            Value::Float(f) => f as f32,
+            _ => -1.0,
+        };
+        // Range is 100 − 40 = 60px.
+        interp.tick();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            read(&interp).abs() < 1e-3,
+            "expanded → 0, got {}",
+            read(&interp)
+        );
+        interp.write_var(sy, Value::Float(30.0));
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (read(&interp) - 0.5).abs() < 1e-2,
+            "halfway → 0.5, got {}",
+            read(&interp)
+        );
+        interp.write_var(sy, Value::Float(90.0));
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            (read(&interp) - 1.0).abs() < 1e-3,
+            "past range → clamped 1, got {}",
+            read(&interp)
+        );
+    }
+
+    /// RFC-0021 collapsing header: the header (first child) stays pinned to the
+    /// viewport top as the content scrolls under it.
+    #[test]
+    fn collapse_header_pins_header_while_content_scrolls() {
+        let src = "View V() { var sx = 0.0 var sy = 0.0 \
+             ScrollView #[collapse_header: true, offset: (sx, sy), width: 200, height: 150] { \
+                 Box #[bg: 0xAABBCC, width: 200, height: 80] {} \
+                 Box #[bg: 0x112233, width: 200, height: 200] {} \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
+        let header_rgba = crate::interp::intrinsics::color_to_rgba(0xAABBCC, false);
+        let content_rgba = crate::interp::intrinsics::color_to_rgba(0x0011_2233, false);
+        // Scroll is applied as a paint-time translate, not baked into the layout
+        // rect, so the painted y is `rect.y + transform.translate.y`.
+        let y_of = |frame: &byard_core::frame::RenderFrame, rgba: [f32; 4]| -> Option<f32> {
+            frame
+                .instances()
+                .iter()
+                .find(|b| b.color == rgba)
+                .map(|b| b.rect[1] + b.transform.translate[1])
+        };
+        let mut f0 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f0, 400.0, 300.0);
+        let (h0, c0) = (y_of(&f0, header_rgba), y_of(&f0, content_rgba));
+        // Scroll down 50px.
+        interp.write_var(sy, Value::Float(50.0));
+        let mut f1 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f1, 400.0, 300.0);
+        let (h1, c1) = (y_of(&f1, header_rgba), y_of(&f1, content_rgba));
+        let (h0, h1) = (h0.expect("header painted"), h1.expect("header painted"));
+        let (c0, c1) = (c0.expect("content painted"), c1.expect("content painted"));
+        assert!((h1 - h0).abs() < 0.5, "header stays pinned: {h0} → {h1}");
+        assert!(
+            (c1 - (c0 - 50.0)).abs() < 0.5,
+            "content scrolls up by 50: {c0} → {c1}"
         );
     }
 

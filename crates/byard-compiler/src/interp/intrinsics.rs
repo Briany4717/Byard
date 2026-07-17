@@ -505,6 +505,8 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             props.insert("pull_refresh", PropType::Bool);
             props.insert("refreshing", PropType::Bool);
             props.insert("collapse_header", PropType::Bool);
+            props.insert("collapse_min", PropType::Int);
+            props.insert("collapse_parallax", PropType::Float);
             props.insert("page", PropType::Int);
             props.insert("page_count", PropType::Int);
             props.insert("end_threshold", PropType::Float);

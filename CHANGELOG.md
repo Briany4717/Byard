@@ -71,6 +71,18 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (overscroll + indicator), and collapsing headers (layout-during-scroll +
   implicit `scroll_fraction`) are follow-up passes — each needs a new
   physics/layout subsystem. See `crates/byard-cli/examples/scroll_snap`.
+- **RFC-0021 collapsing header.** `collapse_header: true` on a `ScrollView` pins
+  its **first child** (the header) to the viewport top while the rest scrolls
+  under it, and exposes an implicit reactive **`scroll_fraction`** binding
+  (`0` = expanded, `1` = collapsed) scoped to that header's subtree — its children
+  read it to interpolate their own size/opacity (e.g. a subtitle
+  `opacity: 1.0 - scroll_fraction`). The fraction runs over the header's
+  collapsible range (its natural height minus `collapse_min`, default 56) and
+  clamps past it. Per RFC-0021's rationale this avoids sticky-positioning layout
+  complexity: the header keeps its laid-out height and the collapse is expressed as
+  ordinary reactive interpolation. New example
+  `crates/byard-cli/examples/collapse_header`. Parallax
+  (`collapse_parallax`) is accepted but not yet applied — a follow-up.
 - **RFC-0021 pull-to-refresh.** `pull_refresh: true` makes a downward over-drag
   past the top of a `ScrollView` grow an elastic pull region (a diminishing-returns
   resistance curve); releasing past the threshold fires the `refresh` event and
