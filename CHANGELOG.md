@@ -84,6 +84,17 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never fired; it fires now. Custom indicator slots (`pull_refresh: { … }`) and the
   platform-specific edge overscroll rubber-band remain follow-ups. See
   `crates/byard-cli/examples/scroll_snap`.
+- **RFC-0021 `snap_spring` + fling-velocity projection (snap physics).** A
+  `snap_spring: anim.spring(stiffness: …, damping: …)` prop overrides the snap
+  glide's spring per `ScrollView` (reusing RFC-0010's curve grammar; a malformed
+  curve is diagnosed and falls back to the default). And a settle now projects the
+  fling: above 150 dp/s it advances one boundary in the fling direction — clamped
+  to ±1 of the nearest, so a fast flick that stops short of the midpoint still
+  turns the page while a moderate one never skips — reusing the same boundary
+  geometry for `snap: page` and `snap: item`. Velocity is estimated from the
+  offset change between scroll inputs over their timestamps, so it needs no extra
+  gesture plumbing. This completes RFC-0021's snap-scrolling pillar. See
+  `crates/byard-cli/examples/scroll_snap`.
 - **RFC-0021 `snap: item` + `snap_align`.** `snap: item` settles the scroll to
   the nearest **direct-child boundary** instead of a fixed page, so a carousel of
   unequal-width cards snaps each card to the viewport edge. `snap_align` places

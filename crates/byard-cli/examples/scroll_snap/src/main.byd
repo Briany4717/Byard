@@ -7,8 +7,9 @@
 //
 // What to verify:
 //   1. Drag the top carousel horizontally and release — it snaps to the nearest
-//      page (`snap: page`), and "Current page" updates via the reflected `page:`
-//      var (a `page_change` also fires on the settle).
+//      page (`snap: page`) with a bouncy `snap_spring`, and "Current page"
+//      updates via the reflected `page:` var (`page_change` fires on settle). A
+//      fast flick projects one page in the fling direction even if it stops short.
 //   2. The middle carousel uses `snap: item, snap_align: center` — its unequal
 //      cards each settle centred in the viewport (child-boundary snapping, not a
 //      fixed page). Scroll it and release; whichever card is nearest centres.
@@ -39,6 +40,7 @@ View Main() {
         Text("Advanced scroll — RFC-0021") #[color: 0xE6E1E5, size: 18]
 
         ScrollView #[axis: horizontal, snap: page, offset: (offX, offY),
+                     snap_spring: anim.spring(stiffness: 260, damping: 16),
                      page: page, page_count: 3, width: 312, height: 160] {
             Row {
                 Box #[bg: 0x381E72, p: 10, m: 5, radius: 12, width: 302, height: 150] {

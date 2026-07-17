@@ -316,6 +316,9 @@ struct ScrollTarget {
     /// `snap_align`-adjusted child boundaries live in
     /// [`Interpreter::scroll_item_bounds`], keyed by [`elem`](Self::elem).
     snap: SnapMode,
+    /// RFC-0021 `snap_spring` override — the packed curve driving the snap glide,
+    /// or `None` for the engine default spring.
+    snap_spring: Option<byard_core::frame::MotionCurve>,
     /// RFC-0021 reflected `page:` var — written the current page index on a
     /// page-snap settle; a `page_change` fires when it changes.
     page_sig: Option<SignalId>,
@@ -625,6 +628,15 @@ pub struct Interpreter {
     /// the app clearing it (`true → false`) edge-triggers the retract spring
     /// without fighting the engine's own set on trigger.
     refreshing_seen: std::collections::HashMap<u32, bool>,
+    /// RFC-0021 fling projection: the latest signed scroll velocity (px/s, positive
+    /// = offset increasing) per `ScrollView` elem, estimated from the offset change
+    /// between scroll inputs over their `time_ms`. A settle above the fling
+    /// threshold projects one boundary in this direction instead of snapping to the
+    /// nearest.
+    scroll_vel: std::collections::HashMap<u32, f32>,
+    /// Fling-velocity bookkeeping: the `(offset, time_ms)` of the last scroll input
+    /// per elem, differenced against the next to estimate [`scroll_vel`](Self::scroll_vel).
+    scroll_vel_last: std::collections::HashMap<u32, (f32, u64)>,
     /// Monotonic render counter (RFC-0021 snap timing): bumped once at the top of
     /// every [`render`](Self::render). Drives the frame-counted "scroll has gone
     /// quiet" test in [`scroll_quiet`](Self::scroll_quiet) without depending on an
@@ -3800,6 +3812,7 @@ impl Interpreter {
                             Some("end") => SnapAlign::End,
                             _ => SnapAlign::Start,
                         };
+                        let snap_spring = self.resolve_snap_spring(attrs);
                         let page_sig = self.resolve_named_var_sig(attrs, "page");
                         let has_end = attrs.iter().any(|a| {
                             a.name.as_str() == "end_reached"
@@ -3839,6 +3852,7 @@ impl Interpreter {
                             y: sig_y.map(|sig| ScrollAxis { sig, max: y_max }),
                             elem: sv_elem,
                             snap,
+                            snap_spring,
                             page_sig,
                             end_threshold,
                             pull_refresh,
@@ -5031,6 +5045,24 @@ impl Interpreter {
             AttrKind::Prop { value } if a.name.as_str() == name => Self::enum_token(value),
             _ => None,
         })
+    }
+
+    /// Resolves the RFC-0021 `snap_spring` prop into a packed spring curve, or
+    /// `None` for the engine default. Reuses the `with`-animation curve grammar
+    /// (`anim.spring(stiffness: …, damping: …)`); a malformed curve is reported
+    /// and falls back to the default.
+    fn resolve_snap_spring(&mut self, attrs: &[Attr]) -> Option<byard_core::frame::MotionCurve> {
+        let value = attrs.iter().find_map(|a| match &a.kind {
+            AttrKind::Prop { value } if a.name.as_str() == "snap_spring" => Some(value),
+            _ => None,
+        })?;
+        match crate::interp::anim::resolve_curve(value) {
+            Ok(curve) => Some(pack_curve(curve)),
+            Err(e) => {
+                self.errors.push(e);
+                None
+            }
+        }
     }
 
     fn eval_fit_prop(&mut self, attrs: &[Attr]) -> byard_core::frame::ImageFit {
@@ -6379,6 +6411,22 @@ impl Interpreter {
         self.write_scroll(axis.sig, next);
     }
 
+    /// Estimates and records the signed scroll velocity for `elem` (RFC-0021 fling
+    /// projection): the offset change since the last input over its `time_ms`
+    /// (px/s, positive = offset increasing). Skipped when the clock does not
+    /// advance (`dt == 0`, e.g. unit tests) so velocity stays 0 and a settle snaps
+    /// to the nearest boundary.
+    fn record_scroll_velocity(&mut self, elem: u32, offset: f32, time_ms: u64) {
+        if let Some((prev_off, prev_t)) = self.scroll_vel_last.get(&elem).copied() {
+            let dt = time_ms.saturating_sub(prev_t);
+            if dt > 0 {
+                self.scroll_vel
+                    .insert(elem, (offset - prev_off) / (dt as f32 / 1000.0));
+            }
+        }
+        self.scroll_vel_last.insert(elem, (offset, time_ms));
+    }
+
     /// The scrollable axis of a target and its viewport extent (the one with
     /// travel — `max > 0`), vertical preferred. RFC-0021 snap/pagination helper.
     fn scrollable_axis(t: &ScrollTarget) -> Option<(ScrollAxis, f32)> {
@@ -6469,7 +6517,7 @@ impl Interpreter {
             }
             _ => direct,
         };
-        items
+        let mut offsets: Vec<f32> = items
             .into_iter()
             .filter_map(|child| self.atlas.resolved_rect(child).ok().flatten())
             .map(|r| {
@@ -6485,7 +6533,64 @@ impl Interpreter {
                 };
                 aligned.clamp(0.0, axis_max)
             })
-            .collect()
+            .collect();
+        // Ascending, so the fling-projection ±1 clamp indexes adjacent items.
+        offsets.sort_by(f32::total_cmp);
+        offsets
+    }
+
+    /// The offset a settle should target, applying RFC-0021 fling projection: above
+    /// the fling velocity threshold it advances one boundary in the fling direction
+    /// (clamped ±1 of the nearest — no multi-item skip); otherwise the nearest.
+    /// Shares boundary geometry with [`snap_target_offset`](Self::snap_target_offset).
+    fn snap_settle_target(&self, t: &ScrollTarget, axis: ScrollAxis, vp: f32) -> Option<f32> {
+        /// Fling velocity (px/s) above which the settle projects rather than snaps
+        /// to nearest (RFC-0021 resolved question: 150 dp/s).
+        const FLING: f32 = 150.0;
+        let cur = self.peek_scroll(axis.sig);
+        let vel = t
+            .elem
+            .and_then(|e| self.scroll_vel.get(&e).copied())
+            .unwrap_or(0.0);
+        // The ordered boundary offsets on this axis.
+        let bounds: Vec<f32> = match t.snap {
+            SnapMode::None => return None,
+            SnapMode::Page => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let last = (axis.max / vp).ceil().max(0.0) as usize;
+                #[allow(clippy::cast_precision_loss)]
+                (0..=last)
+                    .map(|i| ((i as f32) * vp).min(axis.max))
+                    .collect()
+            }
+            SnapMode::Item => self.scroll_item_bounds.get(&t.elem?)?.clone(),
+        };
+        if bounds.is_empty() {
+            return None;
+        }
+        let nearest = bounds
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (**a - cur).abs().total_cmp(&(**b - cur).abs()))
+            .map(|(i, _)| i)?;
+        let target = if vel > FLING {
+            // first boundary strictly ahead of the current offset
+            bounds
+                .iter()
+                .position(|&b| b > cur + 0.5)
+                .unwrap_or(nearest)
+        } else if vel < -FLING {
+            // last boundary strictly behind
+            bounds
+                .iter()
+                .rposition(|&b| b < cur - 0.5)
+                .unwrap_or(nearest)
+        } else {
+            nearest
+        };
+        // Clamp to ±1 of the nearest so a fling never skips more than one boundary.
+        let target = target.clamp(nearest.saturating_sub(1), nearest + 1);
+        Some(bounds[target].clamp(0.0, axis.max))
     }
 
     /// Begins a smooth snap of `t`'s scrollable axis to its nearest boundary: reflects
@@ -6509,9 +6614,14 @@ impl Interpreter {
             return;
         }
         let cur = self.peek_scroll(axis.sig);
-        let Some(target) = self.snap_target_offset(t, axis, vp) else {
+        // A fling above the velocity threshold projects one boundary ahead; a slow
+        // settle snaps to the nearest. Consume the velocity so the next gesture
+        // starts fresh.
+        let Some(target) = self.snap_settle_target(t, axis, vp) else {
             return;
         };
+        self.scroll_vel.remove(&elem);
+        self.scroll_vel_last.remove(&elem);
         if (cur - target).abs() < EPS {
             self.snap_anims.remove(&elem);
             return; // already on a boundary — nothing to glide
@@ -6521,7 +6631,9 @@ impl Interpreter {
         // the spring (or the instant fallback) arrives.
         self.reflect_page(t);
         if self.clock_set {
-            let curve = pack_curve(crate::interp::anim::Curve::DEFAULT_SPRING);
+            let curve = t
+                .snap_spring
+                .unwrap_or_else(|| pack_curve(crate::interp::anim::Curve::DEFAULT_SPRING));
             self.snap_anims.insert(
                 elem,
                 SnapAnim {
@@ -7010,6 +7122,10 @@ impl Interpreter {
             if let Some(elem) = t.elem {
                 self.scroll_quiet.insert(elem, self.frame_seq);
                 self.snap_anims.remove(&elem);
+                if let Some((axis, _)) = Self::scrollable_axis(&t) {
+                    let off = self.peek_scroll(axis.sig);
+                    self.record_scroll_velocity(elem, off, ev.time_ms);
+                }
             }
         }
 
@@ -7050,10 +7166,12 @@ impl Interpreter {
                         pull_refresh: t.pull_refresh,
                         refreshing_sig: t.refreshing_sig,
                     });
-                    // A fresh press on a pull view cancels its retract spring so
-                    // the drag owns the pull region (RFC-0021).
-                    if let Some(elem) = target.filter(|t| t.pull_refresh).and_then(|t| t.elem) {
+                    // A fresh press cancels a pull view's retract spring and resets
+                    // fling-velocity tracking so this gesture starts clean (RFC-0021).
+                    if let Some(elem) = target.and_then(|t| t.elem) {
                         self.pull_anims.remove(&elem);
+                        self.scroll_vel.remove(&elem);
+                        self.scroll_vel_last.remove(&elem);
                     }
                 }
                 CoreKind::PointerMove => {
@@ -7068,6 +7186,15 @@ impl Interpreter {
                         }
                         if d.pull_refresh {
                             self.drive_pull_drag(d, ev.pos.1);
+                        }
+                        // RFC-0021 fling projection: track the drag's velocity on
+                        // its scrollable axis (vertical preferred) for the release.
+                        if let Some(elem) = d.elem {
+                            let axis = d.y.filter(|a| a.max > 0.0).or(d.x);
+                            if let Some(a) = axis {
+                                let off = self.peek_scroll(a.sig);
+                                self.record_scroll_velocity(elem, off, ev.time_ms);
+                            }
                         }
                     }
                 }
@@ -9639,6 +9766,58 @@ mod tests {
         );
     }
 
+    /// RFC-0021 fling projection: a fast flick that stops short of the midpoint
+    /// still advances one page in the fling direction (the velocity carries it),
+    /// whereas the same offset with no velocity snaps back to the nearest page.
+    #[test]
+    fn fast_fling_projects_one_page_forward() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let peek_f = |i: &Interpreter| match i.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        let wheel = |dx: f32, t: u64| byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (dx, 0.0),
+            payload: None,
+            time_ms: t,
+        };
+        // Two quick flicks 20px apart in 40ms → ~500 px/s, well past 150 dp/s, but
+        // the offset only reaches 40 — short of the page-0→1 midpoint (50).
+        interp.dispatch_events(&[wheel(-20.0, 0)]);
+        interp.dispatch_events(&[wheel(-20.0, 40)]);
+        assert!(
+            (peek_f(&interp) - 40.0).abs() < 1.0,
+            "offset reached 40 (short of the midpoint), got {}",
+            peek_f(&interp)
+        );
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        assert!(
+            (peek_f(&interp) - 100.0).abs() < 1.0,
+            "the fling projects forward to page 1 (100), got {}",
+            peek_f(&interp)
+        );
+    }
+
     /// RFC-0021 `snap_align: center`: the snapped item is centred in the viewport,
     /// so its rest offset is its start minus half the slack `(viewport − item)`.
     #[test]
@@ -9681,6 +9860,77 @@ mod tests {
             (peek_f(&interp) - 80.0).abs() < 1.0,
             "centres item 1 at offset 80, got {}",
             peek_f(&interp)
+        );
+    }
+
+    /// RFC-0021 `snap_spring`: a custom spring override checks clean and still
+    /// snaps to the page (the override changes the glide feel, not the target).
+    #[test]
+    fn snap_spring_override_checks_and_snaps() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, \
+                          snap_spring: anim.spring(stiffness: 320, damping: 18), \
+                          offset: (offX, offY), width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(
+            interp.errors().is_empty(),
+            "snap_spring resolves cleanly: {:?}",
+            interp.errors()
+        );
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-70.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        let got = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        assert!(
+            (got - 100.0).abs() < 1.0,
+            "still snaps to page 1 with the custom spring, got {got}"
+        );
+    }
+
+    /// RFC-0021 `snap_spring`: a malformed curve is reported (and falls back to the
+    /// default), not silently accepted.
+    #[test]
+    fn snap_spring_malformed_is_reported() {
+        let src = "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, snap_spring: anim.wobble, \
+                          offset: (offX, offY), width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        // `snap_spring` is resolved during render (scroll-target build), so drive a
+        // frame to surface the diagnostic.
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        assert!(
+            !interp.errors().is_empty(),
+            "an unknown curve name is diagnosed"
         );
     }
 
