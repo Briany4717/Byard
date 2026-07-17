@@ -1313,6 +1313,28 @@ impl LayoutAtlas {
         }
     }
 
+    /// The direct child nodes of `node`, in layout order, if it belongs to this
+    /// atlas. Empty for a leaf or a node from another atlas. RFC-0021 `snap: item`
+    /// reads each item's boundary by pairing this with
+    /// [`resolved_rect`](Self::resolved_rect).
+    #[must_use]
+    pub fn children(&self, node: AtlasNodeId) -> Vec<AtlasNodeId> {
+        if node.atlas_id != self.instance_id {
+            return Vec::new();
+        }
+        self.tree.children(node.node_id).map_or_else(
+            |_| Vec::new(),
+            |ids| {
+                ids.into_iter()
+                    .map(|node_id| AtlasNodeId {
+                        node_id,
+                        atlas_id: self.instance_id,
+                    })
+                    .collect()
+            },
+        )
+    }
+
     /// Recursively walks the tree from `node` in pre-order, pushing each
     /// resolved rectangle — and its dirty state — into `frame`.
     ///

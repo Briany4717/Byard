@@ -71,6 +71,19 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (overscroll + indicator), and collapsing headers (layout-during-scroll +
   implicit `scroll_fraction`) are follow-up passes — each needs a new
   physics/layout subsystem. See `crates/byard-cli/examples/scroll_snap`.
+- **RFC-0021 `snap: item` + `snap_align`.** `snap: item` settles the scroll to
+  the nearest **direct-child boundary** instead of a fixed page, so a carousel of
+  unequal-width cards snaps each card to the viewport edge. `snap_align` places
+  the snapped item at the viewport's `start` (default), `center`, or `end`. The
+  item boundaries are read from the laid-out child rects each render (offset is a
+  paint-time translate, so layout positions are the natural content coordinates),
+  aligned, and clamped to the scroll extent — the settle then picks the boundary
+  nearest the current offset and reuses the same spring glide and momentum-aware
+  quiet detection as `snap: page`. When the content is wrapped in a single
+  `Row`/`Column` (the usual scroll layout), the items are that container's
+  children. New engine surface: `LayoutAtlas::children`. `snap_spring` overrides
+  and fling-velocity projection remain follow-ups. See
+  `crates/byard-cli/examples/scroll_snap`.
 - **RFC-0024 extended style states + combined selectors.** The style-state
   system (RFC-0012/0016) gains five engine-managed pseudo-states — `checked`
   (a value-widget's value is true), `selected` (the `selected:` prop, or a

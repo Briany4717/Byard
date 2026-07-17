@@ -268,6 +268,29 @@ struct ScrollAxis {
     max: f32,
 }
 
+/// RFC-0021 `snap` mode: where a scroll settles after a fling/scroll goes quiet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapMode {
+    /// Free scrolling (`snap: none`, the default) — never snaps.
+    None,
+    /// `snap: page` — settle to the nearest viewport-sized page.
+    Page,
+    /// `snap: item` — settle to the nearest direct-child boundary (the child
+    /// offsets are precomputed into [`Interpreter::scroll_item_bounds`]).
+    Item,
+}
+
+/// RFC-0021 `snap_align`: where the snapped item aligns within the viewport.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapAlign {
+    /// Item's leading edge at the viewport's leading edge (default).
+    Start,
+    /// Item centred in the viewport.
+    Center,
+    /// Item's trailing edge at the viewport's trailing edge.
+    End,
+}
+
 /// A wheel/drag-scrollable region recorded during render (RFC-0005
 /// `ScrollView`). `dispatch_events` turns a wheel or a drag over `rect` into a
 /// clamped write to whichever of `offset.x`/`offset.y` is a writable `var`.
@@ -282,9 +305,10 @@ struct ScrollTarget {
     /// The `ScrollView` element index, for firing engine scroll events
     /// (`end_reached`/`page_change`/`scroll_end`) — RFC-0021.
     elem: Option<u32>,
-    /// RFC-0021 `snap: page`: on release, snap the offset to the nearest
-    /// viewport-sized page. (`snap: item` boundary snapping is a follow-up.)
-    snap_page: bool,
+    /// RFC-0021 `snap` mode (`none`/`page`/`item`). For `item`, the
+    /// `snap_align`-adjusted child boundaries live in
+    /// [`Interpreter::scroll_item_bounds`], keyed by [`elem`](Self::elem).
+    snap: SnapMode,
     /// RFC-0021 reflected `page:` var — written the current page index on a
     /// page-snap settle; a `page_change` fires when it changes.
     page_sig: Option<SignalId>,
@@ -567,6 +591,12 @@ pub struct Interpreter {
     /// offset pinned exactly on the page). A fresh scroll/drag on the elem cancels
     /// it so the user always takes over cleanly (interruptible).
     snap_anims: std::collections::HashMap<u32, SnapAnim>,
+    /// RFC-0021 `snap: item`: the candidate rest offsets (one per direct child,
+    /// pre-adjusted for `snap_align` and clamped to the scroll extent) per
+    /// `ScrollView` elem. Rebuilt each render from the laid-out child rects; the
+    /// item settle picks the candidate nearest the current offset. Empty for
+    /// `snap: none`/`page`.
+    scroll_item_bounds: std::collections::HashMap<u32, Vec<f32>>,
     /// Monotonic render counter (RFC-0021 snap timing): bumped once at the top of
     /// every [`render`](Self::render). Drives the frame-counted "scroll has gone
     /// quiet" test in [`scroll_quiet`](Self::scroll_quiet) without depending on an
@@ -1896,8 +1926,10 @@ impl Interpreter {
         self.advance_snap_anims();
         self.settle_snaps();
         // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
-        // router's hit rects.
+        // router's hit rects. RFC-0021 `snap: item` boundaries follow the same
+        // lifecycle (settle above read the previous frame's; emit rebuilds them).
         self.scroll_targets.clear();
+        self.scroll_item_bounds.clear();
         // RFC-0018 radio groups are rebuilt from the fresh layout each render.
         self.radio_groups.clear();
 
@@ -3689,7 +3721,16 @@ impl Interpreter {
                             .flatten()
                             .unwrap_or((current_rect.w, current_rect.h));
                         // RFC-0021 behaviours resolved from props.
-                        let snap_page = matches!(Self::enum_prop(attrs, "snap"), Some("page"));
+                        let snap = match Self::enum_prop(attrs, "snap") {
+                            Some("page") => SnapMode::Page,
+                            Some("item") => SnapMode::Item,
+                            _ => SnapMode::None,
+                        };
+                        let snap_align = match Self::enum_prop(attrs, "snap_align") {
+                            Some("center") => SnapAlign::Center,
+                            Some("end") => SnapAlign::End,
+                            _ => SnapAlign::Start,
+                        };
                         let page_sig = self.resolve_named_var_sig(attrs, "page");
                         let has_end = attrs.iter().any(|a| {
                             a.name.as_str() == "end_reached"
@@ -3701,6 +3742,23 @@ impl Interpreter {
                                 .map_or(0.8, |v| v as f32)
                         });
                         let sv_elem = self.atlas.node_index(atlas_node);
+                        let x_max = (content_w - current_rect.w).max(0.0);
+                        let y_max = (content_h - current_rect.h).max(0.0);
+                        // RFC-0021 `snap: item`: precompute the rest offset for each
+                        // direct child on the scrolling axis (vertical preferred,
+                        // matching `scrollable_axis`), aligned per `snap_align`.
+                        if let (Some(elem), SnapMode::Item) = (sv_elem, snap) {
+                            let horizontal = y_max <= 0.0 && x_max > 0.0;
+                            let (vp, axis_max) = if horizontal {
+                                (current_rect.w, x_max)
+                            } else {
+                                (current_rect.h, y_max)
+                            };
+                            let bounds = self.item_snap_offsets(
+                                atlas_node, horizontal, vp, axis_max, snap_align,
+                            );
+                            self.scroll_item_bounds.insert(elem, bounds);
+                        }
                         self.scroll_targets.push(ScrollTarget {
                             rect: crate::interp::intrinsics::Rect::new(
                                 clip.x,
@@ -3708,16 +3766,10 @@ impl Interpreter {
                                 clip.width,
                                 clip.height,
                             ),
-                            x: sig_x.map(|sig| ScrollAxis {
-                                sig,
-                                max: (content_w - current_rect.w).max(0.0),
-                            }),
-                            y: sig_y.map(|sig| ScrollAxis {
-                                sig,
-                                max: (content_h - current_rect.h).max(0.0),
-                            }),
+                            x: sig_x.map(|sig| ScrollAxis { sig, max: x_max }),
+                            y: sig_y.map(|sig| ScrollAxis { sig, max: y_max }),
                             elem: sv_elem,
-                            snap_page,
+                            snap,
                             page_sig,
                             end_threshold,
                         });
@@ -6293,7 +6345,79 @@ impl Interpreter {
         self.scroll_page_last.insert(elem, page);
     }
 
-    /// Begins a smooth snap of `t`'s scrollable axis to its nearest page: reflects
+    /// The offset `t`'s scrollable `axis` should rest at, snapping the current
+    /// offset to the mode's nearest boundary (RFC-0021): a viewport multiple for
+    /// [`SnapMode::Page`], or the nearest precomputed direct-child boundary for
+    /// [`SnapMode::Item`] (already `snap_align`-adjusted in
+    /// [`scroll_item_bounds`](Self::scroll_item_bounds)). `None` for `snap: none`
+    /// or when an item view has no measured children yet.
+    fn snap_target_offset(&self, t: &ScrollTarget, axis: ScrollAxis, vp: f32) -> Option<f32> {
+        let cur = self.peek_scroll(axis.sig);
+        match t.snap {
+            SnapMode::None => None,
+            SnapMode::Page => Some(((cur / vp).round() * vp).clamp(0.0, axis.max)),
+            SnapMode::Item => {
+                let bounds = self.scroll_item_bounds.get(&t.elem?)?;
+                bounds
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| (a - cur).abs().total_cmp(&(b - cur).abs()))
+                    .map(|v| v.clamp(0.0, axis.max))
+            }
+        }
+    }
+
+    /// RFC-0021 `snap: item`: the rest offset for each direct child of the
+    /// `ScrollView` atlas node, on the scrolling axis, aligned per `snap_align`
+    /// and clamped to `[0, axis_max]`. Read once per render from the laid-out
+    /// child rects (offset is a paint-time translate, so layout positions are the
+    /// natural, offset-free content coordinates). A child whose start is `s` and
+    /// extent `w` rests at `s` (start), `s − (vp − w)/2` (centre), or `s − (vp − w)`
+    /// (end).
+    fn item_snap_offsets(
+        &self,
+        sv_node: byard_core::atlas::layout::AtlasNodeId,
+        horizontal: bool,
+        vp: f32,
+        axis_max: f32,
+        align: SnapAlign,
+    ) -> Vec<f32> {
+        let Ok(Some(sv)) = self.atlas.resolved_rect(sv_node) else {
+            return Vec::new();
+        };
+        // The items are the flex children that lay out along the scroll axis. A
+        // scrolling `ScrollView` almost always wraps them in one `Row`/`Column`
+        // (needed to flow on the scroll axis), so when there is a single content
+        // child, descend into it and snap to *its* children; otherwise the direct
+        // children are the items.
+        let direct = self.atlas.children(sv_node);
+        let items = match direct.as_slice() {
+            [only] => {
+                let inner = self.atlas.children(*only);
+                if inner.is_empty() { direct } else { inner }
+            }
+            _ => direct,
+        };
+        items
+            .into_iter()
+            .filter_map(|child| self.atlas.resolved_rect(child).ok().flatten())
+            .map(|r| {
+                let (start, extent) = if horizontal {
+                    (r.x - sv.x, r.width)
+                } else {
+                    (r.y - sv.y, r.height)
+                };
+                let aligned = match align {
+                    SnapAlign::Start => start,
+                    SnapAlign::Center => start - (vp - extent) / 2.0,
+                    SnapAlign::End => start - (vp - extent),
+                };
+                aligned.clamp(0.0, axis_max)
+            })
+            .collect()
+    }
+
+    /// Begins a smooth snap of `t`'s scrollable axis to its nearest boundary: reflects
     /// `page` right away (the indicator jumps to the destination as the glide
     /// starts) and seeds a spring from the current offset to the page boundary
     /// (RFC-0021 §2, RFC-0010 spring). [`advance_snap_anims`](Self::advance_snap_anims)
@@ -6302,9 +6426,9 @@ impl Interpreter {
     /// behaviour is identical minus the animation. Shared by drag-release and the
     /// scroll-quiet settle; a no-op if already resting on a page.
     fn begin_snap(&mut self, t: &ScrollTarget) {
-        /// Sub-pixel tolerance for "already on a page".
+        /// Sub-pixel tolerance for "already on a boundary".
         const EPS: f32 = 0.5;
-        if !t.snap_page {
+        if t.snap == SnapMode::None {
             return;
         }
         let (Some((axis, vp)), Some(elem)) = (Self::scrollable_axis(t), t.elem) else {
@@ -6314,10 +6438,12 @@ impl Interpreter {
             return;
         }
         let cur = self.peek_scroll(axis.sig);
-        let target = ((cur / vp).round() * vp).clamp(0.0, axis.max);
+        let Some(target) = self.snap_target_offset(t, axis, vp) else {
+            return;
+        };
         if (cur - target).abs() < EPS {
             self.snap_anims.remove(&elem);
-            return; // already on a page — nothing to glide
+            return; // already on a boundary — nothing to glide
         }
         // Destination page is known now — reflect it immediately (fires
         // `page_change`) so pagination leads the glide, and settle it exactly once
@@ -6439,7 +6565,10 @@ impl Interpreter {
         for t in targets {
             let Some(elem) = t.elem else { continue };
             // A drag in progress, or a glide already running, owns the offset.
-            if !t.snap_page || drag_elem == Some(elem) || self.snap_anims.contains_key(&elem) {
+            if t.snap == SnapMode::None
+                || drag_elem == Some(elem)
+                || self.snap_anims.contains_key(&elem)
+            {
                 continue;
             }
             let Some((axis, vp)) = Self::scrollable_axis(&t) else {
@@ -6449,9 +6578,11 @@ impl Interpreter {
                 continue;
             }
             let cur = self.peek_scroll(axis.sig);
-            let boundary = ((cur / vp).round() * vp).clamp(0.0, axis.max);
+            let Some(boundary) = self.snap_target_offset(&t, axis, vp) else {
+                continue;
+            };
             if (cur - boundary).abs() < EPS {
-                continue; // already resting on a page
+                continue; // already resting on a boundary
             }
             // Off a boundary: wait for the scroll to go quiet, then glide. `quiet`
             // is how many renders since the last scroll input touched this elem;
@@ -9210,6 +9341,98 @@ mod tests {
         assert!(
             (peek_f(&interp) - 100.0).abs() < 1.0,
             "once quiet, it snaps to page 1 (100), got {}",
+            peek_f(&interp)
+        );
+    }
+
+    /// RFC-0021 `snap: item`: with unequal-width items the offset settles to the
+    /// nearest *child boundary* (not a fixed page), so a carousel of varied cards
+    /// snaps each card to the viewport edge.
+    #[test]
+    fn item_snap_settles_to_the_nearest_child_boundary() {
+        use byard_core::platform::EventKind as K;
+        // Three items of widths 80/140/100 in a 120px viewport. Boundaries (item
+        // starts) are 0, 80, 220; content 320, max 200. A wheel to offX 60 is
+        // nearer boundary 80 than 0 → snaps to 80.
+        let src = "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: item, offset: (offX, offY), \
+                          width: 120, height: 100] { \
+                 Row { Box #[width: 80, height: 100] {} \
+                       Box #[width: 140, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let peek_f = |i: &Interpreter| match i.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-60.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        assert!(
+            (peek_f(&interp) - 80.0).abs() < 1.0,
+            "snaps to the item-2 boundary (80), got {}",
+            peek_f(&interp)
+        );
+    }
+
+    /// RFC-0021 `snap_align: center`: the snapped item is centred in the viewport,
+    /// so its rest offset is its start minus half the slack `(viewport − item)`.
+    #[test]
+    fn item_snap_align_center_centres_the_item() {
+        use byard_core::platform::EventKind as K;
+        // Uniform 100px items in a 140px viewport. Centring item 1 (start 100)
+        // rests at 100 − (140 − 100)/2 = 80. A wheel near there settles to 80.
+        let src = "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: item, snap_align: center, \
+                          offset: (offX, offY), width: 140, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let peek_f = |i: &Interpreter| match i.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-75.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        assert!(
+            (peek_f(&interp) - 80.0).abs() < 1.0,
+            "centres item 1 at offset 80, got {}",
             peek_f(&interp)
         );
     }
