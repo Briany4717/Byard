@@ -3998,6 +3998,16 @@ impl Interpreter {
                         let mut pin_tf = child_transform;
                         pin_tf.translate[1] += pin;
                         let child_id = flat_ids[*flat_idx];
+                        // Bind `scroll_fraction` in the *render* env so the header's
+                        // prop expressions (`opacity: 1.0 - scroll_fraction`, …)
+                        // resolve it to the live signal — `eval_pure` re-lowers
+                        // against the current env each frame, so the lower-time scope
+                        // alone isn't enough. Truncated right after (header-only).
+                        let fenv = self.env.len();
+                        if let Some(fs) = *bound_sig {
+                            self.env
+                                .push(Symbol::intern("scroll_fraction"), Value::Signal(fs));
+                        }
                         self.render_node_with_atlas(
                             header,
                             child_id,
@@ -4011,6 +4021,7 @@ impl Interpreter {
                             child_window,
                             pools,
                         );
+                        self.env.truncate(fenv);
                         *flat_idx = after;
                     }
                 } else {
@@ -10084,6 +10095,45 @@ mod tests {
             "scroll_fraction advanced past 0.5 after scrolling 40px, got {:?}",
             interp.peek(frac)
         );
+    }
+
+    /// RFC-0021 collapsing header: a header child's `opacity: 1.0 -
+    /// scroll_fraction` actually fades its text as the header collapses.
+    #[test]
+    fn collapse_header_fades_child_via_scroll_fraction() {
+        let src = "View V() { var sx = 0.0 var sy = 0.0 \
+             ScrollView #[collapse_header: true, collapse_min: 20, offset: (sx, sy), \
+                          width: 200, height: 100] { \
+                 Box #[bg: 0xAABBCC, width: 200, p: 8] { \
+                     Box #[opacity: 1.0 - scroll_fraction] { Text(\"Sub\") #[color: 0xC7BFDE] } \
+                 } \
+                 Column #[p: 8] { Box #[bg: 0x112233, width: 180, height: 120] {} \
+                                  Box #[bg: 0x223344, width: 180, height: 120] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
+        let sub_rgb = crate::interp::intrinsics::color_to_rgba(0x00C7_BFDE, false);
+        let sub_alpha = |frame: &byard_core::frame::RenderFrame| -> Option<f32> {
+            frame
+                .texts()
+                .iter()
+                .find(|t| t.color[..3] == sub_rgb[..3])
+                .map(|t| t.color[3])
+        };
+        let mut f0 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f0, 400.0, 300.0);
+        let a0 = sub_alpha(&f0).expect("subtitle painted");
+        interp.write_var(sy, Value::Float(80.0));
+        let mut f1 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f1, 400.0, 300.0);
+        let a1 = sub_alpha(&f1).expect("subtitle painted");
+        assert!(a0 > 0.9, "expanded subtitle is opaque, got {a0}");
+        assert!(a1 < 0.1, "collapsed subtitle has faded out, got {a1}");
     }
 
     /// RFC-0021 `snap_align: center`: the snapped item is centred in the viewport,

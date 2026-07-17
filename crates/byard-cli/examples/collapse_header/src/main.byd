@@ -5,25 +5,30 @@
 //   cargo run -p byard-cli -- dev
 //
 // What to verify:
-//   Scroll the list down. The header (first child) stays pinned to the top while
-//   the list scrolls under it, and its subtitle fades out as it collapses — the
-//   implicit `scroll_fraction` binding (0 = expanded, 1 = collapsed) is available
-//   to the header's children and drives the fade. `collapse_min` sets how tall the
-//   header is once fully collapsed (so how far `scroll_fraction` reaches 1).
+//   Scroll the list down. The header (first child) stays pinned to the top and
+//   paints over the list as it scrolls under it, while its subtitle block fades
+//   out — the implicit `scroll_fraction` binding (0 = expanded, 1 = collapsed) is
+//   available to the header's children and drives the `opacity`. `collapse_min`
+//   sets the collapsed height, so the fade completes over `header − collapse_min`
+//   px of scroll. Scroll back up and it fades in again.
 View Main() {
     var sx = 0.0
     var sy = 0.0
 
     Column #[bg: 0x14141C, width: 360] {
-        ScrollView #[collapse_header: true, collapse_min: 64, offset: (sx, sy),
-                     width: 360, height: 480] {
+        ScrollView #[collapse_header: true, collapse_min: 66, offset: (sx, sy),
+                     width: 360, height: 420] {
             // The header — pinned to the top; its children read `scroll_fraction`.
-            Box #[bg: 0x381E72, width: 360, p: 20] {
-                Column #[gap: 6] {
-                    Text("Large title") #[color: 0xE8DEF8, size: 28]
+            Box #[bg: 0x381E72, width: 360, p: 28] {
+                Column #[gap: 10] {
+                    Text("Large title") #[color: 0xE8DEF8, size: 32]
                     Box #[opacity: 1.0 - scroll_fraction] {
-                        Text("Scroll to collapse — this subtitle fades")
-                            #[color: 0xC7BFDE, size: 14]
+                        Column #[gap: 4] {
+                            Text("This subtitle fades as you scroll")
+                                #[color: 0xC7BFDE, size: 15]
+                            Text("collapse_header + scroll_fraction")
+                                #[color: 0x9A8FB8, size: 13]
+                        }
                     }
                 }
             }
@@ -53,6 +58,12 @@ View Main() {
                 }
                 Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
                     Text("Item 8") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 9") #[color: 0xCAC4D0, size: 16]
+                }
+                Box #[bg: 0x1E1E2A, radius: 8, width: 328, p: 14] {
+                    Text("Item 10") #[color: 0xCAC4D0, size: 16]
                 }
             }
         }
