@@ -65,6 +65,19 @@ pub enum EventKind {
     /// produced by a raw [`InputEvent`] — fired directly by
     /// [`EventRouter::steal_focus`] on the falling edge of `focused_sig`.
     Blur,
+    // ── RFC-0021 advanced scroll behaviours ──────────────────────────────
+    /// A `ScrollView` scrolled past its `end_threshold` (infinite scroll).
+    /// **Internal-only**: fired by the scroll machinery, debounced until the
+    /// offset falls back below the threshold.
+    EndReached,
+    /// A snapping `ScrollView` settled on a new page. **Internal-only**: fired on
+    /// a snap that changes the reflected `page` index; payload = the new index.
+    PageChange,
+    /// A `ScrollView`'s scroll/snap settled. **Internal-only**.
+    ScrollEnd,
+    /// A pull-to-refresh gesture crossed its threshold and released.
+    /// **Internal-only** (RFC-0021 pull-to-refresh).
+    Refresh,
 }
 
 impl EventKind {
@@ -394,6 +407,20 @@ impl EventRouter {
         self.steal_focus(ctx, Some(elem));
     }
 
+    /// Fires the handler of `kind` registered on `elem`, if any — the engine's
+    /// path for delivering *synthesized* events like RFC-0021's
+    /// `end_reached`/`page_change`/`scroll_end`, which have no `InputEvent`. A
+    /// no-op when the element has no such handler (or is disabled).
+    pub fn fire_event(
+        &mut self,
+        ctx: &mut ReactiveCtx,
+        elem: u32,
+        kind: EventKind,
+        payload: Option<&Value>,
+    ) {
+        self.fire_on_elem(ctx, Some(elem), kind, (0.0, 0.0), payload);
+    }
+
     /// Drains one tick's events: coalesces continuous ones (E7), dispatches in
     /// order (E4 ordering, E1 write-back, E3 focus) — marking only. The caller
     /// runs the single pull afterwards (§8).
@@ -584,10 +611,16 @@ impl EventRouter {
             EventKind::TextInput => {
                 self.fire_focused(ctx, EventKind::TextInput, ev.value.as_ref());
             }
-            // Never produced as a raw `InputEvent` — `steal_focus` fires
-            // these directly via `fire_on_elem`. Present only so this match
-            // stays exhaustive as the enum grows.
-            EventKind::Focus | EventKind::Blur => {}
+            // Never produced as a raw `InputEvent` — these are fired directly by
+            // the engine via `fire_on_elem`/`fire_event` (`steal_focus` for
+            // focus/blur; the scroll machinery for RFC-0021's scroll events).
+            // Present only so this match stays exhaustive as the enum grows.
+            EventKind::Focus
+            | EventKind::Blur
+            | EventKind::EndReached
+            | EventKind::PageChange
+            | EventKind::ScrollEnd
+            | EventKind::Refresh => {}
         }
     }
 
