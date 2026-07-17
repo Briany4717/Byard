@@ -71,6 +71,19 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (overscroll + indicator), and collapsing headers (layout-during-scroll +
   implicit `scroll_fraction`) are follow-up passes — each needs a new
   physics/layout subsystem. See `crates/byard-cli/examples/scroll_snap`.
+- **RFC-0021 pull-to-refresh.** `pull_refresh: true` makes a downward over-drag
+  past the top of a `ScrollView` grow an elastic pull region (a diminishing-returns
+  resistance curve); releasing past the threshold fires the `refresh` event and
+  rests a default indicator (a ring drawn in the revealed gap that grows and fades
+  in with pull progress). With a reflected `refreshing: Bool` the app owns the
+  lifecycle — the engine sets it `true` on trigger and holds the indicator until
+  the controller clears it, which springs the region away; without the binding the
+  pull is a momentary trigger that retracts immediately. Works with or without an
+  `offset` var (the pull region is engine state, not the scroll offset), and the
+  spring reuses RFC-0010's `Motion`. `refresh` was parsed since the first slice but
+  never fired; it fires now. Custom indicator slots (`pull_refresh: { … }`) and the
+  platform-specific edge overscroll rubber-band remain follow-ups. See
+  `crates/byard-cli/examples/scroll_snap`.
 - **RFC-0021 `snap: item` + `snap_align`.** `snap: item` settles the scroll to
   the nearest **direct-child boundary** instead of a fixed page, so a carousel of
   unequal-width cards snaps each card to the viewport edge. `snap_align` places
