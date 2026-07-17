@@ -1,5 +1,5 @@
-// RFC-0021 — advanced scroll behaviours: page snapping, pagination, and
-// infinite scroll (on_end_reached).
+// RFC-0021 — advanced scroll behaviours: page snapping, item snapping,
+// pagination, and infinite scroll (on_end_reached).
 //
 // Run it (from the repo root):
 //   cd crates/byard-cli/examples/scroll_snap
@@ -9,17 +9,22 @@
 //   1. Drag the top carousel horizontally and release — it snaps to the nearest
 //      page (`snap: page`), and "Current page" updates via the reflected `page:`
 //      var (a `page_change` also fires on the settle).
-//   2. Scroll the lower list to the bottom — crossing `end_threshold` fires
+//   2. The middle carousel uses `snap: item, snap_align: center` — its unequal
+//      cards each settle centred in the viewport (child-boundary snapping, not a
+//      fixed page). Scroll it and release; whichever card is nearest centres.
+//   3. Scroll the lower list to the bottom — crossing `end_threshold` fires
 //      `end_reached`, flipping the status line (infinite-scroll trigger).
 //
-// NOTE: pull-to-refresh, collapsing headers, spring-smoothed snapping, and
-// `snap: item` boundary snapping are separate follow-up passes (they need
-// overscroll physics / layout-during-scroll subsystems); this example covers the
-// scroll-positioning behaviours.
+// NOTE: pull-to-refresh and collapsing headers are separate follow-up passes
+// (they need overscroll physics / layout-during-scroll subsystems); this example
+// covers the snap + scroll-positioning behaviours.
 View Main() {
     var offX = 0.0
     var offY = 0.0
     var page = 0
+
+    var itemX = 0.0
+    var itemY = 0.0
 
     var listX = 0.0
     var listY = 0.0
@@ -44,6 +49,26 @@ View Main() {
         }
 
         Text("Current page: {page} of 3") #[color: 0x938F99, size: 13]
+
+        Text("snap: item · snap_align: center") #[color: 0x938F99, size: 13]
+
+        ScrollView #[axis: horizontal, snap: item, snap_align: center,
+                     offset: (itemX, itemY), width: 312, height: 96] {
+            Row #[gap: 10] {
+                Box #[bg: 0x4A4458, radius: 12, width: 120, height: 88] {
+                    Text("A") #[color: 0xE8DEF8, size: 18]
+                }
+                Box #[bg: 0x4A4458, radius: 12, width: 200, height: 88] {
+                    Text("B (wide)") #[color: 0xE8DEF8, size: 18]
+                }
+                Box #[bg: 0x4A4458, radius: 12, width: 96, height: 88] {
+                    Text("C") #[color: 0xE8DEF8, size: 18]
+                }
+                Box #[bg: 0x4A4458, radius: 12, width: 160, height: 88] {
+                    Text("D") #[color: 0xE8DEF8, size: 18]
+                }
+            }
+        }
 
         ScrollView #[offset: (listX, listY), end_threshold: 0.8,
                      end_reached => loaded_more = true, width: 312, height: 120] {
