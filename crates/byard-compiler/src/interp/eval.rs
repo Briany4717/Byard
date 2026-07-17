@@ -279,6 +279,34 @@ struct ScrollTarget {
     x: Option<ScrollAxis>,
     /// Vertical axis, present when `offset.y` is a writable `var`.
     y: Option<ScrollAxis>,
+    /// The `ScrollView` element index, for firing engine scroll events
+    /// (`end_reached`/`page_change`/`scroll_end`) — RFC-0021.
+    elem: Option<u32>,
+    /// RFC-0021 `snap: page`: on release, snap the offset to the nearest
+    /// viewport-sized page. (`snap: item` boundary snapping is a follow-up.)
+    snap_page: bool,
+    /// RFC-0021 reflected `page:` var — written the current page index on a
+    /// page-snap settle; a `page_change` fires when it changes.
+    page_sig: Option<SignalId>,
+    /// RFC-0021 `end_threshold` (0..1): the fraction of the scrollable extent at
+    /// which `end_reached` fires. `None` when no `end_reached` handler exists.
+    end_threshold: Option<f32>,
+}
+
+/// An in-flight smooth snap (RFC-0021 §2): a spring driving one `ScrollView`
+/// axis's offset signal to an exact page boundary. Seeded when scrolling settles
+/// (drag release or scroll-quiet), advanced each `render` from the shared engine
+/// clock, and dropped once [`Motion::is_settled_with_eps`] reports it has
+/// arrived — at which point the offset is pinned to `target` and `scroll_end`
+/// fires. Cancelled outright by any fresh scroll/drag on the same elem.
+#[derive(Clone, Copy)]
+struct SnapAnim {
+    /// The offset-axis signal the spring writes each frame.
+    sig: SignalId,
+    /// The spring itself (`from` = offset at settle, `to` = `target`).
+    motion: byard_core::frame::Motion,
+    /// The exact page boundary to pin the offset to on settle.
+    target: f32,
 }
 
 /// The visible slice of a windowed `ScrollView` list (RFC-0005 windowed layout):
@@ -514,6 +542,36 @@ pub struct Interpreter {
     /// pointer press lands on inert `ScrollView` content; each move writes the
     /// offset so the content tracks the pointer; cleared on release.
     scroll_drag: Option<ScrollDrag>,
+    /// RFC-0021 `on_end_reached` debounce: `ScrollView` element indices currently
+    /// past their `end_threshold` and already fired. An elem re-fires only after
+    /// its offset falls back below the threshold (removed here), so appending
+    /// items — which lowers the fraction — re-arms it. Persists across ticks
+    /// (gesture-like state), keyed by the stable element index.
+    end_reached_fired: std::collections::HashSet<u32>,
+    /// RFC-0021 reflected `page:` — the last page value synced to the offset per
+    /// `ScrollView` elem. Edge-triggered: when the `page` var differs from this
+    /// (the app set it), the offset scrolls to `page × viewport`; a drag never
+    /// changes `page` mid-gesture, so this never fights scrolling.
+    scroll_page_last: std::collections::HashMap<u32, i64>,
+    /// RFC-0021 snap settle: the [`frame_seq`](Self::frame_seq) of the last
+    /// wheel/trackpad scroll input per `snap`-enabled `ScrollView` elem. Snapping
+    /// waits until an elem has been *quiet* (no scroll input) for a few frames, so
+    /// trackpad momentum — a stream of ever-smaller deltas that leaves the offset
+    /// looking briefly "still" — cannot trigger a snap mid-fling that then fights
+    /// the next momentum event. Clock-independent (frame-counted), so it settles
+    /// identically whether or not the host advances `now_ms`.
+    scroll_quiet: std::collections::HashMap<u32, u64>,
+    /// RFC-0021 smooth snap: the in-flight spring driving a `snap: page` view's
+    /// offset to its target page, per elem. Seeded on drag release / scroll-quiet
+    /// settle and advanced each `render` until it settles (then removed and the
+    /// offset pinned exactly on the page). A fresh scroll/drag on the elem cancels
+    /// it so the user always takes over cleanly (interruptible).
+    snap_anims: std::collections::HashMap<u32, SnapAnim>,
+    /// Monotonic render counter (RFC-0021 snap timing): bumped once at the top of
+    /// every [`render`](Self::render). Drives the frame-counted "scroll has gone
+    /// quiet" test in [`scroll_quiet`](Self::scroll_quiet) without depending on an
+    /// advancing wall clock.
+    frame_seq: u64,
     /// RFC-0018 `RadioButton` groups: the ordered `value`s of every radio sharing
     /// a `bind:` group var, keyed by that var's [`SignalId`]. Rebuilt each render
     /// (cleared at the top of [`render`](Self::render), appended as each radio is
@@ -551,6 +609,8 @@ struct ScrollDrag {
     x: Option<ScrollDragAxis>,
     /// Vertical axis, present when `offset.y` is a writable `var`.
     y: Option<ScrollDragAxis>,
+    /// The dragged `ScrollView` element (for RFC-0021 snap-settle activity).
+    elem: Option<u32>,
 }
 
 impl Interpreter {
@@ -1205,6 +1265,27 @@ impl Interpreter {
         None
     }
 
+    /// Resolves the attribute `name`'s value to a writable `var`'s `SignalId`
+    /// when it is a bare identifier bound to a `var` (else `None`). Backs
+    /// RFC-0021's reflected `page:` prop; a small generalization of
+    /// [`resolve_group_bind_sig`](Self::resolve_group_bind_sig).
+    fn resolve_named_var_sig(&self, attrs: &[Attr], name: &str) -> Option<super::env::SignalId> {
+        use crate::parser::ast::Expr;
+        for attr in attrs {
+            if attr.name.as_str() == name {
+                if let AttrKind::Prop {
+                    value: Expr::Ident(n, _),
+                } = &attr.kind
+                {
+                    if let Some(super::env::Value::Signal(sig)) = self.env.lookup(n) {
+                        return Some(*sig);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The prop/value-driven style states an element contributes (RFC-0024), on
     /// top of the router's pointer/focus/drag states: `checked` (a value-widget's
     /// bound value is true), `selected` (the `selected:` prop, or a `RadioButton`
@@ -1797,11 +1878,23 @@ impl Interpreter {
         // Recomputed every frame: an animation re-marks itself active below if it
         // sampled without having settled this tick (RFC-0010).
         self.any_active = false;
+        // One monotonic tick per render — the clock-independent basis for the
+        // RFC-0021 "scroll has gone quiet" snap settle.
+        self.frame_seq = self.frame_seq.wrapping_add(1);
         self.atlas.clear();
         // Rebuild the handler set from the fresh layout, but keep the in-flight
         // gesture state (a pending `down`, the focused element) so a tap that
         // spans this re-render is still recognized (RFC-0003 E4).
         self.router.clear_handlers();
+        // RFC-0021, over the previous frame's scroll targets (before they are
+        // dropped, so the offset writes below are what *this* frame paints):
+        //   • reverse `page:` — honour an app-driven `page` change (edge-triggered,
+        //     never fights a drag);
+        //   • snap settle — snap a `snap: page` view once its scroll has gone quiet
+        //     (works for wheel/trackpad, which has no release event).
+        self.sync_page_offsets();
+        self.advance_snap_anims();
+        self.settle_snaps();
         // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
         // router's hit rects.
         self.scroll_targets.clear();
@@ -2258,7 +2351,7 @@ impl Interpreter {
     /// unanchored child (a scrim, which fills the viewport via `grow`).
     fn anchor_token(&mut self, child: &RenderNode) -> Option<String> {
         match child {
-            RenderNode::Box { attrs, .. } => self.eval_str_prop(attrs, "anchor"),
+            RenderNode::Box { attrs, .. } => Self::enum_prop(attrs, "anchor").map(str::to_string),
             _ => None,
         }
     }
@@ -3088,8 +3181,8 @@ impl Interpreter {
             let AttrKind::Prop { value } = &attr.kind else {
                 continue;
             };
-            if let Value::Str(s) = self.eval_pure(value) {
-                return match s.as_str() {
+            if let Some(s) = Self::enum_token(value) {
+                return match s {
                     "top_start" => StackAlign::TopStart,
                     "top_end" => StackAlign::TopEnd,
                     "bottom_start" => StackAlign::BottomStart,
@@ -3595,6 +3688,19 @@ impl Interpreter {
                             .ok()
                             .flatten()
                             .unwrap_or((current_rect.w, current_rect.h));
+                        // RFC-0021 behaviours resolved from props.
+                        let snap_page = matches!(Self::enum_prop(attrs, "snap"), Some("page"));
+                        let page_sig = self.resolve_named_var_sig(attrs, "page");
+                        let has_end = attrs.iter().any(|a| {
+                            a.name.as_str() == "end_reached"
+                                && matches!(a.kind, AttrKind::Event { .. })
+                        });
+                        #[allow(clippy::cast_possible_truncation)]
+                        let end_threshold = has_end.then(|| {
+                            self.eval_float_prop(attrs, "end_threshold")
+                                .map_or(0.8, |v| v as f32)
+                        });
+                        let sv_elem = self.atlas.node_index(atlas_node);
                         self.scroll_targets.push(ScrollTarget {
                             rect: crate::interp::intrinsics::Rect::new(
                                 clip.x,
@@ -3610,6 +3716,10 @@ impl Interpreter {
                                 sig,
                                 max: (content_h - current_rect.h).max(0.0),
                             }),
+                            elem: sv_elem,
+                            snap_page,
+                            page_sig,
+                            end_threshold,
                         });
                     }
                     Some(clip)
@@ -4547,6 +4657,11 @@ impl Interpreter {
                     "pointer_move" => super::events::EventKind::PointerMove,
                     "scroll" => super::events::EventKind::Scroll,
                     "wheel" => super::events::EventKind::Wheel,
+                    // RFC-0021 advanced scroll behaviours (engine-fired).
+                    "end_reached" => super::events::EventKind::EndReached,
+                    "page_change" => super::events::EventKind::PageChange,
+                    "scroll_end" => super::events::EventKind::ScrollEnd,
+                    "refresh" => super::events::EventKind::Refresh,
                     "change" => super::events::EventKind::Change,
                     "key_down" => super::events::EventKind::KeyDown,
                     "key_up" => super::events::EventKind::KeyUp,
@@ -4760,8 +4875,43 @@ impl Interpreter {
         })
     }
 
+    /// The literal keyword token of an *enum* (keyword) prop value, read straight
+    /// from the AST bareword — e.g. the `page` in `snap: page`.
+    ///
+    /// Enum props (`PropType::Enum`) are a closed keyword set validated by the
+    /// checker as a bare [`Expr::Ident`] (`intrinsics.rs`, `check_attr_value`),
+    /// never as a reactive expression. Reading them with [`eval_pure`] would
+    /// instead resolve the identifier through the environment, so a same-named
+    /// `var` silently *shadows* the keyword: `snap: page` next to a `var page`
+    /// evaluates to the variable's `Int`, not the token `"page"`, and the
+    /// behaviour turns off (RFC-0021). Taking the token from the AST matches the
+    /// checker exactly, can never be shadowed, and skips lowering an expression
+    /// for a value that is always a compile-time keyword.
+    fn enum_token(value: &Expr) -> Option<&str> {
+        match value {
+            Expr::Ident(sym, _) => Some(sym.as_str()),
+            // A keyword may also be written as a plain string literal
+            // (`fit: "cover"`). A single, non-interpolated run is a token; an
+            // interpolated string is not.
+            Expr::StrLit(parts, _) => match parts.as_slice() {
+                [StrPart::Text(s)] => Some(s.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`enum_token`](Self::enum_token) for a named attribute: the keyword token
+    /// of enum prop `name`, or `None` if absent or not a bareword keyword.
+    fn enum_prop<'a>(attrs: &'a [Attr], name: &str) -> Option<&'a str> {
+        attrs.iter().find_map(|a| match &a.kind {
+            AttrKind::Prop { value } if a.name.as_str() == name => Self::enum_token(value),
+            _ => None,
+        })
+    }
+
     fn eval_fit_prop(&mut self, attrs: &[Attr]) -> byard_core::frame::ImageFit {
-        match self.eval_str_prop(attrs, "fit").as_deref() {
+        match Self::enum_prop(attrs, "fit") {
             Some("contain") => byard_core::frame::ImageFit::Contain,
             Some("cover") => byard_core::frame::ImageFit::Cover,
             Some("none") => byard_core::frame::ImageFit::None,
@@ -4801,8 +4951,8 @@ impl Interpreter {
                 let val = self.eval_pure(value);
                 match attr.name.as_str() {
                     "axis" if element_name == "ScrollView" => {
-                        if let Value::Str(s) = &val {
-                            let (x, y) = match s.as_str() {
+                        if let Some(s) = Self::enum_token(value) {
+                            let (x, y) = match s {
                                 "horizontal" => (true, false),
                                 "both" => (true, true),
                                 _ => (false, true),
@@ -4822,8 +4972,8 @@ impl Interpreter {
                     "width" => style.width = val.as_int().map(|n| n as f32),
                     "height" => style.height = val.as_int().map(|n| n as f32),
                     "direction" => {
-                        if let Value::Str(s) = &val {
-                            style.direction = match s.as_str() {
+                        if let Some(s) = Self::enum_token(value) {
+                            style.direction = match s {
                                 "column" => FlexDir::Column,
                                 _ => FlexDir::Row,
                             };
@@ -4893,8 +5043,8 @@ impl Interpreter {
                         }
                     }
                     "align" => {
-                        if let Value::Str(s) = &val {
-                            style.align = match s.as_str() {
+                        if let Some(s) = Self::enum_token(value) {
+                            style.align = match s {
                                 "start" => Align::Start,
                                 "center" => Align::Center,
                                 "end" => Align::End,
@@ -4903,8 +5053,8 @@ impl Interpreter {
                         }
                     }
                     "justify" => {
-                        if let Value::Str(s) = &val {
-                            style.justify = match s.as_str() {
+                        if let Some(s) = Self::enum_token(value) {
+                            style.justify = match s {
                                 "center" => Justify::Center,
                                 "end" => Justify::End,
                                 "between" => Justify::Between,
@@ -6106,6 +6256,284 @@ impl Interpreter {
         self.write_scroll(axis.sig, next);
     }
 
+    /// The scrollable axis of a target and its viewport extent (the one with
+    /// travel — `max > 0`), vertical preferred. RFC-0021 snap/pagination helper.
+    fn scrollable_axis(t: &ScrollTarget) -> Option<(ScrollAxis, f32)> {
+        t.y.filter(|a| a.max > 0.0)
+            .map(|a| (a, t.rect.h))
+            .or_else(|| t.x.filter(|a| a.max > 0.0).map(|a| (a, t.rect.w)))
+    }
+
+    /// Reflects the current page for `t` from its offset (`round(offset /
+    /// viewport)`), writing the `page:` var and firing `page_change` on a change.
+    /// Runs continuously (every scroll) so pagination tracks wheel/trackpad
+    /// scrolling, not just snap settles (RFC-0021).
+    fn reflect_page(&mut self, t: &ScrollTarget) {
+        let (Some(psig), Some(elem)) = (t.page_sig, t.elem) else {
+            return;
+        };
+        let Some((axis, vp)) = Self::scrollable_axis(t) else {
+            return;
+        };
+        if vp <= 0.0 {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let page = (self.peek_scroll(axis.sig) / vp).round() as i64;
+        if self.ctx.peek_signal(psig).as_int() != Some(page) {
+            self.ctx.write_signal(psig, Value::Int(page));
+            self.router.fire_event(
+                &mut self.ctx,
+                elem,
+                super::events::EventKind::PageChange,
+                Some(&Value::Int(page)),
+            );
+        }
+        // Treat our reflection as the synced value so `page`→offset never fights.
+        self.scroll_page_last.insert(elem, page);
+    }
+
+    /// Begins a smooth snap of `t`'s scrollable axis to its nearest page: reflects
+    /// `page` right away (the indicator jumps to the destination as the glide
+    /// starts) and seeds a spring from the current offset to the page boundary
+    /// (RFC-0021 §2, RFC-0010 spring). [`advance_snap_anims`](Self::advance_snap_anims)
+    /// drives it to rest and fires `scroll_end`. When no clock is advancing (a
+    /// non-animating host or a test), it resolves to the boundary instantly so the
+    /// behaviour is identical minus the animation. Shared by drag-release and the
+    /// scroll-quiet settle; a no-op if already resting on a page.
+    fn begin_snap(&mut self, t: &ScrollTarget) {
+        /// Sub-pixel tolerance for "already on a page".
+        const EPS: f32 = 0.5;
+        if !t.snap_page {
+            return;
+        }
+        let (Some((axis, vp)), Some(elem)) = (Self::scrollable_axis(t), t.elem) else {
+            return;
+        };
+        if vp <= 0.0 {
+            return;
+        }
+        let cur = self.peek_scroll(axis.sig);
+        let target = ((cur / vp).round() * vp).clamp(0.0, axis.max);
+        if (cur - target).abs() < EPS {
+            self.snap_anims.remove(&elem);
+            return; // already on a page — nothing to glide
+        }
+        // Destination page is known now — reflect it immediately (fires
+        // `page_change`) so pagination leads the glide, and settle it exactly once
+        // the spring (or the instant fallback) arrives.
+        self.reflect_page(t);
+        if self.clock_set {
+            let curve = pack_curve(crate::interp::anim::Curve::DEFAULT_SPRING);
+            self.snap_anims.insert(
+                elem,
+                SnapAnim {
+                    sig: axis.sig,
+                    motion: byard_core::frame::Motion {
+                        from: cur,
+                        to: target,
+                        start_ms: self.now_ms,
+                        curve,
+                    },
+                    target,
+                },
+            );
+            self.any_active = true;
+        } else {
+            self.finish_snap(elem, axis.sig, target);
+        }
+    }
+
+    /// Pins `sig` to the exact page `target`, clears any pending glide, and fires
+    /// `scroll_end` for `elem` (RFC-0021 snap completion).
+    fn finish_snap(&mut self, elem: u32, sig: SignalId, target: f32) {
+        self.snap_anims.remove(&elem);
+        self.write_scroll(sig, target);
+        self.router.fire_event(
+            &mut self.ctx,
+            elem,
+            super::events::EventKind::ScrollEnd,
+            None,
+        );
+    }
+
+    /// Advances every in-flight snap spring one `render` (RFC-0021 smooth snap):
+    /// samples each [`SnapAnim`](SnapAnim) at the engine clock, writes the offset,
+    /// and — once the spring settles — pins the offset exactly on the page and
+    /// fires `scroll_end`. A live drag on an elem cancels its glide (the finger
+    /// takes over). Keeps `any_active` set while any spring is still moving so the
+    /// host keeps presenting frames until it rests.
+    fn advance_snap_anims(&mut self) {
+        /// Pixel/velocity settle gates for a scroll offset (sub-pixel is
+        /// imperceptible; the exact target is pinned on settle regardless).
+        const EPS_POS: f32 = 0.5;
+        const EPS_VEL: f32 = 2.0;
+        if self.snap_anims.is_empty() {
+            return;
+        }
+        let drag_elem = self.scroll_drag.and_then(|d| d.elem);
+        let now = self.now_ms;
+        for (elem, anim) in self
+            .snap_anims
+            .iter()
+            .map(|(e, a)| (*e, *a))
+            .collect::<Vec<_>>()
+        {
+            if drag_elem == Some(elem) {
+                self.snap_anims.remove(&elem); // the finger reclaimed this view
+                continue;
+            }
+            if anim.motion.is_settled_with_eps(now, EPS_POS, EPS_VEL) {
+                self.finish_snap(elem, anim.sig, anim.target);
+            } else {
+                self.write_scroll(anim.sig, anim.motion.sample(now));
+                self.any_active = true;
+            }
+        }
+    }
+
+    /// On drag release, snap the `ScrollView` under the press point (RFC-0021).
+    fn snap_scroll_on_release(&mut self, start_pos: (f32, f32)) {
+        let (px, py) = start_pos;
+        let Some(t) = self
+            .scroll_targets
+            .iter()
+            .rev()
+            .find(|t| {
+                px >= t.rect.x
+                    && px < t.rect.x + t.rect.w
+                    && py >= t.rect.y
+                    && py < t.rect.y + t.rect.h
+            })
+            .copied()
+        else {
+            return;
+        };
+        self.begin_snap(&t);
+    }
+
+    /// Reflects `page` for every scroll target after this tick's scroll writes
+    /// (RFC-0021 continuous pagination).
+    fn reflect_pages(&mut self) {
+        let targets: Vec<ScrollTarget> = self.scroll_targets.clone();
+        for t in targets {
+            self.reflect_page(&t);
+        }
+    }
+
+    /// RFC-0021 snap settle: once a `snap`-enabled `ScrollView` has gone quiet —
+    /// no wheel/trackpad scroll input for [`SETTLE_FRAMES`] renders (so trackpad
+    /// momentum, a stream of shrinking deltas, cannot trigger a snap mid-fling
+    /// that fights the next event) — glide its offset to the nearest page via
+    /// [`begin_snap`](Self::begin_snap). Frame-counted, not clock-based, so it
+    /// settles identically whether or not the host advances `now_ms`. A live drag
+    /// never settles on stillness (it snaps on release). Runs each `render`, over
+    /// the previous frame's targets.
+    fn settle_snaps(&mut self) {
+        /// Renders of quiet (no scroll input) before a `snap: page` view settles.
+        const SETTLE_FRAMES: u64 = 4;
+        /// Sub-pixel tolerance for "already on a page".
+        const EPS: f32 = 0.5;
+        let drag_elem = self.scroll_drag.and_then(|d| d.elem);
+        let targets: Vec<ScrollTarget> = self.scroll_targets.clone();
+        for t in targets {
+            let Some(elem) = t.elem else { continue };
+            // A drag in progress, or a glide already running, owns the offset.
+            if !t.snap_page || drag_elem == Some(elem) || self.snap_anims.contains_key(&elem) {
+                continue;
+            }
+            let Some((axis, vp)) = Self::scrollable_axis(&t) else {
+                continue;
+            };
+            if vp <= 0.0 {
+                continue;
+            }
+            let cur = self.peek_scroll(axis.sig);
+            let boundary = ((cur / vp).round() * vp).clamp(0.0, axis.max);
+            if (cur - boundary).abs() < EPS {
+                continue; // already resting on a page
+            }
+            // Off a boundary: wait for the scroll to go quiet, then glide. `quiet`
+            // is how many renders since the last scroll input touched this elem;
+            // momentum keeps resetting it, so we only snap once the fling ends.
+            let quiet = self
+                .scroll_quiet
+                .get(&elem)
+                .map_or(SETTLE_FRAMES, |last| self.frame_seq.saturating_sub(*last));
+            if quiet >= SETTLE_FRAMES {
+                self.begin_snap(&t);
+            } else {
+                self.any_active = true; // keep frames coming until it goes quiet
+            }
+        }
+    }
+
+    /// RFC-0021 reflected `page:` (the reverse direction): when the app sets the
+    /// `page` var, scroll the `ScrollView`'s offset to that page. Edge-triggered
+    /// against [`scroll_page_last`](Self::scroll_page_last) so it fires only on an
+    /// external change (a drag never writes `page` mid-gesture, and our own snap
+    /// updates the tracker), never level-triggered against the live offset — so it
+    /// can't fight scrolling. Runs at the top of `render` over the previous
+    /// frame's targets.
+    fn sync_page_offsets(&mut self) {
+        let targets: Vec<ScrollTarget> = self.scroll_targets.clone();
+        for t in targets {
+            let (Some(psig), Some(elem)) = (t.page_sig, t.elem) else {
+                continue;
+            };
+            let Some(page) = self.ctx.peek_signal(psig).as_int() else {
+                continue;
+            };
+            if self.scroll_page_last.get(&elem) == Some(&page) {
+                continue; // no external change since we last synced
+            }
+            let axis_vp =
+                t.y.filter(|a| a.max > 0.0)
+                    .map(|a| (a, t.rect.h))
+                    .or_else(|| t.x.filter(|a| a.max > 0.0).map(|a| (a, t.rect.w)));
+            if let Some((axis, vp)) = axis_vp {
+                #[allow(clippy::cast_precision_loss)]
+                let target = (page.max(0) as f32 * vp).clamp(0.0, axis.max);
+                self.write_scroll(axis.sig, target);
+            }
+            self.scroll_page_last.insert(elem, page);
+        }
+    }
+
+    /// RFC-0021 `on_end_reached`: fires `end_reached` once for any `ScrollView`
+    /// whose visible bottom has crossed `end_threshold` of its content, debounced
+    /// via [`end_reached_fired`](Self::end_reached_fired) until the offset falls
+    /// back below the threshold (so appending items re-arms it).
+    fn fire_end_reached(&mut self) {
+        let targets: Vec<ScrollTarget> = self.scroll_targets.clone();
+        for t in targets {
+            let (Some(threshold), Some(elem)) = (t.end_threshold, t.elem) else {
+                continue;
+            };
+            let axis_vp =
+                t.y.filter(|a| a.max > 0.0)
+                    .map(|a| (a, t.rect.h))
+                    .or_else(|| t.x.filter(|a| a.max > 0.0).map(|a| (a, t.rect.w)));
+            let Some((axis, vp)) = axis_vp else { continue };
+            if axis.max <= 0.0 {
+                continue;
+            }
+            let frac = (self.peek_scroll(axis.sig) + vp) / (axis.max + vp);
+            if frac >= threshold {
+                if self.end_reached_fired.insert(elem) {
+                    self.router.fire_event(
+                        &mut self.ctx,
+                        elem,
+                        super::events::EventKind::EndReached,
+                        None,
+                    );
+                }
+            } else {
+                self.end_reached_fired.remove(&elem);
+            }
+        }
+    }
+
     /// Snapshots one axis of a drag at the press: its live offset becomes the
     /// baseline the pointer travel is subtracted from (RFC-0005, IMPL-10).
     fn capture_drag_axis(&self, axis: ScrollAxis) -> ScrollDragAxis {
@@ -6211,6 +6639,13 @@ impl Interpreter {
             if let Some(axis) = t.y {
                 self.nudge_scroll(axis, ev.delta.1 * step);
             }
+            // RFC-0021: mark this elem freshly scrolled and cancel any in-flight
+            // snap glide — the user is driving again, so `settle_snaps` restarts
+            // its quiet countdown and only snaps once the fling truly ends.
+            if let Some(elem) = t.elem {
+                self.scroll_quiet.insert(elem, self.frame_seq);
+                self.snap_anims.remove(&elem);
+            }
         }
 
         // RFC-0005 `ScrollView` drag-to-scroll: a pointer press on inert scroll
@@ -6237,10 +6672,16 @@ impl Interpreter {
                             })
                             .copied()
                     };
+                    // A press reclaims the view — cancel any in-flight snap glide
+                    // so the finger, not the spring, owns the offset (RFC-0021).
+                    if let Some(elem) = target.and_then(|t| t.elem) {
+                        self.snap_anims.remove(&elem);
+                    }
                     self.scroll_drag = target.map(|t| ScrollDrag {
                         start_pos: (px, py),
                         x: t.x.map(|a| self.capture_drag_axis(a)),
                         y: t.y.map(|a| self.capture_drag_axis(a)),
+                        elem: t.elem,
                     });
                 }
                 CoreKind::PointerMove => {
@@ -6255,10 +6696,23 @@ impl Interpreter {
                         }
                     }
                 }
-                CoreKind::PointerUp | CoreKind::Tap => self.scroll_drag = None,
+                CoreKind::PointerUp | CoreKind::Tap => {
+                    // RFC-0021 snap: on release, settle the offset to the nearest
+                    // page for a `snap: page` ScrollView (before clearing the drag).
+                    if let Some(d) = self.scroll_drag {
+                        self.snap_scroll_on_release(d.start_pos);
+                    }
+                    self.scroll_drag = None;
+                }
                 _ => {}
             }
         }
+
+        // RFC-0021: after this tick's scroll writes, reflect `page` continuously
+        // (so pagination tracks wheel/trackpad scrolling, not just snap settles)
+        // and fire `on_end_reached` for anything past its `end_threshold`.
+        self.reflect_pages();
+        self.fire_end_reached();
 
         self.router
             .dispatch_tick(&mut self.ctx, Some(&self.atlas), comp_events);
@@ -8329,6 +8783,433 @@ mod tests {
         assert!(
             (peek_f(&interp) - held).abs() < 0.01,
             "no drag is in flight after release, got {} (was {held})",
+            peek_f(&interp)
+        );
+    }
+
+    // ── RFC-0021: snap + pagination + on_end_reached ─────────────────────
+
+    #[test]
+    fn page_snap_settles_to_nearest_page_on_release() {
+        use byard_core::platform::EventKind as K;
+        // Horizontal `snap: page`: three 100px pages in a 100px viewport (max
+        // 200). Drag left 60px → offset 60; release snaps to page 1 (offset 100),
+        // reflects `page`, and would fire `page_change`.
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 var pg: Int = 0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), page: pg, \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let pg = interp.var_signal(&Symbol::intern("pg")).unwrap();
+        let peek_f = |interp: &Interpreter| match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+
+        interp.dispatch_events(&[ev(K::PointerDown, 50.0, 50.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, -10.0, 50.0)]); // drag left 60 → offX 60
+        assert!(
+            (peek_f(&interp) - 60.0).abs() < 2.0,
+            "mid-drag offset ~60, got {}",
+            peek_f(&interp)
+        );
+        interp.dispatch_events(&[ev(K::PointerUp, -10.0, 50.0)]); // release → snap
+        assert!(
+            (peek_f(&interp) - 100.0).abs() < 1.0,
+            "snapped to page 1 (offset 100), got {}",
+            peek_f(&interp)
+        );
+        assert_eq!(interp.peek(pg), Value::Int(1), "the reflected page is 1");
+    }
+
+    #[test]
+    fn on_end_reached_fires_once_past_threshold() {
+        use byard_core::platform::EventKind as K;
+        // 400px of content in a 100px viewport (max 300); `end_threshold: 0.8`.
+        // Drag up 250 → offset 250 → visible bottom (250+100)/400 = 0.875 ≥ 0.8,
+        // so `end_reached` fires and sets `loaded`.
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 var loaded = false \
+             ScrollView #[offset: (offX, offY), width: 100, height: 100, \
+                          end_threshold: 0.8, end_reached => loaded = true] { \
+                 Column { Box #[width: 100, height: 400] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let loaded = interp.var_signal(&Symbol::intern("loaded")).unwrap();
+        let ev = |kind, x: f32, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+        assert_eq!(
+            interp.peek(loaded),
+            Value::Bool(false),
+            "not loaded at rest"
+        );
+
+        interp.dispatch_events(&[ev(K::PointerDown, 50.0, 50.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 50.0, -200.0)]); // drag up 250 → offY 250
+        interp.tick();
+        assert_eq!(
+            interp.peek(loaded),
+            Value::Bool(true),
+            "end_reached fired past the 0.8 threshold"
+        );
+    }
+
+    #[test]
+    fn setting_the_page_var_scrolls_to_that_page() {
+        // Reflected `page:` (reverse): writing `page = 2` scrolls the horizontal
+        // offset to page 2 (offset 200) on the next render.
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 var pg: Int = 0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), page: pg, \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0); // records the scroll target
+
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let pg = interp.var_signal(&Symbol::intern("pg")).unwrap();
+
+        interp.write_var(pg, Value::Int(2));
+        interp.tick();
+        interp.render(&tree, &mut frame, 400.0, 300.0); // sync scrolls to page 2
+
+        let got = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        assert!(
+            (got - 200.0).abs() < 1.0,
+            "page = 2 scrolled the offset to 200, got {got}"
+        );
+    }
+
+    #[test]
+    fn page_reflects_on_wheel_scroll_without_a_release() {
+        use byard_core::platform::EventKind as K;
+        // A trackpad/wheel `Scroll` updates the reflected `page` continuously —
+        // no drag release needed (the desktop scrolling case).
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 var pg: Int = 0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), page: pg, \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let pg = interp.var_signal(&Symbol::intern("pg")).unwrap();
+        // Scroll right ~120px (a `Scroll` delta is pixels): offX → 120, page → 1.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-120.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        assert_eq!(
+            interp.peek(pg),
+            Value::Int(1),
+            "page reflects the wheel scroll"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_snaps_to_a_page_after_settling() {
+        use byard_core::platform::EventKind as K;
+        // Wheel-scroll 60px, then hold still: once the offset stops moving for a
+        // few frames the settle fires and snaps to page 1 — no release event, no
+        // wall clock, just observed stillness (clock-independent settle).
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-60.0, 0.0), // offX → 60 (not yet a page boundary)
+            payload: None,
+            time_ms: 0,
+        }]);
+        // Render successive idle frames with the offset held still; the settle
+        // counts stable frames and snaps once it reaches its threshold.
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        let got = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        assert!(
+            (got - 100.0).abs() < 1.0,
+            "wheel scroll settled and snapped to page 1 (offset 100), got {got}"
+        );
+    }
+
+    /// RFC-0021: the stillness settle must not fire while a page is *actively*
+    /// being scrolled — the offset moving each frame restarts the settle count,
+    /// so a mid-scroll frame never snaps out from under the motion.
+    #[test]
+    fn wheel_scroll_does_not_snap_while_still_moving() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var offX: Float = 0.0 var offY: Float = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let wheel = |dx: f32| byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (dx, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+        // Several small scrolls, each followed by a render (offset keeps moving),
+        // so the settle count resets every frame and never snaps mid-motion.
+        for _ in 0..3 {
+            interp.dispatch_events(&[wheel(-20.0)]);
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        let got = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        assert!(
+            (got - 60.0).abs() < 1.0,
+            "offset must track the in-progress scroll (60), not snap early, got {got}"
+        );
+    }
+
+    /// RFC-0021: an enum keyword prop (`snap: page`) must keep working even when
+    /// the view declares a `var` of the *same name* as the keyword — the token is
+    /// read from the AST, so the variable can never shadow it. This is exactly the
+    /// `scroll_snap` example's shape (`var page` + `snap: page`), which silently
+    /// disabled snapping before enum props stopped resolving through the env.
+    #[test]
+    fn snap_page_keyword_is_not_shadowed_by_a_same_named_var() {
+        use byard_core::platform::EventKind as K;
+        let src = "View V() { var offX = 0.0 var offY = 0.0 var page = 0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), \
+                          page: page, width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let pg = interp.var_signal(&Symbol::intern("page")).unwrap();
+        // Wheel two-thirds of a page (past the snap midpoint) then hold still: the
+        // stillness settle must snap forward to page 1, not stay put.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-70.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        let got = match interp.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        assert!(
+            (got - 100.0).abs() < 1.0,
+            "`snap: page` must engage despite the `var page`; snapped to {got}, want 100"
+        );
+        assert_eq!(interp.peek(pg), Value::Int(1), "reflected page is 1");
+    }
+
+    fn page_snap_view() -> &'static str {
+        "View V() { var offX = 0.0 var offY = 0.0 \
+             ScrollView #[axis: horizontal, snap: page, offset: (offX, offY), \
+                          width: 100, height: 100] { \
+                 Row { Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} \
+                       Box #[width: 100, height: 100] {} } \
+             } }"
+    }
+
+    /// RFC-0021 smooth snap: with an advancing clock the offset *glides* to the
+    /// page over several frames (a spring), rather than hard-jumping — some frame
+    /// must land strictly between the release offset and the page boundary.
+    #[test]
+    fn page_snap_glides_smoothly_when_a_clock_is_advancing() {
+        use byard_core::platform::EventKind as K;
+        let parsed = parse(page_snap_view());
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.set_now_ms(0);
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let peek_f = |i: &Interpreter| match i.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        // Wheel two-thirds of a page toward page 1, then let it settle: past the
+        // quiet threshold it springs from 70 → 100.
+        interp.dispatch_events(&[byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (-70.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        }]);
+        let mut saw_intermediate = false;
+        for step in 1..=60 {
+            interp.set_now_ms(step * 16);
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            let v = peek_f(&interp);
+            if v > 70.5 && v < 99.5 {
+                saw_intermediate = true; // mid-glide, neither the start nor the page
+            }
+        }
+        assert!(
+            saw_intermediate,
+            "the offset must glide through intermediate positions, not hard-jump"
+        );
+        assert!(
+            (peek_f(&interp) - 100.0).abs() < 1.0,
+            "the glide settles exactly on page 1 (100), got {}",
+            peek_f(&interp)
+        );
+    }
+
+    /// RFC-0021: a stream of shrinking scroll deltas (trackpad momentum) must not
+    /// trigger a snap while the fling is still delivering events — the offset
+    /// tracks the input and only snaps once the scroll goes quiet, so the snap and
+    /// the scroll never fight.
+    #[test]
+    fn momentum_scroll_does_not_snap_until_it_goes_quiet() {
+        use byard_core::platform::EventKind as K;
+        let parsed = parse(page_snap_view());
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let off = interp.var_signal(&Symbol::intern("offX")).unwrap();
+        let peek_f = |i: &Interpreter| match i.peek(off) {
+            Value::Float(f) => f as f32,
+            Value::Int(n) => n as f32,
+            _ => 0.0,
+        };
+        let wheel = |dx: f32| byard_core::platform::InputEvent {
+            kind: K::Scroll,
+            pos: (50.0, 50.0),
+            delta: (dx, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+        // Five momentum frames (input every frame) accumulate to offset 75 without
+        // ever snapping — each event restarts the quiet countdown.
+        let mut acc = 0.0;
+        for _ in 0..5 {
+            interp.dispatch_events(&[wheel(-15.0)]);
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            acc += 15.0;
+            assert!(
+                (peek_f(&interp) - acc).abs() < 1.0,
+                "offset must track momentum ({acc}), never snap mid-fling; got {}",
+                peek_f(&interp)
+            );
+        }
+        // Fling over: a few quiet renders and it snaps to the nearest page (75 → 100).
+        for _ in 0..8 {
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+        }
+        assert!(
+            (peek_f(&interp) - 100.0).abs() < 1.0,
+            "once quiet, it snaps to page 1 (100), got {}",
             peek_f(&interp)
         );
     }

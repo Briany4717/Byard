@@ -73,6 +73,12 @@ const WEIGHT: &[&str] = &["thin", "regular", "medium", "bold"];
 const FIT: &[&str] = &["fill", "contain", "cover", "none"];
 const DIRECTION: &[&str] = &["row", "column"];
 const AXIS: &[&str] = &["vertical", "horizontal", "both"];
+/// RFC-0021 `ScrollView` `snap`: content snaps to discrete positions after a
+/// scroll gesture — `item` to each direct child's boundary, `page` to
+/// viewport-sized pages, `none` for free scrolling.
+const SNAP: &[&str] = &["none", "item", "page"];
+/// RFC-0021 `snap_align`: where a snapped item aligns within the viewport.
+const SNAP_ALIGN: &[&str] = &["start", "center", "end"];
 /// Overlay child placement within the full-viewport coordinate space
 /// (RFC-0017 §"Positioning"). `center` centres; the edge tokens pin the child
 /// to that viewport edge, centred on the cross axis. Absolute `(x, y)` and
@@ -488,6 +494,16 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             // jump as rows scroll past the edge.
             props.insert("windowed", PropType::Bool);
             props.insert("row_height", PropType::Int);
+            // RFC-0021 advanced scroll behaviours (all default to off — a plain
+            // `ScrollView` is unchanged).
+            props.insert("snap", PropType::Enum(SNAP));
+            props.insert("snap_align", PropType::Enum(SNAP_ALIGN));
+            props.insert("pull_refresh", PropType::Bool);
+            props.insert("refreshing", PropType::Bool);
+            props.insert("collapse_header", PropType::Bool);
+            props.insert("page", PropType::Int);
+            props.insert("page_count", PropType::Int);
+            props.insert("end_threshold", PropType::Float);
             Intrinsic {
                 arity: 0,
                 content: None,
@@ -495,7 +511,16 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
                 focusable: false,
                 interactive: true,
                 props,
-                events: events_from(false, &["scroll"]),
+                events: events_from(
+                    false,
+                    &[
+                        "scroll",
+                        "end_reached",
+                        "page_change",
+                        "scroll_end",
+                        "refresh",
+                    ],
+                ),
             }
         }
         // The twelfth intrinsic (RFC-0009 §1, RFC-0005 amendment): an MSDF vector

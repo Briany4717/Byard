@@ -1,0 +1,69 @@
+// RFC-0021 — advanced scroll behaviours: page snapping, pagination, and
+// infinite scroll (on_end_reached).
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/scroll_snap
+//   cargo run -p byard-cli -- dev
+//
+// What to verify:
+//   1. Drag the top carousel horizontally and release — it snaps to the nearest
+//      page (`snap: page`), and "Current page" updates via the reflected `page:`
+//      var (a `page_change` also fires on the settle).
+//   2. Scroll the lower list to the bottom — crossing `end_threshold` fires
+//      `end_reached`, flipping the status line (infinite-scroll trigger).
+//
+// NOTE: pull-to-refresh, collapsing headers, spring-smoothed snapping, and
+// `snap: item` boundary snapping are separate follow-up passes (they need
+// overscroll physics / layout-during-scroll subsystems); this example covers the
+// scroll-positioning behaviours.
+View Main() {
+    var offX = 0.0
+    var offY = 0.0
+    var page = 0
+
+    var listX = 0.0
+    var listY = 0.0
+    var loaded_more = false
+
+    Column #[bg: 0x14141C, p: 24, gap: 14, width: 360] {
+        Text("Advanced scroll — RFC-0021") #[color: 0xE6E1E5, size: 18]
+
+        ScrollView #[axis: horizontal, snap: page, offset: (offX, offY),
+                     page: page, page_count: 3, width: 312, height: 160] {
+            Row {
+                Box #[bg: 0x381E72, p: 10, m: 5, radius: 12, width: 302, height: 150] {
+                    Text("Page 1") #[color: 0xE8DEF8, size: 20]
+                }
+                Box #[bg: 0x1F3A34, p: 10, m: 5, radius: 12, width: 302, height: 150] {
+                    Text("Page 2") #[color: 0xB8F0D8, size: 20]
+                }
+                Box #[bg: 0x633B48, p: 10, m: 5, radius: 12, width: 302, height: 150] {
+                    Text("Page 3") #[color: 0xFFD8E4, size: 20]
+                }
+            }
+        }
+
+        Text("Current page: {page} of 3") #[color: 0x938F99, size: 13]
+
+        ScrollView #[offset: (listX, listY), end_threshold: 0.8,
+                     end_reached => loaded_more = true, width: 312, height: 120] {
+            Column #[gap: 8] {
+                Box #[bg: 0x1E1E2A, p: 5, radius: 8, width: 300, height: 56] {
+                    Text("Item 1") #[color: 0xCAC4D0, size: 15]
+                }
+                Box #[bg: 0x1E1E2A, p: 5,radius: 8, width: 300, height: 56] {
+                    Text("Item 2") #[color: 0xCAC4D0, size: 15]
+                }
+                Box #[bg: 0x1E1E2A, p: 5,radius: 8, width: 300, height: 56] {
+                    Text("Item 3") #[color: 0xCAC4D0, size: 15]
+                }
+            }
+        }
+
+        when loaded_more {
+            Text("Reached the end — loading more…") #[color: 0x7DD3A8, size: 13]
+        } else {
+            Text("Scroll the list to the bottom") #[color: 0x938F99, size: 13]
+        }
+    }
+}

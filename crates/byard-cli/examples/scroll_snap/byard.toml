@@ -1,0 +1,3 @@
+[project]
+name = "scroll_snap"
+entry = "src/main.byd"

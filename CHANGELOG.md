@@ -28,6 +28,20 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Enum keyword props can no longer be shadowed by a same-named `var`.** A
+  keyword-valued prop (`snap: page`, `axis: horizontal`, `align: center`,
+  `justify: …`, `direction: …`, `fit: …`, `alignment: …`, `anchor: …`) is a
+  closed token set the type-checker reads as a bare identifier — but the runtime
+  was resolving that identifier through the reactive environment, so a view
+  declaring a `var` with the same name as the keyword silently evaluated the
+  *variable* instead of the token. Most visibly, RFC-0021's `snap: page` carousel
+  reflects its page through a `var page`, and `snap: page` next to `var page`
+  read as the page index (`0`), disabling snapping entirely. Enum props are now
+  read directly from the AST at the single resolution point, matching the
+  checker: they can never be shadowed, and the read skips lowering an expression
+  for a value that is always a compile-time keyword. Fixes the `scroll_snap`
+  example (`cargo run -p byard-cli -- dev` in
+  `crates/byard-cli/examples/scroll_snap`).
 - **`DecoratedBox` inner border edge is now anti-aliased.** The rounded-rect
   SDF shader smoothed only the *outer* edge; the transition from the border to
   the (possibly transparent) interior used a hard threshold, leaving the inner
@@ -37,6 +51,26 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC-0021 advanced scroll behaviours — page snap, pagination, infinite
+  scroll (first slice).** `ScrollView` gains the full RFC-0021 prop/event surface
+  (`snap`, `snap_align`, `pull_refresh`, `refreshing`, `collapse_header`, `page`,
+  `page_count`, `end_threshold`; events `end_reached`/`page_change`/`scroll_end`/
+  `refresh`). Implemented in this slice: **`snap: page`** glides the offset to the
+  nearest viewport-sized page with a **spring** (RFC-0010) when scrolling stops —
+  on drag release *and* after wheel/trackpad scrolling goes quiet (there is no
+  release event for a wheel). The settle is momentum-aware: it waits for the
+  fling's shrinking deltas to actually stop before snapping, so the snap animation
+  never fights an in-progress scroll, and any fresh scroll/drag cancels the glide
+  so the user always takes over cleanly. It reflects the `page:` var **both ways**:
+  `page` tracks the current page *continuously* as you scroll (wheel or drag,
+  firing `page_change`), and setting `page` scrolls the offset to that page
+  (edge-triggered so it never fights a drag). **`on_end_reached`** fires once when
+  the visible bottom crosses `end_threshold` (debounced until the offset falls
+  back, so appending items re-arms it) — the infinite-scroll trigger. All other
+  props parse and validate. `snap: item` boundary snapping, pull-to-refresh
+  (overscroll + indicator), and collapsing headers (layout-during-scroll +
+  implicit `scroll_fraction`) are follow-up passes — each needs a new
+  physics/layout subsystem. See `crates/byard-cli/examples/scroll_snap`.
 - **RFC-0024 extended style states + combined selectors.** The style-state
   system (RFC-0012/0016) gains five engine-managed pseudo-states — `checked`
   (a value-widget's value is true), `selected` (the `selected:` prop, or a
