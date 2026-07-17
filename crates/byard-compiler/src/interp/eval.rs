@@ -68,6 +68,13 @@ fn step_decimals(step: f64) -> i32 {
 const ANIM_SETTLE_EPS_POS: f32 = 0.002;
 const ANIM_SETTLE_EPS_VEL: f32 = 0.02;
 
+/// RFC-0021 pull-to-refresh geometry, in logical px. The pull region resists with
+/// a diminishing-returns curve that asymptotes to [`PULL_MAX`]; releasing past
+/// [`PULL_THRESHOLD`] triggers a refresh and rests the indicator at [`PULL_REST`].
+const PULL_MAX: f32 = 120.0;
+const PULL_THRESHOLD: f32 = 56.0;
+const PULL_REST: f32 = 44.0;
+
 /// Rounds `val` to `decimals` decimal places (half-away-from-zero).
 fn round_to_decimals(val: f64, decimals: i32) -> f64 {
     let factor = 10f64.powi(decimals);
@@ -315,6 +322,15 @@ struct ScrollTarget {
     /// RFC-0021 `end_threshold` (0..1): the fraction of the scrollable extent at
     /// which `end_reached` fires. `None` when no `end_reached` handler exists.
     end_threshold: Option<f32>,
+    /// RFC-0021 `pull_refresh`: overscrolling past the top drags an elastic pull
+    /// region (see [`Interpreter::pull_distance`]); releasing past the threshold
+    /// fires `refresh`. A pull view needs no `offset` var — the pull region is
+    /// engine state, not the scroll offset.
+    pull_refresh: bool,
+    /// RFC-0021 reflected `refreshing:` var — set `true` by the engine when a pull
+    /// triggers a refresh; the app sets it back to `false` when its load finishes,
+    /// which springs the indicator away.
+    refreshing_sig: Option<SignalId>,
 }
 
 /// An in-flight smooth snap (RFC-0021 §2): a spring driving one `ScrollView`
@@ -597,6 +613,18 @@ pub struct Interpreter {
     /// item settle picks the candidate nearest the current offset. Empty for
     /// `snap: none`/`page`.
     scroll_item_bounds: std::collections::HashMap<u32, Vec<f32>>,
+    /// RFC-0021 pull-to-refresh: the current elastic pull-region height per
+    /// `pull_refresh` `ScrollView` elem (0 when idle). Grown by a downward
+    /// over-drag at the top, sprung back by [`pull_anims`](Self::pull_anims). The
+    /// content is painted shifted down by this much, with the indicator in the gap.
+    pull_distance: std::collections::HashMap<u32, f32>,
+    /// RFC-0021 pull-to-refresh: the in-flight spring retracting or resting the
+    /// pull region per elem (see [`PullAnim`]).
+    pull_anims: std::collections::HashMap<u32, PullAnim>,
+    /// RFC-0021 pull-to-refresh: the last-observed `refreshing:` value per elem, so
+    /// the app clearing it (`true → false`) edge-triggers the retract spring
+    /// without fighting the engine's own set on trigger.
+    refreshing_seen: std::collections::HashMap<u32, bool>,
     /// Monotonic render counter (RFC-0021 snap timing): bumped once at the top of
     /// every [`render`](Self::render). Drives the frame-counted "scroll has gone
     /// quiet" test in [`scroll_quiet`](Self::scroll_quiet) without depending on an
@@ -641,6 +669,24 @@ struct ScrollDrag {
     y: Option<ScrollDragAxis>,
     /// The dragged `ScrollView` element (for RFC-0021 snap-settle activity).
     elem: Option<u32>,
+    /// RFC-0021 `pull_refresh`: whether the dragged view enables pull-to-refresh,
+    /// so a downward over-drag at the top grows the pull region.
+    pull_refresh: bool,
+    /// RFC-0021 reflected `refreshing:` var of the dragged view, set `true` when a
+    /// release past the threshold triggers a refresh.
+    refreshing_sig: Option<SignalId>,
+}
+
+/// An in-flight pull-region spring (RFC-0021 pull-to-refresh): drives a
+/// `ScrollView`'s [`pull_distance`](Interpreter::pull_distance) to `target` —
+/// the indicator's rest height while refreshing, or `0` to retract it — advanced
+/// each `render` from the engine clock like a [`SnapAnim`].
+#[derive(Clone, Copy)]
+struct PullAnim {
+    /// The spring (`from` = pull at release, `to` = `target`).
+    motion: byard_core::frame::Motion,
+    /// The exact pull distance to pin on settle (`0` retracts the indicator).
+    target: f32,
 }
 
 impl Interpreter {
@@ -1925,6 +1971,10 @@ impl Interpreter {
         self.sync_page_offsets();
         self.advance_snap_anims();
         self.settle_snaps();
+        // RFC-0021 pull-to-refresh: honour an app-driven `refreshing` change, then
+        // advance the pull-region spring (retract / rest) over the same targets.
+        self.sync_refreshing();
+        self.advance_pull_anims();
         // Wheel-scroll targets are re-recorded each render (RFC-0005), like the
         // router's hit rects. RFC-0021 `snap: item` boundaries follow the same
         // lifecycle (settle above read the previous frame's; emit rebuilds them).
@@ -3707,19 +3757,38 @@ impl Interpreter {
                     frame.begin_clip(clip);
                     child_transform.translate[0] -= ox * inherited_transform.scale[0];
                     child_transform.translate[1] -= oy * inherited_transform.scale[1];
+                    // RFC-0021 pull-to-refresh: shift the content down by the pull
+                    // region and draw the default indicator in the revealed gap.
+                    let pull_elem = self.atlas.node_index(atlas_node);
+                    let pull = pull_elem
+                        .and_then(|e| self.pull_distance.get(&e).copied())
+                        .unwrap_or(0.0);
+                    if pull > 0.0 {
+                        let gap_px = pull * inherited_transform.scale[1];
+                        child_transform.translate[1] += gap_px;
+                        let progress = (pull / PULL_THRESHOLD).clamp(0.0, 1.0);
+                        let active = pull_elem
+                            .and_then(|e| self.refreshing_seen.get(&e).copied())
+                            .unwrap_or(false);
+                        Self::push_pull_indicator(frame, clip, gap_px, progress, active);
+                    }
                     // Record a wheel/drag scroll target for whichever of
                     // `offset.x`/`offset.y` is a writable signal (e.g.
                     // `offset: (panX, scrollY)`): the input scrolls by writing it,
                     // clamped to the content extent. `dispatch_events` consumes
                     // these next tick (render-then-dispatch handshake).
                     let (sig_x, sig_y) = self.resolve_offset_sigs(attrs);
-                    if sig_x.is_some() || sig_y.is_some() {
+                    // A `pull_refresh` view needs a target even with no `offset`
+                    // var — its pull region is engine state, driven by the drag.
+                    let pull_refresh = self.eval_bool_prop(attrs, "pull_refresh").unwrap_or(false);
+                    if sig_x.is_some() || sig_y.is_some() || pull_refresh {
                         let (content_w, content_h) = self
                             .atlas
                             .content_size(atlas_node)
                             .ok()
                             .flatten()
                             .unwrap_or((current_rect.w, current_rect.h));
+                        let refreshing_sig = self.resolve_named_var_sig(attrs, "refreshing");
                         // RFC-0021 behaviours resolved from props.
                         let snap = match Self::enum_prop(attrs, "snap") {
                             Some("page") => SnapMode::Page,
@@ -3772,6 +3841,8 @@ impl Interpreter {
                             snap,
                             page_sig,
                             end_threshold,
+                            pull_refresh,
+                            refreshing_sig,
                         });
                     }
                     Some(clip)
@@ -6691,6 +6762,169 @@ impl Interpreter {
         self.write_var(axis.sig, value);
     }
 
+    /// Draws the default pull-to-refresh indicator (RFC-0021): a light ring
+    /// centred in the revealed gap that grows and fades in with `progress`
+    /// (0 → threshold) and holds solid while a refresh is `active`. `gap_px` is the
+    /// pull region's on-screen height; `clip` the viewport rect. Drawn as a
+    /// border-only [`DecoratedBox`] (transparent fill + full radii = a ring).
+    fn push_pull_indicator(
+        frame: &mut byard_core::frame::RenderFrame,
+        clip: byard_core::frame::Rect,
+        gap_px: f32,
+        progress: f32,
+        active: bool,
+    ) {
+        let r = (gap_px * 0.28).clamp(3.0, 11.0);
+        let cx = clip.x + clip.width / 2.0;
+        let cy = clip.y + gap_px / 2.0;
+        let opacity = if active { 1.0 } else { progress };
+        frame.push_decorated(byard_core::frame::DecoratedBox {
+            base: byard_core::BoxInstance {
+                rect: [cx - r, cy - r, 2.0 * r, 2.0 * r],
+                color: [0.0; 4],
+                radii: [r; 4],
+                transform: byard_core::frame::Transform::IDENTITY,
+            },
+            border_width: 2.0,
+            border_color: [0.85, 0.84, 0.88, 1.0],
+            opacity,
+            dirty: true,
+            ..Default::default()
+        });
+    }
+
+    /// The elastic pull height for a raw over-drag, in logical px (RFC-0021
+    /// pull-to-refresh): a diminishing-returns curve that asymptotes to
+    /// [`PULL_MAX`], so the region resists ever harder the further it is pulled.
+    fn pull_elastic(raw: f32) -> f32 {
+        if raw <= 0.0 {
+            0.0
+        } else {
+            PULL_MAX * raw / (raw + PULL_MAX)
+        }
+    }
+
+    /// RFC-0021 pull-to-refresh: a downward over-drag past the top grows the pull
+    /// region for `d`'s elem. `pointer_y` is the live pointer; the over-drag is the
+    /// travel beyond whatever upward scroll the press had available (`0` for a
+    /// non-scrolling pull view). A live drag cancels any retract spring.
+    fn drive_pull_drag(&mut self, d: ScrollDrag, pointer_y: f32) {
+        let Some(elem) = d.elem else { return };
+        let start_y = d.y.map_or(0.0, |a| a.start_offset);
+        let over = (pointer_y - d.start_pos.1 - start_y).max(0.0);
+        if over > 0.0 {
+            self.pull_anims.remove(&elem);
+            self.pull_distance.insert(elem, Self::pull_elastic(over));
+            self.any_active = true;
+        } else {
+            self.pull_distance.remove(&elem);
+        }
+    }
+
+    /// RFC-0021 pull-to-refresh release: past [`PULL_THRESHOLD`] fire `refresh`,
+    /// set `refreshing = true`, and rest the indicator at [`PULL_REST`]; otherwise
+    /// retract the pull region to `0`.
+    fn release_pull(&mut self, d: ScrollDrag) {
+        let Some(elem) = d.elem else { return };
+        let pull = self.pull_distance.get(&elem).copied().unwrap_or(0.0);
+        if pull >= PULL_THRESHOLD {
+            self.router
+                .fire_event(&mut self.ctx, elem, super::events::EventKind::Refresh, None);
+            if let Some(sig) = d.refreshing_sig {
+                // The app owns the `refreshing` lifecycle: hold the indicator at
+                // rest until it clears the flag (retracts via `sync_refreshing`).
+                self.ctx.write_signal(sig, Value::Bool(true));
+                self.refreshing_seen.insert(elem, true);
+                self.begin_pull_settle(elem, PULL_REST);
+            } else {
+                // No `refreshing` binding — a momentary trigger; retract now.
+                self.begin_pull_settle(elem, 0.0);
+            }
+        } else {
+            self.begin_pull_settle(elem, 0.0);
+        }
+    }
+
+    /// Springs `elem`'s pull region toward `target` (RFC-0021): the indicator rest
+    /// height while refreshing, or `0` to retract it. Resolves instantly with no
+    /// advancing clock (tests / non-animating hosts), mirroring `begin_snap`.
+    fn begin_pull_settle(&mut self, elem: u32, target: f32) {
+        if !self.clock_set {
+            self.pull_anims.remove(&elem);
+            if target <= 0.0 {
+                self.pull_distance.remove(&elem);
+            } else {
+                self.pull_distance.insert(elem, target);
+            }
+            return;
+        }
+        let from = self.pull_distance.get(&elem).copied().unwrap_or(0.0);
+        let curve = pack_curve(crate::interp::anim::Curve::DEFAULT_SPRING);
+        self.pull_anims.insert(
+            elem,
+            PullAnim {
+                motion: byard_core::frame::Motion {
+                    from,
+                    to: target,
+                    start_ms: self.now_ms,
+                    curve,
+                },
+                target,
+            },
+        );
+        self.any_active = true;
+    }
+
+    /// Advances every in-flight pull-region spring one `render` (RFC-0021): writes
+    /// the sampled height into [`pull_distance`](Self::pull_distance) and, on
+    /// settle, pins the exact target (`0` retracts the indicator entirely).
+    fn advance_pull_anims(&mut self) {
+        const EPS_POS: f32 = 0.5;
+        const EPS_VEL: f32 = 2.0;
+        if self.pull_anims.is_empty() {
+            return;
+        }
+        let now = self.now_ms;
+        for (elem, anim) in self
+            .pull_anims
+            .iter()
+            .map(|(e, a)| (*e, *a))
+            .collect::<Vec<_>>()
+        {
+            if anim.motion.is_settled_with_eps(now, EPS_POS, EPS_VEL) {
+                self.pull_anims.remove(&elem);
+                if anim.target <= 0.0 {
+                    self.pull_distance.remove(&elem);
+                } else {
+                    self.pull_distance.insert(elem, anim.target);
+                }
+            } else {
+                self.pull_distance.insert(elem, anim.motion.sample(now));
+                self.any_active = true;
+            }
+        }
+    }
+
+    /// RFC-0021 reflected `refreshing:`: honour an app-driven change (edge-triggered
+    /// against [`refreshing_seen`](Self::refreshing_seen), never fighting the
+    /// engine's own set on trigger). Clearing it (`true → false`) retracts the
+    /// indicator; setting it programmatically (`false → true`) shows it at rest.
+    /// Runs at the top of `render` over the previous frame's targets.
+    fn sync_refreshing(&mut self) {
+        let targets: Vec<ScrollTarget> = self.scroll_targets.clone();
+        for t in targets {
+            let (Some(sig), Some(elem)) = (t.refreshing_sig, t.elem) else {
+                continue;
+            };
+            let r = matches!(self.ctx.peek_signal(sig), Value::Bool(true));
+            if self.refreshing_seen.get(&elem) == Some(&r) {
+                continue;
+            }
+            self.begin_pull_settle(elem, if r { PULL_REST } else { 0.0 });
+            self.refreshing_seen.insert(elem, r);
+        }
+    }
+
     /// Converts winit-sourced input events to interpreter event payloads and dispatches them to the `EventRouter`.
     pub fn dispatch_events(&mut self, events: &[byard_core::InputEvent]) {
         use crate::interp::events::{EventKind as CompKind, InputEvent as CompEvent};
@@ -6813,7 +7047,14 @@ impl Interpreter {
                         x: t.x.map(|a| self.capture_drag_axis(a)),
                         y: t.y.map(|a| self.capture_drag_axis(a)),
                         elem: t.elem,
+                        pull_refresh: t.pull_refresh,
+                        refreshing_sig: t.refreshing_sig,
                     });
+                    // A fresh press on a pull view cancels its retract spring so
+                    // the drag owns the pull region (RFC-0021).
+                    if let Some(elem) = target.filter(|t| t.pull_refresh).and_then(|t| t.elem) {
+                        self.pull_anims.remove(&elem);
+                    }
                 }
                 CoreKind::PointerMove => {
                     if let Some(d) = self.scroll_drag {
@@ -6825,6 +7066,9 @@ impl Interpreter {
                             let travel = ev.pos.1 - d.start_pos.1;
                             self.write_drag_axis(a, travel);
                         }
+                        if d.pull_refresh {
+                            self.drive_pull_drag(d, ev.pos.1);
+                        }
                     }
                 }
                 CoreKind::PointerUp | CoreKind::Tap => {
@@ -6832,6 +7076,9 @@ impl Interpreter {
                     // page for a `snap: page` ScrollView (before clearing the drag).
                     if let Some(d) = self.scroll_drag {
                         self.snap_scroll_on_release(d.start_pos);
+                        if d.pull_refresh {
+                            self.release_pull(d);
+                        }
                     }
                     self.scroll_drag = None;
                 }
@@ -9435,6 +9682,91 @@ mod tests {
             "centres item 1 at offset 80, got {}",
             peek_f(&interp)
         );
+    }
+
+    fn pull_refresh_view() -> &'static str {
+        "View V() { var refreshing = false var refreshed = false \
+             ScrollView #[pull_refresh: true, refreshing: refreshing, \
+                          refresh => refreshed = true, width: 200, height: 120] { \
+                 Column { Box #[width: 180, height: 50] {} \
+                          Box #[width: 180, height: 50] {} } \
+             } }"
+    }
+
+    /// RFC-0021 pull-to-refresh: a downward over-drag past the threshold fires
+    /// `refresh`, sets the reflected `refreshing` var, and rests the indicator;
+    /// the app clearing `refreshing` retracts it.
+    #[test]
+    fn pull_past_threshold_fires_refresh_and_retracts_when_cleared() {
+        use byard_core::platform::EventKind as K;
+        let parsed = parse(pull_refresh_view());
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let refreshing = interp.var_signal(&Symbol::intern("refreshing")).unwrap();
+        let refreshed = interp.var_signal(&Symbol::intern("refreshed")).unwrap();
+        let ev = |kind, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (100.0, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+        // Press at the top, drag down 130px (past the elastic threshold), release.
+        interp.dispatch_events(&[ev(K::PointerDown, 12.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 142.0)]);
+        interp.dispatch_events(&[ev(K::PointerUp, 142.0)]);
+        assert_eq!(
+            interp.peek(refreshed),
+            Value::Bool(true),
+            "release past the threshold fires `refresh`"
+        );
+        assert_eq!(
+            interp.peek(refreshing),
+            Value::Bool(true),
+            "the engine sets `refreshing` while it loads"
+        );
+        // The controller finishes: clearing `refreshing` retracts the indicator.
+        interp.write_var(refreshing, Value::Bool(false));
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        // (no panic / clean retract — with no clock the spring resolves instantly)
+    }
+
+    /// RFC-0021 pull-to-refresh: a short pull that never reaches the threshold
+    /// retracts on release without firing `refresh`.
+    #[test]
+    fn short_pull_retracts_without_refreshing() {
+        use byard_core::platform::EventKind as K;
+        let parsed = parse(pull_refresh_view());
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        let refreshing = interp.var_signal(&Symbol::intern("refreshing")).unwrap();
+        let refreshed = interp.var_signal(&Symbol::intern("refreshed")).unwrap();
+        let ev = |kind, y: f32| byard_core::platform::InputEvent {
+            kind,
+            pos: (100.0, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: 0,
+        };
+        // Only a 20px pull — well under the threshold.
+        interp.dispatch_events(&[ev(K::PointerDown, 12.0)]);
+        interp.dispatch_events(&[ev(K::PointerMove, 32.0)]);
+        interp.dispatch_events(&[ev(K::PointerUp, 32.0)]);
+        assert_eq!(
+            interp.peek(refreshed),
+            Value::Bool(false),
+            "a short pull does not fire `refresh`"
+        );
+        assert_eq!(interp.peek(refreshing), Value::Bool(false));
     }
 
     /// RFC-0005: a press that lands on an interactive child (here a `Button`)

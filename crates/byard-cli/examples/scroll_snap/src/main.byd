@@ -14,10 +14,13 @@
 //      fixed page). Scroll it and release; whichever card is nearest centres.
 //   3. Scroll the lower list to the bottom — crossing `end_threshold` fires
 //      `end_reached`, flipping the status line (infinite-scroll trigger).
+//   4. Drag the bottom list DOWN from its top and release past the threshold —
+//      the pull indicator (a ring) grows in the gap and `refresh` fires,
+//      flipping its status line (`pull_refresh`).
 //
-// NOTE: pull-to-refresh and collapsing headers are separate follow-up passes
-// (they need overscroll physics / layout-during-scroll subsystems); this example
-// covers the snap + scroll-positioning behaviours.
+// NOTE: collapsing headers are a separate follow-up pass (they need a
+// layout-during-scroll subsystem); this example covers snap, pagination,
+// infinite scroll, and pull-to-refresh.
 View Main() {
     var offX = 0.0
     var offY = 0.0
@@ -29,6 +32,8 @@ View Main() {
     var listX = 0.0
     var listY = 0.0
     var loaded_more = false
+
+    var pulled = false
 
     Column #[bg: 0x14141C, p: 24, gap: 14, width: 360] {
         Text("Advanced scroll — RFC-0021") #[color: 0xE6E1E5, size: 18]
@@ -89,6 +94,26 @@ View Main() {
             Text("Reached the end — loading more…") #[color: 0x7DD3A8, size: 13]
         } else {
             Text("Scroll the list to the bottom") #[color: 0x938F99, size: 13]
+        }
+
+        Text("pull_refresh — drag down from the top") #[color: 0x938F99, size: 13]
+
+        ScrollView #[pull_refresh: true, refresh => pulled = true,
+                     width: 312, height: 96] {
+            Column #[gap: 8] {
+                Box #[bg: 0x24202C, p: 5, radius: 8, width: 300, height: 40] {
+                    Text("Pull me down…") #[color: 0xCAC4D0, size: 15]
+                }
+                Box #[bg: 0x24202C, p: 5, radius: 8, width: 300, height: 40] {
+                    Text("…then release") #[color: 0xCAC4D0, size: 15]
+                }
+            }
+        }
+
+        when pulled {
+            Text("Refresh triggered!") #[color: 0x7DD3A8, size: 13]
+        } else {
+            Text("(no refresh yet)") #[color: 0x938F99, size: 13]
         }
     }
 }
