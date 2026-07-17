@@ -65,6 +65,9 @@ pub enum PropType {
     Angle,
     /// A function-valued callback prop.
     Fn,
+    /// A spring curve literal (`anim.spring(...)`), RFC-0021 `snap_spring`. Shape
+    /// is validated at lower time via `resolve_curve`.
+    Spring,
 }
 
 const ALIGN: &[&str] = &["start", "center", "end", "stretch", "justify"];
@@ -498,6 +501,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             // `ScrollView` is unchanged).
             props.insert("snap", PropType::Enum(SNAP));
             props.insert("snap_align", PropType::Enum(SNAP_ALIGN));
+            props.insert("snap_spring", PropType::Spring);
             props.insert("pull_refresh", PropType::Bool);
             props.insert("refreshing", PropType::Bool);
             props.insert("collapse_header", PropType::Bool);
