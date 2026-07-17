@@ -71,6 +71,10 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos + 1).map(|(t, _)| t.clone())
     }
 
+    fn peek3(&self) -> Option<Token> {
+        self.tokens.get(self.pos + 2).map(|(t, _)| t.clone())
+    }
+
     fn cur_span(&self) -> Span {
         self.tokens.get(self.pos).map_or_else(
             || {

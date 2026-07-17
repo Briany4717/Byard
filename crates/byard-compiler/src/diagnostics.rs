@@ -486,6 +486,43 @@ pub enum CompileError {
         /// The parameter name.
         name: String,
     },
+    /// A binary operator was applied to incompatible operand types (RFC-0027
+    /// §1/§5): e.g. `1 < "a"`, ordering (`<`) on a `List`/`Record`, or a `+`
+    /// between a `Str` and a `List`.
+    TypeMismatch {
+        /// Source range of the offending expression.
+        span: Span,
+        /// The operator's spelling (e.g. `<`, `+`).
+        op: String,
+        /// The left operand's type.
+        lhs_ty: String,
+        /// The right operand's type.
+        rhs_ty: String,
+    },
+    /// A `filter`/`when` predicate did not evaluate to `Bool` (RFC-0027 §4).
+    PredicateNotBool {
+        /// Source range of the predicate.
+        span: Span,
+    },
+    /// A collection lambda (`map`/`filter` argument) performed a side effect —
+    /// an assignment or event action (RFC-0027 §5). Collection lambdas must be
+    /// pure so a reactive pull can re-run them safely.
+    EffectInPureLambda {
+        /// Source range of the offending effect.
+        span: Span,
+    },
+    /// A method call named a method the receiver type does not have (RFC-0027
+    /// §5), with a Levenshtein suggestion like the D4 `UnknownAttribute` path.
+    UnknownMethod {
+        /// Source range of the method name.
+        span: Span,
+        /// The receiver's type description.
+        recv_ty: String,
+        /// The unknown method name.
+        name: String,
+        /// The closest known method, if any.
+        hint: Option<String>,
+    },
 }
 
 impl CompileError {
@@ -541,7 +578,11 @@ impl CompileError {
             | Self::VectorAssetNotStatic { span }
             | Self::CallbackArityMismatch { span, .. }
             | Self::CallbackNotInvocable { span, .. }
-            | Self::CallbackTypeMismatch { span, .. } => *span,
+            | Self::CallbackTypeMismatch { span, .. }
+            | Self::TypeMismatch { span, .. }
+            | Self::PredicateNotBool { span }
+            | Self::EffectInPureLambda { span }
+            | Self::UnknownMethod { span, .. } => *span,
         }
     }
 
@@ -599,7 +640,11 @@ impl CompileError {
             | Self::VectorAssetNotStatic { span }
             | Self::CallbackArityMismatch { span, .. }
             | Self::CallbackNotInvocable { span, .. }
-            | Self::CallbackTypeMismatch { span, .. } => {
+            | Self::CallbackTypeMismatch { span, .. }
+            | Self::TypeMismatch { span, .. }
+            | Self::PredicateNotBool { span }
+            | Self::EffectInPureLambda { span }
+            | Self::UnknownMethod { span, .. } => {
                 span.start = (i64::from(span.start) + delta).max(0) as u32;
                 span.end = (i64::from(span.end) + delta).max(0) as u32;
             }
@@ -660,6 +705,10 @@ impl CompileError {
             Self::CallbackArityMismatch { .. } => "CallbackArityMismatch",
             Self::CallbackNotInvocable { .. } => "CallbackNotInvocable",
             Self::CallbackTypeMismatch { .. } => "CallbackTypeMismatch",
+            Self::TypeMismatch { .. } => "TypeMismatch",
+            Self::PredicateNotBool { .. } => "PredicateNotBool",
+            Self::EffectInPureLambda { .. } => "EffectInPureLambda",
+            Self::UnknownMethod { .. } => "UnknownMethod",
         }
     }
 
@@ -859,6 +908,24 @@ impl CompileError {
             Self::CallbackTypeMismatch { callee, name, .. } => format!(
                 "parameter `{name}` of view `{callee}` is a callback (`Fn(...)`); pass an action \
                  block like `{name}: {{ … }}`"
+            ),
+            Self::TypeMismatch {
+                op, lhs_ty, rhs_ty, ..
+            } => format!("operator `{op}` cannot compare `{lhs_ty}` with `{rhs_ty}`"),
+            Self::PredicateNotBool { .. } => "this predicate must evaluate to `Bool`".to_string(),
+            Self::EffectInPureLambda { .. } => {
+                "a `map`/`filter` lambda must be a pure expression — no assignment or action \
+                 (it may re-run during a reactive pull)"
+                    .to_string()
+            }
+            Self::UnknownMethod {
+                recv_ty,
+                name,
+                hint,
+                ..
+            } => with_hint(
+                format!("`{recv_ty}` has no method `{name}`"),
+                hint.as_deref(),
             ),
         }
     }

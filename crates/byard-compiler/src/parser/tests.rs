@@ -702,3 +702,115 @@ fn shape_command_args_accept_arithmetic() {
         .expect("sweep arg");
     assert!(matches!(sweep.value, Expr::Binary { op: BinOp::Mul, .. }));
 }
+
+// ── RFC-0027 comparison / logic / collections precedence ─────────
+
+#[test]
+fn comparison_binds_looser_than_arithmetic() {
+    // `a + b == c` groups as `(a + b) == c`.
+    let e = init_expr("a + b == c");
+    let Expr::Binary {
+        op: BinOp::Eq, lhs, ..
+    } = &e
+    else {
+        panic!("expected top-level ==, got {e:?}");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+}
+
+#[test]
+fn logic_binds_looser_than_comparison() {
+    // `a < b && c > d` groups as `(a < b) && (c > d)`.
+    let e = init_expr("a < b && c > d");
+    let Expr::Binary {
+        op: BinOp::And,
+        lhs,
+        rhs,
+        ..
+    } = &e
+    else {
+        panic!("expected top-level &&, got {e:?}");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Lt, .. }));
+    assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Gt, .. }));
+}
+
+#[test]
+fn or_binds_looser_than_and() {
+    // `a || b && c` groups as `a || (b && c)`.
+    let e = init_expr("a || b && c");
+    let Expr::Binary {
+        op: BinOp::Or, rhs, ..
+    } = &e
+    else {
+        panic!("expected top-level ||, got {e:?}");
+    };
+    assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::And, .. }));
+}
+
+#[test]
+fn ternary_binds_tighter_than_or() {
+    // RFC-0027 §1 note: `a || b ? c : d` groups as `a || (b ? c : d)`.
+    let e = init_expr("a || b ? c : d");
+    let Expr::Binary {
+        op: BinOp::Or, rhs, ..
+    } = &e
+    else {
+        panic!("expected top-level ||, got {e:?}");
+    };
+    assert!(matches!(rhs.as_ref(), Expr::Ternary { .. }));
+}
+
+#[test]
+fn bang_binds_tighter_than_and() {
+    // `!a && b` groups as `(!a) && b`.
+    let e = init_expr("!a && b");
+    let Expr::Binary {
+        op: BinOp::And,
+        lhs,
+        ..
+    } = &e
+    else {
+        panic!("expected top-level &&, got {e:?}");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Unary { op: UnOp::Not, .. }));
+}
+
+#[test]
+fn index_and_method_call_parse() {
+    let e = init_expr("xs[0]");
+    assert!(matches!(e, Expr::Index { .. }));
+    let e = init_expr("xs.push(v)");
+    let Expr::Call { callee, .. } = &e else {
+        panic!("expected a call, got {e:?}");
+    };
+    assert!(matches!(callee.as_ref(), Expr::Member { .. }));
+}
+
+#[test]
+fn bare_single_param_lambda_parses() {
+    // `t => !t.done` — the map/filter predicate form.
+    let e = init_expr("xs.filter(t => !t.done)");
+    let Expr::Call { args, .. } = &e else {
+        panic!("expected a call, got {e:?}");
+    };
+    assert!(matches!(args[0].value, Expr::Lambda { .. }));
+}
+
+#[test]
+fn record_literal_parses_with_spread() {
+    let e = init_expr("{ ..r, done: true }");
+    let Expr::Record { fields, spread, .. } = &e else {
+        panic!("expected a record, got {e:?}");
+    };
+    assert!(spread.is_some());
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].0.as_str(), "done");
+}
+
+#[test]
+fn empty_braces_stay_a_callback_block_not_a_record() {
+    // `{}` must remain the no-op callback default, never an empty record.
+    let e = init_expr("{}");
+    assert!(matches!(e, Expr::Lambda { .. }));
+}

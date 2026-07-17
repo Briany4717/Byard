@@ -25,7 +25,7 @@ use super::reactive::{FrameTarget, ReactiveCtx, ScopeId, untrack};
 use crate::diagnostics::{CompileError, Span};
 use crate::parser::ast::{
     Arg, AssignOp, Attr, AttrKind, BinOp, ElementNode, Expr, Member, Param, PostfixOp, StateBlock,
-    StrPart, StyleStateKind, Type, ViewDecl,
+    StrPart, StyleStateKind, Type, UnOp, ViewDecl,
 };
 use crate::symbol::Symbol;
 use crate::util::closest_match;
@@ -6008,17 +6008,79 @@ impl Interpreter {
                     }
                 })
             }
-            // Binary arithmetic (`+ - * /`, RFC-0020 enabler). Numeric
-            // promotion: Int∘Int stays Int (division truncates, like Rust);
-            // any Float operand promotes the result to Float. Division by
-            // zero yields 0 — the logic thread never panics on user input
-            // (INV-4 spirit); a non-numeric operand yields `Unit`, which
-            // downstream prop readers treat as "unset".
+            // Binary operators. Arithmetic (`+ - * /`, RFC-0020) promotes
+            // Int↔Float; comparison (`== != < <= > >=`, RFC-0027 §1) yields a
+            // `Bool`; `+` also does string/list concat (RFC-0027 §3/§4). The
+            // short-circuiting `&&`/`||` (RFC-0027 §2) are lowered as control
+            // flow so the un-taken side is neither evaluated nor read-tracked.
             Expr::Binary { op, lhs, rhs, .. } => {
                 let op = *op;
                 let mut lc = self.lower_expr(lhs, payload_name);
                 let mut rc = self.lower_expr(rhs, payload_name);
-                Box::new(move |ctx| eval_binary(op, lc(ctx), rc(ctx)))
+                match op {
+                    BinOp::And => Box::new(move |ctx| {
+                        // Evaluate — and thereby read-track — the RHS only when
+                        // the LHS is true (RFC-0027 §2, mirrors `when`).
+                        if lc(ctx).as_bool().unwrap_or(false) {
+                            Value::Bool(rc(ctx).as_bool().unwrap_or(false))
+                        } else {
+                            Value::Bool(false)
+                        }
+                    }),
+                    BinOp::Or => Box::new(move |ctx| {
+                        if lc(ctx).as_bool().unwrap_or(false) {
+                            Value::Bool(true)
+                        } else {
+                            Value::Bool(rc(ctx).as_bool().unwrap_or(false))
+                        }
+                    }),
+                    _ => Box::new(move |ctx| eval_binary(op, lc(ctx), rc(ctx))),
+                }
+            }
+            // Prefix unary (`!b`, `-x`) — RFC-0027 §2. `!` negates a `Bool`;
+            // `-` negates a numeric. A type mismatch degrades to `Unit`
+            // (the checker reports it, INV-4: no panic).
+            Expr::Unary { op, rhs, .. } => {
+                let op = *op;
+                let mut rc = self.lower_expr(rhs, payload_name);
+                Box::new(move |ctx| match (op, rc(ctx)) {
+                    (UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
+                    (UnOp::Neg, Value::Int(n)) => Value::Int(n.wrapping_neg()),
+                    (UnOp::Neg, Value::Float(f)) => Value::Float(-f),
+                    _ => Value::Unit,
+                })
+            }
+            // Indexing `base[index]` (RFC-0027 §4). Out-of-range or a
+            // non-list/non-int index degrades to `Unit` (INV-4), never a panic.
+            Expr::Index { base, index, .. } => {
+                let mut bc = self.lower_expr(base, payload_name);
+                let mut ic = self.lower_expr(index, payload_name);
+                Box::new(move |ctx| index_value(&bc(ctx), &ic(ctx)))
+            }
+            // A record literal `{ ..spread, k: v }` (RFC-0027 §6): the spread's
+            // fields seed the record, then written fields append/override, all
+            // keeping declaration order.
+            Expr::Record { fields, spread, .. } => {
+                let mut spread_c = spread.as_ref().map(|s| self.lower_expr(s, payload_name));
+                let mut field_cs: Vec<(Symbol, Lowered)> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.lower_expr(v, payload_name)))
+                    .collect();
+                Box::new(move |ctx| {
+                    let mut out: Vec<(Symbol, Value)> = match spread_c.as_mut().map(|c| c(ctx)) {
+                        Some(Value::Record(fs)) => fs,
+                        _ => Vec::new(),
+                    };
+                    for (k, c) in &mut field_cs {
+                        let v = c(ctx);
+                        if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == k) {
+                            slot.1 = v;
+                        } else {
+                            out.push((k.clone(), v));
+                        }
+                    }
+                    Value::Record(out)
+                })
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args, payload_name),
             Expr::ClassRef(class, _) => {
@@ -6105,9 +6167,17 @@ impl Interpreter {
             // signal and projects the token's value for the active scheme. Any
             // other member access needs controller metadata (not modeled in
             // Phase 2); lambdas/assignments are actions, not projected values.
-            Expr::Member { base, field, span } => self
-                .lower_theme_member(base, field, *span)
-                .unwrap_or_else(|| Box::new(|_| Value::Unit)),
+            Expr::Member { base, field, span } => {
+                if let Some(lowered) = self.lower_theme_member(base, field, *span) {
+                    return lowered;
+                }
+                // Data member access (RFC-0027 §4/§6): `xs.len` (list length) and
+                // `r.field` (record field). Unknown members degrade to `Unit`;
+                // the checker reports genuinely unknown ones (INV-4).
+                let field = field.clone();
+                let mut base_c = self.lower_expr(base, payload_name);
+                Box::new(move |ctx| data_member(&base_c(ctx), &field))
+            }
             Expr::Lambda { .. } | Expr::Error(_) => Box::new(|_| Value::Unit),
         }
     }
@@ -6240,7 +6310,7 @@ impl Interpreter {
             for part in &mut lowered {
                 match part {
                     Part::Text(t) => s.push_str(t),
-                    Part::Interp(c) => s.push_str(&display_value(&c(ctx))),
+                    Part::Interp(c) => s.push_str(&format_scalar(&c(ctx))),
                 }
             }
             Value::Str(s)
@@ -6301,7 +6371,97 @@ impl Interpreter {
                 }
             }
         }
+        // Collection method calls (RFC-0027 §4): `xs.push(v)`, `.removeAt(i)`,
+        // `.contains(v)`, `.map(f)`, `.filter(f)` — each pure and value-returning.
+        if let Expr::Member { base, field, .. } = callee {
+            if let Some(lowered) = self.lower_collection_method(base, field, args, payload_name) {
+                return lowered;
+            }
+        }
         Box::new(|_| Value::Unit)
+    }
+
+    /// Lowers a collection method call (RFC-0027 §4). Returns `None` for a
+    /// non-collection method name so `anim.*` curve calls and other member calls
+    /// keep their existing (non-data) handling.
+    fn lower_collection_method(
+        &mut self,
+        base: &Expr,
+        name: &Symbol,
+        args: &[crate::parser::ast::Arg],
+        payload_name: Option<&Symbol>,
+    ) -> Option<Lowered> {
+        let mut base_c = self.lower_expr(base, payload_name);
+        match name.as_str() {
+            "push" => {
+                let mut arg = self.lower_expr(&args.first()?.value, payload_name);
+                Some(Box::new(move |ctx| {
+                    let v = arg(ctx);
+                    match base_c(ctx) {
+                        Value::List(mut xs) => {
+                            xs.push(v);
+                            Value::List(xs)
+                        }
+                        other => other,
+                    }
+                }))
+            }
+            "removeAt" => {
+                let mut arg = self.lower_expr(&args.first()?.value, payload_name);
+                Some(Box::new(move |ctx| {
+                    let i = arg(ctx).as_int().and_then(|i| usize::try_from(i).ok());
+                    match base_c(ctx) {
+                        Value::List(mut xs) => {
+                            // Out-of-range → unchanged list (INV-4, no panic).
+                            if let Some(i) = i.filter(|i| *i < xs.len()) {
+                                xs.remove(i);
+                            }
+                            Value::List(xs)
+                        }
+                        other => other,
+                    }
+                }))
+            }
+            "contains" => {
+                let mut arg = self.lower_expr(&args.first()?.value, payload_name);
+                Some(Box::new(move |ctx| {
+                    let needle = arg(ctx);
+                    match base_c(ctx) {
+                        Value::List(xs) => {
+                            Value::Bool(xs.iter().any(|x| structural_eq(x, &needle)))
+                        }
+                        _ => Value::Bool(false),
+                    }
+                }))
+            }
+            "map" | "filter" => {
+                // The predicate/transform must be a lambda (RFC-0027 §5). Lower
+                // its body once with the parameter routed through the per-element
+                // slot (like an event payload), evaluated per element below.
+                let (param, body) = match &args.first()?.value {
+                    Expr::Lambda { params, body, .. } => (params.first().cloned(), body.clone()),
+                    _ => return None,
+                };
+                let mut body_c = self.lower_expr(&body, param.as_ref());
+                let is_map = name.as_str() == "map";
+                Some(Box::new(move |ctx| {
+                    let Value::List(xs) = base_c(ctx) else {
+                        return Value::List(Vec::new());
+                    };
+                    let mut out = Vec::with_capacity(xs.len());
+                    for elem in xs {
+                        let mapped = with_lambda_elem(elem.clone(), || body_c(ctx));
+                        if is_map {
+                            out.push(mapped);
+                        } else if mapped.as_bool().unwrap_or(false) {
+                            out.push(elem);
+                        }
+                    }
+                    Value::List(out)
+                }))
+            }
+            _ => None,
+        }
     }
 
     // ── actions (mutations & bare expressions) ──────────────────────────
@@ -7488,22 +7648,183 @@ fn resolve_state_attrs<'a>(
 /// a non-numeric operand yields [`Value::Unit`] — the logic thread never
 /// panics on user expressions. Pure and unit-testable.
 fn eval_binary(op: BinOp, lhs: Value, rhs: Value) -> Value {
-    match (lhs, rhs) {
-        (Value::Int(a), Value::Int(b)) => Value::Int(match op {
-            BinOp::Add => a.wrapping_add(b),
-            BinOp::Sub => a.wrapping_sub(b),
-            BinOp::Mul => a.wrapping_mul(b),
-            BinOp::Div => {
-                if b == 0 {
-                    0
-                } else {
-                    a.wrapping_div(b)
-                }
+    match op {
+        // Comparison (RFC-0027 §1) → Bool.
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            eval_compare(op, &lhs, &rhs)
+        }
+        // `&&`/`||` never reach here (lowered as control flow); the arithmetic
+        // path handles `+ - * /` with string/list concat on `+`.
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::And | BinOp::Or => {
+            match (lhs, rhs) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(match op {
+                    BinOp::Add => a.wrapping_add(b),
+                    BinOp::Sub => a.wrapping_sub(b),
+                    BinOp::Mul => a.wrapping_mul(b),
+                    BinOp::Div => {
+                        if b == 0 {
+                            0
+                        } else {
+                            a.wrapping_div(b)
+                        }
+                    }
+                    _ => 0,
+                }),
+                (Value::Int(a), Value::Float(b)) => eval_binary_f(op, a as f64, b),
+                (Value::Float(a), Value::Int(b)) => eval_binary_f(op, a, b as f64),
+                (Value::Float(a), Value::Float(b)) => eval_binary_f(op, a, b),
+                // String concat / list concat (RFC-0027 §3/§4): `+` only.
+                (a, b) if matches!(op, BinOp::Add) => eval_concat(a, b),
+                _ => Value::Unit,
             }
-        }),
-        (Value::Int(a), Value::Float(b)) => eval_binary_f(op, a as f64, b),
-        (Value::Float(a), Value::Int(b)) => eval_binary_f(op, a, b as f64),
-        (Value::Float(a), Value::Float(b)) => eval_binary_f(op, a, b),
+        }
+    }
+}
+
+/// String and list concatenation (RFC-0027 §3/§4). A `Str` on either side
+/// coerces the other operand through the shared scalar formatter
+/// ([`format_scalar`]); two `List`s concatenate; anything else is `Unit` (the
+/// checker reports the mismatch — INV-4).
+fn eval_concat(a: Value, b: Value) -> Value {
+    // A `List` operand only concatenates with another `List` — it never string-
+    // coerces (RFC-0027 §3). A `Str` on either side coerces the other *scalar*.
+    match (a, b) {
+        (Value::List(mut xs), Value::List(ys)) => {
+            xs.extend(ys);
+            Value::List(xs)
+        }
+        (Value::Str(mut s), other) if is_scalar(&other) => {
+            s.push_str(&format_scalar(&other));
+            Value::Str(s)
+        }
+        (other, Value::Str(s)) if is_scalar(&other) => {
+            let mut out = format_scalar(&other);
+            out.push_str(&s);
+            Value::Str(out)
+        }
+        _ => Value::Unit,
+    }
+}
+
+/// Whether a value is a formattable scalar (`Int`/`Float`/`Bool`/`Str`) — the
+/// operands `Str + _` will coerce (RFC-0027 §3). `List`/`Record`/`Unit` are not.
+fn is_scalar(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
+    )
+}
+
+/// Comparison (RFC-0027 §1) → `Bool`. Numeric operands compare with Int→Float
+/// promotion; `Str` by value/lexicographic order; `Bool` by `==`/`!=` only;
+/// `List`/`Record` by structural equality (ordering on them is a checker
+/// `TypeMismatch`, handled there). Incompatible operands degrade to
+/// `Bool(false)` at runtime (never a panic; the checker reports the mismatch).
+fn eval_compare(op: BinOp, a: &Value, b: &Value) -> Value {
+    use std::cmp::Ordering;
+    let ord: Option<Ordering> = match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => {
+            // Bool supports eq only; ordering is meaningless → not-equal-based.
+            return Value::Bool(match op {
+                BinOp::Eq => x == y,
+                BinOp::Ne => x != y,
+                _ => false,
+            });
+        }
+        // Structural equality for List/Record (and any other same-shape pair).
+        _ => {
+            let eq = structural_eq(a, b);
+            return Value::Bool(match op {
+                BinOp::Eq => eq,
+                BinOp::Ne => !eq,
+                _ => false,
+            });
+        }
+    };
+    let Some(ord) = ord else {
+        return Value::Bool(false);
+    };
+    Value::Bool(match op {
+        BinOp::Eq => ord == Ordering::Equal,
+        BinOp::Ne => ord != Ordering::Equal,
+        BinOp::Lt => ord == Ordering::Less,
+        BinOp::Le => ord != Ordering::Greater,
+        BinOp::Gt => ord == Ordering::Greater,
+        BinOp::Ge => ord != Ordering::Less,
+        _ => false,
+    })
+}
+
+/// Structural (element/field-wise) equality for lists and records (RFC-0027
+/// §1), with numeric Int↔Float promotion at the leaves.
+fn structural_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
+            (*x as f64 - *y).abs() < f64::EPSILON
+        }
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Unit, Value::Unit) => true,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| structural_eq(x, y))
+        }
+        (Value::Record(xs), Value::Record(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|((kx, vx), (ky, vy))| kx == ky && structural_eq(vx, vy))
+        }
+        _ => false,
+    }
+}
+
+/// Resolves a data member access (RFC-0027 §4/§6): `xs.len` (list/string
+/// length → `Int`) or `r.field` (record field → its value). Anything else
+/// degrades to `Unit` (INV-4).
+fn data_member(base: &Value, field: &Symbol) -> Value {
+    let f = field.as_str();
+    match base {
+        Value::List(xs) if f == "len" => Value::Int(i64::try_from(xs.len()).unwrap_or(i64::MAX)),
+        Value::Str(s) if f == "len" => {
+            Value::Int(i64::try_from(s.chars().count()).unwrap_or(i64::MAX))
+        }
+        Value::Record(fields) => fields
+            .iter()
+            .find(|(k, _)| k.as_str() == f)
+            .map_or(Value::Unit, |(_, v)| v.clone()),
+        _ => Value::Unit,
+    }
+}
+
+/// Runs `f` with `elem` installed as the current per-element/lambda binding
+/// (RFC-0027 §5), reusing the payload slot the lambda body was lowered against.
+/// The previous slot value is saved and restored so a `map`/`filter` nested in
+/// an event action never clobbers that action's payload.
+fn with_lambda_elem<F: FnOnce() -> Value>(elem: Value, f: F) -> Value {
+    let prev = CURRENT_PAYLOAD.with(|cell| cell.borrow_mut().replace(elem));
+    let out = f();
+    CURRENT_PAYLOAD.with(|cell| *cell.borrow_mut() = prev);
+    out
+}
+
+/// Indexes `base[index]` (RFC-0027 §4): a `List` at an in-range integer index
+/// yields the element; out-of-range or non-list/non-int degrades to `Unit`
+/// (INV-4, never a panic). Negative indices are out of range.
+fn index_value(base: &Value, index: &Value) -> Value {
+    match (base, index) {
+        (Value::List(xs), Value::Int(i)) => usize::try_from(*i)
+            .ok()
+            .and_then(|i| xs.get(i))
+            .cloned()
+            .unwrap_or(Value::Unit),
         _ => Value::Unit,
     }
 }
@@ -7522,6 +7843,7 @@ fn eval_binary_f(op: BinOp, a: f64, b: f64) -> Value {
                 a / b
             }
         }
+        _ => 0.0,
     })
 }
 
@@ -7643,7 +7965,10 @@ fn assign_side(
     }
 }
 
-fn display_value(v: &Value) -> String {
+/// The single scalar-formatting function (RFC-0027 §3): the display form used
+/// by both `Text("{x}")` interpolation and `Str + scalar` concatenation, so the
+/// two paths agree byte-for-byte. Non-scalar values format to an empty string.
+fn format_scalar(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
@@ -7768,9 +8093,14 @@ mod tests {
             eval_binary(BinOp::Div, Value::Float(1.0), Value::Float(0.0)),
             Value::Float(0.0)
         );
-        // Non-numeric operands degrade to Unit.
+        // `Str + scalar` now concatenates (RFC-0027 §3), coercing the scalar.
         assert_eq!(
             eval_binary(BinOp::Add, Value::Str("a".into()), Value::Int(1)),
+            Value::Str("a1".into())
+        );
+        // A truly incompatible pair (`Str + List`) still degrades to Unit.
+        assert_eq!(
+            eval_binary(BinOp::Add, Value::Str("a".into()), Value::List(vec![])),
             Value::Unit
         );
     }
@@ -7794,6 +8124,184 @@ mod tests {
             "width = 45 * 2 + 10 = 100, got {}",
             inst.rect[2]
         );
+    }
+
+    // ── RFC-0027: comparison, logic, strings, collections ───────────
+
+    /// Lowers `view`, ticks once, renders, and returns the first `Text`'s
+    /// resolved string — the simplest way to observe an expression's value.
+    fn first_text(src: &str, view: &str) -> String {
+        let (mut interp, tree) = lower_named(src, view);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        frame.texts()[0].text.clone()
+    }
+
+    #[test]
+    fn comparison_operators_yield_bool() {
+        assert_eq!(
+            eval_compare(BinOp::Lt, &Value::Int(1), &Value::Int(2)),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_compare(BinOp::Ge, &Value::Int(2), &Value::Int(2)),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_compare(BinOp::Eq, &Value::Int(3), &Value::Int(3)),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_compare(BinOp::Ne, &Value::Int(3), &Value::Int(4)),
+            Value::Bool(true)
+        );
+        // Int↔Float promotion.
+        assert_eq!(
+            eval_compare(BinOp::Lt, &Value::Int(2), &Value::Float(2.5)),
+            Value::Bool(true)
+        );
+        // Str lexicographic ordering.
+        assert_eq!(
+            eval_compare(BinOp::Lt, &Value::Str("a".into()), &Value::Str("b".into())),
+            Value::Bool(true)
+        );
+        // Structural list equality.
+        assert_eq!(
+            eval_compare(
+                BinOp::Eq,
+                &Value::List(vec![Value::Int(1), Value::Int(2)]),
+                &Value::List(vec![Value::Int(1), Value::Int(2)])
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn comparison_and_logic_reach_a_text() {
+        assert_eq!(first_text("View V() { Text(\"{1 < 2}\") }", "V"), "true");
+        assert_eq!(first_text("View V() { Text(\"{3 == 4}\") }", "V"), "false");
+        assert_eq!(
+            first_text(
+                "View V() { var a = true\n var b = false\n Text(\"{a && b}\") }",
+                "V"
+            ),
+            "false"
+        );
+        assert_eq!(
+            first_text(
+                "View V() { var a = true\n var b = false\n Text(\"{a || b}\") }",
+                "V"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn boolean_negation_works() {
+        assert_eq!(
+            first_text(
+                "View V() { var showList = true\n Text(\"{!showList}\") }",
+                "V"
+            ),
+            "false"
+        );
+    }
+
+    #[test]
+    fn short_circuit_and_returns_false_without_evaluating_rhs() {
+        // `false && (1/0 == 0)` must not even matter — LHS false short-circuits.
+        assert_eq!(
+            first_text("View V() { Text(\"{false && true}\") }", "V"),
+            "false"
+        );
+        assert_eq!(
+            first_text("View V() { Text(\"{true || false}\") }", "V"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn string_concat_and_scalar_coercion() {
+        assert_eq!(
+            first_text(
+                "View V() { var count = 3\n Text(\"{\\\"n=\\\" + count}\") }",
+                "V"
+            ),
+            "n=3"
+        );
+        assert_eq!(
+            first_text(
+                "View V() { var count = 3\n Text(\"{count + \\\"!\\\"}\") }",
+                "V"
+            ),
+            "3!"
+        );
+        // `Str + List` is not concatenatable → Unit (empty display).
+        assert_eq!(
+            eval_concat(Value::Str("a".into()), Value::List(vec![])),
+            Value::Unit
+        );
+    }
+
+    #[test]
+    fn list_ops_are_pure_and_value_returning() {
+        // push returns a grown list; index; contains; len.
+        let src = "View V() { var xs = [1, 2, 3]\n let ys = xs.push(4)\n Text(\"{ys.len}\") }";
+        assert_eq!(first_text(src, "V"), "4");
+        // Index out of range degrades to Unit (empty display), never panics.
+        assert_eq!(
+            first_text("View V() { var xs = [1, 2]\n Text(\"{xs[99]}\") }", "V"),
+            ""
+        );
+        assert_eq!(
+            index_value(&Value::List(vec![Value::Int(7)]), &Value::Int(0)),
+            Value::Int(7)
+        );
+        assert_eq!(
+            index_value(&Value::List(vec![Value::Int(7)]), &Value::Int(5)),
+            Value::Unit
+        );
+    }
+
+    #[test]
+    fn filter_and_map_over_records() {
+        // filter keeps not-done todos; `.len` counts them.
+        let src = "View V() { \
+            var todos = [{ text: \"a\", done: false }, { text: \"b\", done: true }, { text: \"c\", done: false }]\n \
+            let remaining = todos.filter(t => !t.done).len\n \
+            Text(\"{remaining}\") }";
+        assert_eq!(first_text(src, "V"), "2");
+        // map projects a field.
+        let src2 = "View V() { \
+            var todos = [{ text: \"a\", done: false }]\n \
+            let names = todos.map(t => t.text)\n \
+            Text(\"{names.len}\") }";
+        assert_eq!(first_text(src2, "V"), "1");
+    }
+
+    #[test]
+    fn record_spread_returns_a_new_record() {
+        // `{ ..r, done: true }` overrides `done`, keeps `text`.
+        let src = "View V() { \
+            var r = { text: \"a\", done: false }\n \
+            let r2 = { ..r, done: true }\n \
+            Text(\"{r2.done}\") }";
+        assert_eq!(first_text(src, "V"), "true");
+    }
+
+    #[test]
+    fn structural_eq_promotes_and_recurses() {
+        assert!(structural_eq(&Value::Int(2), &Value::Float(2.0)));
+        assert!(structural_eq(
+            &Value::Record(vec![(Symbol::intern("a"), Value::Int(1))]),
+            &Value::Record(vec![(Symbol::intern("a"), Value::Int(1))])
+        ));
+        assert!(!structural_eq(
+            &Value::List(vec![Value::Int(1)]),
+            &Value::List(vec![Value::Int(2)])
+        ));
     }
 
     // ── Canvas & shape commands (RFC-0020) ──────────────────────────

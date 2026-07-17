@@ -363,8 +363,11 @@ pub struct Arg {
     pub value: Expr,
 }
 
-/// Binary arithmetic operators (`+ - * /`) — the minimal arithmetic surface
-/// required by RFC-0020's reactive shape parameters (`sweep: percent * 3.6`).
+/// Binary operators. Arithmetic (`+ - * /`) is the original minimal surface
+/// (RFC-0020 reactive shape params); RFC-0027 §1/§2 adds comparison
+/// (`== != < <= > >=`) and logic (`&& ||`). Note `&&`/`||` are still lowered as
+/// short-circuiting control flow (RFC-0027 §2), not through the eager
+/// binary-op tables — the variants exist so the parser can name the node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     /// `+`
@@ -375,6 +378,32 @@ pub enum BinOp {
     Mul,
     /// `/`
     Div,
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `&&` (short-circuit)
+    And,
+    /// `||` (short-circuit)
+    Or,
+}
+
+/// Prefix unary operators (RFC-0027 §2): boolean `!` and numeric negation `-`.
+/// `Neg` unifies with the leading-`-` sign form for non-literal operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    /// `!` — boolean negation.
+    Not,
+    /// `-` — numeric negation of a non-literal operand.
+    Neg,
 }
 
 /// Assignment operators (`= += -=`).
@@ -486,6 +515,39 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// A prefix unary expression `op rhs` (`!b`, `-x`) — RFC-0027 §2.
+    Unary {
+        /// The operator.
+        op: UnOp,
+        /// The operand.
+        rhs: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// An index expression `base[index]` (RFC-0027 §4). Out-of-range access
+    /// degrades to [`Value::Unit`](crate::interp::env::Value::Unit) with a
+    /// logic-thread diagnostic (INV-4), never a panic.
+    Index {
+        /// The indexed receiver.
+        base: Box<Expr>,
+        /// The index expression.
+        index: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// A record literal `{ k: v, .., ..spread }` (RFC-0027 §6): a name-keyed,
+    /// ordered, immutable data aggregate. Distinct from [`Expr::Tuple`]
+    /// (positional layout data) and from a callback [`Expr::Block`]; the parser
+    /// disambiguates on a leading `IDENT :` or `..spread`.
+    Record {
+        /// The declared fields, in written order.
+        fields: Vec<(Symbol, Expr)>,
+        /// An optional `..spread` base whose fields seed the record before the
+        /// written fields override them (`{ ..r, done: true }`).
+        spread: Option<Box<Expr>>,
+        /// Source span.
+        span: Span,
+    },
     /// A binary arithmetic expression `lhs op rhs` (`+ - * /`). Standard
     /// precedence (`* /` over `+ -`), left-associative, both tighter than the
     /// ternary/`with`/`merge` band — so `p * 360 with anim.spring()` animates
@@ -570,6 +632,9 @@ impl Expr {
             | Self::Block(_, span)
             | Self::Assign { span, .. }
             | Self::Postfix { span, .. }
+            | Self::Unary { span, .. }
+            | Self::Index { span, .. }
+            | Self::Record { span, .. }
             | Self::Binary { span, .. }
             | Self::Ternary { span, .. }
             | Self::Animated { span, .. }

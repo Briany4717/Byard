@@ -45,6 +45,10 @@ pub enum Value {
     List(Vec<Value>),
     /// A tuple of (optionally named) values, e.g. `(left: 5, bottom: 3)`.
     Tuple(Vec<(Option<Symbol>, Value)>),
+    /// A name-keyed, ordered, immutable data record (RFC-0027 §6): the element
+    /// type of app-state lists and the shape a controller (RFC-0028) returns.
+    /// Fields keep declaration order; access is by name, equality is structural.
+    Record(Vec<(Symbol, Value)>),
     /// A lambda, referenced by its AST id (not a Rust closure).
     Fn(AstId),
     /// A reactive source (`var`), referenced by its `Signal` id.
@@ -94,6 +98,15 @@ impl Value {
     pub fn as_tuple(&self) -> Option<&[(Option<Symbol>, Value)]> {
         match self {
             Value::Tuple(xs) => Some(xs),
+            _ => None,
+        }
+    }
+
+    /// Returns the fields if this is a [`Value::Record`].
+    #[must_use]
+    pub fn as_record(&self) -> Option<&[(Symbol, Value)]> {
+        match self {
+            Value::Record(fs) => Some(fs),
             _ => None,
         }
     }
