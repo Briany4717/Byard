@@ -3978,37 +3978,46 @@ impl Interpreter {
                         render_child(self, row, frame, flat_idx);
                     }
                     *flat_idx += 1;
+                } else if let Some(pin) = header_pin {
+                    // RFC-0021 collapsing header: the first child (the header) is
+                    // pinned to the viewport top (its scroll translate undone on Y)
+                    // *and* drawn last so it paints on top of the content that
+                    // scrolls up under it — draw-order depth is emission order, so a
+                    // header emitted first would sit behind the content. Skip the
+                    // header's flat ids, paint the rest, then rewind and paint the
+                    // header over them.
+                    let concrete = self.expand_concrete(children, pools);
+                    if let Some((&header, rest)) = concrete.split_first() {
+                        let header_start = *flat_idx;
+                        *flat_idx += self.flat_len(header, pools);
+                        for child in rest {
+                            render_child(self, child, frame, flat_idx);
+                        }
+                        let after = *flat_idx;
+                        *flat_idx = header_start;
+                        let mut pin_tf = child_transform;
+                        pin_tf.translate[1] += pin;
+                        let child_id = flat_ids[*flat_idx];
+                        self.render_node_with_atlas(
+                            header,
+                            child_id,
+                            frame,
+                            flat_ids,
+                            flat_idx,
+                            current_rect,
+                            child_opacity,
+                            pin_tf,
+                            child_clip,
+                            child_window,
+                            pools,
+                        );
+                        *flat_idx = after;
+                    }
                 } else {
                     // RFC-0018: expand reactive `when`/`for` into concrete children
                     // in the same order the layout pass did.
-                    for (i, child) in self
-                        .expand_concrete(children, pools)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        // RFC-0021 collapsing header: render the first child with the
-                        // scroll translate undone on Y, so it stays pinned to the
-                        // viewport top while the rest scrolls under it.
-                        if let (0, Some(pin)) = (i, header_pin) {
-                            let mut pin_tf = child_transform;
-                            pin_tf.translate[1] += pin;
-                            let child_id = flat_ids[*flat_idx];
-                            self.render_node_with_atlas(
-                                child,
-                                child_id,
-                                frame,
-                                flat_ids,
-                                flat_idx,
-                                current_rect,
-                                child_opacity,
-                                pin_tf,
-                                child_clip,
-                                child_window,
-                                pools,
-                            );
-                        } else {
-                            render_child(self, child, frame, flat_idx);
-                        }
+                    for child in self.expand_concrete(children, pools) {
+                        render_child(self, child, frame, flat_idx);
                     }
                 }
                 if scroll_clip.is_some() {
@@ -10006,6 +10015,74 @@ mod tests {
         assert!(
             (c1 - (c0 - 50.0)).abs() < 0.5,
             "content scrolls up by 50: {c0} → {c1}"
+        );
+        // The header must paint *on top* of the content that scrolls under it —
+        // draw-order depth is emission order and `draw_depth` decreases with it, so
+        // the (last-emitted) header's depth is strictly nearer than the content's.
+        let depth_of = |frame: &byard_core::frame::RenderFrame, rgba: [f32; 4]| -> f32 {
+            let i = frame
+                .instances()
+                .iter()
+                .position(|b| b.color == rgba)
+                .expect("painted");
+            frame.solid_depths()[i]
+        };
+        assert!(
+            depth_of(&f1, header_rgba) < depth_of(&f1, content_rgba),
+            "the pinned header paints over the scrolling content"
+        );
+    }
+
+    /// RFC-0021 collapsing header: the pin + `scroll_fraction` work with the
+    /// example's real shape — the ScrollView nested in an outer `Column`, and a
+    /// header that is a `Box` wrapping a `Column` of `Text`s (not a bare box).
+    #[test]
+    fn collapse_header_works_nested_like_the_example() {
+        let src = "View V() { var sx = 0.0 var sy = 0.0 \
+             Column #[bg: 0x14141C, width: 200] { \
+                 ScrollView #[collapse_header: true, collapse_min: 30, offset: (sx, sy), \
+                              width: 200, height: 120] { \
+                     Box #[bg: 0xAABBCC, width: 200, p: 10] { \
+                         Column { Text(\"Title\") Text(\"Sub\") } \
+                     } \
+                     Column #[p: 8] { \
+                         Box #[bg: 0x112233, width: 180, height: 90] {} \
+                         Box #[bg: 0x223344, width: 180, height: 90] {} \
+                     } \
+                 } \
+             } }";
+        let parsed = parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut interp = Interpreter::new();
+        let tree = interp.lower_view(&parsed.views[0], &[]);
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        // The `scroll_fraction` signal must be minted even when nested.
+        let frac = find_collapse_sig(&tree).expect("nested collapse header is detected");
+        interp.tick();
+        let sy = interp.var_signal(&Symbol::intern("sy")).unwrap();
+        let header_rgba = crate::interp::intrinsics::color_to_rgba(0xAABBCC, false);
+        let y_of = |frame: &byard_core::frame::RenderFrame| -> Option<f32> {
+            frame
+                .instances()
+                .iter()
+                .find(|b| b.color == header_rgba)
+                .map(|b| b.rect[1] + b.transform.translate[1])
+        };
+        let mut f0 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f0, 400.0, 300.0);
+        let h0 = y_of(&f0).expect("header painted");
+        interp.write_var(sy, Value::Float(40.0));
+        let mut f1 = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut f1, 400.0, 300.0);
+        let h1 = y_of(&f1).expect("header painted");
+        assert!(
+            (h1 - h0).abs() < 0.5,
+            "the header stays pinned when nested: {h0} → {h1}"
+        );
+        assert!(
+            matches!(interp.peek(frac), Value::Float(f) if f > 0.5),
+            "scroll_fraction advanced past 0.5 after scrolling 40px, got {:?}",
+            interp.peek(frac)
         );
     }
 
