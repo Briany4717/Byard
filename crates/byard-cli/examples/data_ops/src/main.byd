@@ -1,0 +1,93 @@
+// RFC-0027 — a live, interactive showcase of EVERY data/collection operation.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/data_ops
+//   cargo run -p byard-cli -- dev
+//
+// Two knobs drive everything:
+//   • the "n −" / "n +" buttons change a number `n`;
+//   • the "push n" / "drop first" buttons grow/shrink a list `xs`;
+//   • the "score +10" button updates a record immutably.
+// Every readout to the right of a label is a *derived* value that recomputes
+// reactively the instant you touch a control — proving comparison, logic,
+// string concat, indexing, `len`, `contains`, `map`, `filter`, records, and
+// record spread all evaluate correctly and stay live.
+View Main() {
+    var n = 3
+    var xs = [1, 2, 3]
+    var user = { name: "Ada", score: 0 }
+
+    // Derived memos — recomputed on every dependency change (RFC-0027 §3).
+    let inRange = n > 0 && n < 10
+    let doubled = xs.map(x => x * 2)
+    let big = xs.filter(x => x > 2)
+
+    Column #[bg: 0x14141C, p: 28, gap: 6, width: 620] {
+        Text("RFC-0027 — live data ops") #[color: 0xFFFFFF, size: 24, weight: bold]
+        Text("Touch the controls; every value on the right recomputes reactively.")
+            #[color: 0x9AA0AC, size: 13]
+
+        // ── number controls ─────────────────────────────────────────────
+        Row #[gap: 10, p: (vertical: 8, horizontal: 0)] {
+            Button("n −") #[bg: 0x3C3C52, radius: 8, p: (vertical: 8, horizontal: 16)]
+                => n = n - 1
+            Text("n = {n}") #[color: 0xFFD479, size: 20, weight: bold, width: 90]
+            Button("n +") #[bg: 0x3C3C52, radius: 8, p: (vertical: 8, horizontal: 16)]
+                => n = n + 1
+        }
+
+        // ── comparison (§1) → Bool ──────────────────────────────────────
+        Text("COMPARISON → Bool") #[color: 0x6750A4, size: 12, weight: bold]
+        Text("n > 5        →  {n > 5}") #[color: 0xCCD2E0, size: 15]
+        Text("n == 3       →  {n == 3}") #[color: 0xCCD2E0, size: 15]
+        Text("n <= 3       →  {n <= 3}") #[color: 0xCCD2E0, size: 15]
+
+        // ── logic with short-circuit (§2) ───────────────────────────────
+        Text("LOGIC  && || !") #[color: 0x6750A4, size: 12, weight: bold]
+        Text("0 < n < 10   →  {inRange}") #[color: 0xCCD2E0, size: 15]
+        Text("!(n > 5)     →  {!(n > 5)}") #[color: 0xCCD2E0, size: 15]
+        Text("n<0 || n>0   →  {n < 0 || n > 0}") #[color: 0xCCD2E0, size: 15]
+
+        // ── string concat + scalar coercion (§3) ────────────────────────
+        Text("STRING CONCAT") #[color: 0x6750A4, size: 12, weight: bold]
+        Text("\"n = \" + n   →  {\"n = \" + n}") #[color: 0xCCD2E0, size: 15]
+        Text("count message →  {\"you have \" + xs.len + \" items\"}")
+            #[color: 0xCCD2E0, size: 15]
+
+        // ── list controls + ops (§4) ────────────────────────────────────
+        Row #[gap: 10, p: (vertical: 8, horizontal: 0)] {
+            Button("push n") #[bg: 0x477A96, radius: 8, p: (vertical: 8, horizontal: 16)]
+                => xs = xs.push(n)
+            Button("drop first") #[bg: 0x964747, radius: 8, p: (vertical: 8, horizontal: 16)]
+                => xs = xs.removeAt(0)
+        }
+        Text("LIST OPS  (pure, value-returning)") #[color: 0x6750A4, size: 12, weight: bold]
+        Text("xs.len       →  {xs.len}") #[color: 0xCCD2E0, size: 15]
+        Text("xs[0]        →  {xs[0]}") #[color: 0xCCD2E0, size: 15]
+        Text("xs.contains(n) →  {xs.contains(n)}") #[color: 0xCCD2E0, size: 15]
+        Text("filter(x>2).len →  {big.len}") #[color: 0xCCD2E0, size: 15]
+
+        Row #[gap: 40] {
+            Column #[gap: 2] {
+                Text("xs =") #[color: 0x9AA0AC, size: 13]
+                for x in xs {
+                    Text("• {x}") #[color: 0x8AD1A0, size: 14]
+                }
+            }
+            Column #[gap: 2] {
+                Text("xs.map(x => x * 2) =") #[color: 0x9AA0AC, size: 13]
+                for d in doubled {
+                    Text("• {d}") #[color: 0x79B8FF, size: 14]
+                }
+            }
+        }
+
+        // ── records + immutable spread update (§6) ───────────────────────
+        Text("RECORDS  \{ ..r, k: v \}") #[color: 0x6750A4, size: 12, weight: bold]
+        Row #[gap: 10] {
+            Button("score +10") #[bg: 0x6750A4, radius: 8, p: (vertical: 8, horizontal: 16)]
+                => user = { ..user, score: user.score + 10 }
+            Text("{user.name} · score {user.score}") #[color: 0xFFD479, size: 16, weight: bold]
+        }
+    }
+}
