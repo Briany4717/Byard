@@ -247,6 +247,28 @@ fn shift_expr(expr: &mut Expr, delta: u32) {
             shift_expr(lhs, delta);
             shift_expr(rhs, delta);
         }
+        Expr::Unary { rhs, span, .. } => {
+            shift(span, delta);
+            shift_expr(rhs, delta);
+        }
+        Expr::Index { base, index, span } => {
+            shift(span, delta);
+            shift_expr(base, delta);
+            shift_expr(index, delta);
+        }
+        Expr::Record {
+            fields,
+            spread,
+            span,
+        } => {
+            shift(span, delta);
+            for (_, value) in fields {
+                shift_expr(value, delta);
+            }
+            if let Some(spread) = spread {
+                shift_expr(spread, delta);
+            }
+        }
         Expr::Ternary {
             cond,
             then,

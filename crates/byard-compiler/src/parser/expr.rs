@@ -8,7 +8,7 @@
 //! `r_bp < l_bp`.
 
 use super::Parser;
-use super::ast::{Arg, AssignOp, BinOp, Expr, PostfixOp, StrPart};
+use super::ast::{Arg, AssignOp, BinOp, Expr, PostfixOp, StrPart, UnOp};
 use crate::diagnostics::Span;
 use crate::lexer::Token;
 use crate::symbol::Symbol;
@@ -18,6 +18,11 @@ struct Bp {
     left: u8,
     right: u8,
 }
+
+/// Binding power a prefix unary operator (`!`/`-`) parses its operand at
+/// (RFC-0027 §2 precedence): tighter than every binary operator, looser than
+/// postfix/call/member so `!a.b` is `!(a.b)` and `-a * b` is `(-a) * b`.
+const UNARY_BP: u8 = 17;
 
 impl Parser<'_> {
     /// Parses an expression whose operators bind at least as tightly as
@@ -63,14 +68,27 @@ impl Parser<'_> {
             }
             Some(Token::Ident(sym)) => {
                 self.advance();
-                Expr::Ident(sym, span)
+                // A bare single-parameter lambda `x => body` (RFC-0027 §5, used
+                // by `map`/`filter`). `IDENT` not followed by `=>` is a plain
+                // identifier reference.
+                if self.eat(&Token::Arrow) {
+                    let body = Box::new(self.parse_expr(0));
+                    Expr::Lambda {
+                        params: vec![sym],
+                        body,
+                        span: self.span_from(span),
+                    }
+                } else {
+                    Expr::Ident(sym, span)
+                }
             }
             Some(Token::Minus) => self.parse_negative(),
+            Some(Token::Bang) => self.parse_not(),
             Some(Token::Style) => self.parse_style_value(),
             Some(Token::LBrack) => self.parse_array(),
             Some(Token::LParen) => self.parse_paren_or_lambda(),
             Some(Token::Pipe) => self.parse_pipe_lambda(),
-            Some(Token::LBrace) => self.parse_callback_block(),
+            Some(Token::LBrace) => self.parse_brace_value(),
             Some(Token::Dot) => self.parse_class_ref(),
             _ => {
                 self.error("an expression");
@@ -187,11 +205,9 @@ impl Parser<'_> {
         })
     }
 
-    /// A negative numeric literal `-<number>`. Byld has no binary arithmetic
-    /// operators, so a leading `-` is only meaningful as the sign of a numeric
-    /// literal (e.g. `translate: (-8, 0)`, `rotate: -90deg`). Anything else
-    /// gets a targeted "a number after `-`" diagnostic instead of the generic
-    /// "expected an expression", so the dev-overlay message is actionable.
+    /// A leading `-`: the sign of a numeric literal (`translate: (-8, 0)`,
+    /// `rotate: -90deg`) folded straight into the literal, or — for any other
+    /// operand — a unary negation [`Expr::Unary`] (RFC-0027 §2, `-x`, `-count`).
     fn parse_negative(&mut self) -> Expr {
         let start = self.cur_span();
         self.advance(); // '-'
@@ -209,17 +225,117 @@ impl Parser<'_> {
                 Expr::AngleLit(-rad, self.span_from(start))
             }
             _ => {
-                self.error("a number after `-`");
-                Expr::Error(self.span_from(start))
+                let rhs = Box::new(self.parse_expr(UNARY_BP));
+                Expr::Unary {
+                    op: UnOp::Neg,
+                    rhs,
+                    span: self.span_from(start),
+                }
             }
         }
     }
 
+    /// A boolean negation `!expr` (RFC-0027 §2). Binds tighter than every binary
+    /// operator, so `!a && b` is `(!a) && b`.
+    fn parse_not(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // '!'
+        let rhs = Box::new(self.parse_expr(UNARY_BP));
+        Expr::Unary {
+            op: UnOp::Not,
+            rhs,
+            span: self.span_from(start),
+        }
+    }
+
+    /// Disambiguates a leading `{` between a **record literal** (RFC-0027 §6:
+    /// `{ k: v, .. }` / `{ ..spread, k: v }`) and a **callback action block**
+    /// (RFC-0019: `{ count++ }`, `{|x| … }`). A record is signalled by a first
+    /// token of `IDENT :` or a `..spread`; everything else is a callback block.
+    /// The empty `{}` stays a no-op callback block (the established default).
+    fn parse_brace_value(&mut self) -> Expr {
+        if self.at_record_literal() {
+            self.parse_record()
+        } else {
+            self.parse_callback_block()
+        }
+    }
+
+    /// True when the cursor sits on a `{` opening a record literal (as opposed
+    /// to a callback block): the token after `{` is `..` (spread), or an
+    /// identifier immediately followed by `:`.
+    fn at_record_literal(&self) -> bool {
+        if !matches!(self.cur(), Some(Token::LBrace)) {
+            return false;
+        }
+        match self.peek2() {
+            Some(Token::DotDot) => true,
+            Some(Token::Ident(_)) => matches!(self.peek3(), Some(Token::Colon)),
+            _ => false,
+        }
+    }
+
+    /// `record := "{" (".." expr ",")? (IDENT ":" expr ("," …)*)? "}"`
+    /// (RFC-0027 §6). Fields keep written order; a single optional `..spread`
+    /// base may appear anywhere and seeds the record before written fields.
+    fn parse_record(&mut self) -> Expr {
+        let start = self.cur_span();
+        self.advance(); // {
+        let mut fields = Vec::new();
+        let mut spread = None;
+        while !matches!(self.cur(), Some(Token::RBrace) | None) {
+            let before = self.pos;
+            if self.eat(&Token::DotDot) {
+                let base = self.parse_expr(0);
+                if spread.is_none() {
+                    spread = Some(Box::new(base));
+                } else {
+                    self.error_at(base.span(), "a single `..spread` per record");
+                }
+            } else if let Some(name) = self.expect_ident("a record field name") {
+                self.expect(&Token::Colon, "':' after the field name");
+                let value = self.parse_expr(0);
+                fields.push((name, value));
+            }
+            if self.pos == before {
+                self.advance(); // guarantee progress on a malformed field
+            }
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RBrace, "'}' to close the record");
+        Expr::Record {
+            fields,
+            spread,
+            span: self.span_from(start),
+        }
+    }
+
     /// Peeks the binding power of the upcoming `led` operator, if any.
+    ///
+    /// Precedence ladder, lowest → highest (RFC-0027 §1 extends the pre-existing
+    /// arithmetic band with logic/comparison):
+    ///
+    /// ```text
+    /// assignment (= += -=)   L2  R1
+    /// with                   L3  R3
+    /// ||                     L4  R5
+    /// ternary ?:             L6  R6      (tighter than ||; looser than comparison)
+    /// &&                     L7  R8
+    /// comparison             L9  R10     (== != < <= > >=)
+    /// merge                  L11 R12
+    /// + -                    L13 R14
+    /// * /                    L15 R16
+    /// (unary prefix !/-      17, in `nud`)
+    /// ++ --                  L18 R19
+    /// call (                 L20 R21
+    /// . [ (member/index)     L22 R23
+    /// ```
     fn peek_led(&self) -> Option<Bp> {
         match self.cur()? {
-            // Member access and calls bind tightest.
-            Token::Dot => Some(Bp {
+            // Member access, indexing, and calls bind tightest.
+            Token::Dot | Token::LBrack => Some(Bp {
                 left: 22,
                 right: 23,
             }),
@@ -233,24 +349,37 @@ impl Parser<'_> {
                 right: 19,
             }),
             // Binary arithmetic (RFC-0020 enabler): standard precedence —
-            // `* /` over `+ -`, both left-associative (`right = left + 1`),
-            // and both above the `merge`/ternary/`with`/assignment band so
-            // `p * 360 with anim.spring()` animates the product.
-            Token::Star | Token::Slash => Some(Bp { left: 9, right: 10 }),
-            Token::Plus | Token::Minus => Some(Bp { left: 7, right: 8 }),
-            // Ternary (right-assoc). `right: 4` (not 3) so the else-branch is
-            // parsed one power *above* the `with` operator (left: 3) below — this
-            // is what makes `a ? b : c with k` group as `(a ? b : c) with k`
-            // (RFC-0010): the whole conditional is the animated value, not just
-            // the else-branch. Nothing else has left bp 3, so this is invisible
-            // to every other expression.
-            Token::Question => Some(Bp { left: 4, right: 4 }),
+            // `* /` over `+ -`, both left-associative (`right = left + 1`).
+            Token::Star | Token::Slash => Some(Bp {
+                left: 15,
+                right: 16,
+            }),
+            Token::Plus | Token::Minus => Some(Bp {
+                left: 13,
+                right: 14,
+            }),
+            // `merge` style composition (RFC-0016): right-assoc, above arithmetic
+            // is meaningless (styles never mix with `+`), so it sits just below.
+            Token::Merge => Some(Bp {
+                left: 11,
+                right: 12,
+            }),
+            // Comparison (RFC-0027 §1): non-chaining in practice, left-assoc.
+            // Above `&&`/`||` and the ternary so `a == b ? x : y` is `(a==b)?x:y`.
+            Token::EqEq | Token::BangEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => {
+                Some(Bp { left: 9, right: 10 })
+            }
+            // `&&` (RFC-0027 §2): short-circuit, tighter than `||`/ternary.
+            Token::AmpAmp => Some(Bp { left: 7, right: 8 }),
+            // Ternary (right-assoc): tighter than `||` (RFC-0027 §1 note), looser
+            // than comparison. `right: 6` keeps the else-branch one power above
+            // `with` (L3) so `a ? b : c with k` groups as `(a ? b : c) with k`.
+            Token::Question => Some(Bp { left: 6, right: 6 }),
+            // `||` (RFC-0027 §2): short-circuit, lowest of the logic band.
+            Token::PipePipe => Some(Bp { left: 4, right: 5 }),
             // `with` animation operator (RFC-0010): below the ternary, above
             // assignment, so `(cond ? a : b) with anim.spring()` is the value.
             Token::With => Some(Bp { left: 3, right: 3 }),
-            // `merge` style composition (RFC-0016): binds tighter than the
-            // ternary so `a merge b` is a single composed style; right-assoc.
-            Token::Merge => Some(Bp { left: 5, right: 6 }),
             // Assignment (right-assoc), lowest.
             Token::Eq | Token::PlusEq | Token::MinusEq => Some(Bp { left: 2, right: 1 }),
             _ => None,
@@ -296,15 +425,47 @@ impl Parser<'_> {
                     span: self.span_from(start),
                 }
             }
-            // Binary arithmetic (RFC-0020 enabler). A `-` reaching `led` is
-            // always subtraction — the numeric-sign form is consumed by
-            // `parse_negative` in `nud`, before any left operand exists.
-            Some(tok @ (Token::Plus | Token::Minus | Token::Star | Token::Slash)) => {
+            // Indexing `base[index]` (RFC-0027 §4).
+            Some(Token::LBrack) => {
+                self.advance();
+                let index = Box::new(self.parse_expr(0));
+                self.expect(&Token::RBracket, "']' to close the index");
+                Expr::Index {
+                    base: Box::new(lhs),
+                    index,
+                    span: self.span_from(start),
+                }
+            }
+            // Binary arithmetic (RFC-0020), comparison and logic (RFC-0027 §1/§2).
+            // A `-` reaching `led` is always subtraction — the numeric-sign form
+            // is consumed by `parse_negative` in `nud`, before any left operand.
+            Some(
+                tok @ (Token::Plus
+                | Token::Minus
+                | Token::Star
+                | Token::Slash
+                | Token::EqEq
+                | Token::BangEq
+                | Token::Lt
+                | Token::LtEq
+                | Token::Gt
+                | Token::GtEq
+                | Token::AmpAmp
+                | Token::PipePipe),
+            ) => {
                 let op = match tok {
                     Token::Plus => BinOp::Add,
                     Token::Minus => BinOp::Sub,
                     Token::Star => BinOp::Mul,
-                    _ => BinOp::Div,
+                    Token::Slash => BinOp::Div,
+                    Token::EqEq => BinOp::Eq,
+                    Token::BangEq => BinOp::Ne,
+                    Token::Lt => BinOp::Lt,
+                    Token::LtEq => BinOp::Le,
+                    Token::Gt => BinOp::Gt,
+                    Token::GtEq => BinOp::Ge,
+                    Token::AmpAmp => BinOp::And,
+                    _ => BinOp::Or,
                 };
                 self.advance();
                 let rhs = Box::new(self.parse_expr(right_bp));

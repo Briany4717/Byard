@@ -1,55 +1,57 @@
-//! Procedural macros for byard (M23 — controller boundary).
+//! Procedural macros for byard — the `#[byard_controller]` boundary marker
+//! (RFC-0028 §2, correcting erratum CB1).
 //!
-//! `#[byard_controller]` marks a Rust struct as a byard controller: it can
-//! provide ambient values via `inject`, expose async methods, and deliver
-//! results back to the logic thread through the relay's I/O channel.
+//! `#[byard_controller]` has two forms, distinguished by what it annotates:
 //!
-//! The macro emits the struct **unchanged** and adds an inherent `impl` exposing
-//! field metadata the interpreter needs for type-directed member-access (M5:
-//! `member → field type`). The generated code is self-contained — it introduces
-//! **no dependency on `byard-core`/`byard-compiler`**, so those crates never gain
-//! a runtime back-dependency on `byard-macro` (INV-1). The metadata is consumed
-//! by the application crate that owns the controller.
+//! - **On a `struct`** it emits the struct **unchanged** plus an inherent `impl`
+//!   exposing field metadata (`BYARD_FIELDS` / `byard_field_type`) the LSP and
+//!   interpreter use for type-directed member access. It does **not** by itself
+//!   make the struct callable — that is the impl-block form below.
+//! - **On an `impl` block** it emits the block unchanged plus
+//!   `impl ::byard::bridge::Controller`: a `type_name` and an `invoke` that
+//!   dispatches each `async fn` by name, converting arguments from `HostValue`,
+//!   awaiting the method, and mapping `Ok`/`Err` back to `HostValue`.
+//!
+//! The generated code references only `::byard::bridge::*` from the *app* crate's
+//! dependency graph, so `byard-macro` keeps **no** dependency on
+//! `byard-core`/`byard-compiler` (INV-1). A controller struct must be `Clone`
+//! (the shim clones `self` into the `'static` reply future).
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Type, parse_macro_input};
+use syn::{Fields, Item, ReturnType, Type, parse_macro_input};
 
-/// Marks a Rust struct as a byard controller.
-///
-/// The struct is emitted unchanged, plus an inherent `impl` with:
-///
-/// - `pub const BYARD_FIELDS: &[(&str, &str)]` — `(field name, byld type name)`
-///   for every named field, in declaration order;
-/// - `pub fn byard_field_type(name: &str) -> Option<&'static str>` — the byld
-///   type of one field, for the interpreter's `member → field type` inference.
-///
-/// Rust scalar types map to byld scalars (`i*`/`u* → Int`, `f* → Float`,
-/// `bool → Bool`, `String`/`&str → Str`); any other type maps to its final path
-/// segment (so a nested controller type keeps its name).
-///
-/// # Example
-///
-/// ```ignore
-/// #[byard_controller]
-/// struct CounterController {
-///     count: i64,
-///     label: String,
-/// }
-/// assert_eq!(CounterController::byard_field_type("count"), Some("Int"));
-/// ```
+/// Marks a Rust struct — or its `impl` block — as a byard controller (RFC-0028
+/// §2). See the crate docs for the two forms. On a struct it emits
+/// `BYARD_FIELDS` + `byard_field_type`; on an `impl` block it emits
+/// `impl Controller` dispatching the block's `async fn`s.
 #[proc_macro_attribute]
 pub fn byard_controller(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Struct(s) => expand_struct(&Item::Struct(s)),
+        Item::Impl(i) => expand_impl(&i),
+        other => syn::Error::new_spanned(
+            other,
+            "#[byard_controller] applies to a struct or an `impl` block",
+        )
+        .to_compile_error()
+        .into(),
+    }
+}
+
+/// Emits a controller struct unchanged plus its field-metadata inherent `impl`.
+fn expand_struct(item: &Item) -> TokenStream {
+    let Item::Struct(input) = item else {
+        unreachable!("expand_struct only called for a struct");
+    };
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    // Collect (field name, byld type) for each named field. Non-struct or
-    // tuple/unit structs simply produce empty metadata (still valid).
+    // Collect (field name, byld type) for each named field. Tuple/unit structs
+    // simply produce empty metadata (still valid).
     let mut entries = Vec::new();
-    if let Data::Struct(s) = &input.data
-        && let Fields::Named(named) = &s.fields
-    {
+    if let Fields::Named(named) = &input.fields {
         for field in &named.named {
             if let Some(ident) = &field.ident {
                 let fname = ident.to_string();
@@ -86,6 +88,113 @@ pub fn byard_controller(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Emits an `impl` block unchanged plus `impl Controller` dispatching its
+/// `async fn`s by name (RFC-0028 §2). Each method's arguments are converted from
+/// `HostValue` via `FromHostValue`, the method is awaited on a clone of `self`
+/// (so the reply future is `'static`), and its `Ok`/`Err` map back through
+/// `IntoHostValue`.
+fn expand_impl(input: &syn::ItemImpl) -> TokenStream {
+    let self_ty = &input.self_ty;
+
+    // One match arm per `async fn` method.
+    let mut arms = Vec::new();
+    for item in &input.items {
+        let syn::ImplItem::Fn(f) = item else { continue };
+        if f.sig.asyncness.is_none() {
+            continue;
+        }
+        let ident = &f.sig.ident;
+        let name_str = ident.to_string();
+
+        // Bind each non-receiver parameter from the argument list, annotated with
+        // its declared type so `FromHostValue::from_host` resolves.
+        let mut binds = Vec::new();
+        let mut call_args = Vec::new();
+        let mut arg_index = 0usize;
+        for input_arg in &f.sig.inputs {
+            let syn::FnArg::Typed(pat) = input_arg else {
+                continue; // skip `&self`
+            };
+            let ty = &pat.ty;
+            let var = quote::format_ident!("__arg{arg_index}");
+            binds.push(quote! {
+                let #var: #ty = ::byard::bridge::FromHostValue::from_host(
+                    __args.next().unwrap_or(::byard::bridge::HostValue::Unit)
+                );
+            });
+            call_args.push(quote! { #var });
+            arg_index += 1;
+        }
+
+        // A `-> Result<T, E>` maps ok/err separately; any other return type is
+        // treated as an infallible success.
+        let returns_result = matches!(&f.sig.output, ReturnType::Type(_, ty) if is_result(ty));
+        let dispatch = if returns_result {
+            quote! {
+                match __this.#ident(#(#call_args),*).await {
+                    ::core::result::Result::Ok(__v) =>
+                        ::core::result::Result::Ok(::byard::bridge::IntoHostValue::into_host(__v)),
+                    ::core::result::Result::Err(__e) =>
+                        ::core::result::Result::Err(::byard::bridge::IntoHostValue::into_host(__e)),
+                }
+            }
+        } else {
+            quote! {
+                ::core::result::Result::Ok(
+                    ::byard::bridge::IntoHostValue::into_host(__this.#ident(#(#call_args),*).await)
+                )
+            }
+        };
+
+        arms.push(quote! {
+            #name_str => {
+                let mut __args = __args.into_iter();
+                #(#binds)*
+                let __this = ::core::clone::Clone::clone(self);
+                ::std::boxed::Box::pin(async move { #dispatch })
+            }
+        });
+    }
+
+    let expanded = quote! {
+        #input
+
+        impl ::byard::bridge::Controller for #self_ty {
+            fn type_name(&self) -> &'static str {
+                ::core::stringify!(#self_ty)
+            }
+
+            fn invoke(
+                &self,
+                method: &str,
+                __args: ::std::vec::Vec<::byard::bridge::HostValue>,
+            ) -> ::byard::bridge::BoxFuture<
+                'static,
+                ::core::result::Result<::byard::bridge::HostValue, ::byard::bridge::HostValue>,
+            > {
+                match method {
+                    #(#arms)*
+                    _ => {
+                        let __m = method.to_string();
+                        ::std::boxed::Box::pin(async move {
+                            ::core::result::Result::Err(::byard::bridge::HostValue::Str(
+                                ::std::format!("unknown controller method `{__m}`")
+                            ))
+                        })
+                    }
+                }
+            }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+/// Whether a return type is syntactically a `Result<…>` (so `invoke` maps its
+/// `Ok`/`Err` arms).
+fn is_result(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Result"))
 }
 
 /// Maps a Rust field type to the byld type name the interpreter understands.

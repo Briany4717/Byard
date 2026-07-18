@@ -231,6 +231,31 @@ pub enum Token {
     /// over two `/` tokens through the skip rule's longest match.
     #[token("/")]
     Slash,
+    /// `==` — equality comparison (RFC-0027 §1). Longest-match keeps this
+    /// distinct from a single `=` (assignment).
+    #[token("==")]
+    EqEq,
+    /// `!=` — inequality comparison (RFC-0027 §1).
+    #[token("!=")]
+    BangEq,
+    /// `!` — boolean negation (RFC-0027 §2). Longest-match keeps `!=` its own
+    /// token.
+    #[token("!")]
+    Bang,
+    /// `<=` — less-than-or-equal (RFC-0027 §1). Longest-match prefers this over
+    /// `<` (generic open / less-than).
+    #[token("<=")]
+    LtEq,
+    /// `>=` — greater-than-or-equal (RFC-0027 §1).
+    #[token(">=")]
+    GtEq,
+    /// `&&` — short-circuiting logical AND (RFC-0027 §2).
+    #[token("&&")]
+    AmpAmp,
+    /// `||` — short-circuiting logical OR (RFC-0027 §2). Longest-match keeps a
+    /// single `|` (lambda delimiter) distinct.
+    #[token("||")]
+    PipePipe,
 }
 
 /// State of the two-state string-scanning stack.
@@ -417,6 +442,27 @@ mod tests {
                 Token::Gt,
                 Token::Pipe,
                 Token::Question,
+            ]
+        );
+    }
+
+    #[test]
+    fn comparison_and_logic_operators_lex() {
+        // Longest-match must keep `==`/`!=`/`<=`/`>=`/`&&`/`||` distinct from
+        // their single-char prefixes (`=`, `!`, `<`, `>`, `|`).
+        assert_eq!(
+            kinds("== != < <= > >= && || ! |"),
+            vec![
+                Token::EqEq,
+                Token::BangEq,
+                Token::Lt,
+                Token::LtEq,
+                Token::Gt,
+                Token::GtEq,
+                Token::AmpAmp,
+                Token::PipePipe,
+                Token::Bang,
+                Token::Pipe,
             ]
         );
     }

@@ -6,6 +6,7 @@
 //! intrinsics, style, events, and hot-reload follow.
 
 pub mod anim;
+pub mod bridge;
 pub mod env;
 pub mod eval;
 pub mod events;

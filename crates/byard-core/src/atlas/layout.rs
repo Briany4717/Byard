@@ -1603,7 +1603,19 @@ fn measure_text_node(
         Some(s) => s.measure(&spec.content, spec.font_size, wrap_w),
         None => spec.fallback,
     };
-    Size { width, height }
+    // Reserve a **whole pixel** of width for the glyphs. Taffy rounds resolved
+    // layout to integer coordinates (rounding on by default), so a node measured
+    // at e.g. 100.4px would resolve to width 100 — and the render pass, which
+    // re-shapes the run to that resolved width, would then wrap a line that
+    // actually fits. Ceiling here makes the reserved width an integer ≥ the
+    // glyph extent; an integer width survives taffy's position rounding exactly
+    // (`round(x + n) == round(x) + n`), so the painted run never re-wraps from a
+    // sub-pixel deficit. Height is left untouched (its own line-height rounding
+    // is handled by the vertical layout).
+    Size {
+        width: width.ceil(),
+        height,
+    }
 }
 
 impl Default for LayoutAtlas {
@@ -2051,6 +2063,62 @@ mod tests {
             r.height > 24.0,
             "wrapped onto multiple lines, got {}",
             r.height
+        );
+    }
+
+    /// A sizer whose natural width is deliberately fractional, to exercise the
+    /// pixel-rounding path.
+    struct FractionalSizer(f32);
+    impl crate::text::TextSizer for FractionalSizer {
+        fn measure(&mut self, _text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
+            let line_h = font_size * 1.2;
+            match max_width {
+                Some(w) if w > 0.0 && self.0 > w => (w, line_h * 2.0),
+                _ => (self.0, line_h),
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_text_width_reserves_a_whole_pixel_and_stays_one_line() {
+        // Regression: a single-line text measured at a fractional width (100.4)
+        // must resolve to an *integer* width ≥ that, so the render pass — which
+        // re-shapes the run to the resolved width — never wraps a line that
+        // actually fits. Taffy rounds resolved coordinates to whole pixels, so
+        // without the ceil the node would resolve to 100 and the run would wrap.
+        let mut atlas = LayoutAtlas::new();
+        let text = atlas
+            .add_text_leaf(TextLeaf {
+                content: "one line".to_string(),
+                font_size: 16.0,
+                width: None,
+                fallback: (100.4, 19.2),
+            })
+            .unwrap();
+        // A **row** keeps width as the main axis, so the text takes its natural
+        // (unconstrained) width rather than being stretched/wrapped.
+        let row = atlas
+            .add_container(
+                ContainerStyle::new(Some(400.0), Some(80.0)).with_direction(FlexDir::Row),
+                &[text],
+            )
+            .unwrap();
+        atlas.set_root(row).unwrap();
+        let mut sizer = FractionalSizer(100.4);
+        atlas
+            .compute_with_text(Viewport::new(800.0, 600.0), &mut sizer)
+            .unwrap();
+
+        let r = atlas.resolved_rect(text).unwrap().unwrap();
+        assert!(
+            r.width >= 100.4,
+            "resolved width must cover the glyph extent (≥ 100.4), got {}",
+            r.width
+        );
+        assert!(
+            (r.width - r.width.round()).abs() < 1e-3,
+            "resolved width must be a whole pixel, got {}",
+            r.width
         );
     }
 

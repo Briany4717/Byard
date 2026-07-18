@@ -12,5 +12,13 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
+[dev-dependencies]
+# The generated code references `::byard::bridge::*`; the façade re-exports both
+# the boundary types and this macro, so a dev-dependency cycle here is expected
+# and permitted (dev-deps never enter the normal build graph). Confirms the
+# emitted `impl Controller` compiles against the real façade (RFC-0028 §2).
+byard = { path = "../byard" }
+pollster = "0.4"
+
 [lints]
 workspace = true
