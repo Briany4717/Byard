@@ -16,6 +16,8 @@ use super::reactive::ScopeId;
 use crate::diagnostics::{CompileError, Span};
 use crate::symbol::Symbol;
 
+pub use byard_core::bridge::ControllerId;
+
 /// An opaque handle to a lambda's AST subtree, held in a side-table by the eval
 /// driver (M9). Lambdas are **never** Rust closures (RFC-0002): a `Value::Fn`
 /// names an AST node, re-walked when the bound event fires or an iterator
@@ -55,6 +57,11 @@ pub enum Value {
     Signal(SignalId),
     /// A computed memo (`let`/`fn`), referenced by its reactive scope id.
     Memo(ScopeId),
+    /// An injected controller handle (RFC-0028 §3): a `Copy` index into the
+    /// engine's `ControllerRegistry`, resolved by `inject T as x`. Read only on
+    /// the logic thread — it only *schedules* async work onto the pool, never
+    /// dereferences a controller off-thread (INV-2).
+    Controller(ControllerId),
     /// An injected design-token theme (RFC-0022). The [`SignalId`] backs the
     /// active scheme's dark flag (`Bool`): reading a token (`theme.primary`)
     /// tracks it, and `theme.dark = …` writes it, so a scheme flip drives

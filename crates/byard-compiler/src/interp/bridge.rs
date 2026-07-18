@@ -14,29 +14,25 @@ use super::env::Value;
 use crate::symbol::Symbol;
 
 /// Converts a [`Value`] to a [`HostValue`] for the crossing to the Tokio pool,
-/// or `Err(())` if it holds a non-data variant (`Signal`/`Memo`/`Fn`/`Theme`/
+/// or `None` if it holds a non-data variant (`Signal`/`Memo`/`Fn`/`Theme`/
 /// `Controller`) — the caller turns that into
 /// [`CompileError::NonDataControllerArg`](crate::diagnostics::CompileError::NonDataControllerArg).
-///
-/// # Errors
-///
-/// Returns `Err(())` when `value` (or anything nested in it) is not a data
-/// value.
-pub fn value_to_host(value: &Value) -> Result<HostValue, ()> {
-    Ok(match value {
+#[must_use]
+pub fn value_to_host(value: &Value) -> Option<HostValue> {
+    Some(match value {
         Value::Unit => HostValue::Unit,
         Value::Bool(b) => HostValue::Bool(*b),
         Value::Int(n) => HostValue::Int(*n),
         Value::Float(f) => HostValue::Float(*f),
         Value::Str(s) => HostValue::Str(s.clone()),
         Value::List(xs) => {
-            HostValue::List(xs.iter().map(value_to_host).collect::<Result<_, _>>()?)
+            HostValue::List(xs.iter().map(value_to_host).collect::<Option<_>>()?)
         }
         Value::Record(fields) => HostValue::Record(
             fields
                 .iter()
-                .map(|(k, v)| Ok((k.as_str().to_string(), value_to_host(v)?)))
-                .collect::<Result<_, ()>>()?,
+                .map(|(k, v)| Some((k.as_str().to_string(), value_to_host(v)?)))
+                .collect::<Option<_>>()?,
         ),
         // A tuple is positional layout data, not a controller data shape; map it
         // to a list of its values (names dropped) so it still crosses lossily
@@ -45,10 +41,14 @@ pub fn value_to_host(value: &Value) -> Result<HostValue, ()> {
             items
                 .iter()
                 .map(|(_, v)| value_to_host(v))
-                .collect::<Result<_, _>>()?,
+                .collect::<Option<_>>()?,
         ),
         // Reactive/handle variants have no data form (INV-13).
-        Value::Signal(_) | Value::Memo(_) | Value::Fn(_) | Value::Theme(_) => return Err(()),
+        Value::Signal(_)
+        | Value::Memo(_)
+        | Value::Fn(_)
+        | Value::Theme(_)
+        | Value::Controller(_) => return None,
     })
 }
 
@@ -93,9 +93,9 @@ mod tests {
     #[test]
     fn non_data_values_are_rejected() {
         use super::super::env::{AstId, SignalId};
-        assert!(value_to_host(&Value::Signal(SignalId(0))).is_err());
-        assert!(value_to_host(&Value::Fn(AstId(0))).is_err());
+        assert!(value_to_host(&Value::Signal(SignalId(0))).is_none());
+        assert!(value_to_host(&Value::Fn(AstId(0))).is_none());
         // Nesting a signal inside a list still fails (recursive check).
-        assert!(value_to_host(&Value::List(vec![Value::Signal(SignalId(1))])).is_err());
+        assert!(value_to_host(&Value::List(vec![Value::Signal(SignalId(1))])).is_none());
     }
 }
