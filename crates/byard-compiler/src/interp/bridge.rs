@@ -25,9 +25,7 @@ pub fn value_to_host(value: &Value) -> Option<HostValue> {
         Value::Int(n) => HostValue::Int(*n),
         Value::Float(f) => HostValue::Float(*f),
         Value::Str(s) => HostValue::Str(s.clone()),
-        Value::List(xs) => {
-            HostValue::List(xs.iter().map(value_to_host).collect::<Option<_>>()?)
-        }
+        Value::List(xs) => HostValue::List(xs.iter().map(value_to_host).collect::<Option<_>>()?),
         Value::Record(fields) => HostValue::Record(
             fields
                 .iter()
