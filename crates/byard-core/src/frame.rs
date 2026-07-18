@@ -631,6 +631,54 @@ impl Default for DecoratedBox {
     }
 }
 
+/// A single in-flight ripple — the RFC-0023 Material ink reveal, lowered to
+/// the `Ripple` effects pipeline. One instance is one expanding, fading circle
+/// clipped to its element's rounded rect, composited *above* the element's
+/// background and *below* its children (the emission order between the
+/// background push and the child walk gives it exactly that draw-order depth).
+///
+/// The logic thread samples the expansion/fade each tick through the shared
+/// [`Motion`] closed forms (the RFC-0010 model as landed: the CPU evaluates the
+/// curve at the engine clock while the animation is active and re-emits the
+/// instance; the shader rasterises the circle analytically). `radius` and
+/// `alpha` therefore carry the *current* sampled values — the GPU never needs
+/// the engine clock.
+///
+/// Lives in `frame` because it crosses the Evaluator → Encoder subsystem
+/// boundary (RFC-0001 §9), like every other primitive here. `#[repr(C)]` +
+/// `bytemuck`: the struct uploads directly as the instance buffer; the field
+/// order must match `encoder/ripple.wgsl`'s `InstanceInput`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RippleInstance {
+    /// The element rect `[x, y, width, height]` in logical pixels — both the
+    /// quad geometry and the rounded-rect clip bounds.
+    pub rect: [f32; 4],
+    /// `[center_x, center_y, radius, alpha]`: the circle centre in absolute
+    /// logical pixels (the tap point), its current sampled radius, and the
+    /// current sampled fade alpha (`0..=1`, inherited opacity folded in).
+    pub params: [f32; 4],
+    /// Ink colour `[r, g, b, a]`; `a` is the ink's own peak alpha (the fade
+    /// multiplies it in the shader via `params.w`).
+    pub color: [f32; 4],
+    /// Per-corner clip radii `[tl, tr, br, bl]` — the element's own border
+    /// radii, so the ink never bleeds past a rounded corner (RFC-0023
+    /// resolved question: always clip, no opt-out).
+    pub radii: [f32; 4],
+    /// Paint-time transform translate (RFC-0011 group transforms).
+    pub t_translate: [f32; 2],
+    /// Paint-time transform per-axis scale (RFC-0011 group transforms).
+    pub t_scale: [f32; 2],
+    /// Paint-time transform rotation in radians (RFC-0011).
+    pub t_rotate: f32,
+    /// Paint-time transform pivot (RFC-0011).
+    pub t_origin: [f32; 2],
+    /// Draw-order depth (NDC-z), stamped by [`RenderFrame::push_ripple`] like
+    /// [`VectorInstance::depth`] — between the element background's depth and
+    /// its children's.
+    pub depth: f32,
+}
+
 /// Shape-kind discriminant for a [`CanvasShape`] (RFC-0020 §2, Tier 1): a
 /// circular arc. `params = [cx, cy, r, start_rad, sweep_rad, 0, 0, 0]`.
 pub const CANVAS_SHAPE_ARC: u32 = 0;
@@ -949,6 +997,11 @@ pub struct RenderFrame {
     /// the `CanvasShape` analytic-SDF pipeline (the sixth pipeline).
     canvas_shapes: Vec<CanvasShape>,
 
+    /// In-flight ripple ink reveals (RFC-0023): one entry per live ripple,
+    /// re-sampled and re-emitted each tick while it expands and fades. Carries
+    /// its own draw-order depth (stamped at push, like `vector_instances`).
+    ripples: Vec<RippleInstance>,
+
     /// Pending MSDF-atlas uploads recorded by the logic thread this tick
     /// (RFC-0009 §2-C / INV-8). Applied by the render thread via a single
     /// `Queue::write_texture` each, during frame application, before the draw.
@@ -996,6 +1049,7 @@ pub struct RenderFrame {
     text_clips: Vec<Option<u16>>,
     vector_clips: Vec<Option<u16>>,
     canvas_clips: Vec<Option<u16>>,
+    ripple_clips: Vec<Option<u16>>,
 
     /// Per-text-line wrap width in logical pixels, parallel to `texts` (kept off
     /// the `TextLine` struct like the depth/clip vecs, so its 19 construction
@@ -1081,6 +1135,8 @@ pub struct LayerMark {
     pub text: u32,
     /// `canvas_shapes` length at the boundary (RFC-0020).
     pub canvas: u32,
+    /// `ripples` length at the boundary (RFC-0023).
+    pub ripple: u32,
 }
 
 /// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
@@ -1125,6 +1181,7 @@ impl RenderFrame {
         self.texts.clear();
         self.vector_instances.clear();
         self.canvas_shapes.clear();
+        self.ripples.clear();
         self.atlas_uploads.clear();
         self.solid_depths.clear();
         self.decorated_depths.clear();
@@ -1139,6 +1196,7 @@ impl RenderFrame {
         self.text_clips.clear();
         self.vector_clips.clear();
         self.canvas_clips.clear();
+        self.ripple_clips.clear();
         self.text_wrap.clear();
         self.layer_marks.clear();
         self.draw_seq = 0;
@@ -1245,6 +1303,17 @@ impl RenderFrame {
         self.vector_clips.push(c);
     }
 
+    /// Appends a [`RippleInstance`] (RFC-0023 ripple ink) to the frame,
+    /// stamping its draw-order depth — pushed by the evaluator between an
+    /// element's background and its children, which is exactly the RFC-0023
+    /// compositing slot (background → ripple → children).
+    pub fn push_ripple(&mut self, mut r: RippleInstance) {
+        r.depth = self.next_depth();
+        let c = self.active_clip();
+        self.ripples.push(r);
+        self.ripple_clips.push(c);
+    }
+
     /// Appends a [`CanvasShape`] (RFC-0020 Tier-1 shape command) to the frame.
     pub fn push_canvas_shape(&mut self, s: CanvasShape) {
         let d = self.next_depth();
@@ -1278,6 +1347,7 @@ impl RenderFrame {
             vector: u32::try_from(self.vector_instances.len()).unwrap_or(u32::MAX),
             text: u32::try_from(self.texts.len()).unwrap_or(u32::MAX),
             canvas: u32::try_from(self.canvas_shapes.len()).unwrap_or(u32::MAX),
+            ripple: u32::try_from(self.ripples.len()).unwrap_or(u32::MAX),
         };
         if self.layer_marks.last() == Some(&mark) {
             return; // empty layer — dedup, an overlay that emitted nothing is free
@@ -1351,6 +1421,12 @@ impl RenderFrame {
         &self.canvas_shapes
     }
 
+    /// Returns the live ripple ink reveals in this frame (RFC-0023).
+    #[must_use]
+    pub fn ripples(&self) -> &[RippleInstance] {
+        &self.ripples
+    }
+
     /// Returns the pending atlas uploads recorded this frame (RFC-0009 §2-C).
     #[must_use]
     pub fn atlas_uploads(&self) -> &[AtlasUpload] {
@@ -1422,6 +1498,11 @@ impl RenderFrame {
     #[must_use]
     pub fn canvas_clips(&self) -> &[Option<u16>] {
         &self.canvas_clips
+    }
+    /// Per-`RippleInstance` clip index (parallel to [`ripples`](Self::ripples)).
+    #[must_use]
+    pub fn ripple_clips(&self) -> &[Option<u16>] {
+        &self.ripple_clips
     }
 
     /// Returns the monotonic version counter for this frame.
@@ -2056,6 +2137,7 @@ mod motion_tests {
                 vector: 0,
                 text: 1,
                 canvas: 0,
+                ripple: 0,
             }]
         );
     }
@@ -2084,6 +2166,43 @@ mod motion_tests {
         assert!(f.canvas_shapes().is_empty());
         assert!(f.canvas_depths().is_empty());
         assert!(f.canvas_clips().is_empty());
+    }
+
+    // ── Ripple pool (RFC-0023) ──────────────────────────────────────────────
+
+    #[test]
+    fn push_ripple_stamps_depth_clip_and_layer_cursor() {
+        let mut f = RenderFrame::new();
+        // Background first, then the ink: the ripple's stamped depth must be
+        // strictly nearer, which is the RFC-0023 "above the background"
+        // compositing guarantee.
+        f.push_instance(box_at(0.0, 0.0));
+        let c = f.begin_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+        f.push_ripple(RippleInstance {
+            rect: [0.0, 0.0, 40.0, 40.0],
+            params: [20.0, 20.0, 10.0, 1.0],
+            color: [1.0, 1.0, 1.0, 0.5],
+            radii: [8.0; 4],
+            t_translate: [0.0, 0.0],
+            t_scale: [1.0, 1.0],
+            t_rotate: 0.0,
+            t_origin: [0.0, 0.0],
+            depth: 123.0, // overwritten by the push
+        });
+        f.end_clip();
+        assert_eq!(f.ripples().len(), 1);
+        assert_eq!(f.ripple_clips(), &[Some(c)]);
+        let ripple_depth = f.ripples()[0].depth;
+        assert!(ripple_depth < DRAW_DEPTH_CLEAR, "depth was stamped");
+        assert!(
+            ripple_depth < f.solid_depths()[0],
+            "ink sits nearer than the background pushed before it"
+        );
+        f.begin_layer();
+        assert_eq!(f.layer_marks()[0].ripple, 1);
+        f.clear();
+        assert!(f.ripples().is_empty());
+        assert!(f.ripple_clips().is_empty());
     }
 
     #[test]
