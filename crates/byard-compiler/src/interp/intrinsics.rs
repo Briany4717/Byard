@@ -148,6 +148,21 @@ const TRANSFORM: &[(&str, PropType)] = &[
     ("rotate", PropType::Angle),
     ("origin", PropType::Vec2),
 ];
+/// Paint-time visual effects (RFC-0023). Like [`TRANSFORM`], these are
+/// paint-only: they never affect layout. `ripple` is the Material ink reveal —
+/// setting it (a colour) enables the effect; `ripple_active` is the boolean
+/// trigger (typically flipped by an `on pressed { … }` state block);
+/// `ripple_radius` overrides the auto max radius (distance from the tap point
+/// to the farthest element corner) and `ripple_duration` the 300 ms default
+/// fade-out. Attached everywhere [`DECORATION`] is on the box render path —
+/// effects composite against an element's background, so they follow the same
+/// prop surface.
+const EFFECTS: &[(&str, PropType)] = &[
+    ("ripple", PropType::Color),
+    ("ripple_active", PropType::Bool),
+    ("ripple_radius", PropType::Float),
+    ("ripple_duration", PropType::Int),
+];
 const TEXT_PROPS: &[(&str, PropType)] = &[
     ("typo", PropType::Typo),
     ("color", PropType::Color),
@@ -304,7 +319,7 @@ fn parse_grid_track(t: &str) -> Option<byard_core::atlas::GridTrack> {
 #[must_use]
 pub fn lookup(name: &str) -> Option<Intrinsic> {
     let container = |dir_default: bool| {
-        let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+        let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
         if dir_default {
             props.insert("direction", PropType::Enum(DIRECTION));
         }
@@ -356,7 +371,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             events: events_from(false, &[]),
         },
         "Button" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TEXT_PROPS, TRANSFORM]);
             props.insert("focused", PropType::Bool);
             props.insert("disabled", PropType::Bool);
             Intrinsic {
@@ -370,7 +385,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "TextField" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TEXT_PROPS, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TEXT_PROPS, TRANSFORM]);
             props.insert("placeholder", PropType::Str);
             props.insert("value", PropType::Str);
             props.insert("bind", PropType::Str);
@@ -387,7 +402,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "Toggle" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("value", PropType::Bool);
             props.insert("bind", PropType::Bool);
             props.insert("focused", PropType::Bool);
@@ -403,7 +418,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "Slider" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             for k in ["min", "max", "step"] {
                 props.insert(k, PropType::Float);
             }
@@ -428,7 +443,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         // visuals (square container + engine-drawn checkmark), so `bg` is the
         // checked accent, not a full-rect slab — mirrors `Toggle`'s model.
         "Checkbox" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("value", PropType::Bool);
             props.insert("bind", PropType::Bool);
             props.insert("indeterminate", PropType::Bool);
@@ -452,7 +467,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         // default; arrow keys move selection within the group (wrapping). Owns its
         // visuals (outer ring + inner dot), so `bg` is the selected accent.
         "RadioButton" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("value", PropType::Str);
             props.insert("bind", PropType::Str);
             props.insert("focused", PropType::Bool);
@@ -483,7 +498,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
             }
         }
         "ScrollView" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("axis", PropType::Enum(AXIS));
             props.insert("offset", PropType::Vec2);
             // RFC-0005 windowed layout: opt-in list virtualization. `windowed`
@@ -607,7 +622,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         // per-axis `col_gap`/`row_gap` (override the shared `gap`). Pipeline: the
         // generic `DecoratedBox` background, same as `Box`.
         "Grid" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("focused", PropType::Bool);
             props.insert("disabled", PropType::Bool);
             props.insert("anchor", PropType::Enum(ANCHOR));
@@ -637,7 +652,7 @@ pub fn lookup(name: &str) -> Option<Intrinsic> {
         // children smaller than the stack are positioned; default `center`).
         // Pipeline: the generic `DecoratedBox` background, same as `Box`.
         "ZStack" => {
-            let mut props = props_from(&[LAYOUT, DECORATION, TRANSFORM]);
+            let mut props = props_from(&[LAYOUT, DECORATION, EFFECTS, TRANSFORM]);
             props.insert("focused", PropType::Bool);
             props.insert("disabled", PropType::Bool);
             props.insert("anchor", PropType::Enum(ANCHOR));
@@ -1328,6 +1343,31 @@ mod tests {
         // RFC-0010: paint-time animatable props accept a `with` curve.
         assert!(errs("View V() { Box #[scale: 1 with anim.spring()] {} }").is_empty());
         assert!(errs("View V() { Box #[opacity: 0.5 with anim.linear(200ms)] {} }").is_empty());
+    }
+
+    #[test]
+    fn ripple_props_are_accepted_on_the_box_render_path() {
+        // RFC-0023: the four ripple effect props, on containers and `Button`.
+        assert!(
+            errs(
+                "View V() { Box #[ripple: 0x80FFFFFF, ripple_active: true, \
+                 ripple_radius: 24.0, ripple_duration: 200] {} }"
+            )
+            .is_empty()
+        );
+        assert!(errs("View V() { Button(\"Save\") #[ripple: 0xFFFFFF] }").is_empty());
+    }
+
+    #[test]
+    fn a_misspelled_ripple_prop_suggests_the_real_one() {
+        let e = errs("View V() { Box #[ripple_activ: true] {} }");
+        assert!(
+            matches!(
+                &e[0],
+                CompileError::UnknownAttribute { hint: Some(h), .. } if h == "ripple_active"
+            ),
+            "got {e:?}"
+        );
     }
 
     #[test]

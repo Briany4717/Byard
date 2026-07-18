@@ -849,6 +849,19 @@ impl EventRouter {
     pub fn is_pointer_pressed(&self) -> bool {
         self.down.is_some()
     }
+
+    /// The in-flight press gesture targeting `elem`, if any: the pointer-down
+    /// position (logical px, the RFC-0023 ripple origin) and the press
+    /// timestamp, which doubles as the gesture's identity — two rapid taps on
+    /// the same element are two distinct `(pos, time)` gestures, so the
+    /// evaluator can spawn one ripple per press without extra bookkeeping.
+    #[must_use]
+    pub fn press_gesture(&self, elem: u32) -> Option<((f32, f32), u64)> {
+        self.down
+            .as_ref()
+            .filter(|d| d.elem == Some(elem))
+            .map(|d| (d.pos, d.time_ms))
+    }
 }
 
 /// Reflected write-back with value-dedup (E1): builds a `Change` action that

@@ -705,6 +705,16 @@ const STYLE_PROPS: &[(&str, &str)] = &[
     ("opacity", "Float (0.0 to 1.0)"),
     ("border", "Color (border color)"),
     ("shadow", "Str (shadow specification)"),
+    ("ripple", "Color (ripple ink color, RFC-0023)"),
+    ("ripple_active", "Bool (triggers the ripple, RFC-0023)"),
+    (
+        "ripple_radius",
+        "Float (max ripple radius override, RFC-0023)",
+    ),
+    (
+        "ripple_duration",
+        "Int (ripple fade-out ms, default 300, RFC-0023)",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
