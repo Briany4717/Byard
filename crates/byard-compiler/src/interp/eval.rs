@@ -526,6 +526,12 @@ pub struct Interpreter {
     /// Current user-view instantiation depth, bounded by [`MAX_INSTANCE_DEPTH`]
     /// to guard against runaway guarded recursion (RFC-0007 §4).
     instance_depth: u32,
+    /// Current `for`-body lowering depth. Like `instance_depth`, a non-zero
+    /// value means an event action lowered *now* must capture the live
+    /// environment (the loop variable `t`) so a render-time re-lowering of the
+    /// action still resolves `t` — the loop binding is truncated out of the
+    /// persistent View env after the body is lowered (RFC-0018 × RFC-0027).
+    for_depth: u32,
     /// Stack of caller-supplied child-block slots, one frame per active
     /// user-view instance (RFC-0007 D-A). The block is
     /// pre-lowered in the *caller* scope so a `content` element reference inside
@@ -1702,7 +1708,7 @@ impl Interpreter {
     /// against the persistent root env, exactly as before, so its snapshot stays
     /// empty and render behaviour is unchanged.
     fn capture_env_snapshot(&self) -> Vec<(Symbol, Value)> {
-        if self.instance_depth == 0 {
+        if self.instance_depth == 0 && self.for_depth == 0 {
             Vec::new()
         } else {
             self.env.snapshot()
@@ -2313,7 +2319,12 @@ impl Interpreter {
                         }
                         self.env.push(item_var, Value::Signal(slot));
                         let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+                        // Mark that we are lowering inside a `for` body so any
+                        // event action captures `t` in its env snapshot (the
+                        // binding is truncated below before render — RFC-0027).
+                        self.for_depth += 1;
                         let body_nodes = self.lower_members(&body_ast, &known_refs);
+                        self.for_depth -= 1;
                         self.env.truncate(env_base);
                         // Index `*pool` is still valid (nested lowering only
                         // appended higher indices).
@@ -6508,6 +6519,19 @@ impl Interpreter {
                 self.ctx.write_signal(sig, new);
                 Ok(Value::Unit)
             }
+            // A brace action `=> { stmt* }` parses as a zero-parameter lambda
+            // over a block (RFC-0019). Unwrap it and run each statement as an
+            // action in order, so a multi-statement handler (e.g. the todo
+            // "Add": `todos = todos.push(…)` then `draft = ""`) writes every
+            // `var` it names, not just the last expression's value.
+            Expr::Lambda { params, body, .. } if params.is_empty() => self.eval_action(body),
+            Expr::Block(stmts, _) => {
+                let mut last = Value::Unit;
+                for stmt in stmts {
+                    last = self.eval_action(stmt)?;
+                }
+                Ok(last)
+            }
             other => Ok(self.eval_pure(other)),
         }
     }
@@ -6627,6 +6651,14 @@ impl Interpreter {
         expr: &Expr,
         payload_name: Option<Symbol>,
     ) -> Result<Action, CompileError> {
+        // A brace action `=> { stmt* }` parses as a zero-parameter lambda over a
+        // block (RFC-0019). Lower the block body directly — its statements each
+        // lower to a signal write — so a multi-statement handler runs every
+        // statement, not the inert lambda value (which lowers to `Unit`).
+        let expr = match expr {
+            Expr::Lambda { params, body, .. } if params.is_empty() => body.as_ref(),
+            other => other,
+        };
         let mut compute = self.lower_expr(expr, payload_name.as_ref());
         Ok(Box::new(move |ctx, payload| {
             CURRENT_PAYLOAD.with(|cell| {
