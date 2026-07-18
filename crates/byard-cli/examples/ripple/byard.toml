@@ -1,0 +1,3 @@
+[project]
+name = "ripple"
+entry = "src/main.byd"
