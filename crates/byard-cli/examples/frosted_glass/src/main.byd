@@ -1,0 +1,83 @@
+// RFC-0023 §2 — backdrop blur & vibrancy: the iOS frosted-glass effect.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/frosted_glass
+//   cargo run -p byard-cli -- dev
+//
+// What to verify:
+//   1. The top bar is frosted glass: the colorful tiles are visibly blurred
+//      *through* it, saturated (vibrancy) and tinted white. Scroll the list —
+//      the blur re-samples live as tiles slide beneath the bar.
+//   2. The bar's rounded corners clip the glass exactly (no square bleed).
+//   3. Hover the "Hover me" card: blur and tint spring in smoothly
+//      (`blur: 0 with anim.spring()` + `on hover { blur: 16 }`).
+//   4. The bottom-left chip forces `blur_quality: low` (quarter-resolution —
+//      cheapest, visibly softer/blockier); the bottom-right forces `high`
+//      (0.75× resolution, the finest frost). Same Gaussian, different cost.
+//   5. Text on every pane stays crisp — children render above the glass.
+//   6. Tint without blur (the amber wash) is just a translucent overlay —
+//      no frost, no extra GPU cost.
+View Main() {
+    var scroll = 0
+
+    let glass = style {
+        blur: 18, backdrop_tint: 0x66FFFFFF, radius: 16
+        p: (12, 18)
+    }
+
+    let hover_glass = style {
+        radius: 14, p: (12, 16)
+        blur: 0 with anim.spring()
+        backdrop_tint: 0x00FFFFFF with anim.spring()
+        on hover { blur: 16, backdrop_tint: 0x80FFFFFF }
+    }
+
+    ZStack #[width: 440, height: 560, bg: 0x101014] {
+        // ── The content behind the glass: a colourful scrolling mosaic ──
+        // `offset` bound to a `var` is what makes the view wheel/drag
+        // scrollable (RFC-0005: input writes the writable axis).
+        ScrollView #[width: 440, height: 560, offset: (0, scroll)] {
+            Column #[p: (76, 20, 20, 20), gap: 14] {
+                Row #[gap: 14] {
+                    Box #[bg: 0xE91E63, radius: 12, width: 120, height: 90] {}
+                    Box #[bg: 0x2196F3, radius: 12, width: 120, height: 90] {}
+                    Box #[bg: 0xFFC107, radius: 12, width: 120, height: 90] {}
+                }
+                Box #[..hover_glass, width: 388] {
+                    Text("Hover me — the glass springs in") #[color: 0xFFFFFF, size: 14]
+                }
+                Row #[gap: 14] {
+                    Box #[bg: 0x4CAF50, radius: 12, width: 187, height: 90] {}
+                    Box #[bg: 0x9C27B0, radius: 12, width: 187, height: 90] {}
+                }
+                // Tint-only: a translucent amber wash, no frost (cheap path).
+                Box #[backdrop_tint: 0x59FFB300, radius: 12, p: 12, width: 388] {
+                    Text("backdrop_tint without blur = plain wash")
+                        #[color: 0xFFE082, size: 13]
+                }
+                Row #[gap: 14] {
+                    Box #[bg: 0x00BCD4, radius: 12, width: 120, height: 90] {}
+                    Box #[bg: 0xFF5722, radius: 12, width: 120, height: 90] {}
+                    Box #[bg: 0x8BC34A, radius: 12, width: 120, height: 90] {}
+                }
+                Row #[gap: 14] {
+                    Box #[blur: 24, blur_quality: low, radius: 12, p: 12, width: 187, height: 200] {
+                        Text("blur_quality: low (0.25x)") #[color: 0xFFFFFF, size: 13]
+                    }
+                    Box #[blur: 24, blur_quality: high, radius: 12, p: 12, width: 187] {
+                        Text("blur_quality: high (0.75x)") #[color: 0xFFFFFF, size: 13]
+                    }
+                }
+                Box #[bg: 0x3F51B5, radius: 12, width: 388, height: 120] {}
+            }
+        }
+
+        // ── The frosted navigation bar, floating over the content ──
+        Column #[width: 440, height: 560, p: 12] {
+            Row #[..glass, width: 416, height: 44, align: center] {
+                Text("Frosted glass — RFC-0023") #[color: 0x1D1B20, size: 16, weight: medium]
+            }
+            Spacer
+        }
+    }
+}
