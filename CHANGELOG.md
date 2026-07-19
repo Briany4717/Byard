@@ -17,18 +17,20 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clamped to 40), `backdrop_tint: Color` (blended over the blurred sample; the
   vibrancy pair with `blur`, a plain translucent wash without it),
   `blur_saturation: Float` (vibrancy boost, default 1.8) and `blur_quality:
-  auto | high | low` (Gaussian at 0.75× when forced high, box blur at 0.5×
-  when forced low, GPU-probed otherwise) — on every box-path intrinsic. A
-  blurred element samples the scene behind it (its own background included),
-  blurs it off-screen at reduced resolution, saturates and tints it, and draws
-  the result as its background clipped to its border radius; children render
-  crisply on top and overlapping panes stack naturally (painter's-order double
-  blur). Both `blur` and `backdrop_tint` animate through the RFC-0010 `with`
+  auto | high | low` (always the two-pass separable Gaussian — the tiers pick
+  the base resolution: 0.75× forced high, 0.25× forced low, GPU-probed 0.5×
+  or 0.25× on auto) — on every box-path intrinsic. `blur` is the Gaussian σ,
+  the CSS `backdrop-filter: blur(N)` convention. A blurred element samples
+  the scene behind it (its own background included), blurs it off-screen at
+  adaptively reduced resolution (tap spacing stays gap-free at any radius —
+  no ghosting), saturates and tints it, and draws the result as its
+  background clipped to its border radius; children render crisply on top
+  and overlapping panes stack naturally (painter's-order double blur). Both `blur` and `backdrop_tint` animate through the RFC-0010 `with`
   chokepoints (`blur: 0 with anim.spring()` + `on hover { blur: 16 }`).
   Engine surface: `frame::BackdropInstance` + `RenderFrame::{push_backdrop,
   backdrops, backdrop_marks, backdrop_clips}` + `LayerMark::backdrop`,
   `encoder::backdrop` (blur + composite pipelines), pass segmentation at
-  backdrop barriers, `EncoderSubsystem::set_blur_auto_gaussian`, and a runtime
+  backdrop barriers, `EncoderSubsystem::set_blur_auto_capable`, and a runtime
   `PerfWarning::OverlappingBlurs` diagnostic (≥ 3 stacked panes) surfaced by
   `byard dev`. Example: `crates/byard-cli/examples/frosted_glass`.
 
