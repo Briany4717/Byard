@@ -1,0 +1,59 @@
+// RFC-0023 — ripple paint effect: the Material ink reveal.
+//
+// Run it (from the repo root):
+//   cd crates/byard-cli/examples/ripple
+//   cargo run -p byard-cli -- dev
+//
+// What to verify:
+//   1. Tap anywhere on the purple button: a soft white circle expands from
+//      the *exact tap point* and fades out over ~300 ms — tap near a corner
+//      and watch the ink still cover the whole surface (auto max radius).
+//   2. The ink never escapes the rounded corners (radius 24): tap right next
+//      to a corner and look at the corner arc — it stays crisp.
+//   3. The label stays sharp *above* the ink (background → ripple → children).
+//   4. Tap rapidly: each tap spawns its own ripple and overlapping ink
+//      accumulates where the circles overlap.
+//   5. The teal chip overrides the physics: a tighter `ripple_radius: 40`
+//      and a slower `ripple_duration: 900` — the ink is a small, lazy pool.
+//   6. The outlined card has a *dark* ink on a light surface — ripple is
+//      just a colour, not hardcoded white, and it darkens the light card.
+View Main() {
+    let ink = style {
+        bg: 0x6750A4, radius: 24, p: (14, 28)
+        ripple: 0x66FFFFFF
+        on pressed { ripple_active: true }
+        on hover { bg: 0x7965AF }
+    }
+
+    let chip = style {
+        bg: 0x00695C, radius: 16, p: (10, 20)
+        ripple: 0x80FFFFFF, ripple_radius: 40, ripple_duration: 900
+        on pressed { ripple_active: true }
+    }
+
+    let card = style {
+        bg: 0xFEF7FF, radius: 12, p: 16, border: 0xCAC4D0, border_width: 1
+        ripple: 0x336750A4
+        on pressed { ripple_active: true }
+    }
+
+    Column #[bg: 0x141218, p: 32, gap: 20, width: 420] {
+        Text("Ripple — RFC-0023 paint effects") #[color: 0xE6E1E5, size: 18]
+
+        Box #[..ink, width: 356] {
+            Text("Tap me anywhere — ink expands from the tap point")
+                #[color: 0xFFFFFF, size: 14]
+        }
+
+        Box #[..chip, width: 356] {
+            Text("Small, slow ink (radius 40, 900 ms)") #[color: 0xB2DFDB, size: 14]
+        }
+
+        Box #[..card, width: 356] {
+            Text("Dark ink on a light card") #[color: 0x1D1B20, size: 14]
+        }
+
+        Text("Tap rapidly on any surface: simultaneous ripples pool where they overlap.")
+            #[color: 0x938F99, size: 12]
+    }
+}

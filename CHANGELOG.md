@@ -10,6 +10,26 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Material ripple ink (RFC-0023).** Four new paint-time style properties —
+  `ripple: Color` (enables the effect and sets the ink colour),
+  `ripple_active: Bool` (the trigger, typically `on pressed { ripple_active:
+  true }`), `ripple_radius: Float` (max-radius override) and `ripple_duration:
+  Int` (fade-out ms, default 300) — on every box-path intrinsic. A press spawns
+  an ink circle at the exact tap point that expands (ease-out) to cover the
+  element and fades linearly, composited *above* the element's background and
+  *below* its children, always clipped to the element's border radius. The ink
+  is alpha-composited over the surface — a light ink brightens a dark surface,
+  a dark ink darkens a light one — and rapid taps spawn one ripple each,
+  pooling where their circles overlap. Backed by a new `Ripple`
+  render pipeline (the seventh): `frame::RippleInstance`,
+  `RenderFrame::{push_ripple, ripples, ripple_clips}`, `LayerMark::ripple`,
+  `encoder::ripple`, and `EventRouter::press_gesture` (the tap-point source).
+  Live ripples participate in the RFC-0010 active-animation set (frames keep
+  flowing until the ink fades) and in the incremental dirty-scissor union.
+  Example: `crates/byard-cli/examples/ripple`.
+
 ### Changed
 
 - **Text now wraps to its parent's width by default (RFC-0005).** A `Text` with

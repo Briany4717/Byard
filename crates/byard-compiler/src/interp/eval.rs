@@ -567,6 +567,19 @@ pub struct Interpreter {
     /// interpolates in a perceptually-uniform space — no muddy mid-points — and
     /// is interruptible like the scalar props. Keyed by the `with` node's span.
     color_animations: std::collections::HashMap<Span, [byard_core::frame::Motion; 3]>,
+    /// Live ripple ink reveals (RFC-0023), spawned by a press gesture over an
+    /// element whose resolved `ripple_active` is true. Gesture-like state: it
+    /// persists across renders (a ripple keeps fading after release) and is
+    /// retired by time at the top of each [`render`](Self::render). An entry
+    /// whose element no longer renders simply stops being emitted and ages
+    /// out the same way — hot-reload safe with no extra bookkeeping.
+    ripples: Vec<ActiveRipple>,
+    /// The last press gesture `(elem, press time)` that already spawned its
+    /// ripple — the rising-edge latch. A single global slot suffices because
+    /// there is one pointer, hence at most one in-flight press (E4): a hold
+    /// never respawns (same identity, even after its ripple retires), while
+    /// each new tap is a fresh identity and spawns again.
+    ripple_spawned: Option<(u32, u64)>,
     /// Set true during a render whenever an animation sampled this frame has not
     /// yet settled — the runner reads it (via [`has_active_animations`]) to keep
     /// requesting frames until motion stops (idle → 0 frames).
@@ -694,6 +707,36 @@ struct ScrollDrag {
     /// release past the threshold triggers a refresh.
     refreshing_sig: Option<SignalId>,
 }
+
+/// One live ripple ink reveal (RFC-0023): spawned on a press gesture over an
+/// element whose resolved `ripple_active` is true, expanded and faded over
+/// `duration_ms`, and retired once fully faded. The snapshot model mirrors the
+/// RFC's `RippleInstance` reference: colour/duration/radius are resolved once
+/// at the spawn (the ink is a launched entity — a later style change doesn't
+/// recolour ink already in flight), while the element rect and clip radii are
+/// re-read at emission each frame so the ink tracks a moving/resizing element.
+#[derive(Clone, Copy)]
+struct ActiveRipple {
+    /// The stable element index this ripple belongs to (the router's key).
+    /// The press identity that spawned it is not kept here — the rising-edge
+    /// latch ([`Interpreter::ripple_spawned`]) is the only reader of gesture
+    /// identity, and a launched ripple's lifecycle is purely time-based.
+    elem: u32,
+    /// Tap point relative to the element rect's origin (RFC-0023 §1) —
+    /// relative, so the ink stays anchored if layout shifts the element.
+    center_rel: [f32; 2],
+    /// Ink colour, resolved at spawn.
+    color: [f32; 4],
+    /// Engine time at activation.
+    start_ms: u32,
+    /// Total expand/fade duration in ms (`ripple_duration`, default 300).
+    duration_ms: f32,
+    /// `ripple_radius` override; `None` auto-expands to the farthest corner.
+    max_radius: Option<f32>,
+}
+
+/// Default ripple fade-out duration in ms (RFC-0023 §"Ripple properties").
+const RIPPLE_DEFAULT_DURATION_MS: f32 = 300.0;
 
 /// An in-flight pull-region spring (RFC-0021 pull-to-refresh): drives a
 /// `ScrollView`'s [`pull_distance`](Interpreter::pull_distance) to `target` —
@@ -1990,6 +2033,12 @@ impl Interpreter {
         // Recomputed every frame: an animation re-marks itself active below if it
         // sampled without having settled this tick (RFC-0010).
         self.any_active = false;
+        // RFC-0023: retire fully-faded ripples by time. Gesture-like state kept
+        // across renders, so this runs before the walk — ink whose element no
+        // longer renders (hot reload, `when` unmount) ages out here too.
+        let now = self.now_ms;
+        self.ripples
+            .retain(|r| (now.saturating_sub(r.start_ms) as f32) < r.duration_ms);
         // One monotonic tick per render — the clock-independent basis for the
         // RFC-0021 "scroll has gone quiet" snap settle.
         self.frame_seq = self.frame_seq.wrapping_add(1);
@@ -3662,6 +3711,20 @@ impl Interpreter {
                         }
                     }
 
+                    // RFC-0023: ripple ink — emitted after this element's
+                    // background and before its children, which stamps its
+                    // draw-order depth into exactly the RFC's compositing slot
+                    // (background → ripple → children).
+                    self.emit_ripples(
+                        paint_attrs,
+                        elem_idx,
+                        current_rect,
+                        radii,
+                        transform,
+                        opacity,
+                        frame,
+                    );
+
                     let element_name = name.as_str();
                     let hit_rect =
                         crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
@@ -3669,12 +3732,17 @@ impl Interpreter {
                     // RFC-0016: an element that styles `on hover`/`on pressed` but
                     // registers no handler still needs the engine to track the
                     // pointer over it, so register a bare hover/press hit region.
+                    // RFC-0023: same for a `ripple:` element — the press gesture
+                    // must resolve to this element for the ink to spawn, even
+                    // when it registers no handler of its own.
                     if let Some(idx) = elem_idx {
-                        if state_blocks.iter().any(|sb| {
+                        let tracks_pointer_states = state_blocks.iter().any(|sb| {
                             sb.states.iter().any(|s| {
                                 matches!(s, StyleStateKind::Hover | StyleStateKind::Pressed)
                             })
-                        }) {
+                        });
+                        let has_ripple = paint_attrs.iter().any(|a| a.name.as_str() == "ripple");
+                        if tracks_pointer_states || has_ripple {
                             self.router.track_region(idx, hit_rect);
                         }
                     }
@@ -5179,6 +5247,134 @@ impl Interpreter {
             Some("cover") => byard_core::frame::ImageFit::Cover,
             Some("none") => byard_core::frame::ImageFit::None,
             _ => byard_core::frame::ImageFit::Fill,
+        }
+    }
+
+    /// Spawns and emits the RFC-0023 ripple ink for one element, called from
+    /// the `Box` paint arm between the background push and the child walk —
+    /// which is exactly the RFC's compositing slot (background → ripple →
+    /// children), resolved by the emission-order draw depth.
+    ///
+    /// Enabled by a `ripple:` colour on the element. A ripple *spawns* on the
+    /// rising edge of a press gesture while the resolved `ripple_active` is
+    /// true (typically flipped by `on pressed { ripple_active: true }`), at the
+    /// pointer-down point; the gesture's press timestamp is the spawn latch, so
+    /// a hold spawns once while each rapid tap spawns its own (their ink
+    /// pools in the pipeline where the circles overlap).
+    /// Colour/duration/radius snapshot at spawn;
+    /// the element rect, clip radii, transform, and opacity are re-read each
+    /// frame so ink tracks a moving element. Expansion is an ease-out ramp and
+    /// fade a linear one, both sampled through the shared [`Motion`] closed
+    /// forms (RFC-0010 as landed).
+    ///
+    /// [`Motion`]: byard_core::frame::Motion
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ripples(
+        &mut self,
+        attrs: &[Attr],
+        elem_idx: Option<u32>,
+        rect: crate::interp::intrinsics::Rect,
+        radii: [f32; 4],
+        transform: byard_core::frame::Transform,
+        opacity: f32,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        use byard_core::frame::{Motion, MotionCurve, RippleInstance};
+
+        let Some(color) = self.eval_color_prop(attrs, "ripple") else {
+            return;
+        };
+        let Some(elem) = elem_idx else {
+            return;
+        };
+
+        // Spawn on a fresh press gesture. Gated on an advancing clock — without
+        // one a ripple could never expand, fade, or retire (mirrors
+        // `eval_animated`'s inert-host rule).
+        if self.clock_set && self.eval_bool_prop(attrs, "ripple_active") == Some(true) {
+            if let Some((pos, press_ms)) = self.router.press_gesture(elem) {
+                if self.ripple_spawned != Some((elem, press_ms)) {
+                    self.ripple_spawned = Some((elem, press_ms));
+                    let duration_ms = self
+                        .eval_float_prop(attrs, "ripple_duration")
+                        .map_or(RIPPLE_DEFAULT_DURATION_MS, |v| v as f32)
+                        .max(1.0);
+                    // Alpha auto-detect, matching shadow/shape colours
+                    // (RFC-0011): above `0xFFFFFF` is `0xAARRGGBB`, else an
+                    // opaque `0xRRGGBB` — ripple ink is typically translucent.
+                    #[allow(clippy::cast_sign_loss)]
+                    let has_alpha = (color as u64) > 0x00FF_FFFF;
+                    let max_radius = self
+                        .eval_float_prop(attrs, "ripple_radius")
+                        .map(|v| v as f32);
+                    self.ripples.push(ActiveRipple {
+                        elem,
+                        center_rel: [
+                            (pos.0 - rect.x).clamp(0.0, rect.w),
+                            (pos.1 - rect.y).clamp(0.0, rect.h),
+                        ],
+                        color: super::intrinsics::color_to_rgba(color, has_alpha),
+                        start_ms: self.now_ms,
+                        duration_ms,
+                        max_radius,
+                    });
+                }
+            }
+        }
+
+        // Emit every live ripple owned by this element; `any_active` is set
+        // after the loop so the iteration's borrow of `self.ripples` never
+        // overlaps the mutation.
+        let now = self.now_ms;
+        let mut emitted_any = false;
+        for r in &self.ripples {
+            if r.elem != elem {
+                continue;
+            }
+            // Auto max radius: the distance from the tap point to the farthest
+            // element corner, so the ink always covers the whole surface
+            // (RFC-0023 §"Ripple properties").
+            let max_r = r.max_radius.unwrap_or_else(|| {
+                let dx = r.center_rel[0].max(rect.w - r.center_rel[0]);
+                let dy = r.center_rel[1].max(rect.h - r.center_rel[1]);
+                dx.hypot(dy)
+            });
+            let curve = |kind: u32| MotionCurve {
+                kind,
+                params: [r.duration_ms, 0.0, 0.0],
+            };
+            let expand = Motion {
+                from: 0.0,
+                to: max_r,
+                start_ms: r.start_ms,
+                curve: curve(MotionCurve::EASE_OUT),
+            };
+            let fade = Motion {
+                from: 1.0,
+                to: 0.0,
+                start_ms: r.start_ms,
+                curve: curve(MotionCurve::LINEAR),
+            };
+            frame.push_ripple(RippleInstance {
+                rect: [rect.x, rect.y, rect.w, rect.h],
+                params: [
+                    rect.x + r.center_rel[0],
+                    rect.y + r.center_rel[1],
+                    expand.sample(now),
+                    fade.sample(now) * opacity,
+                ],
+                color: r.color,
+                radii,
+                t_translate: transform.translate,
+                t_scale: transform.scale,
+                t_rotate: transform.rotate,
+                t_origin: transform.origin,
+                depth: 0.0, // stamped by `push_ripple`
+            });
+            emitted_any = true;
+        }
+        if emitted_any {
+            self.any_active = true;
         }
     }
 
@@ -13897,6 +14093,229 @@ mod tests {
         assert!(
             frame.solid_depths()[inner] < frame.solid_depths()[outer],
             "nested overlay stacks above its parent overlay"
+        );
+    }
+
+    // ── RFC-0023 ripple ink ─────────────────────────────────────────────
+
+    /// A 200×100 box at the layout origin with a semi-transparent white
+    /// ripple, triggered by `on pressed` — the RFC-0023 guide example shape.
+    const RIPPLE_SRC: &str = "View V() {
+        let btn = style {
+            bg: 0x6750A4, radius: 20, ripple: 0x80FFFFFF
+            on pressed { ripple_active: true }
+        }
+        Box #[..btn, width: 200, height: 100] {}
+    }";
+
+    fn pointer(
+        kind: byard_core::platform::EventKind,
+        x: f32,
+        y: f32,
+        t: u64,
+    ) -> byard_core::platform::InputEvent {
+        byard_core::platform::InputEvent {
+            kind,
+            pos: (x, y),
+            delta: (0.0, 0.0),
+            payload: None,
+            time_ms: t,
+        }
+    }
+
+    /// Lowers `src`, renders once at `t = 0` (registering the hit region),
+    /// presses at `(x, y)` with press identity `press_t`, and renders once at
+    /// `t = 10` — the frame that spawns the ripple, so its `start_ms` is 10.
+    fn pressed_ripple_named(
+        src: &str,
+        x: f32,
+        y: f32,
+        press_t: u64,
+    ) -> (Interpreter, Vec<RenderNode>) {
+        use byard_core::platform::EventKind as K;
+        let (mut interp, tree) = lower_named(src, "V");
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.set_now_ms(0);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[pointer(K::PointerDown, x, y, press_t)]);
+        let spawn_frame = render_at(&mut interp, &tree, 10);
+        assert_eq!(
+            spawn_frame.ripples().len(),
+            1,
+            "the press spawns one ripple"
+        );
+        (interp, tree)
+    }
+
+    /// [`pressed_ripple_named`] over the canonical [`RIPPLE_SRC`] view.
+    fn pressed_ripple_interp(x: f32, y: f32, press_t: u64) -> (Interpreter, Vec<RenderNode>) {
+        pressed_ripple_named(RIPPLE_SRC, x, y, press_t)
+    }
+
+    /// Renders `tree` at `ms` and returns the frame.
+    fn render_at(
+        interp: &mut Interpreter,
+        tree: &[RenderNode],
+        ms: u32,
+    ) -> byard_core::frame::RenderFrame {
+        interp.set_now_ms(ms);
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(tree, &mut frame, 400.0, 300.0);
+        frame
+    }
+
+    #[test]
+    fn a_press_spawns_a_ripple_at_the_tap_point() {
+        let (mut interp, tree) = pressed_ripple_interp(30.0, 40.0, 1);
+        let frame = render_at(&mut interp, &tree, 50);
+
+        assert_eq!(frame.ripples().len(), 1, "one press spawns one ripple");
+        let r = frame.ripples()[0];
+        // The circle is centred on the tap point, in absolute coordinates.
+        assert!(
+            (r.params[0] - 30.0).abs() < 0.01,
+            "center x: {:?}",
+            r.params
+        );
+        assert!(
+            (r.params[1] - 40.0).abs() < 0.01,
+            "center y: {:?}",
+            r.params
+        );
+        // Mid-animation: expanding and still visible.
+        assert!(r.params[2] > 0.0, "radius has started expanding");
+        assert!(r.params[3] > 0.0 && r.params[3] < 1.0, "fade in flight");
+        // The ink colour is the resolved `ripple:` colour (50% white).
+        assert!((r.color[3] - 0.5).abs() < 0.01, "ink alpha: {:?}", r.color);
+        // Clipped to the element's rounded rect: rect and radii carried over.
+        assert_eq!(r.rect, [0.0, 0.0, 200.0, 100.0]);
+        assert_eq!(r.radii, [20.0; 4]);
+        assert!(
+            interp.has_active_animations(),
+            "a live ripple keeps requesting frames"
+        );
+    }
+
+    #[test]
+    fn ripple_expands_monotonically_and_retires_after_its_duration() {
+        let (mut interp, tree) = pressed_ripple_interp(30.0, 40.0, 1);
+        let r1 = render_at(&mut interp, &tree, 50).ripples()[0].params[2];
+        let f2 = render_at(&mut interp, &tree, 150);
+        let r2 = f2.ripples()[0].params[2];
+        assert!(r2 > r1, "radius grows with time ({r1} → {r2})");
+
+        // Past the 300 ms default duration the ripple is gone, and with it the
+        // frame demand (no other animation is in flight in this view).
+        let f3 = render_at(&mut interp, &tree, 400);
+        assert!(f3.ripples().is_empty(), "faded ripple retires");
+        assert!(!interp.has_active_animations(), "no lingering frame demand");
+    }
+
+    #[test]
+    fn the_auto_max_radius_reaches_the_farthest_corner() {
+        // Tap at the top-left origin of the 200×100 box: the farthest corner
+        // is (200, 100), so the ink must grow to cover hypot(200, 100).
+        let (mut interp, tree) = pressed_ripple_interp(0.0, 0.0, 1);
+        let expected = 200.0_f32.hypot(100.0);
+        // One ms before retirement the ease-out ramp has essentially arrived.
+        let frame = render_at(&mut interp, &tree, 299);
+        let r = frame.ripples()[0].params[2];
+        assert!(
+            r > expected * 0.99,
+            "radius {r} must reach the farthest corner ({expected})"
+        );
+    }
+
+    #[test]
+    fn a_hold_spawns_once_while_rapid_taps_spawn_one_ripple_each() {
+        use byard_core::platform::EventKind as K;
+        let (mut interp, tree) = pressed_ripple_interp(30.0, 40.0, 1);
+        // Held press across two renders: still exactly one ripple.
+        let _ = render_at(&mut interp, &tree, 20);
+        let held = render_at(&mut interp, &tree, 40);
+        assert_eq!(held.ripples().len(), 1, "a hold never respawns");
+
+        // Release and tap again (a fresh press identity): a second ripple
+        // joins the first, still fading — their ink pools on the GPU.
+        interp.dispatch_events(&[pointer(K::PointerUp, 30.0, 40.0, 60)]);
+        interp.dispatch_events(&[pointer(K::PointerDown, 80.0, 50.0, 80)]);
+        let both = render_at(&mut interp, &tree, 100);
+        assert_eq!(both.ripples().len(), 2, "each tap spawns its own ripple");
+    }
+
+    #[test]
+    fn ripple_radius_and_duration_props_override_the_defaults() {
+        let src = "View V() {
+            let btn = style {
+                bg: 0x6750A4, ripple: 0x80FFFFFF
+                ripple_radius: 10, ripple_duration: 100
+                on pressed { ripple_active: true }
+            }
+            Box #[..btn, width: 200, height: 100] {}
+        }";
+        // Spawned at t = 10 by the helper.
+        let (mut interp, tree) = pressed_ripple_named(src, 30.0, 40.0, 1);
+
+        let mid = render_at(&mut interp, &tree, 100);
+        assert_eq!(mid.ripples().len(), 1);
+        assert!(
+            mid.ripples()[0].params[2] <= 10.0,
+            "`ripple_radius` caps the expansion: {:?}",
+            mid.ripples()[0].params
+        );
+        let done = render_at(&mut interp, &tree, 120);
+        assert!(
+            done.ripples().is_empty(),
+            "`ripple_duration: 100` retires the ink after 100 ms"
+        );
+    }
+
+    #[test]
+    fn a_ripple_without_an_active_trigger_never_spawns() {
+        use byard_core::platform::EventKind as K;
+        // `ripple:` set but no `ripple_active` anywhere: pressing must not ink.
+        let src = "View V() {
+            Box #[bg: 0x6750A4, ripple: 0x80FFFFFF, width: 200, height: 100] {}
+        }";
+        let (mut interp, tree) = lower_named(src, "V");
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.set_now_ms(0);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        interp.dispatch_events(&[pointer(K::PointerDown, 30.0, 40.0, 1)]);
+        let frame = render_at(&mut interp, &tree, 50);
+        assert!(frame.ripples().is_empty(), "no trigger, no ink");
+    }
+
+    #[test]
+    fn ripple_depth_sits_between_the_background_and_the_children() {
+        // A box with a child label: the ink must draw above the box fill but
+        // beneath the text (RFC-0023 compositing order).
+        let src = "View V() {
+            let btn = style {
+                bg: 0x6750A4, ripple: 0x80FFFFFF
+                on pressed { ripple_active: true }
+            }
+            Box #[..btn, width: 200, height: 100] {
+                Text(\"Save\") #[color: 0xFFFFFF]
+            }
+        }";
+        let (mut interp, tree) = pressed_ripple_named(src, 30.0, 40.0, 1);
+        let frame = render_at(&mut interp, &tree, 50);
+        let ripple_depth = frame.ripples()[0].depth;
+        let bg_depth = frame.solid_depths()[0];
+        let text_depth = frame.text_depths()[0];
+        // Later emission = nearer = smaller NDC-z.
+        assert!(
+            ripple_depth < bg_depth,
+            "ink above the background ({ripple_depth} vs {bg_depth})"
+        );
+        assert!(
+            text_depth < ripple_depth,
+            "children above the ink ({text_depth} vs {ripple_depth})"
         );
     }
 }

@@ -27,6 +27,7 @@
 pub mod canvas_shape;
 pub mod decorated_box;
 pub mod gpu_timer;
+pub mod ripple;
 pub mod text_glyph;
 pub mod texture_sampler;
 pub mod vector_msdf;
@@ -48,7 +49,9 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::ByardError;
-use crate::frame::{AtlasUpload, Rect, RenderFrame, Transform, VectorInstance, Viewport};
+use crate::frame::{
+    AtlasUpload, Rect, RenderFrame, RippleInstance, Transform, VectorInstance, Viewport,
+};
 use text_glyph::{TextGlyphPipeline, TextLine};
 use vector_msdf::VectorAtlas;
 
@@ -194,6 +197,13 @@ pub struct EncoderSubsystem {
     /// viewport bind group (group 0); transparent geometry, so it tests but
     /// never writes the draw-order depth buffer (RFC-0017 split).
     canvas_pipeline: wgpu::RenderPipeline,
+    /// `Ripple` pipeline (RFC-0023, the seventh pipeline) — the Material ink
+    /// reveal: an expanding, fading circle clipped in-shader to its element's
+    /// rounded rect, composited with premultiplied-alpha "over" blending (so
+    /// ink works on light and dark surfaces alike). Shares the viewport bind
+    /// group (group 0); transparent geometry, so it tests but never writes
+    /// the draw-order depth buffer (RFC-0017 split).
+    ripple_pipeline: wgpu::RenderPipeline,
     /// The MSDF atlas: an array texture uploaded to by the JIT/AOT paths via
     /// [`RenderFrame::atlas_uploads`] (RFC-0009 §2-C, INV-8 — this is the only
     /// place `Queue::write_texture` is called for it).
@@ -299,6 +309,12 @@ pub struct EncoderSubsystem {
     /// incremental dirty-scissor union — same contract as
     /// [`last_decorated_bounds`](Self::last_decorated_bounds).
     last_canvas_bounds: Vec<Rect>,
+    /// Previous-frame bounds of every `RippleInstance` (RFC-0023), for the
+    /// incremental dirty-scissor union. A ripple animates every frame it is
+    /// alive (all instances are treated dirty, like solids) and its element
+    /// rect must keep repainting until the last frame *after* it fades — the
+    /// previous-bounds union is what erases the final frame of ink.
+    last_ripple_bounds: Vec<Rect>,
     /// Per-`TextureSampler` bounding boxes from the previous call (M27),
     /// aligned with that call's `textures` slice.
     last_texture_bounds: Vec<Rect>,
@@ -492,6 +508,26 @@ impl EncoderSubsystem {
             draw_depth_stencil_no_write(),
         )
         .await?;
+        // `Ripple` pipeline (RFC-0023, the seventh pipeline). Transparent
+        // geometry (the ink reveal), so it also uses the no-write depth
+        // state — its stamped depth places it between an element's
+        // background and its children without ever culling either.
+        let ripple_pipeline = ripple::build_pipeline(
+            &device,
+            &bind_group_layout,
+            wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            surface_format,
+            draw_depth_stencil_no_write(),
+        )
+        .await?;
 
         // The atlas is an *array* texture (`vector_msdf::ATLAS_LAYERS` layers):
         // it must be a real `GL_TEXTURE_2D_ARRAY` on the GL backend, so a single
@@ -527,6 +563,7 @@ impl EncoderSubsystem {
             texture_cache: texture_sampler::TextureCache::default(),
             vector_pipeline,
             canvas_pipeline,
+            ripple_pipeline,
             vector_atlas,
             vector_ack_tx: None,
             io: None,
@@ -547,6 +584,7 @@ impl EncoderSubsystem {
             last_box_bounds: Vec::new(),
             last_decorated_bounds: Vec::new(),
             last_canvas_bounds: Vec::new(),
+            last_ripple_bounds: Vec::new(),
             last_texture_bounds: Vec::new(),
             last_relay_version: 0,
             gpu_timer,
@@ -714,6 +752,7 @@ impl EncoderSubsystem {
             &[],
             &[],
             &[],
+            &[],
             DrawDepths::default(),
             FrameClips::default(),
             &[],
@@ -733,6 +772,7 @@ impl EncoderSubsystem {
         textures: &[crate::frame::TextureSampler],
         vectors: &[VectorInstance],
         canvas_shapes: &[crate::frame::CanvasShape],
+        ripples: &[RippleInstance],
         atlas_uploads: &[AtlasUpload],
         depths: DrawDepths<'_>,
         clips: FrameClips<'_>,
@@ -794,6 +834,8 @@ impl EncoderSubsystem {
                     prev_textures: &self.last_texture_bounds,
                     canvas_shapes,
                     prev_canvas: &self.last_canvas_bounds,
+                    ripples,
+                    prev_ripples: &self.last_ripple_bounds,
                 },
                 self.scale_factor,
                 self.phys_w,
@@ -852,6 +894,7 @@ impl EncoderSubsystem {
                     texture: &self.texture_pipeline,
                     vector: &self.vector_pipeline,
                     canvas: &self.canvas_pipeline,
+                    ripple: &self.ripple_pipeline,
                 },
                 &self.viewport_bind_group,
                 &self.quad_buffer,
@@ -868,6 +911,7 @@ impl EncoderSubsystem {
                     vectors,
                     vector_atlas: &self.vector_atlas,
                     canvas_shapes,
+                    ripples,
                     solid_depths: depths.solid,
                     decorated_depths: depths.decorated,
                     texture_depths: depths.texture,
@@ -912,7 +956,15 @@ impl EncoderSubsystem {
             },
         );
 
-        update_frame_bookkeeping(self, instances, texts, decorated, textures, canvas_shapes);
+        update_frame_bookkeeping(
+            self,
+            instances,
+            texts,
+            decorated,
+            textures,
+            canvas_shapes,
+            ripples,
+        );
 
         Ok(encoder.finish())
     }
@@ -964,6 +1016,7 @@ impl EncoderSubsystem {
                 frame.textures(),
                 frame.vector_instances(),
                 frame.canvas_shapes(),
+                frame.ripples(),
                 frame.atlas_uploads(),
                 frame_draw_depths(frame),
                 frame_clips(frame),
@@ -980,6 +1033,7 @@ impl EncoderSubsystem {
             frame.textures(),
             frame.vector_instances(),
             frame.canvas_shapes(),
+            frame.ripples(),
             frame.atlas_uploads(),
             frame_draw_depths(frame),
             frame_clips(frame),
@@ -1070,6 +1124,7 @@ fn update_frame_bookkeeping(
     decorated: &[crate::frame::DecoratedBox],
     textures: &[crate::frame::TextureSampler],
     canvas_shapes: &[crate::frame::CanvasShape],
+    ripples: &[RippleInstance],
 ) {
     state.needs_full_redraw = false;
     state.last_instance_count = instances.len();
@@ -1085,6 +1140,7 @@ fn update_frame_bookkeeping(
         .iter()
         .map(crate::frame::CanvasShape::bounds)
         .collect();
+    state.last_ripple_bounds = ripples.iter().map(|r| rect_of(r.rect)).collect();
     state.last_texture_bounds = textures.iter().map(|t| rect_of(t.rect)).collect();
 }
 
@@ -1109,6 +1165,7 @@ struct DrawPipelines<'a> {
     texture: &'a wgpu::RenderPipeline,
     vector: &'a wgpu::RenderPipeline,
     canvas: &'a wgpu::RenderPipeline,
+    ripple: &'a wgpu::RenderPipeline,
 }
 
 /// Draw-order depth slices for one frame (RFC-0011 cross-pass paint order),
@@ -1147,6 +1204,8 @@ pub struct FrameClips<'a> {
     pub vector: &'a [Option<u16>],
     /// Parallel to `CanvasShape`s (RFC-0020).
     pub canvas: &'a [Option<u16>],
+    /// Parallel to `RippleInstance`s (RFC-0023).
+    pub ripple: &'a [Option<u16>],
     /// Per-`TextLine` wrap width in logical px (RFC-0018 text wrap); `Some(w)`
     /// shapes that line bounded to `w` so it wraps. Carried alongside the clip
     /// slices because it is another per-text-line parallel slice consumed by the
@@ -1164,6 +1223,7 @@ fn frame_clips(frame: &RenderFrame) -> FrameClips<'_> {
         text: frame.text_clips(),
         vector: frame.vector_clips(),
         canvas: frame.canvas_clips(),
+        ripple: frame.ripple_clips(),
         text_wrap: frame.text_wraps(),
     }
 }
@@ -1193,6 +1253,10 @@ struct DrawPrimitives<'a> {
     vector_atlas: &'a VectorAtlas,
     /// `Canvas` shape primitives (RFC-0020, the sixth pipeline).
     canvas_shapes: &'a [crate::frame::CanvasShape],
+    /// Ripple ink reveals (RFC-0023, the seventh pipeline); depth is a field
+    /// on `RippleInstance` itself (stamped by `RenderFrame::push_ripple`),
+    /// like `vectors`.
+    ripples: &'a [RippleInstance],
     /// Draw-order depths, parallel to `instances`/`decorated`/`textures`
     /// respectively (RFC-0011 cross-pass paint order). `texts` depth is applied
     /// inside `TextGlyphPipeline::prepare` via glyphon's per-glyph metadata;
@@ -1261,6 +1325,7 @@ fn draw_ui_pass(
         texture: texture_pipeline,
         vector: vector_pipeline,
         canvas: canvas_pipeline,
+        ripple: ripple_pipeline,
     } = *pipelines;
     let DrawPrimitives {
         instances,
@@ -1271,6 +1336,7 @@ fn draw_ui_pass(
         vectors,
         vector_atlas,
         canvas_shapes,
+        ripples,
         solid_depths,
         decorated_depths,
         texture_depths,
@@ -1365,6 +1431,7 @@ fn draw_ui_pass(
     let vector_ranges = layer_pool_ranges(layers, vectors.len(), |m| m.vector);
     let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
     let canvas_ranges = layer_pool_ranges(layers, canvas_shapes.len(), |m| m.canvas);
+    let ripple_ranges = layer_pool_ranges(layers, ripples.len(), |m| m.ripple);
 
     let layer_count = layers.len() + 1;
     for layer in 0..layer_count {
@@ -1374,6 +1441,7 @@ fn draw_ui_pass(
         let vr = &vector_ranges[layer];
         let xr = &text_ranges[layer];
         let cr = &canvas_ranges[layer];
+        let rr = &ripple_ranges[layer];
 
         // Drawn on every call to this function, not just a full redraw — the
         // clear quad above can wipe a box's area on an incremental frame, so
@@ -1409,6 +1477,20 @@ fn draw_ui_pass(
             &decorated[dr.clone()],
             sub_slice(decorated_depths, dr),
             sub_slice(clips.decorated, dr),
+            clip_ctx,
+        );
+        // RFC-0023: ripple ink reveals. Transparent geometry — its stamped
+        // depth (between an element's background and its children) resolves
+        // the compositing slot against the shared depth buffer, so draw
+        // order within the layer doesn't matter.
+        ripple::draw(
+            &mut render_pass,
+            device,
+            ripple_pipeline,
+            viewport_bind_group,
+            quad_buffer,
+            &ripples[rr.clone()],
+            sub_slice(clips.ripple, rr),
             clip_ctx,
         );
         // RFC-0020: programmatic `Canvas` shapes (arcs/circles/lines/rects),
@@ -1670,6 +1752,15 @@ fn dirty_canvas_bounds(shapes: &[crate::frame::CanvasShape], previous: &[Rect]) 
     union_dirty_rects(shapes.iter().map(|s| (s.bounds(), s.dirty)), previous)
 }
 
+/// `dirty_text_bounds` for the `Ripple` pipeline (RFC-0023). A live ripple
+/// animates every frame by definition (its radius/alpha are re-sampled each
+/// tick), so every instance is treated dirty — like solids — and the
+/// previous-frame bounds keep the element repainting on the frame *after* the
+/// last ripple fades, erasing its final ink.
+fn dirty_ripple_bounds(ripples: &[RippleInstance], previous: &[Rect]) -> Option<Rect> {
+    union_dirty_rects(ripples.iter().map(|r| (rect_of(r.rect), true)), previous)
+}
+
 /// `dirty_text_bounds` for the `TextureSampler` pipeline (M27); dirtiness comes
 /// from each sampler's own [`TextureSampler::dirty`](crate::frame::TextureSampler::dirty)
 /// bit.
@@ -1711,6 +1802,8 @@ struct ScissorInputs<'a> {
     prev_textures: &'a [Rect],
     canvas_shapes: &'a [crate::frame::CanvasShape],
     prev_canvas: &'a [Rect],
+    ripples: &'a [RippleInstance],
+    prev_ripples: &'a [Rect],
 }
 
 #[cfg(test)]
@@ -1730,6 +1823,8 @@ impl<'a> ScissorInputs<'a> {
             textures: &[],
             prev_textures: &[],
             canvas_shapes: &[],
+            ripples: &[],
+            prev_ripples: &[],
             prev_canvas: &[],
         }
     }
@@ -1836,7 +1931,10 @@ fn compute_scissor(
                 dirty_texture_bounds(inputs.textures, inputs.prev_textures),
             ),
         ),
-        dirty_canvas_bounds(inputs.canvas_shapes, inputs.prev_canvas),
+        union_opt(
+            dirty_canvas_bounds(inputs.canvas_shapes, inputs.prev_canvas),
+            dirty_ripple_bounds(inputs.ripples, inputs.prev_ripples),
+        ),
     )?;
     let (x, y, w, h) = logical_rect_to_physical_scissor(bounds, scale, max_w, max_h);
     if w > 0 && h > 0 {
@@ -2222,6 +2320,7 @@ mod tests {
             vector: n,
             text: n,
             canvas: n,
+            ripple: n,
         }
     }
 
@@ -2284,6 +2383,7 @@ mod tests {
             ("canvas_shape.rs", include_str!("canvas_shape.rs")),
             ("decorated_box.rs", include_str!("decorated_box.rs")),
             ("gpu_timer.rs", include_str!("gpu_timer.rs")),
+            ("ripple.rs", include_str!("ripple.rs")),
             ("text_glyph.rs", include_str!("text_glyph.rs")),
             ("texture_sampler.rs", include_str!("texture_sampler.rs")),
         ] {
