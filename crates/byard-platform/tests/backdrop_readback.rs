@@ -256,12 +256,33 @@ fn tint_corner_clip_and_children_compose_over_the_glass() {
     // clips to the border radius, so the pixel reads as the *bare*
     // background — compare against the outside sample rather than an
     // absolute (0.05 linear encodes to ~63/255 in sRGB, not "near zero").
+    // On failure, dump enough neighbourhood to see *what* was written: all
+    // four rounded corners (BGRA, alpha included — an exact 0 smells like a
+    // cleared/NaN write, a bright value like a failed clip) and an r-channel
+    // grid marching diagonally out of the top-left corner arc.
     let (_, _, corner_r, _) = rb.at(44.0, 44.0);
-    assert!(
-        (i32::from(corner_r) - i32::from(bare_r)).abs() <= 8,
-        "the rounded corner must clip the glass to the bare background: \
-         corner r={corner_r} vs bare r={bare_r}"
-    );
+    if (i32::from(corner_r) - i32::from(bare_r)).abs() > 8 {
+        let grid: Vec<String> = (0..8u8)
+            .map(|i| {
+                let p = 40.0 + 2.0 * f32::from(i);
+                format!("({p},{p})r={}", rb.at(p, p).2)
+            })
+            .collect();
+        panic!(
+            "the rounded corner must clip the glass to the bare background: \
+             corner r={corner_r} vs bare r={bare_r}\n\
+             corners BGRA: tl={:?} tr={:?} bl={:?} br={:?}\n\
+             inside-shape BGRA at (60,100): {:?}; bare at (20,100): {:?}\n\
+             diagonal r out of the tl corner: {}",
+            rb.at(44.0, 44.0),
+            rb.at(156.0, 44.0),
+            rb.at(44.0, 156.0),
+            rb.at(156.0, 156.0),
+            rb.at(60.0, 100.0),
+            rb.at(20.0, 100.0),
+            grid.join(" ")
+        );
+    }
 
     // The child stays pure blue above the glass (no tint wash over it).
     let (cb, cg, cr, _) = rb.at(100.0, 100.0);
