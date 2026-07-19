@@ -422,6 +422,26 @@ fn push_stroke_quad(
     });
 }
 
+/// Shifts a hit rect by the accumulated scroll displacement and clips it to
+/// the enclosing scroll viewport (RFC-0005): interaction follows the content
+/// to its *on-screen* position, and content scrolled out of the viewport
+/// stops being hittable — it is not visible, so it must not be tappable.
+fn scrolled_hit_rect(
+    r: crate::interp::intrinsics::Rect,
+    shift: (f32, f32),
+    viewport: Option<byard_core::frame::Rect>,
+) -> crate::interp::intrinsics::Rect {
+    let shifted = crate::interp::intrinsics::Rect::new(r.x + shift.0, r.y + shift.1, r.w, r.h);
+    let Some(v) = viewport else {
+        return shifted;
+    };
+    let x0 = shifted.x.max(v.x);
+    let y0 = shifted.y.max(v.y);
+    let x1 = (shifted.x + shifted.w).min(v.x + v.width);
+    let y1 = (shifted.y + shifted.h).min(v.y + v.height);
+    crate::interp::intrinsics::Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
+
 /// A shadow-only [`DecoratedBox`](byard_core::frame::DecoratedBox): the box's
 /// geometry (rect/radii/transform) with a transparent fill and no border, so it
 /// casts `sh` beneath the surface. Emitted per shadow (RFC-0011 layered shadows).
@@ -563,10 +583,12 @@ pub struct Interpreter {
     /// (interruptible springs).
     animations: std::collections::HashMap<Span, byard_core::frame::Motion>,
     /// Persisted colour-animation state (RFC-0010 A3): one `Motion` per OKLab
-    /// channel (`L`, `a`, `b`), so a `bg`/`color`/`border` transition
-    /// interpolates in a perceptually-uniform space — no muddy mid-points — and
+    /// channel (`L`, `a`, `b`) plus one for the alpha byte, so a
+    /// `bg`/`color`/`border`/`backdrop_tint` transition interpolates in a
+    /// perceptually-uniform space — no muddy mid-points — with translucency
+    /// animating alongside (RFC-0023: a tint fading in is an alpha ramp), and
     /// is interruptible like the scalar props. Keyed by the `with` node's span.
-    color_animations: std::collections::HashMap<Span, [byard_core::frame::Motion; 3]>,
+    color_animations: std::collections::HashMap<Span, [byard_core::frame::Motion; 4]>,
     /// Live ripple ink reveals (RFC-0023), spawned by a press gesture over an
     /// element whose resolved `ripple_active` is true. Gesture-like state: it
     /// persists across renders (a ripple keeps fading after release) and is
@@ -580,6 +602,10 @@ pub struct Interpreter {
     /// never respawns (same identity, even after its ripple retires), while
     /// each new tap is a fresh identity and spawns again.
     ripple_spawned: Option<(u32, u64)>,
+    /// Runtime performance diagnostics recomputed each render (RFC-0023):
+    /// currently the overlapping-blurs stack check, run over the frame's
+    /// emitted backdrops at the end of [`render`](Self::render).
+    perf_warnings: Vec<PerfWarning>,
     /// Set true during a render whenever an animation sampled this frame has not
     /// yet settled — the runner reads it (via [`has_active_animations`]) to keep
     /// requesting frames until motion stops (idle → 0 frames).
@@ -737,6 +763,45 @@ struct ActiveRipple {
 
 /// Default ripple fade-out duration in ms (RFC-0023 §"Ripple properties").
 const RIPPLE_DEFAULT_DURATION_MS: f32 = 300.0;
+
+/// Default `blur_saturation` boost (RFC-0023 §"Blur properties"): the iOS
+/// vibrancy look.
+const BLUR_DEFAULT_SATURATION: f32 = 1.8;
+
+/// A runtime performance diagnostic surfaced by the evaluator (RFC-0023
+/// resolved question "multiple blurred elements overlap"). Recomputed every
+/// [`render`](Interpreter::render); hosts (the dev runner) report new ones to
+/// the developer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PerfWarning {
+    /// Three or more backdrop-blur panes overlap in the same frame: each
+    /// upper pane re-blurs the already-blurred output of the ones below
+    /// (visually correct stacked frosted glass, but each pane costs a
+    /// pass-split + copy + blur). `count` is the largest overlap cluster
+    /// around a single pane — the pane itself plus every pane sharing area
+    /// with it — a deliberately conservative stack estimate.
+    OverlappingBlurs {
+        /// The size of the largest overlap cluster.
+        count: usize,
+    },
+}
+
+/// The largest overlap cluster among `rects` (`[x, y, w, h]` each): the
+/// maximum, over every rect, of how many rects intersect it (itself
+/// included). A conservative estimate of blur-stack depth — a chain
+/// `a∩b, b∩c` reports 3 around `b` even though no single point is 3 deep,
+/// which errs on the side of surfacing the diagnostic. Quadratic — fine for
+/// the handful of glass panes a real frame carries.
+fn deepest_rect_overlap(rects: &[[f32; 4]]) -> usize {
+    let intersects = |a: &[f32; 4], b: &[f32; 4]| {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    };
+    rects
+        .iter()
+        .map(|a| rects.iter().filter(|b| intersects(a, b)).count())
+        .max()
+        .unwrap_or(0)
+}
 
 /// An in-flight pull-region spring (RFC-0021 pull-to-refresh): drives a
 /// `ScrollView`'s [`pull_distance`](Interpreter::pull_distance) to `target` —
@@ -2186,6 +2251,7 @@ impl Interpreter {
                     1.0,
                     byard_core::frame::Transform::IDENTITY,
                     None,
+                    (0.0, 0.0),
                     None,
                     pools,
                 );
@@ -2214,6 +2280,26 @@ impl Interpreter {
         // build/paint phase.
         self.for_pools = for_pools;
         self.when_pools = when_pools;
+
+        // RFC-0023 performance diagnostic: ≥ 3 stacked frosted-glass panes in
+        // one frame means each upper pane re-blurs the output of the lower
+        // ones — visually correct, but each pane costs a pass-split + copy +
+        // blur. Recomputed from this frame's emitted pool; the host decides
+        // how to surface it.
+        self.perf_warnings.clear();
+        let pane_rects: Vec<[f32; 4]> = frame.backdrops().iter().map(|b| b.rect).collect();
+        let deepest = deepest_rect_overlap(&pane_rects);
+        if deepest >= 3 {
+            self.perf_warnings
+                .push(PerfWarning::OverlappingBlurs { count: deepest });
+        }
+    }
+
+    /// Runtime performance diagnostics recomputed by the last
+    /// [`render`](Self::render) (RFC-0023): empty when the frame is healthy.
+    #[must_use]
+    pub fn perf_warnings(&self) -> &[PerfWarning] {
+        &self.perf_warnings
     }
 
     /// Flattens a node slice into the concrete nodes to lay out/paint this frame
@@ -2592,6 +2678,7 @@ impl Interpreter {
                 1.0,
                 byard_core::frame::Transform::IDENTITY,
                 None,
+                (0.0, 0.0),
                 None,
                 pools,
             );
@@ -2635,15 +2722,13 @@ impl Interpreter {
         })
     }
 
-    /// Evaluates a shape color parameter. The alpha byte is auto-detected:
-    /// values above `0xFFFFFF` are `0xAARRGGBB`, else `0xRRGGBB` at full
-    /// alpha — matching how shadow colors already read (RFC-0011).
+    /// Evaluates a shape color parameter. The alpha byte is auto-detected
+    /// (the lexer's >6-digit tag, or magnitude for computed values) —
+    /// matching every alpha-aware colour consumer (RFC-0011).
     fn shape_color(&mut self, el: &ElementNode, name: &str) -> Option<[f32; 4]> {
         let e = Self::shape_arg(el, name)?.clone();
         let packed = self.eval_pure(&e).as_int()?;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let has_alpha = (packed as u64) > 0x00FF_FFFF;
-        Some(super::intrinsics::color_to_rgba(packed, has_alpha))
+        Some(super::intrinsics::color_rgba_auto(packed))
     }
 
     /// Evaluates a `(a, b)` shape parameter (the `dash` pattern).
@@ -3442,6 +3527,15 @@ impl Interpreter {
         // this only spares the CPU the emission. `None` outside any scroll
         // container (the whole viewport is live).
         cull_clip: Option<byard_core::frame::Rect>,
+        // Accumulated scroll displacement from every enclosing `ScrollView`
+        // (RFC-0005), in screen px. Paint applies it through the inherited
+        // transform; **hit-testing** cannot ride that path — RFC-0011/INV-8
+        // deliberately keeps paint transforms out of hit rects (a hover-scale
+        // must not move its own hit target) — so the scroll displacement
+        // travels separately and shifts every hit rect registered inside the
+        // scrolled subtree. This is what keeps a scrolled button interactive
+        // at its *on-screen* position, not its laid-out one.
+        scroll_shift: (f32, f32),
         // Set only on a windowed `ScrollView`'s list child (RFC-0005 windowed
         // layout): this node renders just rows `start..end`, bracketed by the two
         // spacer leaves the build pass emitted, so the flat-id cursor stays
@@ -3539,8 +3633,11 @@ impl Interpreter {
                             rect.width,
                             rect.height,
                         );
-                        let hit_rect =
-                            crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect);
+                        let hit_rect = scrolled_hit_rect(
+                            crate::interp::intrinsics::inflate_hit_rect(self_rect, parent_rect),
+                            scroll_shift,
+                            cull_clip,
+                        );
                         self.register_event_attrs(attrs, hit_rect, elem_idx);
                     }
                 }
@@ -3571,6 +3668,9 @@ impl Interpreter {
                 // group transforms): this box's own transform ∘ its ancestors',
                 // set once the rect is known, else passed through unchanged.
                 let mut child_transform = inherited_transform;
+                // And the accumulated scroll displacement (RFC-0005): grown by
+                // this box when it is a `ScrollView`, passed through otherwise.
+                let mut child_scroll_shift = scroll_shift;
                 if let Ok(Some(rect)) = self.atlas.resolved_rect(atlas_node) {
                     current_rect = crate::interp::intrinsics::Rect::new(
                         rect.x,
@@ -3711,6 +3811,12 @@ impl Interpreter {
                         }
                     }
 
+                    // RFC-0023 §2: backdrop blur — emitted right after this
+                    // element's background (the §4 compositing slot), so the
+                    // pane samples everything painted behind it, its own
+                    // background included, and its children render on top.
+                    self.emit_backdrop(paint_attrs, current_rect, radii, transform, opacity, frame);
+
                     // RFC-0023: ripple ink — emitted after this element's
                     // background and before its children, which stamps its
                     // draw-order depth into exactly the RFC's compositing slot
@@ -3722,12 +3828,19 @@ impl Interpreter {
                         radii,
                         transform,
                         opacity,
+                        scroll_shift,
                         frame,
                     );
 
                     let element_name = name.as_str();
-                    let hit_rect =
-                        crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect);
+                    // Inflate to the 44×44 slop, then move the target to where
+                    // the content actually is on screen (RFC-0005 scroll shift)
+                    // and clip it to the scroll viewport.
+                    let hit_rect = scrolled_hit_rect(
+                        crate::interp::intrinsics::inflate_hit_rect(current_rect, parent_rect),
+                        scroll_shift,
+                        cull_clip,
+                    );
 
                     // RFC-0016: an element that styles `on hover`/`on pressed` but
                     // registers no handler still needs the engine to track the
@@ -3870,6 +3983,11 @@ impl Interpreter {
                     frame.begin_clip(clip);
                     child_transform.translate[0] -= ox * inherited_transform.scale[0];
                     child_transform.translate[1] -= oy * inherited_transform.scale[1];
+                    // Hit rects travel with the content (paint rides the
+                    // transform above; hit-testing rides this — see the
+                    // `scroll_shift` parameter docs).
+                    child_scroll_shift.0 -= ox * inherited_transform.scale[0];
+                    child_scroll_shift.1 -= oy * inherited_transform.scale[1];
                     // RFC-0021 pull-to-refresh: shift the content down by the pull
                     // region and draw the default indicator in the revealed gap.
                     let pull_elem = self.atlas.node_index(atlas_node);
@@ -3879,6 +3997,7 @@ impl Interpreter {
                     if pull > 0.0 {
                         let gap_px = pull * inherited_transform.scale[1];
                         child_transform.translate[1] += gap_px;
+                        child_scroll_shift.1 += gap_px;
                         let progress = (pull / PULL_THRESHOLD).clamp(0.0, 1.0);
                         let active = pull_elem
                             .and_then(|e| self.refreshing_seen.get(&e).copied())
@@ -4040,6 +4159,7 @@ impl Interpreter {
                         child_opacity,
                         child_transform,
                         child_clip,
+                        child_scroll_shift,
                         child_window,
                         pools,
                     );
@@ -4097,6 +4217,10 @@ impl Interpreter {
                             child_opacity,
                             pin_tf,
                             child_clip,
+                            // The pin undoes the vertical scroll translate, so
+                            // the header's hit rects stay at the viewport top
+                            // exactly like its pixels do.
+                            (child_scroll_shift.0, child_scroll_shift.1 + pin),
                             child_window,
                             pools,
                         );
@@ -4278,9 +4402,13 @@ impl Interpreter {
                     }
 
                     // Events: the canvas rect only — individual shapes are not
-                    // hit-testable (RFC-0020 resolved question).
-                    let hit_rect =
-                        crate::interp::intrinsics::inflate_hit_rect(canvas_rect, parent_rect);
+                    // hit-testable (RFC-0020 resolved question). Shifted to
+                    // the on-screen position like every hit rect (RFC-0005).
+                    let hit_rect = scrolled_hit_rect(
+                        crate::interp::intrinsics::inflate_hit_rect(canvas_rect, parent_rect),
+                        scroll_shift,
+                        cull_clip,
+                    );
                     // RFC-0016: an `on hover`/`on pressed` block with no handler
                     // still needs pointer tracking, mirroring the Box path.
                     if let Some(idx) = elem_idx {
@@ -5052,9 +5180,12 @@ impl Interpreter {
     }
 
     /// Drives one colour `with` animation (RFC-0010 A3): interpolates from the
-    /// current colour to the target in OKLab (one [`Motion`] per channel), so
-    /// the transition is perceptually uniform and interruptible. Returns the
-    /// current colour packed as `0xRRGGBB`.
+    /// current colour to the target in OKLab (one [`Motion`] per channel, plus
+    /// a fourth for the alpha byte — a translucent `backdrop_tint`/`bg` fades
+    /// in and out rather than popping, RFC-0023), so the transition is
+    /// perceptually uniform and interruptible. Returns the current colour
+    /// packed as `0xAARRGGBB` — opaque targets carry `AA = 0xFF`, which every
+    /// consumer's alpha auto-detect reads as the same opaque colour.
     ///
     /// [`Motion`]: byard_core::frame::Motion
     fn eval_animated_color(&mut self, target: &Expr, anim: &Expr, key: Span) -> i64 {
@@ -5069,22 +5200,31 @@ impl Interpreter {
         };
         let packed = pack_curve(curve);
         let now = self.now_ms;
-        let target_oklab = oklab_from_hex(target_int);
+        // Channel targets: OKLab L/a/b plus the alpha byte (auto-detected via
+        // the lexer tag or the magnitude heuristic, like every colour
+        // consumer — this is what lets `0x00FFFFFF → 0x80FFFFFF` ramp).
+        let lab = oklab_from_hex(target_int);
+        let alpha = if super::intrinsics::color_has_alpha(target_int) {
+            ((target_int >> 24) & 0xFF) as f32 / 255.0
+        } else {
+            1.0
+        };
+        let target_ch = [lab[0], lab[1], lab[2], alpha];
         let motions = self.color_animations.entry(key).or_insert_with(|| {
-            [0, 1, 2].map(|i| byard_core::frame::Motion {
-                from: target_oklab[i],
-                to: target_oklab[i],
+            [0, 1, 2, 3].map(|i| byard_core::frame::Motion {
+                from: target_ch[i],
+                to: target_ch[i],
                 start_ms: now,
                 curve: packed,
             })
         });
-        let mut current = [0.0_f32; 3];
+        let mut current = [0.0_f32; 4];
         let mut all_settled = true;
         for (i, m) in motions.iter_mut().enumerate() {
-            if (m.to - target_oklab[i]).abs() > 1e-5 {
+            if (m.to - target_ch[i]).abs() > 1e-5 {
                 let here = m.sample(now);
                 m.from = here;
-                m.to = target_oklab[i];
+                m.to = target_ch[i];
                 m.start_ms = now;
             }
             m.curve = packed;
@@ -5096,7 +5236,12 @@ impl Interpreter {
         if !all_settled {
             self.any_active = true;
         }
-        hex_from_oklab(current)
+        let rgb = hex_from_oklab([current[0], current[1], current[2]]);
+        #[allow(clippy::cast_sign_loss)]
+        let alpha_byte = i64::from((current[3].clamp(0.0, 1.0) * 255.0).round() as u8);
+        // Tagged like an 8-digit literal, so a downstream consumer honours a
+        // mid-ramp alpha of exactly zero instead of reading it as opaque.
+        crate::lexer::COLOR_HAS_ALPHA_TAG | (alpha_byte << 24) | rgb
     }
 
     fn eval_int_prop(&mut self, attrs: &[Attr], name: &str) -> Option<i64> {
@@ -5250,6 +5395,89 @@ impl Interpreter {
         }
     }
 
+    /// Emits the RFC-0023 §2 backdrop-blur pane for one element, called from
+    /// the `Box` paint arm right after the background push — the RFC-0023 §4
+    /// compositing slot (background → blur → tint → ripple → children): the
+    /// pane samples everything already emitted, its own background included.
+    ///
+    /// `blur` (clamped to [`byard_core::frame::BLUR_MAX_RADIUS`]) enables the
+    /// pane; both it and `backdrop_tint` resolve through the RFC-0010
+    /// animation chokepoints, so `blur: 0 with anim.spring()` +
+    /// `on hover { blur: 16 }` animates the glass for free. A tint *without*
+    /// blur needs no barrier or off-screen work at all — it lowers to a plain
+    /// translucent fill over the content behind, which is the identical
+    /// composite at zero cost.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_backdrop(
+        &mut self,
+        attrs: &[Attr],
+        rect: crate::interp::intrinsics::Rect,
+        radii: [f32; 4],
+        transform: byard_core::frame::Transform,
+        opacity: f32,
+        frame: &mut byard_core::frame::RenderFrame,
+    ) {
+        use byard_core::frame::{
+            BLUR_MAX_RADIUS, BLUR_QUALITY_AUTO, BLUR_QUALITY_HIGH, BLUR_QUALITY_LOW,
+            BackdropInstance,
+        };
+
+        let blur = self
+            .eval_float_prop(attrs, "blur")
+            .map_or(0.0, |v| (v as f32).clamp(0.0, BLUR_MAX_RADIUS));
+        let tint = self.eval_color_prop(attrs, "backdrop_tint");
+        // Alpha auto-detect (lexer tag or magnitude, RFC-0011): a tint is
+        // translucent by nature, `0x00FFFFFF` included.
+        let tint_rgba = tint.map_or([0.0; 4], super::intrinsics::color_rgba_auto);
+
+        if blur <= 0.0 {
+            // Tint-only: a translucent wash over the (unblurred) content
+            // behind — a plain alpha-blended fill composites identically.
+            if tint_rgba[3] > 0.0 {
+                frame.push_decorated(byard_core::frame::DecoratedBox {
+                    base: byard_core::BoxInstance {
+                        rect: [rect.x, rect.y, rect.w, rect.h],
+                        color: tint_rgba,
+                        radii,
+                        transform,
+                    },
+                    opacity,
+                    dirty: true,
+                    ..Default::default()
+                });
+            }
+            return;
+        }
+
+        let saturation = self
+            .eval_float_prop(attrs, "blur_saturation")
+            .map_or(BLUR_DEFAULT_SATURATION, |v| (v as f32).max(0.0));
+        let quality = attrs
+            .iter()
+            .find(|a| a.name.as_str() == "blur_quality")
+            .and_then(|a| match &a.kind {
+                AttrKind::Prop { value } => Self::enum_token(value),
+                _ => None,
+            })
+            .map_or(BLUR_QUALITY_AUTO, |token| match token {
+                "high" => BLUR_QUALITY_HIGH,
+                "low" => BLUR_QUALITY_LOW,
+                _ => BLUR_QUALITY_AUTO,
+            });
+
+        frame.push_backdrop(BackdropInstance {
+            rect: [rect.x, rect.y, rect.w, rect.h],
+            radii,
+            blur,
+            tint: tint_rgba,
+            saturation,
+            quality,
+            opacity,
+            transform,
+            depth: 0.0, // stamped by `push_backdrop`
+        });
+    }
+
     /// Spawns and emits the RFC-0023 ripple ink for one element, called from
     /// the `Box` paint arm between the background push and the child walk —
     /// which is exactly the RFC's compositing slot (background → ripple →
@@ -5277,6 +5505,10 @@ impl Interpreter {
         radii: [f32; 4],
         transform: byard_core::frame::Transform,
         opacity: f32,
+        // Accumulated scroll displacement (RFC-0005): the press position is
+        // in screen space while `rect` is layout space, so the tap point maps
+        // back through the shift.
+        scroll_shift: (f32, f32),
         frame: &mut byard_core::frame::RenderFrame,
     ) {
         use byard_core::frame::{Motion, MotionCurve, RippleInstance};
@@ -5299,21 +5531,18 @@ impl Interpreter {
                         .eval_float_prop(attrs, "ripple_duration")
                         .map_or(RIPPLE_DEFAULT_DURATION_MS, |v| v as f32)
                         .max(1.0);
-                    // Alpha auto-detect, matching shadow/shape colours
-                    // (RFC-0011): above `0xFFFFFF` is `0xAARRGGBB`, else an
-                    // opaque `0xRRGGBB` — ripple ink is typically translucent.
-                    #[allow(clippy::cast_sign_loss)]
-                    let has_alpha = (color as u64) > 0x00FF_FFFF;
                     let max_radius = self
                         .eval_float_prop(attrs, "ripple_radius")
                         .map(|v| v as f32);
                     self.ripples.push(ActiveRipple {
                         elem,
                         center_rel: [
-                            (pos.0 - rect.x).clamp(0.0, rect.w),
-                            (pos.1 - rect.y).clamp(0.0, rect.h),
+                            (pos.0 - scroll_shift.0 - rect.x).clamp(0.0, rect.w),
+                            (pos.1 - scroll_shift.1 - rect.y).clamp(0.0, rect.h),
                         ],
-                        color: super::intrinsics::color_to_rgba(color, has_alpha),
+                        // Alpha auto-detect (lexer tag or magnitude) — ripple
+                        // ink is typically translucent.
+                        color: super::intrinsics::color_rgba_auto(color),
                         start_ms: self.now_ms,
                         duration_ms,
                         max_radius,
@@ -5407,7 +5636,27 @@ impl Interpreter {
         }
         for attr in attrs {
             if let AttrKind::Prop { value } = &attr.kind {
-                let val = self.eval_pure(value);
+                // Evaluate only the layout props this resolver consumes.
+                // Paint/effect attrs (`bg`, `blur`, `opacity`, …) must NOT be
+                // evaluated here: layout runs in the build phase against the
+                // *base* attrs, and driving a paint prop through the RFC-0010
+                // `with` chokepoint from here would fight the paint pass's
+                // state-resolved evaluation of the same `Motion` — a
+                // retarget ping-pong that freezes state-driven animations
+                // short of their target. Layout props themselves are never
+                // animatable (`LayoutPropNotAnimatable`), so skipping the
+                // rest removes wasted work without changing behaviour.
+                let val = match attr.name.as_str() {
+                    "width" | "height" | "gap" | "grow" | "basis" | "pt" | "padding_top"
+                    | "padding-top" | "pr" | "padding_right" | "padding-right" | "pb"
+                    | "padding_bottom" | "padding-bottom" | "pl" | "padding_left"
+                    | "padding-left" | "mt" | "margin_top" | "margin-top" | "mr"
+                    | "margin_right" | "margin-right" | "mb" | "margin_bottom"
+                    | "margin-bottom" | "ml" | "margin_left" | "margin-left" | "mx"
+                    | "margin_x" | "margin_horizontal" | "margin-horizontal" | "my"
+                    | "margin_y" | "margin_vertical" | "margin-vertical" => self.eval_pure(value),
+                    _ => Value::Unit,
+                };
                 match attr.name.as_str() {
                     "axis" if element_name == "ScrollView" => {
                         if let Some(s) = Self::enum_token(value) {
@@ -7861,10 +8110,51 @@ fn resolve_state_attrs<'a>(
     let mut resolved = base.to_vec();
     for (_, idx) in matching {
         for a in &state_blocks[idx].attrs {
-            override_attr(&mut resolved, a.clone());
+            override_state_attr(&mut resolved, a.clone());
         }
     }
     std::borrow::Cow::Owned(resolved)
+}
+
+/// Inserts a state-block attr over the resolved base set, keeping the base's
+/// `with` animation shell when the state provides a bare value — the
+/// RFC-0010 × RFC-0012/0016 state-driven-animation contract:
+/// `blur: 0 with anim.spring()` + `on hover { blur: 16 }` must *animate* to
+/// 16, not pop. The state changes the target; the base owns the curve. The
+/// wrapped value reuses the base `Animated` node's span, which is the
+/// persisted `Motion`'s key — so entering and leaving the state retargets
+/// one interruptible animation instead of restarting a fresh one each flip.
+fn override_state_attr(set: &mut Vec<Attr>, attr: Attr) {
+    let Some(existing) = set
+        .iter_mut()
+        .find(|a| a.name == attr.name && a.axis == attr.axis)
+    else {
+        set.push(attr);
+        return;
+    };
+    if let (
+        AttrKind::Prop {
+            value: Expr::Animated { anim, span, .. },
+        },
+        AttrKind::Prop { value: incoming },
+    ) = (&existing.kind, &attr.kind)
+    {
+        if !matches!(incoming, Expr::Animated { .. }) {
+            let wrapped = Attr {
+                kind: AttrKind::Prop {
+                    value: Expr::Animated {
+                        value: Box::new(incoming.clone()),
+                        anim: anim.clone(),
+                        span: *span,
+                    },
+                },
+                ..attr.clone()
+            };
+            *existing = wrapped;
+            return;
+        }
+    }
+    *existing = attr;
 }
 
 /// Multiplies a colour's alpha by `opacity` — folds an element's effective
@@ -14317,5 +14607,251 @@ mod tests {
             text_depth < ripple_depth,
             "children above the ink ({text_depth} vs {ripple_depth})"
         );
+    }
+
+    // ── RFC-0005 scroll × hit-testing ───────────────────────────────────
+
+    #[test]
+    fn hit_targets_follow_the_scroll_offset() {
+        use byard_core::platform::EventKind as K;
+        // A tappable card that starts at y 80..160 inside a 100-high
+        // viewport. Scrolling down 60 shows it at y 20..100 on screen.
+        let src = "View V() { var n = 0 var off = 0
+            ScrollView #[width: 200, height: 100, offset: (0, off)] {
+                Column {
+                    Box #[bg: 0x111111, width: 200, height: 80] {}
+                    Box #[bg: 0x222222, width: 200, height: 80, tap => n = n + 1] {}
+                }
+            }
+        }";
+        let (mut interp, tree) = lower_named(src, "V");
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        let n = interp.var_signal(&Symbol::intern("n")).unwrap();
+        let taps = |interp: &Interpreter| match interp.peek(n) {
+            Value::Int(v) => v,
+            other => panic!("n must be an Int, got {other:?}"),
+        };
+        let tap_at = |interp: &mut Interpreter, x: f32, y: f32, t: u64| {
+            interp.dispatch_events(&[pointer(K::PointerDown, x, y, t)]);
+            interp.dispatch_events(&[pointer(K::PointerUp, x, y, t + 20)]);
+        };
+
+        // Scroll down 60 and re-render (handlers re-register shifted).
+        let off = interp.var_signal(&Symbol::intern("off")).unwrap();
+        interp.write_var(off, Value::Int(60));
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Tapping where the card now IS on screen fires its action…
+        tap_at(&mut interp, 100.0, 30.0, 100);
+        assert_eq!(taps(&interp), 1, "the on-screen position must be tappable");
+
+        // …and tapping where layout *placed* it (y 110, scrolled away and
+        // outside the viewport) must not — the hit rect moved with the
+        // content and is clipped to the scroll viewport.
+        tap_at(&mut interp, 100.0, 110.0, 200);
+        assert_eq!(taps(&interp), 1, "the stale laid-out position is inert");
+    }
+
+    // ── RFC-0023 §2 backdrop blur / vibrancy ────────────────────────────
+
+    fn rendered_frame(src: &str) -> (Interpreter, byard_core::frame::RenderFrame) {
+        let (mut interp, tree) = lower_named(src, "V");
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+        (interp, frame)
+    }
+
+    #[test]
+    fn blur_props_emit_a_backdrop_with_the_resolved_fields() {
+        let (_interp, frame) = rendered_frame(
+            "View V() { Box #[width: 200, height: 100, radius: 16, blur: 20, \
+             backdrop_tint: 0x80FFFFFF, blur_saturation: 2.0, blur_quality: high] {} }",
+        );
+        assert_eq!(frame.backdrops().len(), 1);
+        let b = frame.backdrops()[0];
+        assert_eq!(b.rect, [0.0, 0.0, 200.0, 100.0]);
+        assert_eq!(b.radii, [16.0; 4]);
+        assert!((b.blur - 20.0).abs() < f32::EPSILON);
+        assert!((b.tint[3] - 0.5).abs() < 0.01, "tint alpha: {:?}", b.tint);
+        assert!((b.saturation - 2.0).abs() < f32::EPSILON);
+        assert_eq!(b.quality, byard_core::frame::BLUR_QUALITY_HIGH);
+    }
+
+    #[test]
+    fn blur_clamps_to_the_max_radius_and_defaults_saturation() {
+        let (_interp, frame) =
+            rendered_frame("View V() { Box #[width: 100, height: 100, blur: 500] {} }");
+        let b = frame.backdrops()[0];
+        assert!(
+            (b.blur - byard_core::frame::BLUR_MAX_RADIUS).abs() < f32::EPSILON,
+            "500 clamps to the max, got {}",
+            b.blur
+        );
+        assert!((b.saturation - 1.8).abs() < 0.01, "vibrancy default 1.8");
+        assert_eq!(b.quality, byard_core::frame::BLUR_QUALITY_AUTO);
+    }
+
+    #[test]
+    fn a_tint_without_blur_lowers_to_a_plain_translucent_fill() {
+        // No blur → no barrier, no off-screen work: the identical composite
+        // is a translucent fill over the content behind.
+        let (_interp, frame) = rendered_frame(
+            "View V() { Box #[width: 100, height: 100, backdrop_tint: 0x80336699] {} }",
+        );
+        assert!(frame.backdrops().is_empty(), "no blur, no backdrop barrier");
+        let wash = frame
+            .decorated()
+            .iter()
+            .find(|d| (d.base.color[3] - 0.5).abs() < 0.01)
+            .expect("the tint lowers to a translucent decorated fill");
+        assert_eq!(wash.base.rect, [0.0, 0.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn the_backdrop_barrier_snapshots_the_content_behind_it() {
+        // A solid card behind, then a bg-less glass pane with a child label:
+        // the barrier must capture the card (and nothing later), and the
+        // pane's depth must sit between the card and the label.
+        let src = "View V() {
+            Column #[width: 300, height: 200] {
+                Box #[bg: 0xFF3366, width: 300, height: 80] {}
+                Box #[blur: 12, width: 300, height: 80] {
+                    Text(\"glass\") #[color: 0x000000]
+                }
+            }
+        }";
+        let (_interp, frame) = rendered_frame(src);
+        assert_eq!(frame.backdrops().len(), 1);
+        let mark = frame.backdrop_marks()[0];
+        assert_eq!(mark.solid, 1, "the card was emitted behind the barrier");
+        assert_eq!(mark.text, 0, "the pane's own label comes after it");
+        let d = frame.backdrops()[0].depth;
+        assert!(d < frame.solid_depths()[0], "pane above the card");
+        assert!(frame.text_depths()[0] < d, "label above the pane");
+    }
+
+    #[test]
+    fn blur_animates_as_a_paint_prop() {
+        let sample =
+            |f: &byard_core::frame::RenderFrame| f.backdrops().first().map_or(0.0, |b| b.blur);
+        let [a, b, c] = ramp_paint_prop(
+            "View V() { var on: Bool = false \
+             Box #[width: 100, height: 100, blur: on ? 16.0 : 4.0 with anim.linear(1000)] }",
+            sample,
+        );
+        assert!((a - 4.0).abs() < 0.5, "starts near 4, got {a}");
+        assert!((b - 10.0).abs() < 1.5, "~halfway, got {b}");
+        assert!((c - 16.0).abs() < 0.5, "arrives at 16, got {c}");
+    }
+
+    #[test]
+    fn a_state_override_retargets_the_base_with_animation() {
+        use byard_core::platform::EventKind as K;
+        // RFC-0010 × RFC-0012/0016: the state changes the target, the base
+        // owns the curve — `on hover { blur: 16 }` over
+        // `blur: 4 with anim.linear(1000)` must ramp, not pop.
+        let src = "View V() {
+            let glass = style {
+                blur: 4.0 with anim.linear(1000)
+                on hover { blur: 16 }
+            }
+            Box #[..glass, width: 200, height: 100] {}
+        }";
+        let (mut interp, tree) = lower_named(src, "V");
+        assert!(interp.errors().is_empty(), "{:?}", interp.errors());
+        interp.set_now_ms(0);
+        interp.tick();
+        let mut frame = byard_core::frame::RenderFrame::new();
+        interp.render(&tree, &mut frame, 400.0, 300.0);
+
+        // Hover the pane; the next renders sample the retargeted ramp.
+        interp.dispatch_events(&[pointer(K::PointerMove, 50.0, 50.0, 1)]);
+        let blur_at = |interp: &mut Interpreter, ms: u32| {
+            interp.set_now_ms(ms);
+            let mut frame = byard_core::frame::RenderFrame::new();
+            interp.render(&tree, &mut frame, 400.0, 300.0);
+            frame.backdrops().first().map_or(-1.0, |b| b.blur)
+        };
+        let a = blur_at(&mut interp, 0);
+        let b = blur_at(&mut interp, 500);
+        let c = blur_at(&mut interp, 1000);
+        assert!((a - 4.0).abs() < 0.5, "starts at the base value, got {a}");
+        assert!(
+            (b - 10.0).abs() < 1.5,
+            "~halfway to the hover target, got {b}"
+        );
+        assert!(
+            (c - 16.0).abs() < 0.5,
+            "arrives at the hover target, got {c}"
+        );
+    }
+
+    #[test]
+    fn an_animated_color_ramps_its_alpha_channel_too() {
+        // RFC-0023 regression: a translucent `backdrop_tint` fades in — the
+        // alpha byte animates alongside the OKLab channels. The old 3-channel
+        // path dropped alpha entirely, collapsing `0x00FFFFFF → 0x80FFFFFF`
+        // into an instant opaque white.
+        let sample =
+            |f: &byard_core::frame::RenderFrame| f.backdrops().first().map_or(-1.0, |b| b.tint[3]);
+        let [a, b, c] = ramp_paint_prop(
+            "View V() { var on: Bool = false \
+             Box #[width: 100, height: 100, blur: 8, \
+             backdrop_tint: on ? 0x80FFFFFF : 0x00FFFFFF with anim.linear(1000)] }",
+            sample,
+        );
+        assert!(a.abs() < 0.02, "starts fully transparent, got {a}");
+        assert!(
+            (b - 0.25).abs() < 0.05,
+            "~half the 0.5 target mid-ramp, got {b}"
+        );
+        assert!((c - 0.502).abs() < 0.02, "arrives at 0x80 alpha, got {c}");
+    }
+
+    #[test]
+    fn deepest_rect_overlap_counts_the_tallest_stack() {
+        let r = |x: f32| [x, 0.0, 100.0, 100.0];
+        assert_eq!(deepest_rect_overlap(&[]), 0);
+        assert_eq!(deepest_rect_overlap(&[r(0.0)]), 1);
+        // Disjoint panes never stack.
+        assert_eq!(deepest_rect_overlap(&[r(0.0), r(200.0), r(400.0)]), 1);
+        // Two overlapping panes plus a distant third: the cluster is 2.
+        assert_eq!(deepest_rect_overlap(&[r(0.0), r(80.0), r(400.0)]), 2);
+        // A chain a∩b, b∩c clusters to 3 around b — deliberately
+        // conservative (see the fn docs), erring toward the diagnostic.
+        assert_eq!(deepest_rect_overlap(&[r(0.0), r(80.0), r(160.0)]), 3);
+        // Three co-located panes: a genuine 3-deep stack.
+        assert_eq!(deepest_rect_overlap(&[r(0.0), r(10.0), r(20.0)]), 3);
+    }
+
+    #[test]
+    fn three_stacked_glass_panes_raise_the_overlap_warning() {
+        let (interp, frame) = rendered_frame(
+            "View V() { ZStack #[width: 200, height: 200] { \
+             Box #[blur: 8, width: 180, height: 180] {} \
+             Box #[blur: 8, width: 160, height: 160] {} \
+             Box #[blur: 8, width: 140, height: 140] {} } }",
+        );
+        assert_eq!(frame.backdrops().len(), 3);
+        assert_eq!(
+            interp.perf_warnings(),
+            &[PerfWarning::OverlappingBlurs { count: 3 }]
+        );
+
+        // Two panes are fine — stacked glass only warns at three.
+        let (interp, _frame) = rendered_frame(
+            "View V() { ZStack #[width: 200, height: 200] { \
+             Box #[blur: 8, width: 180, height: 180] {} \
+             Box #[blur: 8, width: 160, height: 160] {} } }",
+        );
+        assert!(interp.perf_warnings().is_empty());
     }
 }
