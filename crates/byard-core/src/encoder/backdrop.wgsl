@@ -112,11 +112,15 @@ fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Clip to the element's rounded rect.
+    // Clip to the element's rounded rect. `smoothstep` edges are kept in
+    // ascending order (`1 - smoothstep(0, soft, d)` rather than the inverted
+    // trick) — descending edges are undefined per the spec and DX12/HLSL
+    // resolves them differently from Metal/Vulkan. The `!(x > y)` form of
+    // the discard is deliberate: it also discards on NaN.
     let dist = sd_rounded_box(in.local_pos, in.half_size, in.radii);
     let soft = max(length(vec2<f32>(dpdx(dist), dpdy(dist))), 1e-5);
-    let coverage = smoothstep(soft, 0.0, dist);
-    if (coverage <= 0.0) {
+    let coverage = 1.0 - smoothstep(0.0, soft, dist);
+    if (!(coverage > 0.001)) {
         discard;
     }
 

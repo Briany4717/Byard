@@ -122,16 +122,19 @@ fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Clip to the element's rounded rect (RFC-0023: always, no opt-out).
+    // `smoothstep` edges stay in ascending order — descending edges are
+    // undefined per the spec and DX12/HLSL resolves them differently from
+    // Metal/Vulkan — and the `!(x > y)` discard also fires on NaN.
     let box_dist = sd_rounded_box(in.local_pos, in.half_size, in.radii);
     let box_soft = max(length(vec2<f32>(dpdx(box_dist), dpdy(box_dist))), 1e-5);
-    let box_cov = smoothstep(box_soft, 0.0, box_dist);
+    let box_cov = 1.0 - smoothstep(0.0, box_soft, box_dist);
 
     // The expanding ink circle, anti-aliased over the same screen-space fringe.
     let circle_dist = length(in.local_pos - in.center_local) - in.radius_alpha.x;
-    let circle_cov = smoothstep(box_soft, 0.0, circle_dist);
+    let circle_cov = 1.0 - smoothstep(0.0, box_soft, circle_dist);
 
     let a = box_cov * circle_cov * in.color.a * in.radius_alpha.y;
-    if (a <= 0.0) {
+    if (!(a > 0.0)) {
         discard;
     }
     // Premultiplied output for the PREMULTIPLIED_ALPHA_BLENDING "over" state:
