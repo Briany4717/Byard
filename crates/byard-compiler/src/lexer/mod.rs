@@ -31,6 +31,16 @@ pub enum LexError {
     UnterminatedString,
 }
 
+/// Bit 32 of a [`Token::IntLit`], set at lex time on a hex literal written
+/// with **more than six digits** — the RFC-0005 §1 alpha-first `0xAARRGGBB`
+/// colour form. The tag is what lets a colour consumer distinguish
+/// `0x00FFFFFF` (transparent white, alpha byte explicitly written as zero)
+/// from `0xFFFFFF` (opaque white): the two are the same `i64` value.
+/// Channel extraction always truncates to `u32`, so the tag never bleeds
+/// into a colour; computed (untagged) values keep the magnitude heuristic
+/// (`> 0xFFFFFF` ⇒ alpha present).
+pub const COLOR_HAS_ALPHA_TAG: i64 = 1 << 32;
+
 /// The terminal set of the `byld` Lume surface (RFC-0002 §"Data structures",
 /// RFC-0003 §"Attribute syntax").
 ///
@@ -133,7 +143,24 @@ pub enum Token {
     /// An integer literal (`i64`; D9), decimal or hex (`0xRRGGBB` colors,
     /// RFC-0005 §1). Hex is listed first so `0x1E` is one hex int, not `0`
     /// followed by an identifier.
-    #[regex(r"0x[0-9a-fA-F]+", |lex| i64::from_str_radix(&lex.slice()[2..], 16).ok())]
+    ///
+    /// A hex literal with **more than six digits** is, per the RFC-0005 §1
+    /// colour contract, alpha-first `0xAARRGGBB` — and the written width is
+    /// semantic: `0x00FFFFFF` (transparent white) and `0xFFFFFF` (opaque
+    /// white) are the same `i64`, so the value alone cannot carry "the alpha
+    /// byte was written". Such literals are tagged with
+    /// [`COLOR_HAS_ALPHA_TAG`] (bit 32) here at lex time. Colour consumers
+    /// read the tag (or fall back to the magnitude heuristic for computed
+    /// values) and truncate to `u32` for the channels, so the tag never
+    /// reaches a channel; a >6-digit hex literal used as a plain *number* is
+    /// the one degenerate case this trades away (RFC-0005 reserves that
+    /// width for colours).
+    #[regex(r"0x[0-9a-fA-F]+", |lex| {
+        let digits = &lex.slice()[2..];
+        i64::from_str_radix(digits, 16)
+            .ok()
+            .map(|v| if digits.len() > 6 { v | COLOR_HAS_ALPHA_TAG } else { v })
+    })]
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     IntLit(i64),
     /// A raw string literal (possibly interpolated). The slice (via its span)

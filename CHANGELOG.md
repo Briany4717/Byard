@@ -12,6 +12,28 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Backdrop blur & vibrancy (RFC-0023 §2).** Four new paint-time style
+  properties — `blur: Float` (frosted-glass backdrop blur in logical px,
+  clamped to 40), `backdrop_tint: Color` (blended over the blurred sample; the
+  vibrancy pair with `blur`, a plain translucent wash without it),
+  `blur_saturation: Float` (vibrancy boost, default 1.8) and `blur_quality:
+  auto | high | low` (always the two-pass separable Gaussian — the tiers pick
+  the base resolution: 0.75× forced high, 0.25× forced low, GPU-probed 0.5×
+  or 0.25× on auto) — on every box-path intrinsic. `blur` is the Gaussian σ,
+  the CSS `backdrop-filter: blur(N)` convention. A blurred element samples
+  the scene behind it (its own background included), blurs it off-screen at
+  adaptively reduced resolution (tap spacing stays gap-free at any radius —
+  no ghosting), saturates and tints it, and draws the result as its
+  background clipped to its border radius; children render crisply on top
+  and overlapping panes stack naturally (painter's-order double blur). Both `blur` and `backdrop_tint` animate through the RFC-0010 `with`
+  chokepoints (`blur: 0 with anim.spring()` + `on hover { blur: 16 }`).
+  Engine surface: `frame::BackdropInstance` + `RenderFrame::{push_backdrop,
+  backdrops, backdrop_marks, backdrop_clips}` + `LayerMark::backdrop`,
+  `encoder::backdrop` (blur + composite pipelines), pass segmentation at
+  backdrop barriers, `EncoderSubsystem::set_blur_auto_capable`, and a runtime
+  `PerfWarning::OverlappingBlurs` diagnostic (≥ 3 stacked panes) surfaced by
+  `byard dev`. Example: `crates/byard-cli/examples/frosted_glass`.
+
 - **Material ripple ink (RFC-0023).** Four new paint-time style properties —
   `ripple: Color` (enables the effect and sets the ink colour),
   `ripple_active: Bool` (the trigger, typically `on pressed { ripple_active:
@@ -47,6 +69,27 @@ Byard uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `text::TextSizer` trait.
 
 ### Fixed
+
+- **Hit targets now follow the scroll offset (RFC-0005).** Interactive
+  elements inside a `ScrollView` registered their hit rects at the laid-out
+  position: after scrolling, a button reacted at the stale location and was
+  inert at its on-screen one. The scroll displacement (which paints through
+  the transform, deliberately excluded from hit-testing by RFC-0011/INV-8)
+  now travels separately through the render walk and shifts every hit rect —
+  handlers, hover/press regions, focusables — to its on-screen position,
+  clipped to the scroll viewport (content scrolled out of view is no longer
+  tappable). Ripple tap points and backdrop-blur sample regions map through
+  the same displacement.
+
+- **Colour `with` animations now animate the alpha byte.** A translucent
+  colour transition (`backdrop_tint: 0x00FFFFFF` → `0x80FFFFFF` on hover)
+  collapsed to an instant opaque colour: the OKLab interpolator dropped the
+  alpha byte, and `0x00FFFFFF` is numerically identical to opaque `0xFFFFFF`.
+  Hex colour literals written with more than six digits (the RFC-0005 §1
+  `0xAARRGGBB` form) are now tagged at lex time, every alpha-aware colour
+  consumer shares one auto-detect, and colour animations carry a fourth
+  alpha channel — so translucent tints, ripple inks, and shape colours fade
+  the way they read.
 
 - **Enum keyword props can no longer be shadowed by a same-named `var`.** A
   keyword-valued prop (`snap: page`, `axis: horizontal`, `align: center`,

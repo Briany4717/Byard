@@ -715,6 +715,19 @@ const STYLE_PROPS: &[(&str, &str)] = &[
         "ripple_duration",
         "Int (ripple fade-out ms, default 300, RFC-0023)",
     ),
+    (
+        "blur",
+        "Float (backdrop blur radius in px, max 40, RFC-0023)",
+    ),
+    (
+        "backdrop_tint",
+        "Color (tint over the blurred backdrop, RFC-0023)",
+    ),
+    (
+        "blur_saturation",
+        "Float (vibrancy boost, default 1.8, RFC-0023)",
+    ),
+    ("blur_quality", "Enum: auto | high | low (RFC-0023)"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

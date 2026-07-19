@@ -154,14 +154,28 @@ const TRANSFORM: &[(&str, PropType)] = &[
 /// trigger (typically flipped by an `on pressed { … }` state block);
 /// `ripple_radius` overrides the auto max radius (distance from the tap point
 /// to the farthest element corner) and `ripple_duration` the 300 ms default
-/// fade-out. Attached everywhere [`DECORATION`] is on the box render path —
-/// effects composite against an element's background, so they follow the same
-/// prop surface.
+/// fade-out. `blur` is the iOS frosted-glass backdrop blur (logical px,
+/// clamped to 40, `0` disables); `backdrop_tint` blends a colour over the
+/// blurred sample (with `blur`, the vibrancy pair; alone, a plain translucent
+/// wash); `blur_saturation` is the vibrancy saturation boost (default 1.8)
+/// and `blur_quality` the tier override (`auto`/`high`/`low`). Attached
+/// everywhere [`DECORATION`] is on the box render path — effects composite
+/// against an element's background, so they follow the same prop surface.
+/// `blur_quality` tokens (RFC-0023 resolved question "blur quality tiers").
+/// The kernel is always the separable Gaussian; the tiers pick the base
+/// resolution: `auto` probes the GPU at startup (0.5× on capable adapters,
+/// 0.25× on software ones), `high` forces the finest 0.75×, `low` the
+/// cheapest 0.25×.
+const BLUR_QUALITY: &[&str] = &["auto", "high", "low"];
 const EFFECTS: &[(&str, PropType)] = &[
     ("ripple", PropType::Color),
     ("ripple_active", PropType::Bool),
     ("ripple_radius", PropType::Float),
     ("ripple_duration", PropType::Int),
+    ("blur", PropType::Float),
+    ("backdrop_tint", PropType::Color),
+    ("blur_saturation", PropType::Float),
+    ("blur_quality", PropType::Enum(BLUR_QUALITY)),
 ];
 const TEXT_PROPS: &[(&str, PropType)] = &[
     ("typo", PropType::Typo),
@@ -1243,6 +1257,26 @@ pub fn inflate_hit_rect(rect: Rect, parent: Rect) -> Rect {
     Rect { x, y, w, h }
 }
 
+/// Whether a colour value carries an alpha byte: the lexer's >6-digit-hex
+/// tag ([`crate::lexer::COLOR_HAS_ALPHA_TAG`], which is what distinguishes
+/// `0x00FFFFFF` from `0xFFFFFF`), or — for computed/theme values that never
+/// went through a literal — the RFC-0011 magnitude heuristic (above
+/// `0xFFFFFF` is alpha-first `0xAARRGGBB`).
+#[must_use]
+pub fn color_has_alpha(hex: i64) -> bool {
+    #[allow(clippy::cast_sign_loss)]
+    let magnitude = (hex as u64) & 0xFFFF_FFFF;
+    hex & crate::lexer::COLOR_HAS_ALPHA_TAG != 0 || magnitude > 0x00FF_FFFF
+}
+
+/// [`color_to_rgba`] with the alpha byte auto-detected via
+/// [`color_has_alpha`] — the one resolver every alpha-aware colour consumer
+/// (ripple ink, `backdrop_tint`, shape colours) funnels through.
+#[must_use]
+pub fn color_rgba_auto(hex: i64) -> [f32; 4] {
+    color_to_rgba(hex, color_has_alpha(hex))
+}
+
 /// Parses a `Color` integer into RGBA `[f32; 4]` (6-digit ⇒ opaque, 8-digit ⇒
 /// alpha-first `0xAARRGGBB`) — RFC-0005 §1.
 #[must_use]
@@ -1356,6 +1390,21 @@ mod tests {
             .is_empty()
         );
         assert!(errs("View V() { Button(\"Save\") #[ripple: 0xFFFFFF] }").is_empty());
+    }
+
+    #[test]
+    fn blur_props_are_accepted_and_quality_is_a_closed_token_set() {
+        // RFC-0023 §2: the four backdrop props on the box render path.
+        assert!(
+            errs(
+                "View V() { Box #[blur: 20, backdrop_tint: 0x80FFFFFF, \
+                 blur_saturation: 1.8, blur_quality: high] {} }"
+            )
+            .is_empty()
+        );
+        // An unknown quality token is rejected against the closed set.
+        let e = errs("View V() { Box #[blur: 20, blur_quality: ultra] {} }");
+        assert!(!e.is_empty(), "unknown `blur_quality` token must error");
     }
 
     #[test]

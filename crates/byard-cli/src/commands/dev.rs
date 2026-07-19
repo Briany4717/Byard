@@ -146,6 +146,10 @@ struct ByldRuntime {
     /// Epoch for the animation clock (RFC-0010): `with` animations sample
     /// against ms elapsed since the logic runtime started.
     start: std::time::Instant,
+    /// Performance diagnostics already reported to the terminal (RFC-0023,
+    /// e.g. overlapping blurs), so each distinct warning prints once instead
+    /// of every frame.
+    reported_perf: std::collections::HashSet<String>,
 }
 
 impl ByldRuntime {
@@ -248,6 +252,21 @@ impl LogicRuntime for ByldRuntime {
             render_error_overlay(frame, errors, w, h);
         } else {
             self.interp.render(&self.tree, frame, w, h);
+            // RFC-0023 runtime perf diagnostics (e.g. ≥ 3 stacked frosted-glass
+            // panes): surface each distinct warning once on the terminal.
+            for warning in self.interp.perf_warnings() {
+                let text = match warning {
+                    byard_compiler::interp::eval::PerfWarning::OverlappingBlurs { count } => {
+                        format!(
+                            "perf: {count} overlapping backdrop-blur panes in one frame — \
+                             each pane re-blurs the ones below it (RFC-0023)"
+                        )
+                    }
+                };
+                if self.reported_perf.insert(text.clone()) {
+                    eprintln!("  {text}");
+                }
+            }
         }
     }
 }
@@ -509,6 +528,7 @@ impl PlatformHost for App {
                 width_bits: w_clone,
                 height_bits: h_clone,
                 start: std::time::Instant::now(),
+                reported_perf: std::collections::HashSet::new(),
             })
         })?;
 
