@@ -24,6 +24,7 @@
 //! [`ByardError::PipelineCompilation`](crate::ByardError::PipelineCompilation)
 //! — the engine never panics on a GPU error.
 
+pub mod backdrop;
 pub mod canvas_shape;
 pub mod decorated_box;
 pub mod gpu_timer;
@@ -50,7 +51,8 @@ use wgpu::util::DeviceExt;
 
 use crate::ByardError;
 use crate::frame::{
-    AtlasUpload, Rect, RenderFrame, RippleInstance, Transform, VectorInstance, Viewport,
+    AtlasUpload, BackdropInstance, LayerMark, Rect, RenderFrame, RippleInstance, Transform,
+    VectorInstance, Viewport,
 };
 use text_glyph::{TextGlyphPipeline, TextLine};
 use vector_msdf::VectorAtlas;
@@ -155,6 +157,12 @@ const QUAD_VERTICES: &[f32] = &[
 /// Initialised once via [`EncoderSubsystem::init`]. Holds `Arc` handles to
 /// the device and queue so the render thread can submit commands without
 /// locking the logic thread.
+// The four bools (`viewport_dirty`, `needs_full_redraw`, `blur_auto_capable`,
+// `gpu_timing_pending`) are orthogonal, independently-set flags owned by
+// different subsystem concerns — folding them into a state machine would
+// invent states that cannot exist and couple concerns RFC-0001 §9 keeps
+// apart, so the lint's suggestion does not apply here.
+#[allow(clippy::struct_excessive_bools)]
 pub struct EncoderSubsystem {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -204,6 +212,19 @@ pub struct EncoderSubsystem {
     /// group (group 0); transparent geometry, so it tests but never writes
     /// the draw-order depth buffer (RFC-0017 split).
     ripple_pipeline: wgpu::RenderPipeline,
+    /// Backdrop-blur pipelines (RFC-0023 §2, the eighth pipeline pair): the
+    /// off-screen blur passes plus the in-pass frosted-glass composite.
+    backdrop_pipelines: backdrop::BackdropPipelines,
+    /// Per-backdrop-slot blur scratch textures, cached across frames and
+    /// recreated only when a pane's region size changes.
+    blur_scratch: backdrop::ScratchCache,
+    /// Whether the `blur_quality: auto` tier runs at the capable 0.5× base
+    /// resolution on this device (RFC-0023 resolved question "blur quality
+    /// tiers"; the kernel is always the separable Gaussian — tiers differ in
+    /// resolution only). Set by the engine from the adapter probe
+    /// ([`set_blur_auto_capable`](Self::set_blur_auto_capable)); defaults to
+    /// the cheap 0.25× tier, so a bare encoder (tests) is deterministic.
+    blur_auto_capable: bool,
     /// The MSDF atlas: an array texture uploaded to by the JIT/AOT paths via
     /// [`RenderFrame::atlas_uploads`] (RFC-0009 §2-C, INV-8 — this is the only
     /// place `Queue::write_texture` is called for it).
@@ -315,6 +336,10 @@ pub struct EncoderSubsystem {
     /// rect must keep repainting until the last frame *after* it fades — the
     /// previous-bounds union is what erases the final frame of ink.
     last_ripple_bounds: Vec<Rect>,
+    /// Previous-frame bounds of every `BackdropInstance` (RFC-0023 §2), same
+    /// contract. A backdrop re-samples the scene behind it whenever anything
+    /// in the frame changed, so its pane is treated always-dirty like solids.
+    last_backdrop_bounds: Vec<Rect>,
     /// Per-`TextureSampler` bounding boxes from the previous call (M27),
     /// aligned with that call's `textures` slice.
     last_texture_bounds: Vec<Rect>,
@@ -528,6 +553,24 @@ impl EncoderSubsystem {
             draw_depth_stencil_no_write(),
         )
         .await?;
+        // Backdrop blur + composite pipelines (RFC-0023 §2). The composite is
+        // transparent geometry like the decorated pass (no-write depth).
+        let backdrop_pipelines = backdrop::build_pipelines(
+            &device,
+            &bind_group_layout,
+            wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            surface_format,
+            draw_depth_stencil_no_write(),
+        )
+        .await?;
 
         // The atlas is an *array* texture (`vector_msdf::ATLAS_LAYERS` layers):
         // it must be a real `GL_TEXTURE_2D_ARRAY` on the GL backend, so a single
@@ -564,6 +607,9 @@ impl EncoderSubsystem {
             vector_pipeline,
             canvas_pipeline,
             ripple_pipeline,
+            backdrop_pipelines,
+            blur_scratch: backdrop::ScratchCache::new(),
+            blur_auto_capable: false,
             vector_atlas,
             vector_ack_tx: None,
             io: None,
@@ -585,6 +631,7 @@ impl EncoderSubsystem {
             last_decorated_bounds: Vec::new(),
             last_canvas_bounds: Vec::new(),
             last_ripple_bounds: Vec::new(),
+            last_backdrop_bounds: Vec::new(),
             last_texture_bounds: Vec::new(),
             last_relay_version: 0,
             gpu_timer,
@@ -599,6 +646,16 @@ impl EncoderSubsystem {
     /// the `wgpu::Surface` without duplicating the device handle.
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    /// Resolves the `blur_quality: auto` tier for this device (RFC-0023
+    /// resolved question "blur quality tiers"): `true` selects the 0.5× base
+    /// resolution, `false` the cheap 0.25× one — the kernel is always the
+    /// separable Gaussian. The engine calls this once after adapter probing
+    /// (capable on everything except software/virtual adapters); a
+    /// per-element `blur_quality: high | low` always overrides it.
+    pub fn set_blur_auto_capable(&mut self, capable: bool) {
+        self.blur_auto_capable = capable;
     }
 
     /// Whether this encoder's GPU pass timing is active (RFC-0013 **P5**) —
@@ -753,6 +810,7 @@ impl EncoderSubsystem {
             &[],
             &[],
             &[],
+            (&[], &[]),
             DrawDepths::default(),
             FrameClips::default(),
             &[],
@@ -774,6 +832,9 @@ impl EncoderSubsystem {
         canvas_shapes: &[crate::frame::CanvasShape],
         ripples: &[RippleInstance],
         atlas_uploads: &[AtlasUpload],
+        // The backdrop pool and its parallel barrier snapshots (RFC-0023 §2),
+        // bundled to stay within the argument-count lint.
+        (backdrops, backdrop_marks): (&[BackdropInstance], &[LayerMark]),
         depths: DrawDepths<'_>,
         clips: FrameClips<'_>,
         layers: &[crate::frame::LayerMark],
@@ -836,6 +897,8 @@ impl EncoderSubsystem {
                     prev_canvas: &self.last_canvas_bounds,
                     ripples,
                     prev_ripples: &self.last_ripple_bounds,
+                    backdrops,
+                    prev_backdrops: &self.last_backdrop_bounds,
                 },
                 self.scale_factor,
                 self.phys_w,
@@ -852,13 +915,28 @@ impl EncoderSubsystem {
         // the scissor union (rect-based) would otherwise miss it entirely.
         let should_draw = full_redraw || scissor.is_some() || !atlas_uploads.is_empty();
 
+        // ── Pass segmentation (RFC-0017 z-layers × RFC-0023 backdrops) ────────
+        let totals = LayerMark {
+            solid: u32::try_from(instances.len()).unwrap_or(u32::MAX),
+            decorated: u32::try_from(decorated.len()).unwrap_or(u32::MAX),
+            texture: u32::try_from(textures.len()).unwrap_or(u32::MAX),
+            vector: u32::try_from(vectors.len()).unwrap_or(u32::MAX),
+            text: u32::try_from(texts.len()).unwrap_or(u32::MAX),
+            canvas: u32::try_from(canvas_shapes.len()).unwrap_or(u32::MAX),
+            ripple: u32::try_from(ripples.len()).unwrap_or(u32::MAX),
+            backdrop: u32::try_from(backdrops.len()).unwrap_or(u32::MAX),
+        };
+        let segments = compute_segments(layers, backdrop_marks, &totals);
+
         // ── Text prepare (before the render pass) ─────────────────────────────
         if should_draw {
             let viewport_dirty = self.viewport_dirty;
-            // One glyph batch per z-layer (RFC-0017 layered draw batches) —
-            // shaping inside `prepare` stays global, so this partition costs
-            // nothing beyond one extra small vertex buffer per extra layer.
-            let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
+            // One glyph batch per pass segment (z-layer batches, further split
+            // at backdrop barriers) — shaping inside `prepare` stays global,
+            // so this partition costs nothing beyond one extra small vertex
+            // buffer per extra segment.
+            let text_ranges: Vec<std::ops::Range<usize>> =
+                segments.iter().map(|s| s.text.clone()).collect();
             self.text_pipeline.prepare(
                 &self.device,
                 &self.queue,
@@ -882,6 +960,14 @@ impl EncoderSubsystem {
             });
 
         if should_draw {
+            let mut backdrop_draw = BackdropDraw {
+                pipes: &self.backdrop_pipelines,
+                scratch: &mut self.blur_scratch,
+                persistent: &self.persistent_color,
+                format: self.surface_format,
+                auto_capable: self.blur_auto_capable,
+                backdrops,
+            };
             draw_ui_pass(
                 &mut encoder,
                 &self.persistent_view,
@@ -904,7 +990,6 @@ impl EncoderSubsystem {
                 (self.scale_factor, self.phys_w, self.phys_h),
                 &DrawPrimitives {
                     instances,
-                    texts,
                     decorated,
                     textures,
                     texture_cache: &self.texture_cache,
@@ -917,8 +1002,9 @@ impl EncoderSubsystem {
                     texture_depths: depths.texture,
                     canvas_depths: depths.canvas,
                     clips,
-                    layers,
                 },
+                &segments,
+                &mut backdrop_draw,
                 self.gpu_timer.as_ref(),
             )?;
             // Only when a pass actually ran this frame — resolving an
@@ -964,6 +1050,7 @@ impl EncoderSubsystem {
             textures,
             canvas_shapes,
             ripples,
+            backdrops,
         );
 
         Ok(encoder.finish())
@@ -1018,6 +1105,7 @@ impl EncoderSubsystem {
                 frame.canvas_shapes(),
                 frame.ripples(),
                 frame.atlas_uploads(),
+                (frame.backdrops(), frame.backdrop_marks()),
                 frame_draw_depths(frame),
                 frame_clips(frame),
                 frame.layer_marks(),
@@ -1035,6 +1123,7 @@ impl EncoderSubsystem {
             frame.canvas_shapes(),
             frame.ripples(),
             frame.atlas_uploads(),
+            (frame.backdrops(), frame.backdrop_marks()),
             frame_draw_depths(frame),
             frame_clips(frame),
             frame.layer_marks(),
@@ -1117,6 +1206,7 @@ impl EncoderSubsystem {
 ///
 /// Extracted out of `encode_frame` purely to keep that function under
 /// clippy's line-count threshold.
+#[allow(clippy::too_many_arguments)]
 fn update_frame_bookkeeping(
     state: &mut EncoderSubsystem,
     instances: &[BoxInstance],
@@ -1125,6 +1215,7 @@ fn update_frame_bookkeeping(
     textures: &[crate::frame::TextureSampler],
     canvas_shapes: &[crate::frame::CanvasShape],
     ripples: &[RippleInstance],
+    backdrops: &[BackdropInstance],
 ) {
     state.needs_full_redraw = false;
     state.last_instance_count = instances.len();
@@ -1141,6 +1232,7 @@ fn update_frame_bookkeeping(
         .map(crate::frame::CanvasShape::bounds)
         .collect();
     state.last_ripple_bounds = ripples.iter().map(|r| rect_of(r.rect)).collect();
+    state.last_backdrop_bounds = backdrops.iter().map(|b| rect_of(b.rect)).collect();
     state.last_texture_bounds = textures.iter().map(|t| rect_of(t.rect)).collect();
 }
 
@@ -1206,6 +1298,8 @@ pub struct FrameClips<'a> {
     pub canvas: &'a [Option<u16>],
     /// Parallel to `RippleInstance`s (RFC-0023).
     pub ripple: &'a [Option<u16>],
+    /// Parallel to `BackdropInstance`s (RFC-0023 §2).
+    pub backdrop: &'a [Option<u16>],
     /// Per-`TextLine` wrap width in logical px (RFC-0018 text wrap); `Some(w)`
     /// shapes that line bounded to `w` so it wraps. Carried alongside the clip
     /// slices because it is another per-text-line parallel slice consumed by the
@@ -1224,6 +1318,7 @@ fn frame_clips(frame: &RenderFrame) -> FrameClips<'_> {
         vector: frame.vector_clips(),
         canvas: frame.canvas_clips(),
         ripple: frame.ripple_clips(),
+        backdrop: frame.backdrop_clips(),
         text_wrap: frame.text_wraps(),
     }
 }
@@ -1243,7 +1338,6 @@ fn frame_draw_depths(frame: &RenderFrame) -> DrawDepths<'_> {
 #[derive(Clone, Copy)]
 struct DrawPrimitives<'a> {
     instances: &'a [BoxInstance],
-    texts: &'a [TextLine],
     decorated: &'a [crate::frame::DecoratedBox],
     textures: &'a [crate::frame::TextureSampler],
     texture_cache: &'a texture_sampler::TextureCache,
@@ -1268,37 +1362,110 @@ struct DrawPrimitives<'a> {
     canvas_depths: &'a [f32],
     /// Content-clip table + per-pool clip slices (RFC-0005 `ScrollView`).
     clips: FrameClips<'a>,
-    /// Z-layer boundaries (RFC-0017 layered draw batches): pool cursors at
-    /// each [`RenderFrame::begin_layer`] call. Empty = one layer = the exact
-    /// pre-layering draw stream.
-    layers: &'a [crate::frame::LayerMark],
 }
 
-/// Partitions one drawable pool into its per-z-layer index ranges (RFC-0017
-/// layered draw batches): `marks` are the pool cursors recorded at each layer
-/// boundary, `total` is the pool's final length, and `field` selects this
-/// pool's cursor out of a [`LayerMark`](crate::frame::LayerMark). Always
-/// returns `marks.len() + 1` contiguous, non-overlapping ranges covering
-/// `0..total` — the degenerate no-marks case is the single full range.
+/// One contiguous slice of the frame's draw stream, rendered inside a single
+/// `wgpu` render pass: per-pool index ranges plus an optional RFC-0023 §2
+/// backdrop barrier to honour after drawing it.
 ///
-/// Cursors are clamped monotonically (a decreasing or overshooting mark can
-/// come only from a logic-thread bug, and must degrade to an empty layer, not
-/// a panic or an out-of-bounds slice on the render thread). Pure and
-/// unit-testable without any GPU state, per the project's CPU-mirror pattern.
-fn layer_pool_ranges(
-    marks: &[crate::frame::LayerMark],
-    total: usize,
-    field: impl Fn(&crate::frame::LayerMark) -> u32,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::with_capacity(marks.len() + 1);
-    let mut start = 0usize;
-    for m in marks {
-        let cut = (field(m) as usize).clamp(start, total);
-        ranges.push(start..cut);
-        start = cut;
+/// Segments are the product of two partitions of the same emission-ordered
+/// stream: RFC-0017 z-layer boundaries (which never split the pass — they
+/// only order batches within it) and RFC-0023 backdrop barriers (which *do*
+/// split the pass, because the pane must sample everything drawn before it).
+/// A frame with no layers and no backdrops is exactly one segment — the
+/// classic single-pass draw stream, byte for byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SegmentRanges {
+    solid: std::ops::Range<usize>,
+    decorated: std::ops::Range<usize>,
+    texture: std::ops::Range<usize>,
+    vector: std::ops::Range<usize>,
+    text: std::ops::Range<usize>,
+    canvas: std::ops::Range<usize>,
+    ripple: std::ops::Range<usize>,
+    /// `Some(b)`: after drawing this segment, end the pass, blur what has
+    /// been rasterised so far for backdrop `b`, and composite `b` at the
+    /// start of the next segment's pass.
+    backdrop_after: Option<usize>,
+}
+
+/// Field-wise clamp of a pool-cursor snapshot into `[lo, hi]` — the same
+/// monotonic-degrade contract as the old per-pool range partitioning: a
+/// decreasing or overshooting cursor (a logic-thread bug) collapses to an
+/// empty sub-range on the render thread, never a panic or an out-of-bounds
+/// slice.
+fn mark_clamped(m: &LayerMark, lo: &LayerMark, hi: &LayerMark) -> LayerMark {
+    LayerMark {
+        solid: m.solid.clamp(lo.solid, hi.solid),
+        decorated: m.decorated.clamp(lo.decorated, hi.decorated),
+        texture: m.texture.clamp(lo.texture, hi.texture),
+        vector: m.vector.clamp(lo.vector, hi.vector),
+        text: m.text.clamp(lo.text, hi.text),
+        canvas: m.canvas.clamp(lo.canvas, hi.canvas),
+        ripple: m.ripple.clamp(lo.ripple, hi.ripple),
+        backdrop: m.backdrop.clamp(lo.backdrop, hi.backdrop),
     }
-    ranges.push(start..total);
-    ranges
+}
+
+/// The [`SegmentRanges`] between two clamped cursor snapshots.
+fn ranges_between(a: &LayerMark, b: &LayerMark, backdrop_after: Option<usize>) -> SegmentRanges {
+    SegmentRanges {
+        solid: a.solid as usize..b.solid as usize,
+        decorated: a.decorated as usize..b.decorated as usize,
+        texture: a.texture as usize..b.texture as usize,
+        vector: a.vector as usize..b.vector as usize,
+        text: a.text as usize..b.text as usize,
+        canvas: a.canvas as usize..b.canvas as usize,
+        ripple: a.ripple as usize..b.ripple as usize,
+        backdrop_after,
+    }
+}
+
+/// Partitions the frame's draw stream into render-pass segments: one per
+/// z-layer (RFC-0017), further split at every RFC-0023 backdrop barrier that
+/// falls inside that layer. Pure and unit-testable without any GPU state,
+/// per the project's CPU-mirror pattern. Always returns at least one segment
+/// covering `0..totals` for every pool.
+fn compute_segments(
+    layers: &[LayerMark],
+    backdrop_marks: &[LayerMark],
+    totals: &LayerMark,
+) -> Vec<SegmentRanges> {
+    let mut segments = Vec::with_capacity(layers.len() + backdrop_marks.len() + 1);
+    let mut cursor = LayerMark::default();
+    for l in 0..=layers.len() {
+        let end = mark_clamped(layers.get(l).unwrap_or(totals), &cursor, totals);
+        // Backdrops emitted inside this layer, in emission order.
+        let b_start = cursor.backdrop as usize;
+        let b_end = (end.backdrop as usize).min(backdrop_marks.len());
+        for (b, mark) in backdrop_marks.iter().enumerate().take(b_end).skip(b_start) {
+            let mut mid = mark_clamped(mark, &cursor, &end);
+            segments.push(ranges_between(&cursor, &mid, Some(b)));
+            mid.backdrop = u32::try_from(b + 1).unwrap_or(u32::MAX);
+            cursor = mid;
+        }
+        segments.push(ranges_between(&cursor, &end, None));
+        cursor = end;
+    }
+    segments
+}
+
+/// Everything `draw_ui_pass` needs to honour RFC-0023 backdrop barriers,
+/// bundled (with the mutable scratch cache) to stay within the
+/// argument-count lint.
+struct BackdropDraw<'a> {
+    /// The blur + composite pipelines.
+    pipes: &'a backdrop::BackdropPipelines,
+    /// Per-slot scratch texture cache (mutable: recreated on size change).
+    scratch: &'a mut backdrop::ScratchCache,
+    /// The persistent colour target the regions are copied out of.
+    persistent: &'a wgpu::Texture,
+    /// Its pixel format (scratch textures match it).
+    format: wgpu::TextureFormat,
+    /// The startup GPU probe's answer for the `auto` quality tier.
+    auto_capable: bool,
+    /// The frame's backdrop pool.
+    backdrops: &'a [BackdropInstance],
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1316,6 +1483,10 @@ fn draw_ui_pass(
     // (scale_factor, physical width, physical height) — for clip→scissor math.
     dims: (f32, u32, u32),
     primitives: &DrawPrimitives<'_>,
+    // The pass segmentation (z-layers × backdrop barriers) computed by
+    // `encode_frame_with_decorations` — also the text batch partition.
+    segments: &[SegmentRanges],
+    bd: &mut BackdropDraw<'_>,
     gpu_timer: Option<&GpuTimer>,
 ) -> Result<(), ByardError> {
     let DrawPipelines {
@@ -1329,7 +1500,6 @@ fn draw_ui_pass(
     } = *pipelines;
     let DrawPrimitives {
         instances,
-        texts,
         decorated,
         textures,
         texture_cache,
@@ -1342,7 +1512,6 @@ fn draw_ui_pass(
         texture_depths,
         canvas_depths,
         clips,
-        layers,
     } = *primitives;
     // The base scissor every clipped draw intersects with: the dirty region on
     // an incremental frame, or the whole physical target on a full redraw.
@@ -1358,90 +1527,116 @@ fn draw_ui_pass(
         phys_w,
         phys_h,
     };
-    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("ByardCore - UI Render Pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: persistent_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: if full_redraw {
-                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                } else {
-                    wgpu::LoadOp::Load
-                },
-                store: wgpu::StoreOp::Store,
-            },
-            // wgpu 29: new field; None = standard 2-D rendering (no depth slice).
-            depth_slice: None,
-        })],
-        // The draw-order depth buffer is frame-local scratch: every primitive is
-        // re-emitted (and re-depth-stamped) each frame, so it's cleared to the
-        // far plane every pass, even incremental ones. That keeps depth ordering
-        // correct within the frame without any cross-frame depth bookkeeping,
-        // and (colour is `Load`ed on incremental frames) doesn't disturb the
-        // preserved pixels outside the scissor.
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: depth_view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(crate::frame::DRAW_DEPTH_CLEAR),
-                store: wgpu::StoreOp::Discard,
-            }),
-            stencil_ops: None,
-        }),
-        timestamp_writes: gpu_timer.and_then(|t| t.timestamp_writes(GPU_UI_PASS_SCOPE)),
-        occlusion_query_set: None,
-        // wgpu 28: new required field; None disables multiview rendering.
-        multiview_mask: None,
-    });
-
-    // Restrict fragment writes to the dirty region on an incremental frame,
-    // and wipe exactly that region first — see
-    // `EncoderSubsystem::clear_pipeline`'s doc comment for why a clear pass
-    // is required before standard alpha-blended redraw can erase stale
-    // content. A full redraw draws unscissored and already cleared the
-    // whole target via `LoadOp::Clear` above, so no clear quad is needed in
-    // that case.
-    if let Some((bounds, x, y, w, h)) = scissor {
-        render_pass.set_scissor_rect(x, y, w, h);
-        draw_clear_quad(
-            &mut render_pass,
-            device,
-            clear_pipeline,
-            viewport_bind_group,
-            quad_buffer,
-            bounds,
-        );
-    }
-
-    // ── Z-layer interleaved draw batches (RFC-0017) ───────────────────────────
+    // ── Segmented draw (RFC-0017 z-layers × RFC-0023 backdrop barriers) ───────
     //
-    // One iteration per z-layer, all inside this single render pass (pipeline
-    // re-binds between batches are cheap; a pass break — the thing that
-    // flushes the tile buffer on TBDR GPUs — never happens). Within a layer
-    // the shared depth buffer keeps resolving paint order exactly as before;
-    // across layers, draw order itself now matches emission order, so a later
-    // layer's *transparent* geometry (a modal scrim, a dialog shadow)
-    // genuinely alpha-blends over an earlier layer's text and images instead
-    // of being drawn before the frame-final text batch. With no layer marks
-    // this loop runs exactly once over the full pools — the pre-layering draw
-    // stream, byte for byte.
-    let solid_ranges = layer_pool_ranges(layers, instances.len(), |m| m.solid);
-    let decorated_ranges = layer_pool_ranges(layers, decorated.len(), |m| m.decorated);
-    let texture_ranges = layer_pool_ranges(layers, textures.len(), |m| m.texture);
-    let vector_ranges = layer_pool_ranges(layers, vectors.len(), |m| m.vector);
-    let text_ranges = layer_pool_ranges(layers, texts.len(), |m| m.text);
-    let canvas_ranges = layer_pool_ranges(layers, canvas_shapes.len(), |m| m.canvas);
-    let ripple_ranges = layer_pool_ranges(layers, ripples.len(), |m| m.ripple);
+    // One iteration per segment. Without backdrops there is one segment per
+    // z-layer and — critically — every segment after the first is only ever
+    // *created* when a backdrop barrier or additional layer exists, so the
+    // no-effects frame still renders inside batches of the very first pass:
+    // the classic single-pass stream, byte for byte. A backdrop barrier ends
+    // the pass (everything behind the pane is now rasterised), records the
+    // region copy + blur passes, and the next segment's pass opens by
+    // compositing the pane before drawing its own primitives. Within any
+    // pass the shared depth buffer keeps resolving paint order exactly as
+    // before; across passes the depth buffer is stored and re-loaded so
+    // occlusion still spans the whole frame.
+    let mut pending: Option<(usize, backdrop::PreparedBackdrop)> = None;
+    let seg_count = segments.len();
+    for (i, seg) in segments.iter().enumerate() {
+        let first = i == 0;
+        let last = i + 1 == seg_count;
+        // Composite prepared between the previous segment and this one; held
+        // in a local so it outlives this pass's recording.
+        let taken = pending.take();
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ByardCore - UI Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: persistent_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: if first && full_redraw {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+                // wgpu 29: new field; None = standard 2-D rendering.
+                depth_slice: None,
+            })],
+            // The draw-order depth buffer is frame-local scratch: cleared to
+            // the far plane at the first pass of every frame, carried across
+            // backdrop pass-splits (Store + Load) so occlusion spans the
+            // whole frame, and discarded after the last segment.
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: if first {
+                        wgpu::LoadOp::Clear(crate::frame::DRAW_DEPTH_CLEAR)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: if last {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
+                    },
+                }),
+                stencil_ops: None,
+            }),
+            // The single GPU-timed scope brackets the first segment (the
+            // whole frame when no backdrop splits the pass).
+            timestamp_writes: if first {
+                gpu_timer.and_then(|t| t.timestamp_writes(GPU_UI_PASS_SCOPE))
+            } else {
+                None
+            },
+            occlusion_query_set: None,
+            // wgpu 28: new required field; None disables multiview rendering.
+            multiview_mask: None,
+        });
 
-    let layer_count = layers.len() + 1;
-    for layer in 0..layer_count {
-        let sr = &solid_ranges[layer];
-        let dr = &decorated_ranges[layer];
-        let tr = &texture_ranges[layer];
-        let vr = &vector_ranges[layer];
-        let xr = &text_ranges[layer];
-        let cr = &canvas_ranges[layer];
-        let rr = &ripple_ranges[layer];
+        // Restrict fragment writes to the dirty region on an incremental
+        // frame, and wipe exactly that region first (see
+        // `EncoderSubsystem::clear_pipeline`) — first segment only: later
+        // segments keep drawing into the already-cleared region (every draw
+        // below re-establishes its own scissor via the clip runs).
+        if first {
+            if let Some((bounds, x, y, w, h)) = scissor {
+                render_pass.set_scissor_rect(x, y, w, h);
+                draw_clear_quad(
+                    &mut render_pass,
+                    device,
+                    clear_pipeline,
+                    viewport_bind_group,
+                    quad_buffer,
+                    bounds,
+                );
+            }
+        }
+
+        // The frosted-glass pane whose barrier ended the previous segment:
+        // its blurred sample is ready, composite it before this segment's
+        // own primitives (its stamped depth keeps it below them anyway).
+        if let Some((bidx, prep)) = taken.as_ref() {
+            backdrop::draw_composite(
+                &mut render_pass,
+                bd.pipes,
+                viewport_bind_group,
+                quad_buffer,
+                prep,
+                clips.backdrop.get(*bidx).copied().flatten(),
+                clip_ctx,
+            );
+        }
+
+        let sr = &seg.solid;
+        let dr = &seg.decorated;
+        let tr = &seg.texture;
+        let vr = &seg.vector;
+        let xr = &seg.text;
+        let cr = &seg.canvas;
+        let rr = &seg.ripple;
 
         // Drawn on every call to this function, not just a full redraw — the
         // clear quad above can wipe a box's area on an incremental frame, so
@@ -1547,16 +1742,39 @@ fn draw_ui_pass(
             }
         }
 
-        // This layer's glyph batch. `prepare` (called before this pass began)
-        // saw the full, unfiltered `texts` slice partitioned by the same layer
-        // ranges — its internal cache is positionally index-aligned with that
-        // slice, so filtering to only the dirty lines here would silently
-        // associate a non-dirty line's cached glyph buffer with the wrong
-        // line. The scissor rect set above (on incremental frames) is what
-        // actually limits which pixels this call may write — not the slice
-        // contents.
+        // This segment's glyph batch. `prepare` (called before any pass
+        // began) saw the full, unfiltered `texts` slice partitioned by the
+        // same segment ranges — its internal cache is positionally
+        // index-aligned with that slice, so filtering to only the dirty
+        // lines here would silently associate a non-dirty line's cached
+        // glyph buffer with the wrong line. The scissor rect set above (on
+        // incremental frames) is what actually limits which pixels this
+        // call may write — not the slice contents.
         if !xr.is_empty() {
-            text_pipeline.render_layer(&mut render_pass, layer)?;
+            text_pipeline.render_layer(&mut render_pass, i)?;
+        }
+
+        // A backdrop barrier: end this pass (dropping the recorder), record
+        // the region copy + blur for the pane, and let the next segment's
+        // pass composite it (RFC-0023 §2 steps 2–4).
+        drop(render_pass);
+        if let Some(b) = seg.backdrop_after {
+            if let Some(instance) = bd.backdrops.get(b) {
+                pending = backdrop::prepare(
+                    encoder,
+                    device,
+                    bd.pipes,
+                    bd.scratch,
+                    b,
+                    bd.persistent,
+                    instance,
+                    scale,
+                    (phys_w, phys_h),
+                    bd.format,
+                    bd.auto_capable,
+                )
+                .map(|p| (b, p));
+            }
         }
     }
 
@@ -1761,6 +1979,15 @@ fn dirty_ripple_bounds(ripples: &[RippleInstance], previous: &[Rect]) -> Option<
     union_dirty_rects(ripples.iter().map(|r| (rect_of(r.rect), true)), previous)
 }
 
+/// `dirty_text_bounds` for the `Backdrop` pipeline (RFC-0023 §2). A pane
+/// re-samples whatever is behind it on every drawn frame, so it is treated
+/// always-dirty like solids: whenever *anything* in the frame changed, the
+/// pane's region joins the union and it re-blurs — and the previous-frame
+/// bounds erase a pane that shrank or unmounted.
+fn dirty_backdrop_bounds(backdrops: &[BackdropInstance], previous: &[Rect]) -> Option<Rect> {
+    union_dirty_rects(backdrops.iter().map(|b| (rect_of(b.rect), true)), previous)
+}
+
 /// `dirty_text_bounds` for the `TextureSampler` pipeline (M27); dirtiness comes
 /// from each sampler's own [`TextureSampler::dirty`](crate::frame::TextureSampler::dirty)
 /// bit.
@@ -1804,6 +2031,8 @@ struct ScissorInputs<'a> {
     prev_canvas: &'a [Rect],
     ripples: &'a [RippleInstance],
     prev_ripples: &'a [Rect],
+    backdrops: &'a [BackdropInstance],
+    prev_backdrops: &'a [Rect],
 }
 
 #[cfg(test)]
@@ -1825,6 +2054,8 @@ impl<'a> ScissorInputs<'a> {
             canvas_shapes: &[],
             ripples: &[],
             prev_ripples: &[],
+            backdrops: &[],
+            prev_backdrops: &[],
             prev_canvas: &[],
         }
     }
@@ -1933,7 +2164,10 @@ fn compute_scissor(
         ),
         union_opt(
             dirty_canvas_bounds(inputs.canvas_shapes, inputs.prev_canvas),
-            dirty_ripple_bounds(inputs.ripples, inputs.prev_ripples),
+            union_opt(
+                dirty_ripple_bounds(inputs.ripples, inputs.prev_ripples),
+                dirty_backdrop_bounds(inputs.backdrops, inputs.prev_backdrops),
+            ),
         ),
     )?;
     let (x, y, w, h) = logical_rect_to_physical_scissor(bounds, scale, max_w, max_h);
@@ -2321,14 +2555,27 @@ mod tests {
             text: n,
             canvas: n,
             ripple: n,
+            backdrop: n,
         }
+    }
+
+    /// The per-segment text ranges — the pool the ported layer-partition
+    /// tests below assert on (every pool follows the same arithmetic).
+    fn text_ranges(segments: &[SegmentRanges]) -> Vec<std::ops::Range<usize>> {
+        segments.iter().map(|s| s.text.clone()).collect()
     }
 
     #[test]
     fn no_marks_is_one_full_range() {
         let none: &[crate::frame::LayerMark] = &[];
-        assert_eq!(layer_pool_ranges(none, 5, |m| m.text), vec![0..5]);
-        assert_eq!(layer_pool_ranges(none, 0, |m| m.text), vec![0..0]);
+        assert_eq!(
+            text_ranges(&compute_segments(none, &[], &mark(5))),
+            vec![0..5]
+        );
+        assert_eq!(
+            text_ranges(&compute_segments(none, &[], &mark(0))),
+            vec![0..0]
+        );
     }
 
     #[test]
@@ -2336,7 +2583,7 @@ mod tests {
         let marks = [mark(2), mark(2), mark(4)];
         // Layer 1 is empty (two marks at the same cursor) — legal, draws nothing.
         assert_eq!(
-            layer_pool_ranges(&marks, 6, |m| m.text),
+            text_ranges(&compute_segments(&marks, &[], &mark(6))),
             vec![0..2, 2..2, 2..4, 4..6]
         );
     }
@@ -2348,9 +2595,65 @@ mod tests {
         // a logic-thread bug degrades to a misdrawn layer, never a panic.
         let marks = [mark(9), mark(1)];
         assert_eq!(
-            layer_pool_ranges(&marks, 4, |m| m.text),
+            text_ranges(&compute_segments(&marks, &[], &mark(4))),
             vec![0..4, 4..4, 4..4]
         );
+    }
+
+    // ── Backdrop barriers split segments (RFC-0023 §2) ─────────────────────────
+
+    /// A [`crate::frame::LayerMark`] with every pool cursor at `n` except the
+    /// backdrop cursor, which sits at `b`.
+    fn mark_b(n: u32, b: u32) -> crate::frame::LayerMark {
+        crate::frame::LayerMark {
+            backdrop: b,
+            ..mark(n)
+        }
+    }
+
+    #[test]
+    fn a_backdrop_barrier_splits_the_single_layer_into_two_segments() {
+        // 6 primitives per pool, one backdrop whose barrier snapshot sits at
+        // cursor 4: segment 0 draws 0..4 then blurs for pane 0; segment 1
+        // composites it and draws 4..6.
+        let segs = compute_segments(&[], &[mark_b(4, 0)], &mark_b(6, 1));
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, 0..4);
+        assert_eq!(segs[0].backdrop_after, Some(0));
+        assert_eq!(segs[1].text, 4..6);
+        assert_eq!(segs[1].backdrop_after, None);
+    }
+
+    #[test]
+    fn two_backdrops_in_one_layer_stack_in_painter_order() {
+        // The upper pane's barrier (cursor 5) comes after the lower's
+        // (cursor 2) — natural painter's order, the RFC's "double blur".
+        let segs = compute_segments(&[], &[mark_b(2, 0), mark_b(5, 1)], &mark_b(8, 2));
+        assert_eq!(text_ranges(&segs), vec![0..2, 2..5, 5..8]);
+        assert_eq!(segs[0].backdrop_after, Some(0));
+        assert_eq!(segs[1].backdrop_after, Some(1));
+        assert_eq!(segs[2].backdrop_after, None);
+    }
+
+    #[test]
+    fn a_backdrop_inside_an_overlay_layer_splits_only_that_layer() {
+        // Layer boundary at cursor 3 (no backdrops in the main layer); the
+        // overlay layer holds one backdrop at cursor 5.
+        let layers = [mark_b(3, 0)];
+        let segs = compute_segments(&layers, &[mark_b(5, 0)], &mark_b(8, 1));
+        assert_eq!(text_ranges(&segs), vec![0..3, 3..5, 5..8]);
+        assert_eq!(segs[0].backdrop_after, None, "main layer intact");
+        assert_eq!(segs[1].backdrop_after, Some(0));
+        assert_eq!(segs[2].backdrop_after, None);
+    }
+
+    #[test]
+    fn a_malformed_backdrop_cursor_clamps_into_its_layer() {
+        // The barrier snapshot overshoots the pool: it clamps to the layer
+        // end — an empty trailing segment, never a panic.
+        let segs = compute_segments(&[], &[mark_b(9, 0)], &mark_b(4, 1));
+        assert_eq!(text_ranges(&segs), vec![0..4, 4..4]);
+        assert_eq!(segs[0].backdrop_after, Some(0));
     }
 
     #[test]
@@ -2380,6 +2683,7 @@ mod tests {
         let forbidden_call = ["LayoutAtlas", "::", "compute"].concat();
         for (name, src) in [
             ("mod.rs", include_str!("mod.rs")),
+            ("backdrop.rs", include_str!("backdrop.rs")),
             ("canvas_shape.rs", include_str!("canvas_shape.rs")),
             ("decorated_box.rs", include_str!("decorated_box.rs")),
             ("gpu_timer.rs", include_str!("gpu_timer.rs")),

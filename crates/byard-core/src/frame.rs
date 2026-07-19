@@ -679,6 +679,74 @@ pub struct RippleInstance {
     pub depth: f32,
 }
 
+/// [`BackdropInstance::quality`] tier: auto-select from the GPU capability
+/// probed at startup (RFC-0023 resolved question "Blur quality tiers"). The
+/// kernel is always the two-pass separable Gaussian — the tiers differ only
+/// in base resolution: `auto` runs at 0.5× on capable GPUs and drops to the
+/// cheap 0.25× on software/virtual adapters.
+pub const BLUR_QUALITY_AUTO: u32 = 0;
+/// [`BackdropInstance::quality`] tier: force the cheap 0.25× base
+/// resolution (`blur_quality: low`).
+pub const BLUR_QUALITY_LOW: u32 = 1;
+/// [`BackdropInstance::quality`] tier: force the finest 0.75× base
+/// resolution (`blur_quality: high`).
+pub const BLUR_QUALITY_HIGH: u32 = 2;
+
+/// Maximum accepted `blur` radius in logical pixels (RFC-0023 §2: "blur
+/// radius is clamped to a maximum to bound kernel size"). The evaluator
+/// clamps at emission; the encoder trusts the clamp.
+pub const BLUR_MAX_RADIUS: f32 = 40.0;
+
+/// One backdrop-blur surface (RFC-0023 §2): the iOS frosted-glass/vibrancy
+/// effect. The element's rect samples the scene *behind* it — everything
+/// emitted before this instance, its own background included (RFC-0023 §4
+/// compositing order) — blurs it, boosts saturation, blends `tint` on top,
+/// and draws the result as the element's background, clipped to its rounded
+/// rect. Children and later elements render on top.
+///
+/// Unlike every other primitive, a backdrop is a **barrier**: the encoder
+/// must have rasterised everything emitted before it into the colour target
+/// before it can sample. [`RenderFrame::push_backdrop`] therefore records a
+/// pool-cursor snapshot ([`RenderFrame::backdrop_marks`]) alongside each
+/// instance, and the encoder splits its single UI pass into segments at
+/// those cursors — zero segments (the single classic pass) when no backdrop
+/// is live.
+///
+/// Lives in `frame` because it crosses the Evaluator → Encoder subsystem
+/// boundary (RFC-0001 §9).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BackdropInstance {
+    /// The element rect `[x, y, width, height]` in logical pixels — both the
+    /// quad geometry and the sampling region behind the element.
+    pub rect: [f32; 4],
+    /// Per-corner clip radii `[tl, tr, br, bl]` — the element's own border
+    /// radii, so the glass pane matches its outline exactly.
+    pub radii: [f32; 4],
+    /// Gaussian blur σ in logical pixels — the CSS `backdrop-filter:
+    /// blur(N)` convention the RFC cites as its inspiration — already
+    /// clamped to [`BLUR_MAX_RADIUS`] by the evaluator; always `> 0` (a
+    /// blur-less tint never becomes a backdrop — the evaluator lowers it to
+    /// a plain translucent fill instead).
+    pub blur: f32,
+    /// `backdrop_tint` colour `[r, g, b, a]`, blended over the blurred
+    /// sample (`a = 0` disables the tint).
+    pub tint: [f32; 4],
+    /// `blur_saturation` boost applied to the blurred sample before the tint
+    /// (RFC-0023: default 1.8, the iOS vibrancy look; `1.0` is neutral).
+    pub saturation: f32,
+    /// Quality tier: one of [`BLUR_QUALITY_AUTO`] / [`BLUR_QUALITY_LOW`] /
+    /// [`BLUR_QUALITY_HIGH`].
+    pub quality: u32,
+    /// Element opacity (ancestor-folded, RFC-0011) multiplied into the pane.
+    pub opacity: f32,
+    /// Paint-time transform (RFC-0011 group transforms) applied to the quad.
+    pub transform: Transform,
+    /// Draw-order depth (NDC-z), stamped by
+    /// [`RenderFrame::push_backdrop`] — after the element's background,
+    /// before its ripple and children.
+    pub depth: f32,
+}
+
 /// Shape-kind discriminant for a [`CanvasShape`] (RFC-0020 §2, Tier 1): a
 /// circular arc. `params = [cx, cy, r, start_rad, sweep_rad, 0, 0, 0]`.
 pub const CANVAS_SHAPE_ARC: u32 = 0;
@@ -1002,6 +1070,17 @@ pub struct RenderFrame {
     /// its own draw-order depth (stamped at push, like `vector_instances`).
     ripples: Vec<RippleInstance>,
 
+    /// Backdrop-blur surfaces (RFC-0023 §2): frosted-glass panes that sample,
+    /// blur, saturate, and tint the scene behind them.
+    backdrops: Vec<BackdropInstance>,
+    /// One pool-cursor snapshot per backdrop, recorded at
+    /// [`push_backdrop`](Self::push_backdrop): everything at pool indices
+    /// strictly below the snapshot was emitted *behind* that backdrop, which
+    /// is exactly the set the encoder must rasterise before sampling. The
+    /// [`LayerMark`] shape is reused — it is precisely "a cursor into every
+    /// pool".
+    backdrop_marks: Vec<LayerMark>,
+
     /// Pending MSDF-atlas uploads recorded by the logic thread this tick
     /// (RFC-0009 §2-C / INV-8). Applied by the render thread via a single
     /// `Queue::write_texture` each, during frame application, before the draw.
@@ -1050,6 +1129,7 @@ pub struct RenderFrame {
     vector_clips: Vec<Option<u16>>,
     canvas_clips: Vec<Option<u16>>,
     ripple_clips: Vec<Option<u16>>,
+    backdrop_clips: Vec<Option<u16>>,
 
     /// Per-text-line wrap width in logical pixels, parallel to `texts` (kept off
     /// the `TextLine` struct like the depth/clip vecs, so its 19 construction
@@ -1137,6 +1217,8 @@ pub struct LayerMark {
     pub canvas: u32,
     /// `ripples` length at the boundary (RFC-0023).
     pub ripple: u32,
+    /// `backdrops` length at the boundary (RFC-0023 §2).
+    pub backdrop: u32,
 }
 
 /// NDC far-plane depth the shared draw-order depth buffer is cleared to at the
@@ -1182,6 +1264,8 @@ impl RenderFrame {
         self.vector_instances.clear();
         self.canvas_shapes.clear();
         self.ripples.clear();
+        self.backdrops.clear();
+        self.backdrop_marks.clear();
         self.atlas_uploads.clear();
         self.solid_depths.clear();
         self.decorated_depths.clear();
@@ -1197,6 +1281,7 @@ impl RenderFrame {
         self.vector_clips.clear();
         self.canvas_clips.clear();
         self.ripple_clips.clear();
+        self.backdrop_clips.clear();
         self.text_wrap.clear();
         self.layer_marks.clear();
         self.draw_seq = 0;
@@ -1314,6 +1399,30 @@ impl RenderFrame {
         self.ripple_clips.push(c);
     }
 
+    /// Appends a [`BackdropInstance`] (RFC-0023 §2 frosted-glass pane) to the
+    /// frame, stamping its draw-order depth and recording the pool-cursor
+    /// snapshot that tells the encoder what was emitted *behind* it (the
+    /// content it must rasterise before sampling). Pushed by the evaluator
+    /// right after the element's own background — the RFC-0023 §4 slot
+    /// (background → blur → tint → ripple → children).
+    pub fn push_backdrop(&mut self, mut b: BackdropInstance) {
+        let mark = LayerMark {
+            solid: u32::try_from(self.instances.len()).unwrap_or(u32::MAX),
+            decorated: u32::try_from(self.decorated.len()).unwrap_or(u32::MAX),
+            texture: u32::try_from(self.textures.len()).unwrap_or(u32::MAX),
+            vector: u32::try_from(self.vector_instances.len()).unwrap_or(u32::MAX),
+            text: u32::try_from(self.texts.len()).unwrap_or(u32::MAX),
+            canvas: u32::try_from(self.canvas_shapes.len()).unwrap_or(u32::MAX),
+            ripple: u32::try_from(self.ripples.len()).unwrap_or(u32::MAX),
+            backdrop: u32::try_from(self.backdrops.len()).unwrap_or(u32::MAX),
+        };
+        b.depth = self.next_depth();
+        let c = self.active_clip();
+        self.backdrops.push(b);
+        self.backdrop_marks.push(mark);
+        self.backdrop_clips.push(c);
+    }
+
     /// Appends a [`CanvasShape`] (RFC-0020 Tier-1 shape command) to the frame.
     pub fn push_canvas_shape(&mut self, s: CanvasShape) {
         let d = self.next_depth();
@@ -1348,6 +1457,7 @@ impl RenderFrame {
             text: u32::try_from(self.texts.len()).unwrap_or(u32::MAX),
             canvas: u32::try_from(self.canvas_shapes.len()).unwrap_or(u32::MAX),
             ripple: u32::try_from(self.ripples.len()).unwrap_or(u32::MAX),
+            backdrop: u32::try_from(self.backdrops.len()).unwrap_or(u32::MAX),
         };
         if self.layer_marks.last() == Some(&mark) {
             return; // empty layer — dedup, an overlay that emitted nothing is free
@@ -1427,6 +1537,19 @@ impl RenderFrame {
         &self.ripples
     }
 
+    /// Returns the backdrop-blur surfaces in this frame (RFC-0023 §2).
+    #[must_use]
+    pub fn backdrops(&self) -> &[BackdropInstance] {
+        &self.backdrops
+    }
+
+    /// Returns the per-backdrop pool-cursor snapshots (parallel to
+    /// [`backdrops`](Self::backdrops)): the encoder's pass-split boundaries.
+    #[must_use]
+    pub fn backdrop_marks(&self) -> &[LayerMark] {
+        &self.backdrop_marks
+    }
+
     /// Returns the pending atlas uploads recorded this frame (RFC-0009 §2-C).
     #[must_use]
     pub fn atlas_uploads(&self) -> &[AtlasUpload] {
@@ -1503,6 +1626,11 @@ impl RenderFrame {
     #[must_use]
     pub fn ripple_clips(&self) -> &[Option<u16>] {
         &self.ripple_clips
+    }
+    /// Per-`BackdropInstance` clip index (parallel to [`backdrops`](Self::backdrops)).
+    #[must_use]
+    pub fn backdrop_clips(&self) -> &[Option<u16>] {
+        &self.backdrop_clips
     }
 
     /// Returns the monotonic version counter for this frame.
@@ -2138,6 +2266,7 @@ mod motion_tests {
                 text: 1,
                 canvas: 0,
                 ripple: 0,
+                backdrop: 0,
             }]
         );
     }
@@ -2203,6 +2332,50 @@ mod motion_tests {
         f.clear();
         assert!(f.ripples().is_empty());
         assert!(f.ripple_clips().is_empty());
+    }
+
+    // ── Backdrop pool (RFC-0023 §2) ─────────────────────────────────────────
+
+    #[test]
+    fn push_backdrop_stamps_depth_clip_and_records_the_behind_cursor() {
+        let mut f = RenderFrame::new();
+        // Two solids behind the glass, one after (a child).
+        f.push_instance(box_at(0.0, 0.0));
+        f.push_instance(box_at(1.0, 1.0));
+        let c = f.begin_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+        f.push_backdrop(BackdropInstance {
+            rect: [0.0, 0.0, 80.0, 40.0],
+            radii: [8.0; 4],
+            blur: 20.0,
+            tint: [1.0, 1.0, 1.0, 0.5],
+            saturation: 1.8,
+            quality: BLUR_QUALITY_AUTO,
+            opacity: 1.0,
+            transform: Transform::IDENTITY,
+            depth: 123.0, // overwritten by the push
+        });
+        f.end_clip();
+        f.push_instance(box_at(2.0, 2.0));
+
+        assert_eq!(f.backdrops().len(), 1);
+        assert_eq!(f.backdrop_clips(), &[Some(c)]);
+        // The barrier snapshot captures exactly what was emitted behind it.
+        let mark = f.backdrop_marks()[0];
+        assert_eq!(mark.solid, 2, "two solids sit behind the glass");
+        assert_eq!(mark.backdrop, 0, "its own index in the backdrop pool");
+        // Depth was stamped between the behind-content and the child.
+        let d = f.backdrops()[0].depth;
+        assert!(
+            d < f.solid_depths()[1],
+            "glass sits above the content behind"
+        );
+        assert!(f.solid_depths()[2] < d, "the child sits above the glass");
+        f.begin_layer();
+        assert_eq!(f.layer_marks()[0].backdrop, 1);
+        f.clear();
+        assert!(f.backdrops().is_empty());
+        assert!(f.backdrop_marks().is_empty());
+        assert!(f.backdrop_clips().is_empty());
     }
 
     #[test]

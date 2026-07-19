@@ -343,6 +343,16 @@ impl Engine {
             height,
         )
         .await?;
+        // RFC-0023 resolved question "blur quality tiers": the `auto` tier
+        // runs the separable Gaussian at 0.5× base resolution on every real
+        // GPU — `IntegratedGpu` includes Apple Silicon and modern mobile
+        // parts, which handle it easily — and drops to the cheap 0.25× base
+        // only on software/virtual adapters, where every fragment costs CPU.
+        // A per-element `blur_quality: high | low` always overrides this.
+        encoder.set_blur_auto_capable(!matches!(
+            info.device_type,
+            wgpu::DeviceType::Cpu | wgpu::DeviceType::VirtualGpu
+        ));
 
         // Viewport uniform uses LOGICAL pixels so all instance coordinates can
         // be authored in density-independent units. cast precision loss is
